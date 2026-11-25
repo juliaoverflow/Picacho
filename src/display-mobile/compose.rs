@@ -96,7 +96,7 @@ impl Composer {
                     .text_size(px(17.))
                     .text_color(rgb(c.accent))
                     .active(|s| s.opacity(0.5))
-                    .child("Cancel")
+                    .child(t!("mobile-compose-cancel"))
                     .on_click(cx.listener(|_, _, _, cx| cx.emit(ComposerEvent::Close))),
             )
             .child(div().flex_1())
@@ -112,7 +112,7 @@ impl Composer {
                         .text_size(px(17.))
                         .text_color(rgb(c.accent))
                         .active(|s| s.opacity(0.5))
-                        .child(if self.previewing() { "Edit" } else { "Preview" })
+                        .child(if self.previewing() { t!("mobile-compose-edit") } else { t!("mobile-compose-preview") })
                         .on_click(cx.listener(|this, _, _, cx| this.toggle_preview(cx))),
                 )
             })

@@ -33,7 +33,7 @@ impl MailApp {
         let settings = self.bar_icon(
             "mobile-settings",
             "settings",
-            "Settings",
+            t!("mobile-mailboxes-settings"),
             Rc::new(
                 |this: &mut MailApp, w: &mut Window, cx: &mut Context<MailApp>| {
                     this.mobile_open_settings(w, cx)
@@ -50,7 +50,7 @@ impl MailApp {
                 "mobile-mailboxes-bar",
                 insets,
                 None,
-                "Mailboxes",
+                t!("mobile-mailboxes-mailboxes"),
                 None,
                 self.mobile_reorder_button(cx).into_iter().collect(),
             ))
@@ -104,7 +104,7 @@ impl MailApp {
             self.cell(
                 "mobile-open-calendar",
                 icon_el("clock", 22., c.accent).into_any_element(),
-                "Calendar",
+                t!("mobile-mailboxes-calendar"),
                 None,
                 true,
                 false,
@@ -117,7 +117,7 @@ impl MailApp {
             self.cell(
                 "mobile-open-contacts",
                 icon_el("contact", 22., c.accent).into_any_element(),
-                "Contacts",
+                t!("mobile-mailboxes-contacts"),
                 None,
                 true,
                 false,
@@ -132,7 +132,7 @@ impl MailApp {
                     self.cell(
                         "mobile-add-account",
                         icon_el("plus", 20., c.accent).into_any_element(),
-                        "Add Account",
+                        t!("mobile-mailboxes-add-account"),
                         None,
                         false,
                         false,
@@ -212,7 +212,7 @@ impl MailApp {
         self.cell(
             format!("mobile-subscriptions-{id}"),
             icon_el("subscriptions", 22., c.accent).into_any_element(),
-            "Subscriptions",
+            t!("mobile-mailboxes-subscriptions"),
             None,
             true,
             active,
@@ -229,7 +229,7 @@ impl MailApp {
         self.cell(
             format!("mobile-summary-{id}"),
             icon_el("summary", 22., c.accent).into_any_element(),
-            "Summary",
+            t!("mobile-mailboxes-summary"),
             None,
             true,
             active,
@@ -317,7 +317,7 @@ impl MailApp {
                 d.child(self.touch_icon(
                     SharedString::from(format!("mobile-issue-{id}")),
                     "triangle-alert",
-                    "This account needs attention",
+                    t!("mobile-mailboxes-this-account-needs-attention"),
                     super::chrome::push(Action::AccountSettings(id.clone())),
                     cx,
                 ))
@@ -326,7 +326,7 @@ impl MailApp {
             .child(self.touch_icon(
                 SharedString::from(format!("mobile-account-menu-{id}")),
                 "ellipsis",
-                "Account actions",
+                t!("mobile-mailboxes-account-actions"),
                 Rc::new(
                     move |this: &mut MailApp, w: &mut Window, cx: &mut Context<MailApp>| {
                         let entries = without_folding(this.account_entries(&menu_id, false));
@@ -419,7 +419,7 @@ impl MailApp {
                     .child(self.touch_icon(
                         SharedString::from(format!("mobile-view-menu-{id}")),
                         "ellipsis",
-                        "Actions",
+                        t!("mobile-mailboxes-actions"),
                         Rc::new(
                             move |this: &mut MailApp, w: &mut Window, cx: &mut Context<MailApp>| {
                                 let entries = without_folding(this.view_entries(&menu_id));
@@ -458,26 +458,22 @@ impl MailApp {
     pub(super) fn mobile_status(&self) -> (bool, String) {
         let d = &self.download;
         if self.checking_server() || self.mailbox_loading() {
-            (true, "Checking for mail…".to_owned())
+            (true, t!("mobile-mailboxes-checking-for-mail").to_owned())
         } else if d.total > 0 && d.missing > 0 {
             (
                 true,
-                format!(
-                    "Downloading {} of {}",
-                    fmt_count(d.total - d.missing),
-                    fmt_count(d.total)
-                ),
+                t!("mobile-mailboxes-downloading-of", done = fmt_count(d.total - d.missing), total = fmt_count(d.total)),
             )
         } else if !self.unreachable_accounts().is_empty() {
-            (false, "Offline".to_owned())
+            (false, t!("mobile-mailboxes-offline").to_owned())
         } else {
             let unread = self.mailbox_unread();
             (
                 false,
                 if unread > 0 {
-                    format!("{} unread", fmt_count(unread))
+                    t!("mobile-mailboxes-unread", shown = fmt_count(unread), count = unread)
                 } else {
-                    "Up to date".to_owned()
+                    t!("mobile-mailboxes-up-to-date").to_owned()
                 },
             )
         }
@@ -495,7 +491,7 @@ impl MailApp {
             } else {
                 "chevron-right"
             },
-            if open { "Hide folders" } else { "Show folders" },
+            if open { t!("mobile-mailboxes-hide-folders") } else { t!("mobile-mailboxes-show-folders") },
             act(Action::ToggleAccount(id.to_owned())),
             cx,
         )

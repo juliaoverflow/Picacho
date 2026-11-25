@@ -253,7 +253,7 @@ pub fn open_default_apps() -> anyhow::Result<()> {
             return Ok(());
         }
     }
-    anyhow::bail!("Could not open Windows Default apps settings.")
+    anyhow::bail!(t!("windows-could-not-open-windows-default-apps"))
 }
 
 /// "Show animations in Windows" (Settings → Accessibility → Visual

@@ -111,16 +111,16 @@ struct WidgetSnapshot: Codable, Sendable {
         accentSoftDark: 0x30463b,
         totalUnread: 3,
         accounts: [
-            AccountSummary(id: "sample", name: "Inbox", email: "you@example.com", unread: 3)
+            AccountSummary(id: "sample", name: String(localized: "Inbox", bundle: .picacho), email: "you@example.com", unread: 3)
         ],
         messages: [
             WidgetMessage(
                 id: "1",
                 accountId: "sample",
-                accountLabel: "Inbox",
+                accountLabel: String(localized: "Inbox", bundle: .picacho),
                 sender: "Ana López",
-                subject: "Weekend plans",
-                snippet: "Are we still on for Saturday morning?",
+                subject: String(localized: "Weekend plans", bundle: .picacho, comment: "Sample data for the widget gallery"),
+                snippet: String(localized: "Are we still on for Saturday morning?", bundle: .picacho, comment: "Sample data for the widget gallery"),
                 date: Int64(Date().timeIntervalSince1970) - 600,
                 unread: true,
                 starred: false,
@@ -129,10 +129,10 @@ struct WidgetSnapshot: Codable, Sendable {
             WidgetMessage(
                 id: "2",
                 accountId: "sample",
-                accountLabel: "Inbox",
-                sender: "Design Team",
-                subject: "Updated mockups attached",
-                snippet: "Here is the revised layout for the release.",
+                accountLabel: String(localized: "Inbox", bundle: .picacho),
+                sender: String(localized: "Design Team", bundle: .picacho, comment: "Sample data for the widget gallery"),
+                subject: String(localized: "Updated mockups attached", bundle: .picacho, comment: "Sample data for the widget gallery"),
+                snippet: String(localized: "Here is the revised layout for the release.", bundle: .picacho, comment: "Sample data for the widget gallery"),
                 date: Int64(Date().timeIntervalSince1970) - 3600,
                 unread: true,
                 starred: true,
@@ -141,10 +141,10 @@ struct WidgetSnapshot: Codable, Sendable {
             WidgetMessage(
                 id: "3",
                 accountId: "sample",
-                accountLabel: "Inbox",
+                accountLabel: String(localized: "Inbox", bundle: .picacho),
                 sender: "Sam Patel",
-                subject: "Notes from today's call",
-                snippet: "Thanks everyone — action items below.",
+                subject: String(localized: "Notes from today's call", bundle: .picacho, comment: "Sample data for the widget gallery"),
+                snippet: String(localized: "Thanks everyone — action items below.", bundle: .picacho, comment: "Sample data for the widget gallery"),
                 date: Int64(Date().timeIntervalSince1970) - 9200,
                 unread: false,
                 starred: false,
@@ -155,52 +155,52 @@ struct WidgetSnapshot: Codable, Sendable {
         events: [
             WidgetEvent(
                 uid: "evt-1",
-                title: "Design review",
-                location: "Room 4B",
+                title: String(localized: "Design review", bundle: .picacho, comment: "Sample data for the widget gallery"),
+                location: String(localized: "Room 4B", bundle: .picacho, comment: "Sample data for the widget gallery"),
                 start: Int64(Date().timeIntervalSince1970) + 1800,
                 end: Int64(Date().timeIntervalSince1970) + 5400,
                 allDay: false,
-                calendarName: "Work",
+                calendarName: String(localized: "Work", bundle: .picacho, comment: "Sample data for the widget gallery"),
                 calendarColor: "#246846"
             ),
             WidgetEvent(
                 uid: "evt-2",
-                title: "Coffee with Ana",
-                location: "Downtown Cafe",
+                title: String(localized: "Coffee with Ana", bundle: .picacho, comment: "Sample data for the widget gallery"),
+                location: String(localized: "Downtown Cafe", bundle: .picacho, comment: "Sample data for the widget gallery"),
                 start: Int64(Date().timeIntervalSince1970) + 10800,
                 end: Int64(Date().timeIntervalSince1970) + 14400,
                 allDay: false,
-                calendarName: "Personal",
+                calendarName: String(localized: "Personal", bundle: .picacho, comment: "Sample data for the widget gallery"),
                 calendarColor: "#2459A8"
             ),
         ],
         packages: [
             WidgetPackage(
                 key: "1Z999AA10123456784",
-                title: "Camera Lens",
+                title: String(localized: "Camera Lens", bundle: .picacho, comment: "Sample data for the widget gallery"),
                 number: "1Z999AA10123456784",
                 carrier: "UPS",
-                status: "Out for delivery",
+                status: String(localized: "Out for delivery", bundle: .picacho, comment: "Sample data for the widget gallery"),
                 stage: 3,
                 delivered: false,
-                expected: "Today",
+                expected: String(localized: "Today", bundle: .picacho),
                 updated: Int64(Date().timeIntervalSince1970) - 1800,
                 accountId: "sample",
-                accountLabel: "Inbox",
+                accountLabel: String(localized: "Inbox", bundle: .picacho),
                 mailId: "1"
             ),
             WidgetPackage(
                 key: "order:402-8821",
-                title: "Order 402-8821",
+                title: String(localized: "Order 402-8821", bundle: .picacho, comment: "Sample data for the widget gallery"),
                 number: "",
                 carrier: "USPS",
-                status: "Delivered",
+                status: String(localized: "Delivered", bundle: .picacho, comment: "Sample data for the widget gallery"),
                 stage: 4,
                 delivered: true,
                 expected: "",
                 updated: Int64(Date().timeIntervalSince1970) - 86400,
                 accountId: "sample",
-                accountLabel: "Inbox",
+                accountLabel: String(localized: "Inbox", bundle: .picacho),
                 mailId: "2"
             ),
         ],
@@ -214,7 +214,7 @@ struct WidgetSnapshot: Codable, Sendable {
                 date: Int64(Date().timeIntervalSince1970) - 3600,
                 updated: Int64(Date().timeIntervalSince1970) - 3600,
                 accountId: "sample",
-                accountLabel: "Inbox",
+                accountLabel: String(localized: "Inbox", bundle: .picacho),
                 mailId: "1"
             ),
             WidgetReceipt(
@@ -226,7 +226,7 @@ struct WidgetSnapshot: Codable, Sendable {
                 date: Int64(Date().timeIntervalSince1970) - 90000,
                 updated: Int64(Date().timeIntervalSince1970) - 90000,
                 accountId: "sample",
-                accountLabel: "Inbox",
+                accountLabel: String(localized: "Inbox", bundle: .picacho),
                 mailId: "2"
             ),
         ]
@@ -239,7 +239,14 @@ struct WidgetSnapshot: Codable, Sendable {
         else {
             return .empty
         }
+        // The widgets' words in the language Picacho shows.
+        PicachoLanguage.use((try? JSONDecoder().decode(Language.self, from: data))?.language ?? "")
         return decoded
+    }
+
+    /// The snapshot's "language": the one Picacho shows.
+    private struct Language: Decodable {
+        let language: String?
     }
 
     /// The App Group container's widget-snapshot.json, written by Picacho.
@@ -286,22 +293,22 @@ struct WidgetSnapshot: Codable, Sendable {
 
     func label(for accountId: String?) -> String {
         if let accountId, !accountId.isEmpty {
-            return accounts.first(where: { $0.id == accountId })?.name ?? "Inbox"
+            return accounts.first(where: { $0.id == accountId })?.name ?? String(localized: "Inbox", bundle: .picacho)
         }
         if accounts.count == 1 {
             return accounts[0].name
         }
-        return "All Inboxes"
+        return String(localized: "All Inboxes", bundle: .picacho)
     }
 
     func accountLabel(for accountId: String?) -> String {
         if let accountId, !accountId.isEmpty {
-            return accounts.first(where: { $0.id == accountId })?.name ?? "All Accounts"
+            return accounts.first(where: { $0.id == accountId })?.name ?? String(localized: "All Accounts", bundle: .picacho)
         }
         if accounts.count == 1 {
             return accounts[0].name
         }
-        return "All Accounts"
+        return String(localized: "All Accounts", bundle: .picacho)
     }
 
     func filteredMessages(accountId: String?, unreadOnly: Bool, limit: Int) -> [WidgetMessage] {
@@ -633,15 +640,15 @@ enum WidgetFormatting {
         let date = Date(timeIntervalSince1970: TimeInterval(epochSeconds))
         let cal = Calendar.current
         if cal.isDateInToday(date) {
-            return date.formatted(date: .omitted, time: .shortened)
+            return date.formatted(Date.FormatStyle(date: .omitted, time: .shortened).locale(PicachoLanguage.locale))
         }
         if let days = cal.dateComponents([.day], from: date, to: Date()).day, days >= 0, days < 6 {
-            return date.formatted(.dateTime.weekday(.abbreviated))
+            return date.formatted(.dateTime.weekday(.abbreviated).locale(PicachoLanguage.locale))
         }
         if cal.component(.year, from: date) == cal.component(.year, from: Date()) {
-            return date.formatted(.dateTime.month(.abbreviated).day())
+            return date.formatted(.dateTime.month(.abbreviated).day().locale(PicachoLanguage.locale))
         }
-        return date.formatted(date: .abbreviated, time: .omitted)
+        return date.formatted(Date.FormatStyle(date: .abbreviated, time: .omitted).locale(PicachoLanguage.locale))
     }
 
     static func eventTime(_ event: WidgetEvent) -> String {
@@ -652,14 +659,14 @@ enum WidgetFormatting {
             let date = Date(timeIntervalSince1970: TimeInterval(event.start))
             let comps = utc.dateComponents([.year, .month, .day], from: date)
             let localDate = cal.date(from: comps) ?? date
-            return "\(dayLabel(localDate)) · All day"
+            return "\(dayLabel(localDate)) · \(String(localized: "All day", bundle: .picacho, comment: "An event that lasts all day, after its day"))"
         }
         let start = Date(timeIntervalSince1970: TimeInterval(event.start))
         let day = dayLabel(start)
-        let startStr = start.formatted(date: .omitted, time: .shortened)
+        let startStr = start.formatted(Date.FormatStyle(date: .omitted, time: .shortened).locale(PicachoLanguage.locale))
         if event.end > event.start {
             let end = Date(timeIntervalSince1970: TimeInterval(event.end))
-            let endStr = end.formatted(date: .omitted, time: .shortened)
+            let endStr = end.formatted(Date.FormatStyle(date: .omitted, time: .shortened).locale(PicachoLanguage.locale))
             return "\(day) · \(startStr) – \(endStr)"
         }
         return "\(day) · \(startStr)"
@@ -668,11 +675,11 @@ enum WidgetFormatting {
     private static func dayLabel(_ date: Date) -> String {
         let cal = Calendar.current
         if cal.isDateInToday(date) {
-            return "Today"
+            return String(localized: "Today", bundle: .picacho)
         }
         if cal.isDateInTomorrow(date) {
-            return "Tomorrow"
+            return String(localized: "Tomorrow", bundle: .picacho)
         }
-        return date.formatted(.dateTime.weekday(.abbreviated).month(.abbreviated).day())
+        return date.formatted(.dateTime.weekday(.abbreviated).month(.abbreviated).day().locale(PicachoLanguage.locale))
     }
 }

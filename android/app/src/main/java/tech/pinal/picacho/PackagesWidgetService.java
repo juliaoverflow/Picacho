@@ -76,7 +76,8 @@ public final class PackagesWidgetService extends RemoteViewsService {
             int fillColor = p.delivered ? muted : accent;
 
             row.setInt(R.id.widget_pkg_item_icon, "setColorFilter", fillColor);
-            row.setTextViewText(R.id.widget_pkg_item_title, p.title.isEmpty() ? "Package" : p.title);
+            row.setTextViewText(R.id.widget_pkg_item_title,
+                    p.title.isEmpty() ? Lang.of(context).getString(R.string.widget_package) : p.title);
             if (p.number.isEmpty()) {
                 row.setViewVisibility(R.id.widget_pkg_item_number, View.GONE);
             } else {
@@ -94,7 +95,7 @@ public final class PackagesWidgetService extends RemoteViewsService {
             }
             if (!p.expected.isEmpty()) {
                 if (detail.length() > 0) detail.append(" · ");
-                detail.append("Expected ").append(p.expected);
+                detail.append(Lang.of(context).getString(R.string.widget_expected, p.expected));
             } else {
                 String date = WidgetStore.formatMessageDate(context, p.updated);
                 if (!date.isEmpty()) {

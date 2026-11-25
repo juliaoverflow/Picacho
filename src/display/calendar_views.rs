@@ -91,7 +91,7 @@ impl Ordinal {
             Self::Second => "2nd",
             Self::Third => "3rd",
             Self::Fourth => "4th",
-            Self::Last => "Last",
+            Self::Last => t!("calendar-views-last"),
         }
     }
     fn pos(self) -> i32 {
@@ -145,16 +145,16 @@ impl NthTarget {
     ];
     fn label(self) -> &'static str {
         match self {
-            Self::Mon => "Mon",
-            Self::Tue => "Tue",
-            Self::Wed => "Wed",
-            Self::Thu => "Thu",
-            Self::Fri => "Fri",
-            Self::Sat => "Sat",
-            Self::Sun => "Sun",
-            Self::Day => "Day",
-            Self::Weekday => "Weekday",
-            Self::Weekend => "Weekend day",
+            Self::Mon => t!("calendar-views-mon"),
+            Self::Tue => t!("calendar-views-tue"),
+            Self::Wed => t!("calendar-views-wed"),
+            Self::Thu => t!("calendar-views-thu"),
+            Self::Fri => t!("calendar-views-fri"),
+            Self::Sat => t!("calendar-views-sat"),
+            Self::Sun => t!("calendar-views-sun"),
+            Self::Day => t!("calendar-views-day"),
+            Self::Weekday => t!("calendar-views-weekday"),
+            Self::Weekend => t!("calendar-views-weekend-day"),
         }
     }
     fn weekday_code(self) -> Option<&'static str> {
@@ -191,19 +191,36 @@ pub(super) enum Ends {
     On,
 }
 
-const WEEKDAYS: [(&str, &str); 7] = [
-    ("MO", "Mon"),
-    ("TU", "Tue"),
-    ("WE", "Wed"),
-    ("TH", "Thu"),
-    ("FR", "Fri"),
-    ("SA", "Sat"),
-    ("SU", "Sun"),
-];
+/// The days of the week, Monday first: their RFC 5545 codes and short names.
+fn weekday_names() -> [(&'static str, &'static str); 7] {
+    [
+        ("MO", t!("calendar-views-mon")),
+        ("TU", t!("calendar-views-tue")),
+        ("WE", t!("calendar-views-wed")),
+        ("TH", t!("calendar-views-thu")),
+        ("FR", t!("calendar-views-fri")),
+        ("SA", t!("calendar-views-sat")),
+        ("SU", t!("calendar-views-sun")),
+    ]
+}
 
-const MONTHS: [&str; 12] = [
-    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
-];
+/// The months' short names, January first.
+fn month_names() -> [&'static str; 12] {
+    [
+        t!("calendar-views-jan"),
+        t!("calendar-views-feb"),
+        t!("calendar-views-mar"),
+        t!("calendar-views-apr"),
+        t!("calendar-views-may"),
+        t!("calendar-views-jun"),
+        t!("calendar-views-jul"),
+        t!("calendar-views-aug"),
+        t!("calendar-views-sep"),
+        t!("calendar-views-oct"),
+        t!("calendar-views-nov"),
+        t!("calendar-views-dec"),
+    ]
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub(super) enum CalAction {
@@ -279,7 +296,7 @@ impl CalViews {
             days: [false; 7],
             months,
             pattern: PatternMode::default(),
-            month_day: input("15 (or -1 for last day)", false, window, cx),
+            month_day: input(t!("calendar-views-15-or-1-for-last-day"), false, window, cx),
             ordinal: Ordinal::default(),
             nth_target: NthTarget::from_chrono(today.weekday()),
             ends: Ends::default(),
@@ -319,7 +336,7 @@ pub(super) fn custom_rule(spec: &CustomRuleSpec) -> String {
     match spec.freq {
         Freq::Daily => {}
         Freq::Weekly => {
-            let byday: Vec<&str> = WEEKDAYS
+            let byday: Vec<&str> = weekday_names()
                 .iter()
                 .zip(&spec.days)
                 .filter(|(_, on)| **on)
@@ -427,7 +444,7 @@ fn time_of(ts: i64) -> String {
     Local
         .timestamp_opt(ts, 0)
         .single()
-        .map(|t| t.format("%H:%M").to_string())
+        .map(|t| t.local(t!("dates-calendar-time")))
         .unwrap_or_default()
 }
 
@@ -710,11 +727,11 @@ impl MailApp {
                 )
                 .ok();
                 if self.cal.ends == Ends::After && count == 0 {
-                    self.notice("Say how many times it repeats", true, cx);
+                    self.notice(t!("calendar-views-say-how-many-times-it-repeats"), true, cx);
                     return;
                 }
                 if self.cal.ends == Ends::On && until.is_none() {
-                    self.notice("Type the last date as 2027-06-30", true, cx);
+                    self.notice(t!("calendar-views-type-the-last-date-as-2027"), true, cx);
                     return;
                 }
                 let md_raw = Self::value(&self.cal.month_day, cx);
@@ -724,7 +741,7 @@ impl MailApp {
                     && !md_raw.trim().is_empty()
                     && month_days.is_empty()
                 {
-                    self.notice("Type day numbers from 1 to 31 (or -1 for the last day)", true, cx);
+                    self.notice(t!("calendar-views-type-day-numbers-from-1-to"), true, cx);
                     return;
                 }
                 let spec = CustomRuleSpec {
@@ -763,7 +780,7 @@ impl MailApp {
             return div()
                 .child(self.link(
                     "custom-repeat",
-                    "Custom repeat…",
+                    t!("calendar-views-custom-repeat"),
                     act(CalAction::Custom(true)),
                     cx,
                 ))
@@ -794,10 +811,10 @@ impl MailApp {
                 .into_iter()
                 .map(|f| {
                     let label = match f {
-                        Freq::Daily => "Daily",
-                        Freq::Weekly => "Weekly",
-                        Freq::Monthly => "Monthly",
-                        Freq::Yearly => "Yearly",
+                        Freq::Daily => t!("calendar-views-daily"),
+                        Freq::Weekly => t!("calendar-views-weekly"),
+                        Freq::Monthly => t!("calendar-views-monthly"),
+                        Freq::Yearly => t!("calendar-views-yearly"),
                     };
                     (label.to_owned(), act(CalAction::Freq(f)), self.cal.freq == f)
                 })
@@ -805,7 +822,7 @@ impl MailApp {
             cx,
         );
         let mut days = div().flex().flex_wrap().gap_1();
-        for (i, (_, label)) in WEEKDAYS.iter().enumerate() {
+        for (i, (_, label)) in weekday_names().into_iter().enumerate() {
             days = days.child(pill(
                 format!("custom-day-{i}"),
                 label,
@@ -814,7 +831,7 @@ impl MailApp {
             ));
         }
         let mut months = div().flex().flex_wrap().gap_1();
-        for (i, label) in MONTHS.iter().enumerate() {
+        for (i, label) in month_names().into_iter().enumerate() {
             months = months.child(pill(
                 format!("custom-month-{i}"),
                 label,
@@ -826,12 +843,12 @@ impl MailApp {
             "custom-pattern",
             vec![
                 (
-                    "On day of month".into(),
+                    t!("calendar-views-on-day-of-month").into(),
                     act(CalAction::Pattern(PatternMode::OnDayOfMonth)),
                     self.cal.pattern == PatternMode::OnDayOfMonth,
                 ),
                 (
-                    "On the Nth weekday".into(),
+                    t!("calendar-views-on-the-nth-weekday").into(),
                     act(CalAction::Pattern(PatternMode::OnNthWeekday)),
                     self.cal.pattern == PatternMode::OnNthWeekday,
                 ),
@@ -860,17 +877,17 @@ impl MailApp {
             "custom-ends",
             vec![
                 (
-                    "Never".into(),
+                    t!("calendar-views-never").into(),
                     act(CalAction::Ends(Ends::Never)),
                     self.cal.ends == Ends::Never,
                 ),
                 (
-                    "After a number of times".into(),
+                    t!("calendar-views-after-a-number-of-times").into(),
                     act(CalAction::Ends(Ends::After)),
                     self.cal.ends == Ends::After,
                 ),
                 (
-                    "On a date".into(),
+                    t!("calendar-views-on-a-date").into(),
                     act(CalAction::Ends(Ends::On)),
                     self.cal.ends == Ends::On,
                 ),
@@ -887,22 +904,22 @@ impl MailApp {
             .flex()
             .flex_col()
             .gap_2()
-            .child(small("Repeats"))
+            .child(small(t!("calendar-views-repeats")))
             .child(freqs)
             .child(
                 div()
                     .flex()
                     .items_center()
                     .gap_2()
-                    .child(small("Every"))
+                    .child(small(t!("calendar-views-every")))
                     .child(div().w(px(70.)).child(field(Input::new(&self.cal.interval), c, false)))
                     .child(small(self.cal.freq.unit())),
             )
             .when(self.cal.freq == Freq::Weekly, |d| {
-                d.child(small("On")).child(days)
+                d.child(small(t!("calendar-views-on"))).child(days)
             })
             .when(self.cal.freq == Freq::Yearly, |d| {
-                d.child(small("In")).child(months)
+                d.child(small(t!("calendar-views-in"))).child(months)
             })
             .when(monthly_or_yearly, |d| {
                 d.child(pattern)
@@ -912,7 +929,7 @@ impl MailApp {
                                 .flex()
                                 .items_center()
                                 .gap_2()
-                                .child(small("Day(s)"))
+                                .child(small(t!("calendar-views-day-s")))
                                 .child(
                                     div()
                                         .w(px(190.))
@@ -924,7 +941,7 @@ impl MailApp {
                         d.child(ordinals).child(targets)
                     })
             })
-            .child(small("Ends"))
+            .child(small(t!("calendar-views-ends")))
             .child(ends)
             .when(self.cal.ends == Ends::After, |d| {
                 d.child(
@@ -945,7 +962,7 @@ impl MailApp {
                     .gap_2()
                     .child(self.button(
                         "custom-apply",
-                        "Use This Repeat",
+                        t!("calendar-views-use-this-repeat"),
                         "check",
                         act(CalAction::ApplyCustom),
                         true,
@@ -953,7 +970,7 @@ impl MailApp {
                     ))
                     .child(self.button(
                         "custom-cancel",
-                        "Cancel",
+                        t!("calendar-views-cancel"),
                         "",
                         act(CalAction::Custom(false)),
                         false,
@@ -972,10 +989,10 @@ impl MailApp {
             .segmented(
                 "calendar-view",
                 [
-                    ("Agenda", CalendarView::Agenda),
-                    ("Day", CalendarView::Day),
-                    ("Week", CalendarView::Week),
-                    ("Month", CalendarView::Month),
+                    (t!("calendar-views-agenda"), CalendarView::Agenda),
+                    (t!("calendar-views-day"), CalendarView::Day),
+                    (t!("calendar-views-week"), CalendarView::Week),
+                    (t!("calendar-views-month"), CalendarView::Month),
                 ]
                 .into_iter()
                 .map(|(label, v)| (label.to_owned(), act(CalAction::View(v)), view == v))
@@ -1006,13 +1023,13 @@ impl MailApp {
             day_start(from + Days::days(days as i64)) + 86_400,
         );
         let title = match view {
-            CalendarView::Month => anchor.format("%B %Y").to_string(),
+            CalendarView::Month => anchor.local(t!("dates-month-year")),
             CalendarView::Week => format!(
                 "{} – {}",
-                from.format("%b %-d"),
-                (from + Days::days(6)).format("%b %-d, %Y")
+                from.local(t!("dates-month-day")),
+                (from + Days::days(6)).local(t!("dates-month-day-year"))
             ),
-            _ => anchor.format("%A, %B %-d, %Y").to_string(),
+            _ => anchor.local(t!("dates-long-date")),
         };
         let now = Local::now();
         let today = now.date_naive();
@@ -1034,7 +1051,7 @@ impl MailApp {
             ))
             .child(self.button(
                 "calendar-today",
-                "Today",
+                t!("calendar-views-today"),
                 "",
                 act(CalAction::Today),
                 false,
@@ -1086,7 +1103,7 @@ impl MailApp {
                     .rounded_lg()
                     .overflow_hidden();
                 let mut names = div().flex().bg(rgb(c.bg));
-                for (_, n) in WEEKDAYS {
+                for (_, n) in weekday_names() {
                     names = names.child(
                         div()
                             .flex_1()
@@ -1149,7 +1166,7 @@ impl MailApp {
                                 div()
                                     .text_size(px(10.))
                                     .text_color(rgb(c.muted))
-                                    .child(format!("{more} more")),
+                                    .child(t!("calendar-views-more", more = more)),
                             );
                         }
                         row = row.child(cell);
@@ -1213,7 +1230,7 @@ impl MailApp {
                                 .py_1()
                                 .text_size(px(10.))
                                 .text_color(rgb(c.muted))
-                                .child("All day"),
+                                .child(t!("calendar-views-all-day")),
                         );
                     for (i, all_day) in all_day_by_day.iter().enumerate() {
                         let day = day_list[i];
@@ -1412,8 +1429,8 @@ impl MailApp {
     ) -> AnyElement {
         let c = self.colors();
         let (title, page) = match view {
-            AppView::Calendar => ("Calendar", self.calendar_page(cx)),
-            AppView::Contacts => ("Contacts", self.contacts_page(cx)),
+            AppView::Calendar => (t!("calendar-views-calendar"), self.calendar_page(cx)),
+            AppView::Contacts => (t!("calendar-views-contacts"), self.contacts_page(cx)),
         };
         div()
             .id("app-view")
@@ -1445,7 +1462,7 @@ impl MailApp {
                     )
                     .child(self.button(
                         "app-view-close",
-                        "@Back to mail",
+                        t!("calendar-views-back-to-mail"),
                         "close",
                         Action::Calendar(CalAction::Close),
                         false,
@@ -1504,8 +1521,8 @@ impl MailApp {
             .gap(px(1.))
             .mt_2()
             .when(collapsed, |d| d.items_center())
-            .child(item("open-calendar", "Calendar", "clock", AppView::Calendar))
-            .child(item("open-contacts", "Contacts", "contact", AppView::Contacts))
+            .child(item("open-calendar", t!("calendar-views-calendar"), "clock", AppView::Calendar))
+            .child(item("open-contacts", t!("calendar-views-contacts"), "contact", AppView::Contacts))
             .into_any_element()
     }
 }

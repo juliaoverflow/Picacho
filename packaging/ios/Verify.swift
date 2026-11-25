@@ -25,16 +25,17 @@ final class PicachoVerify: UIViewController, WKNavigationDelegate, WKScriptMessa
 
     private let id: Int32
     private let url: URL
+    private let heading: String
     private var answered = false
     private var web: WKWebView?
 
-    /// Shows `url` for request `id`; false if it can't be.
-    static func start(id: Int32, url: String) -> Bool {
+    /// Shows `url` for request `id`, under `title`; false if it can't be.
+    static func start(id: Int32, url: String, title: String) -> Bool {
         guard url.hasPrefix(page), let url = URL(string: url), let top = picachoTopController() else {
             return false
         }
         current?.finish()
-        let verify = PicachoVerify(id: id, url: url)
+        let verify = PicachoVerify(id: id, url: url, heading: title)
         let navigation = UINavigationController(rootViewController: verify)
         navigation.presentationController?.delegate = verify
         top.present(navigation, animated: true)
@@ -49,9 +50,10 @@ final class PicachoVerify: UIViewController, WKNavigationDelegate, WKScriptMessa
         verify.finish()
     }
 
-    private init(id: Int32, url: URL) {
+    private init(id: Int32, url: URL, heading: String) {
         self.id = id
         self.url = url
+        self.heading = heading
         super.init(nibName: nil, bundle: nil)
     }
 
@@ -78,7 +80,7 @@ final class PicachoVerify: UIViewController, WKNavigationDelegate, WKScriptMessa
 
     override func viewDidLoad() {
         super.viewDidLoad()
-        title = "Verify that it's you"
+        title = heading
         navigationItem.leftBarButtonItem = UIBarButtonItem(
             systemItem: .cancel,
             primaryAction: UIAction { [weak self] _ in self?.finish() })
@@ -207,9 +209,12 @@ final class PicachoVerify: UIViewController, WKNavigationDelegate, WKScriptMessa
 }
 
 @_cdecl("picacho_ios_verify_start")
-public func picachoIosVerifyStart(_ id: Int32, _ url: UnsafePointer<UInt8>?, _ len: Int) -> Bool {
+public func picachoIosVerifyStart(
+    _ id: Int32, _ url: UnsafePointer<UInt8>?, _ len: Int, _ title: UnsafePointer<UInt8>?, _ titleLen: Int
+) -> Bool {
     let url = picachoString(url, len)
-    return picachoOnMain { PicachoVerify.start(id: id, url: url) }
+    let title = picachoString(title, titleLen)
+    return picachoOnMain { PicachoVerify.start(id: id, url: url, title: title) }
 }
 
 @_cdecl("picacho_ios_verify_close")

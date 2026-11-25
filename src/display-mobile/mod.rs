@@ -1335,7 +1335,7 @@ impl MailApp {
                 .bg(rgb(c.surface))
                 .text_color(rgb(c.muted))
                 .child(icon_el("mail", 44., c.border))
-                .child("No message selected")
+                .child(t!("mobile-mod-no-message-selected"))
                 .into_any_element()
         };
         let reader = self.mobile_pane_motion(SplitPane::Reader, reader);

@@ -221,11 +221,11 @@ pub(super) fn split_quoted(body: &str) -> (&str, Option<&str>) {
     let lines: Vec<&str> = body.split_inclusive('\n').collect();
     for (i, line) in lines.iter().enumerate() {
         let t = line.trim();
-        let attribution = (t.starts_with("On ") && t.ends_with("wrote:"))
+        let attribution = crate::manage::composing::introduces_quote(t)
             || (t.starts_with("Le ") && t.ends_with("a écrit :"))
             || (t.starts_with("Am ") && t.ends_with("schrieb:"))
             || t.starts_with("-----Original Message-----")
-            || t.starts_with("---------- Forwarded message")
+            || crate::manage::composing::starts_forward(t)
             || t.starts_with("________________________________")
             // Outlook: "From: …" followed by "Sent:" within two lines.
             || (t.starts_with("From:")
@@ -291,7 +291,7 @@ pub(super) fn short_names(list: &str, own: &[String]) -> Vec<String> {
         .into_iter()
         .map(|(name, email)| {
             if own.iter().any(|o| o.eq_ignore_ascii_case(&email)) {
-                return "me".to_string();
+                return t!("reader-me").to_owned();
             }
             match name.filter(|n| !n.trim().is_empty()) {
                 Some(n) if several => n.split_whitespace().next().unwrap_or(&n).to_string(),

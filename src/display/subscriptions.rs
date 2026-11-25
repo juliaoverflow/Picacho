@@ -278,19 +278,19 @@ impl MailApp {
         let moved = |folder| change(Change::Move(folder));
         vec![
             if unread {
-                entry("Mark All as Read", "mail-open", change(Change::Read(true)))
+                entry(t!("subscriptions-mark-all-as-read"), "mail-open", change(Change::Read(true)))
             } else {
-                entry("Mark All as Unread", "mail", change(Change::Read(false)))
+                entry(t!("subscriptions-mark-all-as-unread"), "mail", change(Change::Read(false)))
             },
             Entry::Separator,
-            entry("Move All to Inbox", "inbox", moved(Folder::Inbox)),
-            entry("Archive All", "archive", moved(Folder::Archive)),
-            entry("Move All to Spam", "spam", moved(Folder::Junk)),
-            danger("Move All to Trash", "trash", moved(Folder::Trash)),
+            entry(t!("subscriptions-move-all-to-inbox"), "inbox", moved(Folder::Inbox)),
+            entry(t!("subscriptions-archive-all"), "archive", moved(Folder::Archive)),
+            entry(t!("subscriptions-move-all-to-spam"), "spam", moved(Folder::Junk)),
+            danger(t!("subscriptions-move-all-to-trash"), "trash", moved(Folder::Trash)),
         ]
         .into_iter()
         .chain(self.move_folder_entry(
-            "Move All to Folder…",
+            t!("subscriptions-move-all-to-folder"),
             MoveTarget::Subscription(Box::new(sub.clone())),
         ))
         .collect()
@@ -394,19 +394,16 @@ impl MailApp {
                 match result {
                     Ok(0) => {}
                     Ok(n) => {
-                        let messages = format!("{} message{}", fmt_count(n), if n == 1 { "" } else { "s" });
+                        let messages = t!("subscriptions-message", count = n, shown = fmt_count(n));
                         let done = match &change {
-                            Change::Read(true) => format!("Marked {messages} from {who} as read"),
-                            Change::Read(false) => format!("Marked {messages} from {who} as unread"),
-                            Change::Move(_) | Change::MoveTo(_) => format!(
-                                "Moved {messages} from {who} to {}",
-                                this.destination_label(&account_id, &change).unwrap_or_default()
-                            ),
+                            Change::Read(true) => t!("subscriptions-marked-from-as-read", messages = messages, who = who),
+                            Change::Read(false) => t!("subscriptions-marked-from-as-unread", messages = messages, who = who),
+                            Change::Move(_) | Change::MoveTo(_) => t!("subscriptions-moved-from-to", messages = messages, who = who, to = this.destination_label(&account_id, &change).unwrap_or_default()),
                             Change::Star(_) | Change::Label(..) | Change::Mark(_) => String::new(),
                         };
                         this.notice(done, false, cx);
                     }
-                    Err(e) => this.notice(format!("Couldn't change {who}'s mail: {e:#}"), true, cx),
+                    Err(e) => this.notice(t!("subscriptions-couldnt-change-s-mail", who = who, e = format!("{:#}", e)), true, cx),
                 }
                 if this.subs_open {
                     this.reload_subscriptions(cx);
@@ -426,7 +423,7 @@ impl MailApp {
         }
         let Some(account) = self.accounts.iter().find(|a| a.id == sub.account).cloned() else {
             self.unsubscribing.remove(&key);
-            self.notice("Add this mailbox's account to unsubscribe.", true, cx);
+            self.notice(t!("subscriptions-add-this-mailboxs-account-to-unsubscribe"), true, cx);
             return;
         };
         let who = if sub.name.is_empty() || sub.name.eq_ignore_ascii_case(&sub.address) {
@@ -436,7 +433,7 @@ impl MailApp {
         };
         // Finding a trustworthy way to unsubscribe can take a few seconds
         // (the sender's signature is checked against its DNS); say so now.
-        self.notice(format!("Checking how to unsubscribe from {who}…"), false, cx);
+        self.notice(t!("subscriptions-checking-how-to-unsubscribe-from", who = who), false, cx);
         let window = w.window_handle();
         let planning = account.clone();
         self.task(
@@ -447,7 +444,7 @@ impl MailApp {
                     Ok(plan) => plan,
                     Err(e) => {
                         this.unsubscribing.remove(&key);
-                        this.notice(format!("Couldn't unsubscribe: {e:#}"), true, cx);
+                        this.notice(t!("subscriptions-couldnt-unsubscribe", e = format!("{:#}", e)), true, cx);
                         return;
                     }
                 };
@@ -457,28 +454,22 @@ impl MailApp {
                 }
                 let (title, mut detail, go) = match &plan.method {
                     subs::Method::Mail { to, subject } => (
-                        format!("Email {to} to unsubscribe?"),
-                        format!(
-                            "A message saying \"unsubscribe\", with the subject \"{subject}\", will be sent from {} to {to}.",
-                            account.email
-                        ),
-                        "Send",
+                        t!("subscriptions-email-to-unsubscribe", to = to),
+                        t!("subscriptions-a-message-saying-unsubscribe-with-the", subject = subject, email = account.email, to = to),
+                        t!("subscriptions-send"),
                     ),
                     subs::Method::Web(url) => (
-                        format!("Open {who}'s unsubscribe page?"),
-                        format!("{url} will open in your browser."),
-                        "Open",
+                        t!("subscriptions-open-s-unsubscribe-page", who = who),
+                        t!("subscriptions-will-open-in-your-browser", url = url),
+                        t!("subscriptions-open"),
                     ),
                     subs::Method::OneClick(_) => unreachable!("one click needs no confirmation"),
                 };
                 if !plan.verified {
-                    detail.push_str(&format!(
-                        "\n\nThe sender's signature doesn't cover this request, so it may not come from {}.",
-                        sub_address(&key)
-                    ));
+                    detail.push_str(&t!("subscriptions-the-senders-signature-doesnt-cover-this", address = sub_address(&key)));
                 }
                 let answer = window.update(cx, |_, window, cx| {
-                    window.prompt(PromptLevel::Info, &title, Some(&detail), &[go, "Cancel"], cx)
+                    window.prompt(PromptLevel::Info, &title, Some(&detail), &[go, t!("subscriptions-cancel")], cx)
                 });
                 let Ok(answer) = answer else {
                     this.unsubscribing.remove(&key);
@@ -519,7 +510,7 @@ impl MailApp {
                         this.save_unsubscribed();
                         match outcome {
                             Outcome::Done => {
-                                this.notice(format!("Unsubscribed from {who}"), false, cx)
+                                this.notice(t!("subscriptions-unsubscribed-from", who = who), false, cx)
                             }
                             Outcome::Open(url) => {
                                 // The sender's page: only a web link, as an
@@ -529,19 +520,19 @@ impl MailApp {
                                 match crate::display::html::openable_url(&url) {
                                     Some(url) => this.open_external(url.as_str(), cx),
                                     None => {
-                                        this.notice("Picacho only opens web and email links.", true, cx);
+                                        this.notice(t!("subscriptions-picacho-only-opens-web-and-email"), true, cx);
                                         return;
                                     }
                                 }
                                 this.notice(
-                                    format!("Finish unsubscribing from {who} on the page that opened"),
+                                    t!("subscriptions-finish-unsubscribing-from-on-the-page", who = who),
                                     false,
                                     cx,
                                 );
                             }
                         }
                     }
-                    Err(e) => this.notice(format!("Couldn't unsubscribe: {e:#}"), true, cx),
+                    Err(e) => this.notice(t!("subscriptions-couldnt-unsubscribe", e = format!("{:#}", e)), true, cx),
                 }
                 cx.notify();
             },
@@ -564,12 +555,12 @@ impl MailApp {
                 .text_size(px(12.))
                 .text_color(rgb(c.muted))
                 .child(icon_el("check", 13., c.muted))
-                .child("Unsubscribed");
+                .child(t!("subscriptions-unsubscribed"));
         }
         let busy = self.unsubscribing.contains(&key);
         self.button(
             id,
-            if busy { "Unsubscribing…" } else { "Unsubscribe" },
+            if busy { t!("subscriptions-unsubscribing") } else { t!("subscriptions-unsubscribe") },
             "",
             Action::Unsubscribe(sub.clone()),
             false,
@@ -592,7 +583,7 @@ impl MailApp {
                 "unsubscribe-banner",
                 "subscriptions",
                 BannerStyle::Outlined,
-                "This message is from a mailing list or subscription.",
+                t!("subscriptions-this-message-is-from-a-mailing"),
                 [unsubscribe.into_any_element()],
             )
             // A quiet line: it is offered on every such message.
@@ -636,7 +627,7 @@ impl MailApp {
                     } else {
                         FontWeight::MEDIUM
                     })
-                    .child("Subscriptions"),
+                    .child(t!("subscriptions-subscriptions")),
             )
             .on_click(cx.listener(move |this, _, w, cx| this.handle(action.clone(), w, cx)))
     }
@@ -646,7 +637,7 @@ impl MailApp {
         let active = self.subs_open && self.account.as_deref() == Some(id);
         self.rail_button(
             format!("rail-{id}-subscriptions"),
-            "Subscriptions".into(),
+            t!("subscriptions-subscriptions").into(),
             icon_el("subscriptions", 17., if active { c.accent } else { c.muted })
                 .into_any_element(),
             active,
@@ -718,7 +709,7 @@ impl MailApp {
                 .text_size(px(13.))
                 .text_color(rgb(c.muted))
                 .child(icon_el("subscriptions", 36., c.border))
-                .child("Choose a subscription to see its mail")
+                .child(t!("subscriptions-choose-a-subscription-to-see-its"))
                 .into_any_element();
         };
         if self.selected_ref().is_some() {
@@ -792,7 +783,7 @@ impl MailApp {
                             .truncate()
                             .text_size(px(17.))
                             .font_weight(FontWeight::SEMIBOLD)
-                            .child("Subscriptions"),
+                            .child(t!("subscriptions-subscriptions")),
                     )
                     .when(self.subs_loading, |d| d.child(spinner(13., c.muted))),
             )
@@ -803,13 +794,13 @@ impl MailApp {
                     .gap_1()
                     .child(tab(
                         "subs-tab-subscribed",
-                        format!("Subscribed · {}", fmt_count(self.subs.len() - unsubscribed)),
+                        t!("subscriptions-subscribed", shown = fmt_count(self.subs.len() - unsubscribed)),
                         self.subs_tab == SubsTab::Subscribed,
                         Action::SubscriptionsTab(false),
                     ))
                     .child(tab(
                         "subs-tab-unsubscribed",
-                        format!("Unsubscribed · {}", fmt_count(unsubscribed)),
+                        t!("subscriptions-unsubscribed-2", shown = fmt_count(unsubscribed)),
                         self.subs_tab == SubsTab::Unsubscribed,
                         Action::SubscriptionsTab(true),
                     )),
@@ -820,16 +811,9 @@ impl MailApp {
                     .text_size(px(11.))
                     .text_color(rgb(c.muted))
                     .child(if count == 0 {
-                        "Senders whose mail offers to unsubscribe".to_string()
+                        t!("subscriptions-senders-whose-mail-offers-to-unsubscribe").to_string()
                     } else {
-                        format!(
-                            "{} sender{} · {} message{} · {} unread",
-                            fmt_count(count),
-                            if count == 1 { "" } else { "s" },
-                            fmt_count(total),
-                            if total == 1 { "" } else { "s" },
-                            fmt_count(unread),
-                        )
+                        t!("subscriptions-sender-message-unread", senders = count, senders_shown = fmt_count(count), messages = total, messages_shown = fmt_count(total), unread = fmt_count(unread))
                     }),
             )
     }
@@ -854,11 +838,11 @@ impl MailApp {
                     icon_el("subscriptions", 28., c.border).into_any_element()
                 })
                 .child(if self.subs_loading {
-                    "Loading…"
+                    t!("subscriptions-loading")
                 } else if self.subs_tab == SubsTab::Unsubscribed {
-                    "You haven't unsubscribed from anything yet"
+                    t!("subscriptions-you-havent-unsubscribed-from-anything-yet")
                 } else {
-                    "No subscriptions found"
+                    t!("subscriptions-no-subscriptions-found")
                 })
                 .into_any_element();
         }
@@ -893,7 +877,7 @@ impl MailApp {
             .gap_1()
             .when(busy, |d| d.child(spinner(13., c.muted)))
             .child(
-                self.button(id, "@More actions", "ellipsis", Action::SubscriptionMenu(sub.clone()), false, cx)
+                self.button(id, t!("subscriptions-more-actions"), "ellipsis", Action::SubscriptionMenu(sub.clone()), false, cx)
                     .h(px(28.))
                     .w(px(28.)),
             )
@@ -985,19 +969,17 @@ impl MailApp {
                                         .flex_shrink_0()
                                         .text_color(rgb(c.accent))
                                         .font_weight(FontWeight::SEMIBOLD)
-                                        .child(format!("{} unread · ", fmt_count(sub.unread))),
+                                        .child(format!("{} · ", t!("subscriptions-unread", count = sub.unread, shown = fmt_count(sub.unread)))),
                                 )
                             })
-                            .child(div().min_w_0().truncate().child(format!(
-                                "{} message{}{}",
-                                fmt_count(sub.count),
-                                if sub.count == 1 { "" } else { "s" },
+                            .child(div().min_w_0().truncate().child({
+                                let messages = t!("subscriptions-message-2", count = sub.count, shown = fmt_count(sub.count));
                                 if sub.latest > 0 {
-                                    format!(" · Last email {}", date_short(sub.latest))
+                                    format!("{messages} · {}", t!("subscriptions-last-email", date = date_short(sub.latest)))
                                 } else {
-                                    String::new()
+                                    messages
                                 }
-                            ))),
+                            })),
                     ),
             )
             .child(self.subscription_menu_button(format!("subscription-{index}-menu"), sub, cx))
@@ -1033,13 +1015,13 @@ impl MailApp {
                         .pr_2()
                         .text_size(px(12.))
                         .font_weight(FontWeight::SEMIBOLD)
-                        .child(format!("{} selected", fmt_count(n))),
+                        .child(t!("subscriptions-selected", shown = fmt_count(n), count = n)),
                 )
-                .child(self.button("sender-selected-read", "@Mark as read", "mail-open", Action::ApplySelection(Change::Read(true)), false, cx).h(px(30.)))
+                .child(self.button("sender-selected-read", t!("subscriptions-mark-as-read"), "mail-open", Action::ApplySelection(Change::Read(true)), false, cx).h(px(30.)))
                 .child(self.button("sender-selected-archive", "@Archive", "archive", Action::Move(Folder::Archive), false, cx).h(px(30.)))
-                .child(self.button("sender-selected-trash", "@Move to trash", "trash", Action::Move(Folder::Trash), false, cx).h(px(30.)))
+                .child(self.button("sender-selected-trash", t!("subscriptions-move-to-trash"), "trash", Action::Move(Folder::Trash), false, cx).h(px(30.)))
                 .child(div().flex_1())
-                .child(self.button("sender-selected-done", "Done", "", Action::StopSelecting, false, cx).h(px(30.)).text_size(px(12.)))
+                .child(self.button("sender-selected-done", t!("subscriptions-done"), "", Action::StopSelecting, false, cx).h(px(30.)).text_size(px(12.)))
         } else {
             div()
                 .flex()
@@ -1068,7 +1050,7 @@ impl MailApp {
                         d.child(
                             self.button(
                                 "subscription-back",
-                                "@Back to subscriptions",
+                                t!("subscriptions-back-to-subscriptions"),
                                 "arrow-left",
                                 Action::CloseSubscription,
                                 false,
@@ -1094,13 +1076,7 @@ impl MailApp {
                     .text_size(px(11.))
                     .text_color(rgb(c.muted))
                     .truncate()
-                    .child(format!(
-                        "{} · {} message{} · {} unread",
-                        sub.address,
-                        fmt_count(total),
-                        if total == 1 { "" } else { "s" },
-                        fmt_count(unread),
-                    )),
+                    .child(t!("subscriptions-message-unread", address = sub.address, count = total, shown = fmt_count(total), unread = fmt_count(unread))),
             )
             .child(actions)
     }
@@ -1123,7 +1099,7 @@ impl MailApp {
                 } else {
                     icon_el("mail", 28., c.border).into_any_element()
                 })
-                .child(if self.subs_sender_loading { "Loading…" } else { "No messages" })
+                .child(if self.subs_sender_loading { t!("subscriptions-loading") } else { t!("subscriptions-no-messages") })
                 .into_any_element();
         }
         let entity = cx.entity();
@@ -1161,7 +1137,7 @@ impl MailApp {
             .child(
                 self.button(
                     "subscription-mail-back",
-                    "@Back to the list",
+                    t!("subscriptions-back-to-the-list"),
                     "arrow-left",
                     Action::BackToList,
                     false,
@@ -1176,7 +1152,7 @@ impl MailApp {
                     .text_size(px(13.))
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(rgb(c.muted))
-                    .child(format!("Subscriptions › {name}")),
+                    .child(t!("subscriptions-subscriptions-2", name = name)),
             )
     }
 }

@@ -340,13 +340,13 @@ pub fn unsubscribe(
     match &plan.method {
         Method::OneClick(url) => {
             if !plan.verified {
-                bail!("The sender's request to unsubscribe couldn't be verified.");
+                bail!(t!("manage-subscriptions-the-senders-request-to-unsubscribe-couldnt"));
             }
             // The sender chose the address: it, and wherever it redirects,
             // must be on the internet, not this computer or its network.
-            let target = url::Url::parse(url).context("The sender's unsubscribe address isn't valid.")?;
+            let target = url::Url::parse(url).with_context(|| t!("manage-subscriptions-the-senders-unsubscribe-address-isnt-valid"))?;
             if crate::sync::public_net::names_local_address(&target) {
-                bail!("The sender's unsubscribe address is on a local network.");
+                bail!(t!("manage-subscriptions-the-senders-unsubscribe-address-is-on"));
             }
             // Redirects by hand: a client follows 301, 302 and 303 as a GET,
             // and a one-click request must stay a POST (RFC 8058 §3.2).
@@ -378,19 +378,19 @@ pub fn unsubscribe(
                         .get(reqwest::header::LOCATION)
                         .and_then(|l| l.to_str().ok())
                         .and_then(|l| at.join(l).ok())
-                        .context("The sender's redirect had no address.")?;
+                        .with_context(|| t!("manage-subscriptions-the-senders-redirect-had-no-address"))?;
                     if next.scheme() != "https" {
-                        bail!("The sender redirected the request to an address that isn't HTTPS.");
+                        bail!(t!("manage-subscriptions-the-sender-redirected-the-request-to"));
                     }
                     if crate::sync::public_net::names_local_address(&next) {
-                        bail!("The sender redirected the request to an address on a local network.");
+                        bail!(t!("manage-subscriptions-the-sender-redirected-the-request-to-2"));
                     }
                     at = next;
                     continue;
                 }
-                bail!("The sender refused the request ({status}).");
+                bail!(t!("manage-subscriptions-the-sender-refused-the-request", status = status));
             }
-            bail!("The sender redirected the request too many times.")
+            bail!(t!("manage-subscriptions-the-sender-redirected-the-request-too"))
         }
         Method::Mail { to, subject } => {
             let draft = Draft {

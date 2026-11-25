@@ -1,0 +1,68 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  The widgets' names and descriptions in the Widgets Board and in Windows'
+  settings (AppxManifest.xml's ms-resource: names). Built into
+  resources.pri by scripts/bundle-windows-widgets.ps1. To translate, copy
+  this folder to Strings/<language>/ (for example Strings/de-DE/) and
+  translate each <value>. The widgets' own text is in Strings.resx.
+-->
+<root>
+  <resheader name="resmimetype">
+    <value>text/microsoft-resx</value>
+  </resheader>
+  <resheader name="version">
+    <value>2.0</value>
+  </resheader>
+  <resheader name="reader">
+    <value>System.Resources.ResXResourceReader, System.Windows.Forms, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089</value>
+  </resheader>
+  <resheader name="writer">
+    <value>System.Resources.ResXResourceWriter, System.Windows.Forms, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089</value>
+  </resheader>
+  <data name="PackageName" xml:space="preserve">
+    <value>Picacho Widgets</value>
+    <comment>The widgets' package, in Windows' settings</comment>
+  </data>
+  <data name="PackageDescription" xml:space="preserve">
+    <value>Inbox, unread mail, calendar, package and receipt widgets for Picacho</value>
+  </data>
+  <data name="ProviderName" xml:space="preserve">
+    <value>Picacho</value>
+    <comment>Names the widgets' maker in the Widgets Board</comment>
+  </data>
+  <data name="InboxName" xml:space="preserve">
+    <value>Picacho Inbox</value>
+    <comment>A widget's name, in the Widgets Board's list</comment>
+  </data>
+  <data name="InboxDescription" xml:space="preserve">
+    <value>Recent inbox messages, unread count, and quick compose</value>
+  </data>
+  <data name="UnreadName" xml:space="preserve">
+    <value>Picacho Unread Mail</value>
+    <comment>A widget's name</comment>
+  </data>
+  <data name="UnreadDescription" xml:space="preserve">
+    <value>Unread count, latest unread message, and quick compose</value>
+  </data>
+  <data name="CalendarName" xml:space="preserve">
+    <value>Picacho Calendar</value>
+    <comment>A widget's name</comment>
+  </data>
+  <data name="CalendarDescription" xml:space="preserve">
+    <value>Upcoming calendar events</value>
+  </data>
+  <data name="PackagesName" xml:space="preserve">
+    <value>Picacho Packages</value>
+    <comment>A widget's name</comment>
+  </data>
+  <data name="PackagesDescription" xml:space="preserve">
+    <value>Your recent tracked packages and delivery progress</value>
+  </data>
+  <data name="ReceiptsName" xml:space="preserve">
+    <value>Picacho Receipts</value>
+    <comment>A widget's name</comment>
+  </data>
+  <data name="ReceiptsDescription" xml:space="preserve">
+    <value>Your recent receipts and refunds</value>
+  </data>
+</root>

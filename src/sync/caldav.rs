@@ -219,7 +219,7 @@ pub fn tasks(
         && refused == calendars.len()
         && let Some(e) = last_error
     {
-        return Err(e.context("The calendar server didn't list your tasks."));
+        return Err(e.context(t!("sync-caldav-the-calendar-server-didnt-list-your")));
     }
     sort_tasks(&mut out);
     Ok(out)
@@ -283,9 +283,7 @@ pub fn free_busy(
     // Nobody answered: say why rather than show everyone free.
     ensure!(
         !out.is_empty() || unknown.is_empty(),
-        "The server couldn't say when {} {} free.",
-        unknown.join(", "),
-        if unknown.len() == 1 { "is" } else { "are" }
+        t!("sync-caldav-the-server-couldnt-say-when-free", people = unknown.join(", "), count = unknown.len())
     );
     Ok(out)
 }
@@ -312,7 +310,7 @@ impl ScheduleAnswer {
 /// A `schedule-response` (RFC 6638 §10.2): each `response`'s recipient,
 /// request-status and calendar-data.
 pub fn schedule_response(text: &str) -> Result<Vec<ScheduleAnswer>> {
-    let doc = roxmltree::Document::parse(text).context("The server's answer couldn't be read.")?;
+    let doc = roxmltree::Document::parse(text).with_context(|| t!("sync-caldav-the-servers-answer-couldnt-be-read"))?;
     let in_caldav = |n: &roxmltree::Node, name: &str| n.tag_name().name() == name && n.tag_name().namespace() == Some(dav::CALDAV);
     let mut out = Vec::new();
     for response in doc.descendants().filter(|n| in_caldav(n, "response")) {
@@ -352,7 +350,7 @@ pub fn own_free_busy(
     from: i64,
     to: i64,
 ) -> Result<Vec<(i64, i64)>> {
-    ensure!(to > from, "The time asked about ends before it starts.");
+    ensure!(to > from, t!("sync-caldav-the-time-asked-about-ends-before"));
     let c = client(server, password, tls)?;
     let body = format!(
         "<?xml version=\"1.0\" encoding=\"utf-8\"?><c:free-busy-query xmlns:c=\"{}\"><c:time-range start=\"{}\" end=\"{}\"/></c:free-busy-query>",
@@ -545,13 +543,13 @@ pub fn check_limits(limits: &dav::CalendarLimits, stored: &Stored) -> Result<()>
     let events = std::iter::once(&stored.event).chain(&stored.overrides);
     if let Some(most) = limits.max_attendees {
         let guests = events.clone().map(|e| e.attendees.len()).max().unwrap_or(0) as u64;
-        ensure!(guests <= most, "This calendar takes at most {most} guests an event.");
+        ensure!(guests <= most, t!("sync-caldav-this-calendar-takes-at-most-guests", most = most));
     }
     for e in events.filter(|e| e.start != 0) {
         let (from, to) = limits.clamp(e.start, e.end.max(e.start));
         ensure!(
             from == e.start && to == e.end.max(e.start),
-            "This calendar doesn't take events at that date."
+            t!("sync-caldav-this-calendar-doesnt-take-events-at")
         );
     }
     if let Some(most) = limits.max_instances
@@ -564,7 +562,7 @@ pub fn check_limits(limits: &dav::CalendarLimits, stored: &Stored) -> Result<()>
             + stored.event.exdates.len() as u64;
         ensure!(
             count <= most,
-            "This calendar takes at most {most} repeats of an event. Give the repeats an end."
+            t!("sync-caldav-this-calendar-takes-at-most-repeats", most = most)
         );
     }
     Ok(())
@@ -583,7 +581,7 @@ pub fn save(
     server_schedules_this: bool,
     max_size: Option<u64>,
 ) -> Result<Stored> {
-    ensure!(!stored.event.uid.is_empty(), "The event has no identifier.");
+    ensure!(!stored.event.uid.is_empty(), t!("sync-caldav-the-event-has-no-identifier"));
     let c = client(server, password, tls)?;
     let href = if stored.href.is_empty() {
         dav::new_href(&url::Url::parse(calendar)?, &stored.event.uid, "ics")?
@@ -612,8 +610,7 @@ pub fn save(
         && text.len() as u64 > max
     {
         bail!(
-            "This event is too large for the calendar ({} KB at most). Shorten its notes or remove guests.",
-            max / 1024
+            t!("sync-caldav-this-event-is-too-large-for", kilobytes = max / 1024)
         );
     }
     // With a Schedule-Tag, only a change that matters stops the write; a
@@ -644,7 +641,7 @@ pub fn rename_calendar(
     name: &str,
     color: &str,
 ) -> Result<()> {
-    ensure!(!name.trim().is_empty(), "Give the calendar a name.");
+    ensure!(!name.trim().is_empty(), t!("sync-caldav-give-the-calendar-a-name"));
     client(server, password, tls)?.rename_collection(&url::Url::parse(href)?, name.trim(), color)
 }
 
@@ -704,12 +701,12 @@ pub fn attach(
     replacing: Option<&str>,
     occurrence: Option<i64>,
 ) -> Result<String> {
-    ensure!(!stored.href.is_empty(), "Save the event before attaching files.");
+    ensure!(!stored.href.is_empty(), t!("sync-caldav-save-the-event-before-attaching-files"));
     let c = client(server, password, tls)?;
     let calendar = url::Url::parse(&stored.calendar)?;
     ensure!(
         c.manages_attachments(&calendar)?,
-        "This calendar server can't keep attachments."
+        t!("sync-caldav-this-calendar-server-cant-keep-attachments")
     );
     // RFC 8607 §6: the server's limits, said before the file is sent.
     let (most_size, most_count) = c.attachment_limits(&calendar).unwrap_or((None, None));
@@ -719,13 +716,16 @@ pub fn attach(
     let size = std::fs::metadata(path)?.len();
     ensure!(
         size <= most,
-        "This file is too large to attach to this event ({} at most).",
-        if most >= 1 << 20 { format!("{} MB", most >> 20) } else { format!("{} KB", (most >> 10).max(1)) }
+        if most >= 1 << 20 {
+            t!("sync-caldav-this-file-is-too-large-to-mb", megabytes = most >> 20)
+        } else {
+            t!("sync-caldav-this-file-is-too-large-to-kb", kilobytes = (most >> 10).max(1))
+        }
     );
     if let Some(n) = most_count.filter(|_| replacing.is_none()) {
         ensure!(
             (stored.event.attachments().iter().filter(|a| !a.managed_id.is_empty()).count() as u64) < n,
-            "This event has as many attachments as the server allows ({n})."
+            t!("sync-caldav-this-event-has-as-many-attachments", most = n)
         );
     }
     let data = std::fs::read(path)?;
@@ -753,7 +753,7 @@ pub fn remove_attachment(
     managed_id: &str,
     occurrence: Option<i64>,
 ) -> Result<String> {
-    ensure!(!managed_id.is_empty(), "This attachment isn't kept by the calendar server.");
+    ensure!(!managed_id.is_empty(), t!("sync-caldav-this-attachment-isnt-kept-by-the"));
     let c = client(server, password, tls)?;
     let rids = occurrence.map(|at| vec![rid(&stored.event, at)]).unwrap_or_default();
     Ok(c.attachment(&url::Url::parse(&stored.href)?, &stored.etag, &dav::AttachmentChange::Remove { managed_id }, &rids)?.etag)
@@ -771,7 +771,7 @@ fn rid(series: &ical::Event, at: i64) -> String {
 /// Returns it as kept there.
 pub fn move_event(server: &Server, password: &str, tls: native_tls::TlsConnector, stored: &Stored, target: &str) -> Result<Stored> {
     let from = url::Url::parse(&stored.href)?;
-    let name = from.path_segments().and_then(|mut s| s.next_back()).filter(|n| !n.is_empty()).context("This event has no resource name.")?;
+    let name = from.path_segments().and_then(|mut s| s.next_back()).filter(|n| !n.is_empty()).with_context(|| t!("sync-caldav-this-event-has-no-resource-name"))?;
     let mut to = url::Url::parse(target)?;
     if !to.path().ends_with('/') {
         to.set_path(&format!("{}/", to.path()));

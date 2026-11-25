@@ -170,8 +170,8 @@ impl DesktopWidgetWindow {
             return self.snapshot.accounts[0].name.clone();
         }
         match self.tab {
-            WidgetTab::Packages | WidgetTab::Receipts => "All Accounts".to_owned(),
-            _ => "All Inboxes".to_owned(),
+            WidgetTab::Packages | WidgetTab::Receipts => t!("widget-window-all-accounts").to_owned(),
+            _ => t!("widget-window-all-inboxes").to_owned(),
         }
     }
 
@@ -179,11 +179,11 @@ impl DesktopWidgetWindow {
         let msgs = widgets::filtered_messages(&self.snapshot, self.account.as_deref(), unread_only, 25);
         if msgs.is_empty() {
             let empty = if self.snapshot.accounts.is_empty() {
-                "Open Picacho to add an account"
+                t!("widget-window-open-picacho-to-add-an-account")
             } else if unread_only {
-                "All caught up"
+                t!("widget-window-all-caught-up")
             } else {
-                "No messages in Inbox"
+                t!("widget-window-no-messages-in-inbox")
             };
             return div()
                 .flex_1()
@@ -225,12 +225,12 @@ impl DesktopWidgetWindow {
         let account_id = m.account_id.clone();
         let msg_id = m.id.clone();
         let sender = if m.sender.is_empty() {
-            "(Unknown sender)".to_owned()
+            t!("widget-window-unknown-sender").to_owned()
         } else {
             m.sender.clone()
         };
         let subject = if m.subject.is_empty() {
-            "(No subject)".to_owned()
+            t!("widget-window-no-subject").to_owned()
         } else {
             m.subject.clone()
         };
@@ -328,11 +328,9 @@ impl DesktopWidgetWindow {
             unread.to_string()
         };
         let subtitle = if unread == 0 {
-            "All caught up"
-        } else if unread == 1 {
-            "unread message"
+            t!("widget-window-all-caught-up").to_owned()
         } else {
-            "unread messages"
+            t!("widget-window-unread-messages", count = unread)
         };
 
         div()
@@ -387,9 +385,9 @@ impl DesktopWidgetWindow {
     fn render_calendar(&self, c: Colors, cx: &mut Context<Self>) -> AnyElement {
         if self.snapshot.events.is_empty() {
             let empty = if self.snapshot.calendar_connected {
-                "No upcoming events"
+                t!("widget-window-no-upcoming-events")
             } else {
-                "Connect a calendar in Settings"
+                t!("widget-window-connect-a-calendar-in-settings")
             };
             return div()
                 .id("desktop-widget-cal-empty")
@@ -522,7 +520,7 @@ impl DesktopWidgetWindow {
             .pt(px(6.))
             .flex()
             .items_center()
-            .child(div().flex_1().text_xs().text_color(rgb(c.muted)).child("Recent"))
+            .child(div().flex_1().text_xs().text_color(rgb(c.muted)).child(t!("widget-window-recent")))
             .when(total > 0, |d| {
                 d.child(
                     div()
@@ -536,7 +534,7 @@ impl DesktopWidgetWindow {
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.dispatch_action(action.clone(), cx);
                         }))
-                        .child(format!("View all {total}")),
+                        .child(t!("widget-window-view-all", total = total)),
                 )
             })
             .into_any_element()
@@ -566,9 +564,9 @@ impl DesktopWidgetWindow {
         let all = widgets::filtered_packages(&self.snapshot, self.account.as_deref(), usize::MAX);
         if all.is_empty() {
             let empty = if self.loading {
-                "Loading packages…"
+                t!("widget-window-loading-packages")
             } else {
-                "No recent packages"
+                t!("widget-window-no-recent-packages")
             };
             return div()
                 .id("desktop-widget-pkg-empty")
@@ -630,7 +628,7 @@ impl DesktopWidgetWindow {
             detail.push(p.carrier.clone());
         }
         if !p.expected.is_empty() {
-            detail.push(format!("Expected {}", p.expected));
+            detail.push(t!("widget-window-expected", expected = p.expected));
         } else {
             let d = format_short_date(p.updated);
             if !d.is_empty() {
@@ -644,7 +642,7 @@ impl DesktopWidgetWindow {
             detail.push(p.account_label.clone());
         }
         let title = if p.title.is_empty() {
-            "Package".to_owned()
+            t!("widget-window-package").to_owned()
         } else {
             p.title.clone()
         };
@@ -755,9 +753,9 @@ impl DesktopWidgetWindow {
         let all = widgets::filtered_receipts(&self.snapshot, self.account.as_deref(), usize::MAX);
         if all.is_empty() {
             let empty = if self.loading {
-                "Loading receipts…"
+                t!("widget-window-loading-receipts")
             } else {
-                "No recent receipts"
+                t!("widget-window-no-recent-receipts")
             };
             return div()
                 .id("desktop-widget-rcpt-empty")
@@ -816,7 +814,7 @@ impl DesktopWidgetWindow {
         let mail_id = r.mail_id.clone();
         let mut detail = Vec::new();
         if !r.order.is_empty() {
-            detail.push(format!("Order {}", r.order));
+            detail.push(t!("widget-window-order", order = r.order));
         }
         let date_str = format_short_date(r.updated.max(r.date));
         if !date_str.is_empty() {
@@ -892,7 +890,7 @@ impl DesktopWidgetWindow {
                                         .bg(rgb(c.soft))
                                         .text_size(px(10.))
                                         .text_color(rgb(c.accent))
-                                        .child("Refund"),
+                                        .child(t!("widget-window-refund")),
                                 )
                             }),
                     )
@@ -1011,7 +1009,7 @@ impl Render for DesktopWidgetWindow {
                                 cx,
                             );
                         }))
-                        .child("Compose"),
+                        .child(t!("widget-window-compose")),
                 )),
             c,
             |_, w, _| w.remove_window(),
@@ -1052,23 +1050,23 @@ impl Render for DesktopWidgetWindow {
             .flex_wrap()
             .items_center()
             .gap_1()
-            .child(tab_btn("widget-tab-inbox", "Inbox", WidgetTab::Inbox, self.tab == WidgetTab::Inbox))
-            .child(tab_btn("widget-tab-unread", "Unread", WidgetTab::Unread, self.tab == WidgetTab::Unread))
+            .child(tab_btn("widget-tab-inbox", t!("widget-window-inbox"), WidgetTab::Inbox, self.tab == WidgetTab::Inbox))
+            .child(tab_btn("widget-tab-unread", t!("widget-window-unread"), WidgetTab::Unread, self.tab == WidgetTab::Unread))
             .child(tab_btn(
                 "widget-tab-calendar",
-                "Calendar",
+                t!("widget-window-calendar"),
                 WidgetTab::Calendar,
                 self.tab == WidgetTab::Calendar,
             ))
             .child(tab_btn(
                 "widget-tab-packages",
-                "Packages",
+                t!("widget-window-packages"),
                 WidgetTab::Packages,
                 self.tab == WidgetTab::Packages,
             ))
             .child(tab_btn(
                 "widget-tab-receipts",
-                "Receipts",
+                t!("widget-window-receipts"),
                 WidgetTab::Receipts,
                 self.tab == WidgetTab::Receipts,
             ))
@@ -1140,13 +1138,13 @@ fn format_short_date(ts: i64) -> String {
     };
     let now = Local::now();
     if dt.date_naive() == now.date_naive() {
-        dt.format("%H:%M").to_string()
+        dt.local(t!("dates-calendar-time"))
     } else if (now.date_naive() - dt.date_naive()).num_days().abs() < 6 {
-        dt.format("%a").to_string()
+        dt.local("%a")
     } else if dt.year() == now.year() {
-        dt.format("%b %-d").to_string()
+        dt.local(t!("dates-month-day"))
     } else {
-        dt.format("%b %-d, %Y").to_string()
+        dt.local(t!("dates-month-day-year"))
     }
 }
 
@@ -1159,29 +1157,29 @@ fn format_event_time(ev: &WidgetEvent) -> String {
             .single()
             .map(|d| d.date_naive())
             .map(|d| day_label(today, tomorrow, d))
-            .unwrap_or_else(|| "Today".to_owned());
-        return format!("{day} · All day");
+            .unwrap_or_else(|| t!("widget-window-today").to_owned());
+        return t!("widget-window-all-day", day = day);
     }
     let Some(start) = Local.timestamp_opt(ev.start, 0).single() else {
         return String::new();
     };
     let day = day_label(today, tomorrow, start.date_naive());
-    let start_str = start.format("%H:%M");
+    let start_str = start.local(t!("dates-calendar-time"));
     if ev.end > ev.start
         && let Some(end) = Local.timestamp_opt(ev.end, 0).single()
     {
-        return format!("{day} · {start_str} – {}", end.format("%H:%M"));
+        return format!("{day} · {start_str} – {}", end.local(t!("dates-calendar-time")));
     }
     format!("{day} · {start_str}")
 }
 
 fn day_label(today: chrono::NaiveDate, tomorrow: chrono::NaiveDate, date: chrono::NaiveDate) -> String {
     if date == today {
-        "Today".to_owned()
+        t!("widget-window-today").to_owned()
     } else if date == tomorrow {
-        "Tomorrow".to_owned()
+        t!("widget-window-tomorrow").to_owned()
     } else {
-        date.format("%a, %b %-d").to_string()
+        date.local(t!("dates-weekday-month-day"))
     }
 }
 
@@ -1212,7 +1210,7 @@ impl MailApp {
         let app = cx.weak_entity();
         let main = w.window_handle();
         let bounds = Bounds::centered(None, size(px(360.), px(460.)), cx);
-        let mut options = window::detached_options("Picacho Widget".into(), bounds);
+        let mut options = window::detached_options(t!("widget-window-picacho-widget").into(), bounds);
         options.window_min_size = Some(size(px(260.), px(240.)));
         match cx.open_window(options, move |window, cx| {
             let view = cx.new(|cx| DesktopWidgetWindow::new(app, main, store, snap, loading, cx));
@@ -1226,7 +1224,7 @@ impl MailApp {
                 self.widget_window = Some(handle.into());
             }
             Err(e) => {
-                self.notice(format!("Could not open Desktop Widget: {e:#}"), true, cx);
+                self.notice(t!("widget-window-could-not-open-desktop-widget", e = format!("{:#}", e)), true, cx);
             }
         }
     }

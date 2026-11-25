@@ -32,14 +32,14 @@ impl Backend {
     ) -> Result<ServerResults> {
         ensure!(
             a.provider != Provider::Pop3,
-            "POP3 servers can't search; only mail on this computer is searched."
+            t!("manage-remote-search-pop3-servers-cant-search-only-mail")
         );
         ensure!(
             mailbox.folder() != Folder::Drafts,
-            "Drafts are searched on this computer."
+            t!("manage-remote-search-drafts-are-searched-on-this-computer")
         );
         let query = query.trim();
-        ensure!(!query.is_empty(), "Type something to search for.");
+        ensure!(!query.is_empty(), t!("manage-remote-search-type-something-to-search-for"));
         let lock = self.account_lock(&a.id);
         let _operation = lock.lock().unwrap();
         if a.provider == Provider::Proton {

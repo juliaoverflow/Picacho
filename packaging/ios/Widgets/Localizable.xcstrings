@@ -1,0 +1,170 @@
+{
+  "sourceLanguage" : "en",
+  "strings" : {
+    "%@ (%@)" : {
+      "comment" : "An account in a widget's settings: its name, then its address"
+    },
+    "%@ · Unread" : {
+      "comment" : "The Inbox widget's title when it shows only unread messages: the account, or All Inboxes"
+    },
+    "%lld unread" : {
+      "comment" : "How many unread messages there are",
+      "localizations" : {
+        "en" : {
+          "variations" : {
+            "plural" : {
+              "one" : {
+                "stringUnit" : {
+                  "state" : "translated",
+                  "value" : "%lld unread"
+                }
+              },
+              "other" : {
+                "stringUnit" : {
+                  "state" : "translated",
+                  "value" : "%lld unread"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "(No subject)" : {},
+    "(Unknown sender)" : {},
+    "Account" : {},
+    "All Accounts" : {
+      "comment" : "The choice of every account in a widget's settings"
+    },
+    "All caught up" : {
+      "comment" : "No unread messages"
+    },
+    "All day" : {
+      "comment" : "An event that lasts all day, after its day"
+    },
+    "All Inboxes" : {},
+    "Are we still on for Saturday morning?" : {
+      "comment" : "Sample data for the widget gallery"
+    },
+    "Calendar" : {},
+    "Camera Lens" : {
+      "comment" : "Sample data for the widget gallery"
+    },
+    "Caught up" : {
+      "comment" : "Under an unread count of 0, shown larger beside it"
+    },
+    "Choose an account and whether to show only unread messages." : {},
+    "Choose an account or All Accounts for recent packages." : {},
+    "Choose an account or All Accounts for recent receipts." : {},
+    "Choose which account's unread count to display." : {},
+    "Coffee with Ana" : {
+      "comment" : "Sample data for the widget gallery"
+    },
+    "Connect a calendar in Settings" : {},
+    "Delivered" : {
+      "comment" : "Sample data for the widget gallery"
+    },
+    "Design review" : {
+      "comment" : "Sample data for the widget gallery"
+    },
+    "Design Team" : {
+      "comment" : "Sample data for the widget gallery"
+    },
+    "Downtown Cafe" : {
+      "comment" : "Sample data for the widget gallery"
+    },
+    "Expected %@" : {
+      "comment" : "When a package should arrive, for example Expected Nov 26"
+    },
+    "Here is the revised layout for the release." : {
+      "comment" : "Sample data for the widget gallery"
+    },
+    "Inbox" : {},
+    "No messages in Inbox" : {},
+    "No recent packages" : {},
+    "No recent receipts" : {},
+    "No upcoming events" : {},
+    "Notes from today's call" : {
+      "comment" : "Sample data for the widget gallery"
+    },
+    "Open Picacho to sign in" : {},
+    "Order %@" : {
+      "comment" : "A receipt's order number"
+    },
+    "Order 402-8821" : {
+      "comment" : "Sample data for the widget gallery"
+    },
+    "Out for delivery" : {
+      "comment" : "Sample data for the widget gallery"
+    },
+    "Package" : {
+      "comment" : "Stands in for a package without a name"
+    },
+    "Packages" : {},
+    "Packages · %@" : {
+      "comment" : "The Packages widget's title when it shows one account's"
+    },
+    "Personal" : {
+      "comment" : "Sample data for the widget gallery"
+    },
+    "Receipt" : {
+      "comment" : "Stands in for a receipt without a shop name"
+    },
+    "Receipts" : {},
+    "Receipts · %@" : {
+      "comment" : "The Receipts widget's title when it shows one account's"
+    },
+    "Recent inbox messages, unread count, and quick compose." : {},
+    "Refund" : {},
+    "Room 4B" : {
+      "comment" : "Sample data for the widget gallery"
+    },
+    "Thanks everyone — action items below." : {
+      "comment" : "Sample data for the widget gallery"
+    },
+    "Today" : {},
+    "Tomorrow" : {},
+    "unread" : {
+      "comment" : "Beside the unread count, which is shown larger"
+    },
+    "Unread count, latest message, and quick compose." : {},
+    "Unread Mail" : {},
+    "Unread Only" : {},
+    "Upcoming events from your Picacho calendars." : {},
+    "Updated mockups attached" : {
+      "comment" : "Sample data for the widget gallery"
+    },
+    "View all %lld" : {
+      "comment" : "Opens the whole list; the number is how many there are",
+      "localizations" : {
+        "en" : {
+          "variations" : {
+            "plural" : {
+              "one" : {
+                "stringUnit" : {
+                  "state" : "translated",
+                  "value" : "View all %lld"
+                }
+              },
+              "other" : {
+                "stringUnit" : {
+                  "state" : "translated",
+                  "value" : "View all %lld"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "Weekend plans" : {
+      "comment" : "Sample data for the widget gallery"
+    },
+    "Work" : {
+      "comment" : "Sample data for the widget gallery"
+    },
+    "Your most recently updated packages and delivery progress." : {},
+    "Your most recently updated receipts and refunds." : {}
+  },
+  "version" : "1.0"
+}

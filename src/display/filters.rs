@@ -46,17 +46,17 @@ pub(super) struct FilterInputs {
 impl FilterInputs {
     pub(super) fn new(window: &mut Window, cx: &mut App) -> Self {
         Self {
-            value: input("Text to look for", false, window, cx),
-            extra: input("Header name", false, window, cx),
-            act_text: input("Address, reason or label", false, window, cx),
-            subject: input("Out of office", false, window, cx),
+            value: input(t!("filters-text-to-look-for"), false, window, cx),
+            extra: input(t!("filters-header-name"), false, window, cx),
+            act_text: input(t!("filters-address-reason-or-label"), false, window, cx),
+            subject: input(t!("filters-out-of-office"), false, window, cx),
             body: textarea(
-                "I'm away until Monday and will reply when I'm back.",
+                t!("filters-im-away-until-monday-and-will"),
                 window,
                 cx,
             ),
-            from: input("2026-12-20 (optional)", false, window, cx),
-            until: input("2026-12-31 (optional)", false, window, cx),
+            from: input(t!("filters-2026-12-20-optional"), false, window, cx),
+            until: input(t!("filters-2026-12-31-optional"), false, window, cx),
             shows: None,
         }
     }
@@ -207,11 +207,11 @@ impl MailApp {
                     return;
                 };
                 if value.is_empty() {
-                    ui.error = Some("Type what the filter looks for.".into());
+                    ui.error = Some(t!("filters-type-what-the-filter-looks-for").into());
                     return;
                 }
                 if ui.new_act == Act::Inbox {
-                    ui.error = Some("Choose what the filter does.".into());
+                    ui.error = Some(t!("filters-choose-what-the-filter-does").into());
                     return;
                 }
                 let extra = Self::value(&self.filter_inputs.extra, cx).trim().to_owned();
@@ -219,7 +219,7 @@ impl MailApp {
                 let ui = self.filters.get_mut(&id).expect("looked up above");
                 let header = if ui.new_field == Field::Header {
                     if extra.is_empty() {
-                        ui.error = Some("Name the header the filter looks at.".into());
+                        ui.error = Some(t!("filters-name-the-header-the-filter-looks").into());
                         return;
                     }
                     extra.clone()
@@ -230,9 +230,9 @@ impl MailApp {
                 let act = match &ui.new_act {
                     Act::Redirect(_) | Act::Reject(_) | Act::Label(_) if act_text.is_empty() => {
                         ui.error = Some(match ui.new_act {
-                            Act::Redirect(_) => "Enter the address mail is sent on to.",
-                            Act::Reject(_) => "Write why mail is refused.",
-                            _ => "Name the label.",
+                            Act::Redirect(_) => t!("filters-enter-the-address-mail-is-sent"),
+                            Act::Reject(_) => t!("filters-write-why-mail-is-refused"),
+                            _ => t!("filters-name-the-label"),
                         }.into());
                         return;
                     }
@@ -373,7 +373,7 @@ impl MailApp {
                         ui.draft = state.filters.clone();
                         ui.state = Some(state);
                         ui.changed = false;
-                        this.notice("Filters saved on the server", false, cx);
+                        this.notice(t!("filters-filters-saved-on-the-server"), false, cx);
                     }
                     Err(e) => ui.error = Some(format!("{e:#}")),
                 }
@@ -396,8 +396,8 @@ impl MailApp {
                 .gap_1()
                 .text_size(px(12.))
                 .text_color(rgb(c.muted))
-                .children(comment.map(|t| div().child(format!("From the server: {t}"))))
-                .children(admin.map(|t| div().child(format!("Server administrator: {t}")))),
+                .children(comment.map(|t| div().child(t!("filters-from-the-server", t = t))))
+                .children(admin.map(|t| div().child(t!("filters-server-administrator", t = t)))),
         )
     }
 
@@ -410,9 +410,7 @@ impl MailApp {
             div()
                 .text_size(px(12.))
                 .text_color(rgb(self.colors().muted))
-                .child(format!(
-                    "This server also offers this mailbox over JMAP ({host}), which syncs faster and gets changes pushed. Add it again choosing JMAP to use it."
-                )),
+                .child(t!("filters-this-server-also-offers-this-mailbox", host = host)),
         )
     }
 
@@ -427,14 +425,7 @@ impl MailApp {
                     .id("offline-changes")
                     .text_size(px(12.))
                     .text_color(rgb(self.colors().muted))
-                    .child(format!(
-                        "{} made while offline will reach the server with the next connection.",
-                        if n == 1 {
-                            "One change".to_owned()
-                        } else {
-                            format!("{} changes", fmt_count(n))
-                        }
-                    ))
+                    .child(t!("filters-made-while-offline-will-reach-the", count = n, shown = fmt_count(n)))
             })
             .map(|d| div().child(d))
     }
@@ -447,7 +438,7 @@ impl MailApp {
             return div()
                 .text_size(px(12.))
                 .text_color(rgb(c.muted))
-                .child("Asking the server…")
+                .child(t!("filters-asking-the-server"))
                 .into_any_element();
         };
         if ui.loading {
@@ -458,7 +449,7 @@ impl MailApp {
                 .text_size(px(12.))
                 .text_color(rgb(c.muted))
                 .child(spinner(12., c.accent))
-                .child("Asking the server for its filters…")
+                .child(t!("filters-asking-the-server-for-its-filters"))
                 .into_any_element();
         }
         let Some(state) = &ui.state else {
@@ -470,14 +461,14 @@ impl MailApp {
                 .text_color(rgb(c.muted))
                 .child(
                     ui.error.clone().unwrap_or_else(|| {
-                        "This server doesn't offer filters (ManageSieve).".into()
+                        t!("filters-this-server-doesnt-offer-filters-managesieve").into()
                     }),
                 )
                 .child(
                     div().flex().child(
                         self.button(
                             format!("filters-retry-{id}"),
-                            "Try Again",
+                            t!("filters-try-again"),
                             "refresh",
                             act(FilterAction::Load(id.clone())),
                             false,
@@ -491,7 +482,7 @@ impl MailApp {
         };
         let mut folders = self.folders.get(&a.id).cloned().unwrap_or_default();
         // The standard folders by their role, which filters name so.
-        for (role, label) in [("\\Archive", "Archive"), ("\\Junk", "Spam"), ("\\Trash", "Trash")] {
+        for (role, label) in [("\\Archive", t!("filters-archive")), ("\\Junk", t!("filters-spam")), ("\\Trash", t!("filters-trash"))] {
             folders.push(crate::manage::model::RemoteFolder {
                 name: role.into(),
                 label: label.into(),
@@ -507,39 +498,26 @@ impl MailApp {
         };
         let describe = |r: &crate::sync::sieve::Rule| {
             let what = match &r.act {
-                Act::Inbox => "keep in the inbox".to_owned(),
-                Act::Folder(name) => format!("move to {}", folder_label(name)),
-                Act::MarkRead => "mark as read".to_owned(),
-                Act::Star => "star".to_owned(),
-                Act::Discard => "delete".to_owned(),
-                Act::Redirect(to) if r.keep_copy => format!("send a copy to {to}"),
-                Act::Redirect(to) => format!("send on to {to}"),
-                Act::Reject(_) => "refuse".to_owned(),
-                Act::Label(l) => format!("label “{l}”"),
+                Act::Inbox => t!("filters-keep-in-the-inbox").to_owned(),
+                Act::Folder(name) => t!("filters-move-to", folder = folder_label(name)),
+                Act::MarkRead => t!("filters-mark-as-read").to_owned(),
+                Act::Star => t!("filters-act-star").to_owned(),
+                Act::Discard => t!("filters-act-delete").to_owned(),
+                Act::Redirect(to) if r.keep_copy => t!("filters-send-a-copy-to", to = to),
+                Act::Redirect(to) => t!("filters-send-on-to", to = to),
+                Act::Reject(_) => t!("filters-act-refuse").to_owned(),
+                Act::Label(l) => t!("filters-label", l = l),
             };
             let field = if r.field == Field::Header {
-                format!("Header {}", r.header)
+                t!("filters-header", header = r.header)
             } else {
                 r.field.label().to_owned()
             };
+            let negate = if r.negate { "yes" } else { "no" };
             if r.field == Field::LargerThan {
-                return format!("{}larger than {} KB: {what}", if r.negate { "Not " } else { "" }, r.value);
+                return t!("filters-larger-than-kb", negate = negate, kb = r.value, what = what);
             }
-            format!(
-                "{field} {}{} “{}”: {what}",
-                if r.negate { "doesn't " } else { "" },
-                if r.negate {
-                    match r.matching {
-                        crate::sync::sieve::Match::Contains => "contain",
-                        crate::sync::sieve::Match::Is => "equal",
-                        crate::sync::sieve::Match::Matches => "match",
-                        crate::sync::sieve::Match::Regex => "match the pattern",
-                    }
-                } else {
-                    r.matching.label()
-                },
-                r.value
-            )
+            t!("filters-rule", field = field, negate = negate, matching = r.matching.key(), text = r.value, what = what)
         };
         let mut page = div().flex().flex_col().gap_4();
         if let Some(other) = &state.other_active
@@ -552,18 +530,10 @@ impl MailApp {
                     .items_center()
                     .gap_2()
                     .text_size(px(12.))
-                    .child(div().flex_1().text_color(rgb(c.muted)).child(format!(
-                        "“{other}” has {n} {} Picacho can show{}.",
-                        if n == 1 { "filter" } else { "filters" },
-                        if read.left_out > 0 {
-                            format!(", and {} more it can't", read.left_out)
-                        } else {
-                            String::new()
-                        }
-                    )))
+                    .child(div().flex_1().text_color(rgb(c.muted)).child(t!("filters-has-picacho-can-show", other = other, n = n, left_out = read.left_out)))
                     .child(self.button(
                         format!("filters-adopt-{id}"),
-                        "Edit Them Here",
+                        t!("filters-edit-them-here"),
                         "filter",
                         act(FilterAction::AdoptOtherRules(id.clone())),
                         false,
@@ -575,8 +545,8 @@ impl MailApp {
             if state.has("include") {
                 let including = ui.draft.include.is_some();
                 page = page.child(self.switch_setting(
-                    &format!("Keep running “{other}”"),
-                    "Another app's filters are on. Picacho's filters can run them first, so both apply.",
+                    &t!("filters-keep-running", other = other),
+                    t!("filters-another-apps-filters-are-on-picachos"),
                     format!("filters-include-{id}"),
                     including,
                     act(FilterAction::ToggleInclude(id.clone())),
@@ -588,9 +558,7 @@ impl MailApp {
                     div()
                         .text_size(px(12.))
                         .text_color(rgb(c.muted))
-                        .child(format!(
-                            "Another app's filters (“{other}”) are on. This server can run only one set, so saving Picacho's turns those off."
-                        )),
+                        .child(t!("filters-another-apps-filters-are-on-this", other = other)),
                 );
             }
         }
@@ -601,7 +569,7 @@ impl MailApp {
                 div()
                     .text_size(px(12.))
                     .text_color(rgb(c.muted))
-                    .child("No filters yet. Mail arriving on the server is sorted by them, even while Picacho is closed."),
+                    .child(t!("filters-no-filters-yet-mail-arriving-on")),
             );
         }
         for (i, rule) in ui.draft.rules.iter().enumerate() {
@@ -626,16 +594,16 @@ impl MailApp {
                     .child(self.link(
                         &format!("filter-stop-{id}-{i}"),
                         if rule.stop {
-                            "Then stop"
+                            t!("filters-then-stop")
                         } else {
-                            "Then continue"
+                            t!("filters-then-continue")
                         },
                         act(FilterAction::ToggleStop(id.clone(), i)),
                         cx,
                     ))
                     .child(self.button(
                         format!("filter-remove-{id}-{i}"),
-                        "@Remove filter",
+                        t!("filters-remove-filter"),
                         "close",
                         act(FilterAction::Remove(id.clone(), i)),
                         false,
@@ -645,7 +613,7 @@ impl MailApp {
         }
         // A server with only an away reply (JMAP's) runs no rules.
         if !state.vacation_only {
-            page = page.child(self.setting("Filters", "", rules));
+            page = page.child(self.setting(t!("filters-filters"), "", rules));
         }
         // A new rule.
         let fields = self.segmented(
@@ -664,7 +632,7 @@ impl MailApp {
             cx,
         );
         let mut acts: Vec<(String, Action, bool)> = vec![(
-            "Delete".into(),
+            t!("filters-delete").into(),
             act(FilterAction::NewAct(id.clone(), Act::Discard)),
             ui.new_act == Act::Discard,
         )];
@@ -673,7 +641,7 @@ impl MailApp {
             acts.insert(
                 0,
                 (
-                    "Star".into(),
+                    t!("filters-star").into(),
                     act(FilterAction::NewAct(id.clone(), Act::Star)),
                     ui.new_act == Act::Star,
                 ),
@@ -681,7 +649,7 @@ impl MailApp {
             acts.insert(
                 0,
                 (
-                    "Mark read".into(),
+                    t!("filters-mark-read").into(),
                     act(FilterAction::NewAct(id.clone(), Act::MarkRead)),
                     ui.new_act == Act::MarkRead,
                 ),
@@ -689,19 +657,19 @@ impl MailApp {
         }
         if state.has("imap4flags") {
             acts.push((
-                "Label".into(),
+                t!("filters-label-2").into(),
                 act(FilterAction::NewAct(id.clone(), Act::Label(String::new()))),
                 matches!(ui.new_act, Act::Label(_)),
             ));
         }
         acts.push((
-            "Send on".into(),
+            t!("filters-send-on").into(),
             act(FilterAction::NewAct(id.clone(), Act::Redirect(String::new()))),
             matches!(ui.new_act, Act::Redirect(_)),
         ));
         if state.has("reject") {
             acts.push((
-                "Refuse".into(),
+                t!("filters-refuse").into(),
                 act(FilterAction::NewAct(id.clone(), Act::Reject(String::new()))),
                 matches!(ui.new_act, Act::Reject(_)),
             ));
@@ -710,7 +678,7 @@ impl MailApp {
             acts.insert(
                 0,
                 (
-                    "Move to folder".into(),
+                    t!("filters-move-to-folder").into(),
                     act(FilterAction::NewAct(
                         id.clone(),
                         Act::Folder(folders.first().map(|f| f.name.clone()).unwrap_or_default()),
@@ -731,7 +699,7 @@ impl MailApp {
                 div()
                     .text_size(px(12.))
                     .font_weight(FontWeight::MEDIUM)
-                    .child("New filter: when"),
+                    .child(t!("filters-new-filter-when")),
             )
             .child(fields)
             .child(
@@ -788,7 +756,7 @@ impl MailApp {
                     div()
                         .text_size(px(12.))
                         .text_color(rgb(c.muted))
-                        .child("Make a folder in the sidebar first; filters move mail into the account's own folders."),
+                        .child(t!("filters-make-a-folder-in-the-sidebar")),
                 );
             } else {
                 form = form.child(
@@ -821,7 +789,7 @@ impl MailApp {
             div().flex().child(
                 self.button(
                     format!("filter-add-{id}"),
-                    "Add Filter",
+                    t!("filters-add-filter"),
                     "plus",
                     act(FilterAction::Add(id.clone())),
                     false,
@@ -838,11 +806,11 @@ impl MailApp {
         if state.has("vacation") {
             let v = &ui.draft.vacation;
             page = page.child(self.switch_setting(
-                "Vacation reply",
+                t!("filters-vacation-reply"),
                 if state.vacation_only {
-                    "The server answers mail to this account while you're away, once per sender."
+                    t!("filters-the-server-answers-mail-to-this")
                 } else {
-                    "The server answers mail to this account's addresses while you're away, once per sender in the days chosen below."
+                    t!("filters-the-server-answers-mail-to-this-2")
                 },
                 format!("vacation-{id}"),
                 v.on,
@@ -852,7 +820,7 @@ impl MailApp {
             if v.on {
                 page = page
                     .child(self.setting(
-                        "Subject",
+                        t!("filters-subject"),
                         "",
                         div().max_w(px(420.)).child(field(
                             Input::new(&self.filter_inputs.subject),
@@ -862,7 +830,7 @@ impl MailApp {
                     ))
                     .child(
                         self.setting(
-                            "Message",
+                            t!("filters-message"),
                             "",
                             div().h(px(110.)).child(
                                 textarea_field(Textarea::new(&self.filter_inputs.body), c, false)
@@ -872,11 +840,11 @@ impl MailApp {
                     )
                     .when(!state.vacation_only, |page| page.child(
                         self.setting(
-                            "Answer each sender once every",
+                            t!("filters-answer-each-sender-once-every"),
                             "",
                             self.segmented(
                                 &format!("vacation-days-{id}"),
-                                [(1, "Day"), (3, "3 days"), (7, "Week"), (14, "2 weeks")]
+                                [(1, t!("filters-day")), (3, t!("filters-3-days")), (7, t!("filters-week")), (14, t!("filters-2-weeks"))]
                                     .into_iter()
                                     .map(|(d, l)| {
                                         (
@@ -893,8 +861,8 @@ impl MailApp {
                 if state.has("date") && state.has("relational") {
                     page = page.child(
                         self.setting(
-                            "Only between",
-                            "Leave empty to answer from now until you turn it off.",
+                            t!("filters-only-between"),
+                            t!("filters-leave-empty-to-answer-from-now"),
                             div()
                                 .flex()
                                 .items_center()
@@ -937,17 +905,17 @@ impl MailApp {
                         .text_size(px(12.))
                         .text_color(rgb(c.muted))
                         .child(if state.active {
-                            "Picacho's filters are on for this account."
+                            t!("filters-picachos-filters-are-on-for-this")
                         } else {
-                            "Save to turn these filters on."
+                            t!("filters-save-to-turn-these-filters-on")
                         }),
                 )
                 .child(self.button(
                     format!("filters-save-{id}"),
                     if ui.saving {
-                        "Saving…"
+                        t!("filters-saving")
                     } else {
-                        "Save Filters"
+                        t!("filters-save-filters")
                     },
                     "",
                     act(FilterAction::Save(id.clone())),

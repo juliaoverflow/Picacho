@@ -65,7 +65,7 @@ impl MailApp {
         };
         if !a.oauth && !a.kerberos && a.service != Service::Pinal && password.is_empty() {
             self.notice(
-                format!("Enter your {}.", a.service.password_label().to_lowercase()),
+                t!("accounts-enter-your", to_lowercase = a.service.password_label().to_lowercase()),
                 true,
                 cx,
             );
@@ -208,9 +208,9 @@ impl MailApp {
             ))
             .tooltip(move |w, cx| {
                 Tooltip::new(if critical {
-                    "Mailbox needs attention · Show details"
+                    t!("accounts-mailbox-needs-attention-show-details")
                 } else {
-                    "Something didn't work · Show details"
+                    t!("accounts-something-didnt-work-show-details")
                 })
                 .build(w, cx)
             })
@@ -246,16 +246,16 @@ impl MailApp {
         div().w_full().flex().flex_col().gap_3()
             .child(div().text_size(px(13.)).child(a.email.clone()))
             .child(div().text_size(px(12.)).text_color(rgb(self.colors().muted)).child(
-                if browser { "Sign in with the same email address in your browser. Your cached mail, drafts, and settings are kept." }
-                else { "Update the password for this mailbox. Your cached mail, drafts, and settings are kept." }))
+                if browser { t!("accounts-sign-in-with-the-same-email") }
+                else { t!("accounts-update-the-password-for-this-mailbox") }))
             .when_some(a.service.browser_unavailable().filter(|_| !browser), |d, why| d.child(notice_box(why, self.colors())))
             .when(!browser, |d| d.child(self.field(a.service.password_label(), PASSWORD)))
             .when_some(a.service.password_help().filter(|_| !browser), |d, (help, _)| d.child(div().text_size(px(12.)).child(help)))
             .when_some(switchable, |d, what| {
                 d.child(div().flex().child(if browser {
-                    self.link("reconnect-use-token", &format!("Use an {what} instead"), Action::ReconnectWithToken(true), cx)
+                    self.link("reconnect-use-token", &t!("accounts-use-an-instead", what = what), Action::ReconnectWithToken(true), cx)
                 } else {
-                    self.link("reconnect-use-browser", "Sign in with the browser instead", Action::ReconnectWithToken(false), cx)
+                    self.link("reconnect-use-browser", t!("accounts-sign-in-with-the-browser-instead"), Action::ReconnectWithToken(false), cx)
                 }))
             })
             .into_any_element()

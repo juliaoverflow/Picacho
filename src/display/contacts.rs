@@ -21,22 +21,15 @@ impl MailApp {
             .flex()
             .flex_col()
             .gap_5()
-            .child(self.section("Contacts"))
+            .child(self.section(t!("contacts-contacts")))
             .child(
                 div()
                     .id("contacts-summary")
                     .text_size(px(12.))
                     .text_color(rgb(c.muted))
-                    .child(format!(
-                        "{} in your address book. The composer suggests them first, then people from your mail.",
-                        match count {
-                            0 => "No addresses".to_owned(),
-                            1 => "1 address".to_owned(),
-                            n => format!("{n} addresses"),
-                        }
-                    )),
+                    .child(t!("contacts-in-your-address-book-the-composer", count = count)),
             )
-            .child(self.section("Contacts server (CardDAV)"));
+            .child(self.section(t!("contacts-contacts-server-carddav")));
         page = if let Some(server) = server {
             let synced = self
                 .backend
@@ -44,34 +37,33 @@ impl MailApp {
                 .and_then(|t| chrono::DateTime::from_timestamp(t, 0))
                 .map(|t| {
                     t.with_timezone(&chrono::Local)
-                        .format("%b %-d, %H:%M")
-                        .to_string()
+                        .local(t!("dates-month-day-time"))
                 })
-                .unwrap_or_else(|| "never".into());
+                .unwrap_or_else(|| t!("contacts-never").to_owned());
             page.child(
                 self.setting(
                     &server.url,
-                    &format!(
-                        "Signed in as {}{}. Read {synced}; read again each time Picacho starts.",
-                        server.user,
-                        // Kept apart from mail, signing in as a mail account does.
-                        match self
+                    &{
+                        let account = self
                             .backend
                             .contacts_mail_account()
                             .filter(|_| server.jmap_account.is_empty())
-                            .and_then(|id| self.accounts.iter().find(|a| a.id == id))
-                        {
-                            Some(a) => format!(", with your {} account's sign-in", a.email),
-                            None => String::new(),
-                        }
-                    ),
+                            .and_then(|id| self.accounts.iter().find(|a| a.id == id));
+                        t!(
+                            "contacts-signed-in-as-read-read-again",
+                            how = if account.is_some() { "account" } else { "password" },
+                            user = server.user,
+                            email = account.map(|a| a.email.as_str()).unwrap_or_default(),
+                            synced = synced
+                        )
+                    },
                     div()
                         .flex()
                         .gap_2()
                         .child(
                             self.button(
                                 "contacts-sync",
-                                if busy { "Reading…" } else { "Read Now" },
+                                if busy { t!("contacts-reading") } else { t!("contacts-read-now") },
                                 "refresh",
                                 Action::SyncContacts,
                                 false,
@@ -81,7 +73,7 @@ impl MailApp {
                         )
                         .child(self.button(
                             "contacts-disconnect",
-                            "Disconnect",
+                            t!("contacts-disconnect"),
                             "close",
                             Action::DisconnectContacts,
                             false,
@@ -90,8 +82,8 @@ impl MailApp {
                 ),
             )
             .child(self.setting(
-                "New address book",
-                "Made on the server; new contacts then go to it.",
+                t!("contacts-new-address-book"),
+                t!("contacts-made-on-the-server-new-contacts"),
                 div()
                     .flex()
                     .items_center()
@@ -104,7 +96,7 @@ impl MailApp {
                     )
                     .child(self.button(
                         "address-book-create",
-                        "Make Address Book",
+                        t!("contacts-make-address-book"),
                         "plus",
                         Action::CreateAddressBook,
                         false,
@@ -123,7 +115,7 @@ impl MailApp {
                         div()
                             .text_size(px(12.))
                             .text_color(rgb(c.muted))
-                            .child("Read and edit your address books on Fastmail, iCloud, Nextcloud, Radicale or another CardDAV server. iCloud and Fastmail need an app password."),
+                            .child(t!("contacts-read-and-edit-your-address-books")),
                     )
                     .children(self.jmap_sources("contacts-jmap", Action::ConnectJmapContacts, cx))
                     .child(
@@ -131,7 +123,7 @@ impl MailApp {
                             .flex()
                             .flex_col()
                             .gap_1()
-                            .child(label("Server"))
+                            .child(label(t!("contacts-server")))
                             .child(
                                 div()
                                     .id("contacts-url")
@@ -143,7 +135,7 @@ impl MailApp {
                             .flex()
                             .flex_col()
                             .gap_1()
-                            .child(label("User name"))
+                            .child(label(t!("contacts-user-name")))
                             .child(
                                 div()
                                     .id("contacts-user")
@@ -155,7 +147,7 @@ impl MailApp {
                             .flex()
                             .flex_col()
                             .gap_1()
-                            .child(label("Password"))
+                            .child(label(t!("contacts-password")))
                             .child(
                                 div()
                                     .id("contacts-password")
@@ -165,14 +157,14 @@ impl MailApp {
                                 div()
                                     .text_size(px(11.))
                                     .text_color(rgb(c.muted))
-                                    .child("Kept in the system keychain."),
+                                    .child(t!("contacts-kept-in-the-system-keychain")),
                             ),
                     )
                     .child(
                         div().flex().child(
                             self.button(
                                 "contacts-connect",
-                                if busy { "Connecting…" } else { "Connect" },
+                                if busy { t!("contacts-connecting") } else { t!("contacts-connect") },
                                 "plus",
                                 Action::ConnectContacts,
                                 true,
@@ -193,17 +185,17 @@ impl MailApp {
             )
         });
         page.child(self.people_section(&cards, cx))
-            .child(self.section("Files"))
+            .child(self.section(t!("contacts-files")))
             .child(self.setting(
-                "vCard files",
-                "Import contacts exported from another address book (.vcf), or save yours as one.",
+                t!("contacts-vcard-files"),
+                t!("contacts-import-contacts-exported-from-another-address"),
                 div()
                     .flex()
                     .flex_wrap()
                     .gap_2()
                     .child(self.button(
                         "contacts-import",
-                        "Import…",
+                        t!("contacts-import"),
                         "upload",
                         Action::ImportContacts,
                         false,
@@ -211,7 +203,7 @@ impl MailApp {
                     ))
                     .child(self.button(
                         "contacts-export",
-                        "Export…",
+                        t!("contacts-export"),
                         "download",
                         Action::ExportContacts,
                         false,
@@ -220,7 +212,7 @@ impl MailApp {
                     .when(cards.iter().any(|c| !crate::manage::backend::contacts::from_server(c)), |d| {
                         d.child(self.button(
                             "contacts-clear",
-                            "Remove Those on This Computer",
+                            t!("contacts-remove-those-on-this-computer"),
                             "trash",
                             Action::ClearImportedContacts,
                             false,
@@ -251,12 +243,12 @@ impl MailApp {
                     .update(cx, |input, cx| input.set_text("", w, cx));
                 self.contacts_run(cx, move |b| {
                     b.connect_contacts(server, &password)
-                        .map(|n| format!("Read {n} contacts"))
+                        .map(|n| t!("contacts-read-contacts", n = n))
                 });
             }
             Action::SyncContacts => {
                 self.contacts_run(cx, |b| {
-                    b.sync_contacts().map(|n| format!("Read {n} contacts"))
+                    b.sync_contacts().map(|n| t!("contacts-read-contacts", n = n))
                 });
             }
             Action::DisconnectContacts => {
@@ -276,14 +268,14 @@ impl MailApp {
                     files: true,
                     directories: false,
                     multiple: true,
-                    prompt: Some("Import".into()),
+                    prompt: Some(t!("contacts-import-2").into()),
                 });
                 cx.spawn(async move |this, cx| {
                     if let Ok(Ok(Some(paths))) = picker.await {
                         let _ = this.update(cx, |this, cx| {
                             this.contacts_run(cx, move |b| {
                                 b.import_contacts(&paths)
-                                    .map(|n| format!("Imported {n} contacts"))
+                                    .map(|n| t!("contacts-imported-contacts", n = n))
                             });
                         });
                     }
@@ -292,13 +284,13 @@ impl MailApp {
             }
             Action::ExportContacts => {
                 let start = self.save_start();
-                let picker = cx.prompt_for_new_path(&start, Some("Contacts.vcf"));
+                let picker = cx.prompt_for_new_path(&start, Some(t!("contacts-contacts-vcf")));
                 cx.spawn(async move |this, cx| {
                     if let Ok(Ok(Some(path))) = picker.await {
                         let _ = this.update(cx, |this, cx| {
                             this.contacts_run(cx, move |b| {
                                 b.export_contacts(&path)
-                                    .map(|n| format!("Exported {n} contacts"))
+                                    .map(|n| t!("contacts-exported-contacts", n = n))
                             });
                         });
                     }
@@ -312,7 +304,7 @@ impl MailApp {
                 self.contacts_run(cx, move |b| {
                     let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
                     let n = b.use_mail_account_for_contacts(&a, cancel)?;
-                    Ok(format!("Read {n} contacts from {}", a.email))
+                    Ok(t!("contacts-read-contacts-from", n = n, email = a.email))
                 });
             }
             Action::SearchServerContacts => {
@@ -320,9 +312,9 @@ impl MailApp {
                 self.contacts_run(cx, move |b| {
                     let n = b.search_server_contacts(&text)?;
                     Ok(match n {
-                        0 => "The server has no one else by that.".to_owned(),
-                        1 => "Found 1 more on the server".to_owned(),
-                        n => format!("Found {n} more on the server"),
+                        0 => t!("contacts-the-server-has-no-one-else").to_owned(),
+                        1 => t!("contacts-found-1-more-on-the-server").to_owned(),
+                        n => t!("contacts-found-more-on-the-server", n = n),
                     })
                 });
             }
@@ -347,7 +339,7 @@ impl MailApp {
             Action::RenameAddressBook(href) => {
                 let name = self.collection_name.read(cx).value().trim().to_owned();
                 if name.is_empty() {
-                    self.contacts_error = Some("Write the new name in the field first.".into());
+                    self.contacts_error = Some(t!("contacts-write-the-new-name-in-the").into());
                     cx.notify();
                     return;
                 }
@@ -359,7 +351,7 @@ impl MailApp {
                 }
                 self.contacts_run(cx, move |b| {
                     b.rename_address_book(&href, &name)?;
-                    Ok(format!("Renamed the address book {name}"))
+                    Ok(t!("contacts-renamed-the-address-book", name = name))
                 });
             }
             Action::DeleteAddressBook(href) => {
@@ -368,7 +360,7 @@ impl MailApp {
                 }
                 self.contacts_run(cx, move |b| {
                     b.delete_address_book(&href)?;
-                    Ok("Deleted the address book".into())
+                    Ok(t!("contacts-deleted-the-address-book").into())
                 });
             }
             Action::CreateAddressBook => {
@@ -376,7 +368,7 @@ impl MailApp {
                 self.collection_name.update(cx, |i, cx| i.set_text("", w, cx));
                 self.contacts_run(cx, move |b| {
                     b.create_address_book(&name)?;
-                    Ok(format!("Made the address book {name}"))
+                    Ok(t!("contacts-made-the-address-book", name = name))
                 });
             }
             Action::NewContact => self.edit_contact(None, w, cx),
@@ -441,7 +433,7 @@ impl MailApp {
                 }
                 self.contact_editing = None;
                 self.contacts_run(cx, move |b| {
-                    b.save_contact(card).map(|c| format!("Saved {}", c.name))
+                    b.save_contact(card).map(|c| t!("contacts-saved", name = c.name))
                 });
             }
             Action::RemoveContact(uid) => {
@@ -461,9 +453,9 @@ impl MailApp {
         let Some(books) = &self.address_books else {
             return self
                 .setting(
-                    "Address books",
-                    "Rename or delete the server's address books.",
-                    self.button("address-books-list", "Show", "list", Action::ListAddressBooks, false, cx),
+                    t!("contacts-address-books"),
+                    t!("contacts-rename-or-delete-the-servers-address"),
+                    self.button("address-books-list", t!("contacts-show"), "list", Action::ListAddressBooks, false, cx),
                 )
                 .into_any_element();
         };
@@ -482,7 +474,7 @@ impl MailApp {
                             .truncate()
                             .text_size(px(13.))
                             .child(if default {
-                                format!("{name} (new contacts go here)")
+                                t!("contacts-new-contacts-go-here", name = name)
                             } else {
                                 name.clone()
                             }),
@@ -490,7 +482,7 @@ impl MailApp {
                     .when(*writable, |d| {
                         d.child(self.button(
                             format!("address-book-rename-{href}"),
-                            "Rename",
+                            t!("contacts-rename"),
                             "",
                             Action::RenameAddressBook(href.clone()),
                             false,
@@ -499,7 +491,7 @@ impl MailApp {
                         .child(
                             self.button(
                                 format!("address-book-delete-{href}"),
-                                "Delete",
+                                t!("contacts-delete"),
                                 "",
                                 Action::DeleteAddressBook(href.clone()),
                                 false,
@@ -512,14 +504,17 @@ impl MailApp {
         }
         let storage = self.contacts_quota.map(|(used, left)| {
             let mb = |b: u64| b as f64 / 1_048_576.0;
-            format!(" The server keeps {:.0} MB of yours, with {:.0} MB left.", mb(used), mb(left))
+            t!("contacts-the-server-keeps-mb-of-yours", used = format!("{:.0}", mb(used)), left = format!("{:.0}", mb(left)))
         });
         self.setting(
-            "Address books",
-            &format!(
-                "Rename uses the name written in the field above. Deleting removes the book and its contacts from the server.{}",
-                storage.unwrap_or_default()
-            ),
+            t!("contacts-address-books"),
+            &{
+                    let rename = t!("contacts-rename-uses-the-name-written-in");
+                    match storage {
+                        Some(storage) => crate::i18n::sentences(rename, &storage),
+                        None => rename.to_owned(),
+                    }
+                },
             list,
         )
         .into_any_element()
@@ -642,9 +637,9 @@ impl MailApp {
                 .id("contact-editor")
                 .role(Role::Form)
                 .aria_label(if uid.is_empty() {
-                    "New contact"
+                    t!("contacts-new-contact")
                 } else {
-                    "Edit contact"
+                    t!("contacts-edit-contact")
                 })
                 .p_4()
                 .rounded(px(12.))
@@ -660,40 +655,40 @@ impl MailApp {
                         .text_size(px(14.))
                         .font_weight(FontWeight::SEMIBOLD)
                         .child(if uid.is_empty() {
-                            "New Contact"
+                            t!("contacts-new-contact-2")
                         } else {
-                            "Edit Contact"
+                            t!("contacts-edit-contact-2")
                         }),
                 )
-                .child(labelled("Name", "contact-name", &self.contact_name))
+                .child(labelled(t!("contacts-name"), "contact-name", &self.contact_name))
                 .child(labelled(
-                    "Email addresses (separated by commas)",
+                    t!("contacts-email-addresses-separated-by-commas"),
                     "contact-emails",
                     &self.contact_emails,
                 ))
                 .child(labelled(
-                    "Phone numbers",
+                    t!("contacts-phone-numbers"),
                     "contact-phones",
                     &self.contact_phones,
                 ))
-                .child(labelled("Organization", "contact-org", &self.contact_org))
-                .child(labelled("Note", "contact-note", &self.contact_note))
-                .child(labelled("Postal addresses", "contact-addresses", &self.contact_addresses))
-                .child(labelled("Birthday", "contact-birthday", &self.contact_birthday))
-                .child(labelled("Job title", "contact-title", &self.contact_title))
-                .child(labelled("Nicknames", "contact-nicknames", &self.contact_nicknames))
-                .child(labelled("Web and chat", "contact-links", &self.contact_links))
-                .child(labelled("Anniversary", "contact-anniversary", &self.contact_anniversary))
+                .child(labelled(t!("contacts-organization"), "contact-org", &self.contact_org))
+                .child(labelled(t!("contacts-note"), "contact-note", &self.contact_note))
+                .child(labelled(t!("contacts-postal-addresses"), "contact-addresses", &self.contact_addresses))
+                .child(labelled(t!("contacts-birthday"), "contact-birthday", &self.contact_birthday))
+                .child(labelled(t!("contacts-job-title"), "contact-title", &self.contact_title))
+                .child(labelled(t!("contacts-nicknames"), "contact-nicknames", &self.contact_nicknames))
+                .child(labelled(t!("contacts-web-and-chat"), "contact-links", &self.contact_links))
+                .child(labelled(t!("contacts-anniversary"), "contact-anniversary", &self.contact_anniversary))
                 .child(labelled(
-                    "Members (makes it a group)",
+                    t!("contacts-members-makes-it-a-group"),
                     "contact-members",
                     &self.contact_members,
                 ))
                 .child(div().text_size(px(11.)).text_color(rgb(c.muted)).child(
                     if self.backend.contacts_server().is_some() {
-                        "Saved to your contacts server."
+                        t!("contacts-saved-to-your-contacts-server")
                     } else {
-                        "Saved on this computer."
+                        t!("contacts-saved-on-this-computer")
                     },
                 ))
                 .child(
@@ -703,7 +698,7 @@ impl MailApp {
                         .gap_2()
                         .child(self.button(
                             "contact-save",
-                            "Save",
+                            t!("contacts-save"),
                             "check",
                             Action::SaveContact,
                             true,
@@ -711,7 +706,7 @@ impl MailApp {
                         ))
                         .child(self.button(
                             "contact-cancel",
-                            "Cancel",
+                            t!("contacts-cancel"),
                             "close",
                             Action::CancelContactEdit,
                             false,
@@ -720,7 +715,7 @@ impl MailApp {
                         .when(!uid.is_empty(), |d| {
                             d.child(self.button(
                                 "contact-delete",
-                                "Delete",
+                                t!("contacts-delete"),
                                 "trash",
                                 Action::RemoveContact(uid.clone()),
                                 false,
@@ -732,7 +727,7 @@ impl MailApp {
         let list = div()
             .id("contacts-list")
             .role(Role::List)
-            .aria_label("Contacts")
+            .aria_label(t!("contacts-contacts"))
             .rounded(px(12.))
             .border_1()
             .border_color(rgb(c.border))
@@ -748,9 +743,9 @@ impl MailApp {
                     .text_size(px(12.))
                     .text_color(rgb(c.muted))
                     .child(if cards.is_empty() {
-                        "No contacts yet."
+                        t!("contacts-no-contacts-yet")
                     } else {
-                        "No one matches."
+                        t!("contacts-no-one-matches")
                     }),
             )
             // A CardDAV server can be asked for more (RFC 6352 §8.6).
@@ -760,7 +755,7 @@ impl MailApp {
                 |d| {
                     d.child(div().px_4().pb_3().child(self.button(
                         "contacts-search-server",
-                        "Search the server",
+                        t!("contacts-search-the-server"),
                         "search",
                         Action::SearchServerContacts,
                         busy,
@@ -842,11 +837,11 @@ impl MailApp {
                     .flex()
                     .items_center()
                     .gap_2()
-                    .child(div().flex_1().child(self.section("People")))
+                    .child(div().flex_1().child(self.section(t!("contacts-people"))))
                     .when(self.contact_editing.is_none(), |d| {
                         d.child(self.button(
                             "contact-new",
-                            "New Contact",
+                            t!("contacts-new-contact-2"),
                             "plus",
                             Action::NewContact,
                             false,
@@ -868,7 +863,7 @@ impl MailApp {
                     div()
                         .text_size(px(11.5))
                         .text_color(rgb(c.muted))
-                        .child(format!("Showing 200 of {total}. Type to narrow them down.")),
+                        .child(t!("contacts-showing-200-of-type-to-narrow", total = total)),
                 )
             })
             .into_any_element()

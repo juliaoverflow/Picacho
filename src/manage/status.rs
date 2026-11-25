@@ -1,4 +1,5 @@
 //! Presentation-neutral synchronization status shared with Display.
+use crate::i18n::dates::Local as _;
 /// A snapshot of background body downloads. Counts come from the local cache;
 /// the coordinator owns task lifetime, while Display chooses how to draw it.
 #[derive(Default)]
@@ -26,10 +27,10 @@ pub enum SignInStep {
 impl SignInStep {
     pub fn label(self) -> &'static str {
         match self {
-            Self::Browser => "Waiting for your browser…",
-            Self::Finishing => "Signed in. Finishing up…",
-            Self::Mailbox => "Connecting to your mailbox…",
-            Self::Verifying => "Finish Proton's check in the window that opened…",
+            Self::Browser => t!("manage-status-waiting-for-your-browser"),
+            Self::Finishing => t!("manage-status-signed-in-finishing-up"),
+            Self::Mailbox => t!("manage-status-connecting-to-your-mailbox"),
+            Self::Verifying => t!("manage-status-finish-protons-check-in-the-window"),
         }
     }
 }
@@ -43,8 +44,8 @@ pub enum AccessFailure {
 impl std::fmt::Display for AccessFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
-            Self::Keychain => "Cannot access saved credentials",
-            Self::Authentication => "Sign-in needs attention",
+            Self::Keychain => t!("manage-status-cannot-access-saved-credentials"),
+            Self::Authentication => t!("manage-status-sign-in-needs-attention"),
         })
     }
 }
@@ -64,20 +65,13 @@ impl std::fmt::Display for Throttled {
         let local = chrono::DateTime::from_timestamp(self.until, 0)
             .map(|t| {
                 t.with_timezone(&chrono::Local)
-                    .format("%-I:%M %p")
-                    .to_string()
+                    .local(t!("dates-time"))
             })
             .unwrap_or_default();
         if self.budget {
-            write!(
-                f,
-                "Today's background download allowance for this account is used up; it resumes at {local}"
-            )
+            f.write_str(&t!("manage-status-todays-background-download-allowance", local = local))
         } else {
-            write!(
-                f,
-                "The server is limiting this account; background sync resumes at {local}"
-            )
+            f.write_str(&t!("manage-status-the-server-is-limiting-this-account", local = local))
         }
     }
 }
@@ -91,7 +85,7 @@ impl std::error::Error for Throttled {}
 pub struct PushRegistration;
 impl std::fmt::Display for PushRegistration {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("Proton didn't register this device for push notifications")
+        f.write_str(t!("manage-status-proton-didnt-register-this-device-for"))
     }
 }
 impl std::error::Error for PushRegistration {}
@@ -108,12 +102,12 @@ pub enum IssueSource {
 impl IssueSource {
     pub fn label(&self) -> &str {
         match self {
-            Self::Sync(_) => "Checking mail",
-            Self::Download => "Downloading messages",
-            Self::Read => "Opening a message",
-            Self::Change => "Updating messages",
-            Self::Send => "Sending mail",
-            Self::Push => "Push notifications",
+            Self::Sync(_) => t!("manage-status-checking-mail"),
+            Self::Download => t!("manage-status-downloading-messages"),
+            Self::Read => t!("manage-status-opening-a-message"),
+            Self::Change => t!("manage-status-updating-messages"),
+            Self::Send => t!("manage-status-sending-mail"),
+            Self::Push => t!("manage-status-push-notifications"),
         }
     }
 }
@@ -147,23 +141,23 @@ impl AccountIssue {
     }
     pub fn guidance(&self, source: &IssueSource) -> &'static str {
         if self.push {
-            return "This mailbox gets no new-mail notifications until Proton accepts this device: with push notifications on, checks for new mail don't announce it. Choose Try Again, or turn Push notifications off to have checks announce new mail again.";
+            return t!("manage-status-this-mailbox-gets-no-new-mail");
         }
         if *source == IssueSource::Send {
-            return "Your draft has been kept. Check your sign-in, recipient, and outgoing server settings before sending again.";
+            return t!("manage-status-your-draft-has-been-kept-check");
         }
         if self.throttled && self.access.is_none() {
-            return "The server is limiting how much this account can download, which Gmail does after heavy use. Background checks and downloads pause and resume on their own; cached mail stays available, and opening a message still works.";
+            return t!("manage-status-the-server-is-limiting-how-much");
         }
         match self.access {
             Some(AccessFailure::Keychain) => {
-                "Allow Picacho to access your system keychain, then choose Try Again. If the saved credentials are missing, sign in again. Automatic checks are paused for this mailbox."
+                t!("manage-status-allow-picacho-to-access-your-system")
             }
             Some(AccessFailure::Authentication) => {
-                "The server could not accept your sign-in. Sign in again with your provider or update your app password. Automatic checks are paused for this mailbox."
+                t!("manage-status-the-server-could-not-accept-your")
             }
             None => {
-                "Check your connection and server settings, then try again. Your cached mail remains available. Automatic checks will retry on this mailbox's schedule."
+                t!("manage-status-check-your-connection-and-server-settings")
             }
         }
     }

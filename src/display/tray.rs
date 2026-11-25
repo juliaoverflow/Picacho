@@ -20,9 +20,6 @@ pub(super) enum TrayCommand {
 }
 
 const TOOLTIP: &str = "Picacho";
-const OPEN_LABEL: &str = "Open Picacho";
-const WIDGET_LABEL: &str = "Desktop Widget";
-const QUIT_LABEL: &str = "Quit Picacho";
 
 /// The app icon as RGBA pixels, `size` pixels square.
 fn icon_rgba(size: u32) -> Option<Vec<u8>> {
@@ -32,7 +29,7 @@ fn icon_rgba(size: u32) -> Option<Vec<u8>> {
     Some(image.into_rgba8().into_raw())
 }
 
-pub(super) use platform::{Tray, create};
+pub(super) use platform::{Tray, create, relabel};
 
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
 mod platform {
@@ -50,6 +47,21 @@ mod platform {
             // Asks the service to end without waiting for it: the bus must
             // never hold up the window.
             drop(self.handle.shutdown());
+            *SHOWN.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        }
+    }
+
+    /// The icon showing, for `relabel`.
+    static SHOWN: std::sync::Mutex<Option<ksni::blocking::Handle<Sni>>> =
+        std::sync::Mutex::new(None);
+
+    /// Sends the menu again, in the language now shown (`menu` words it as
+    /// it's asked). Off the main thread: the bus must never hold it up.
+    pub(in crate::display) fn relabel() {
+        if let Some(handle) = SHOWN.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+            std::thread::spawn(move || {
+                handle.update(|_| {});
+            });
         }
     }
 
@@ -87,20 +99,20 @@ mod platform {
             use ksni::menu::{MenuItem, StandardItem};
             vec![
                 StandardItem {
-                    label: OPEN_LABEL.into(),
+                    label: t!("tray-open-picacho").into(),
                     activate: Box::new(|this: &mut Self| this.send(TrayCommand::Open)),
                     ..Default::default()
                 }
                 .into(),
                 StandardItem {
-                    label: WIDGET_LABEL.into(),
+                    label: t!("tray-desktop-widget").into(),
                     activate: Box::new(|this: &mut Self| this.send(TrayCommand::Widget)),
                     ..Default::default()
                 }
                 .into(),
                 MenuItem::Separator,
                 StandardItem {
-                    label: QUIT_LABEL.into(),
+                    label: t!("tray-quit-picacho").into(),
                     icon_name: "application-exit".into(),
                     activate: Box::new(|this: &mut Self| this.send(TrayCommand::Quit)),
                     ..Default::default()
@@ -134,7 +146,10 @@ mod platform {
         let sandboxed =
             std::env::var_os("FLATPAK_ID").is_some() || std::env::var_os("SNAP").is_some();
         match tray.disable_dbus_name(sandboxed).spawn() {
-            Ok(handle) => Some(Tray { handle }),
+            Ok(handle) => {
+                *SHOWN.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle.clone());
+                Some(Tray { handle })
+            }
             Err(e) => {
                 eprintln!("Picacho: no tray icon: {e}");
                 None
@@ -171,6 +186,22 @@ mod platform {
         _icon: TrayIcon,
     }
 
+    thread_local! {
+        /// The menu's items and their words, for `relabel` (on the main
+        /// thread, where the menu lives).
+        static ITEMS: std::cell::RefCell<Vec<(MenuItem, fn() -> &'static str)>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    /// Words the menu in the language now shown.
+    pub(in crate::display) fn relabel() {
+        ITEMS.with_borrow(|items| {
+            for (item, words) in items {
+                item.set_text(words());
+            }
+        });
+    }
+
     /// Adds the icon. On the main thread, with the app's event loop running.
     pub(in crate::display) fn create(commands: UnboundedSender<TrayCommand>) -> Option<Tray> {
         static HANDLERS: Once = Once::new();
@@ -200,9 +231,14 @@ mod platform {
             }));
         });
         let menu = Menu::new();
-        let open = MenuItem::with_id(OPEN_ID, OPEN_LABEL, true, None);
-        let widget = MenuItem::with_id(WIDGET_ID, WIDGET_LABEL, true, None);
-        let quit = MenuItem::with_id(QUIT_ID, QUIT_LABEL, true, None);
+        let open = MenuItem::with_id(OPEN_ID, t!("tray-open-picacho"), true, None);
+        let widget = MenuItem::with_id(WIDGET_ID, t!("tray-desktop-widget"), true, None);
+        let quit = MenuItem::with_id(QUIT_ID, t!("tray-quit-picacho"), true, None);
+        ITEMS.set(vec![
+            (open.clone(), || t!("tray-open-picacho")),
+            (widget.clone(), || t!("tray-desktop-widget")),
+            (quit.clone(), || t!("tray-quit-picacho")),
+        ]);
         let built = menu
             .append(&open)
             .and_then(|_| menu.append(&widget))

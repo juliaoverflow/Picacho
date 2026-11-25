@@ -127,12 +127,12 @@ pub fn parse_metadata(v: &serde_json::Value) -> Result<Metadata> {
     };
     ensure!(
         v["jwks_uri"].is_null() || https("jwks_uri").is_some(),
-        "The server's sign-in keys (jwks_uri) aren't served over https."
+        t!("sync-oauth-the-servers-sign-in-keys-jwks")
     );
     if let Some(methods) = v["code_challenge_methods_supported"].as_array() {
         ensure!(
             methods.iter().any(|m| m.as_str() == Some("S256")),
-            "The server's sign-in doesn't support PKCE with S256, which Picacho requires."
+            t!("sync-oauth-the-servers-sign-in-doesnt-support")
         );
     }
     let listed = |key: &str, value: &str| {
@@ -151,9 +151,9 @@ pub fn parse_metadata(v: &serde_json::Value) -> Result<Metadata> {
     Ok(Metadata {
         client_auth,
         authorization: https("authorization_endpoint")
-            .context("The server's sign-in settings have no https authorization endpoint.")?,
+            .with_context(|| t!("sync-oauth-the-servers-sign-in-settings-have"))?,
         token: https("token_endpoint")
-            .context("The server's sign-in settings have no https token endpoint.")?,
+            .with_context(|| t!("sync-oauth-the-servers-sign-in-settings-have-2"))?,
         registration: https("registration_endpoint"),
         revocation: https("revocation_endpoint"),
         end_session: https("end_session_endpoint"),
@@ -229,8 +229,7 @@ pub fn jmap_metadata(host: &str, port: u16) -> Result<Metadata> {
         }
     }
     Err(anyhow::anyhow!(
-        "{host} doesn't offer browser sign-in for mail apps{}. Use a password or an API token instead.",
-        last.map(|e| format!(" ({e:#})")).unwrap_or_default()
+        t!("sync-oauth-doesnt-offer-browser-sign-in-for", host = host, detail = last.map(|e| format!(" ({e:#})")).unwrap_or_default())
     ))
 }
 /// An organization's identity provider's metadata (OpenID Connect
@@ -245,10 +244,10 @@ pub fn sso_metadata(issuer: &str) -> Result<Metadata> {
     if let Some((_, m)) = KNOWN.lock().unwrap().iter().find(|(i, _)| *i == issuer) {
         return Ok(m.clone());
     }
-    let parsed = url::Url::parse(&issuer).context("The sign-in service's address isn't valid.")?;
+    let parsed = url::Url::parse(&issuer).with_context(|| t!("sync-oauth-the-sign-in-services-address-isnt"))?;
     ensure!(
         parsed.scheme() == "https" || cfg!(test),
-        "The sign-in service's address must start with https://."
+        t!("sync-oauth-the-sign-in-services-address-must")
     );
     let origin = parsed.origin().ascii_serialization();
     let path = parsed.path().trim_end_matches('/');
@@ -275,8 +274,7 @@ pub fn sso_metadata(issuer: &str) -> Result<Metadata> {
             let named = v["issuer"].as_str().unwrap_or_default().trim_end_matches('/');
             ensure!(
                 named == issuer,
-                "its sign-in settings are for {}, not {issuer}",
-                if named.is_empty() { "no issuer" } else { named }
+                t!("sync-oauth-its-sign-in-settings-are-for", named = if named.is_empty() { t!("sync-oauth-no-issuer") } else { named }, issuer = issuer)
             );
             parse_metadata(&v)
         }) {
@@ -294,8 +292,7 @@ pub fn sso_metadata(issuer: &str) -> Result<Metadata> {
         }
     }
     Err(anyhow::anyhow!(
-        "{issuer} isn't a sign-in service Picacho can use{}. Check the address with your organization.",
-        last.map(|e| format!(" ({e:#})")).unwrap_or_default()
+        t!("sync-oauth-isnt-a-sign-in-service-picacho", issuer = issuer, detail = last.map(|e| format!(" ({e:#})")).unwrap_or_default())
     ))
 }
 /// What to ask an organization's sign-in for: who you are and a refresh
@@ -322,10 +319,10 @@ pub fn sso_scopes(supported: &[String], extra: &str) -> String {
 /// trailing `/` is allowed, as servers write their origin both ways.
 fn issued_by(v: &serde_json::Value, origin: &str) -> Result<()> {
     match v["issuer"].as_str() {
-        None => Err(anyhow::anyhow!("its sign-in settings name no issuer")),
+        None => Err(anyhow::anyhow!(t!("sync-oauth-its-sign-in-settings-name-no"))),
         Some(issuer) if issuer.trim_end_matches('/').eq_ignore_ascii_case(origin) => Ok(()),
         Some(issuer) => Err(anyhow::anyhow!(
-            "its sign-in settings are for {issuer}, not {origin}"
+            t!("sync-oauth-its-sign-in-settings-are-for-2", issuer = issuer, origin = origin)
         )),
     }
 }
@@ -373,7 +370,7 @@ impl Registration {
     fn from_response(v: &serde_json::Value, redirect: &str) -> Result<Self> {
         let text = |key: &str| v[key].as_str().unwrap_or_default().to_owned();
         let client_id = text("client_id");
-        ensure!(!client_id.is_empty(), "The server registered Picacho without a client id.");
+        ensure!(!client_id.is_empty(), t!("sync-oauth-the-server-registered-picacho-without-a"));
         // RFC 7592 §3: the management URI must be https, as the access
         // token is sent to it.
         let uri = text("registration_client_uri");
@@ -409,9 +406,9 @@ fn register(endpoint: &str, redirect: &str) -> Result<String> {
         .post(endpoint)
         .json(&client_metadata(redirect))
         .send()
-        .context("Couldn't reach the server to register Picacho for sign-in.")?
+        .with_context(|| t!("sync-oauth-couldnt-reach-the-server-to-register"))?
         .error_for_status()
-        .context("The server didn't register Picacho for browser sign-in.")?
+        .with_context(|| t!("sync-oauth-the-server-didnt-register-picacho-for"))?
         .and_then_bounded_json()?;
     let registration = Registration::from_response(&v, redirect)?;
     registration.save(endpoint);
@@ -506,7 +503,7 @@ fn endpoints(provider: Provider) -> (&'static str, &'static str, &'static str) {
 pub fn revoke(endpoint: &str, client_id: &str, secret: &Secret) -> Result<()> {
     ensure!(
         endpoint.starts_with("https://") || cfg!(test),
-        "Tokens are only given up over https."
+        t!("sync-oauth-tokens-are-only-given-up-over")
     );
     let (token, hint) = if !secret.refresh_token.is_empty() {
         (secret.refresh_token.as_str(), "refresh_token")
@@ -684,7 +681,7 @@ pub fn google_picture(access_token: &str) -> Result<Option<Vec<u8>>> {
             && url
                 .host_str()
                 .is_some_and(|h| h.ends_with(".googleusercontent.com")),
-        "Unexpected profile picture address"
+        t!("sync-oauth-unexpected-profile-picture-address")
     );
     // Google sizes pictures with a path suffix such as `=s96-c`.
     if let Some((path, _)) = url.path().rsplit_once('=') {
@@ -811,7 +808,7 @@ impl Browser {
             let _ = visitor.join();
             return code;
         }
-        open::that(url.as_str()).context("Could not open the system browser")?;
+        open::that(url.as_str()).with_context(|| t!("sync-oauth-could-not-open-the-system-browser"))?;
         self.wait(cancel)
     }
     /// On Android, in a Custom Tab over Picacho (or the browser), with the
@@ -826,10 +823,10 @@ impl Browser {
     fn wait(&self, cancel: &AtomicBool) -> Result<String> {
         let start = Instant::now();
         loop {
-            ensure!(!cancel.load(Ordering::Relaxed), "Sign-in cancelled.");
+            ensure!(!cancel.load(Ordering::Relaxed), t!("sync-oauth-sign-in-cancelled"));
             ensure!(
                 start.elapsed() < Duration::from_secs(300),
-                "Sign-in timed out. Please try again."
+                t!("sync-oauth-sign-in-timed-out-please-try")
             );
             {
                 // Claim only this request's callback; it answers once.
@@ -909,14 +906,14 @@ impl Browser {
             && given != expected
         {
             return Some(Err(anyhow::anyhow!(
-                "The sign-in answered for another server ({given}); nothing was signed in."
+                t!("sync-oauth-the-sign-in-answered-for-another", given = given)
             )));
         }
         if let Some(error) = params.get("error") {
             return Some(Err(anyhow::anyhow!(if error == "access_denied" {
-                "Sign-in was cancelled.".to_owned()
+                t!("sync-oauth-sign-in-was-cancelled").to_owned()
             } else {
-                format!("Sign-in was declined: {error}")
+                t!("sync-oauth-sign-in-was-declined", error = error)
             })));
         }
         params.get("code").cloned().map(Ok)
@@ -927,9 +924,9 @@ impl Browser {
 /// content type and body.
 fn callback_page(ok: bool) -> (&'static str, String) {
     let text = if ok {
-        "Sign-in complete. You can return to Picacho."
+        t!("sync-oauth-sign-in-complete-you-can-return")
     } else {
-        "Sign-in could not be completed. Return to Picacho and try again."
+        t!("sync-oauth-sign-in-could-not-be-completed")
     };
     #[cfg(target_os = "android")]
     if let Some(back) = crate::android::return_url() {
@@ -1050,13 +1047,12 @@ fn checked_identity_at(
         return Ok((Identity::default(), String::new()));
     }
     let claims = claims_of(id_token);
-    ensure!(claims.is_object(), "The sign-in's ID token couldn't be read.");
+    ensure!(claims.is_object(), t!("sync-oauth-the-sign-ins-id-token-couldnt"));
     // Step 2: the issuer must be the one signed in with, so a token from
     // another server (a mix-up) isn't taken for this one's.
     ensure!(
         issuer.accepts(&claims),
-        "The sign-in's ID token came from another server ({}).",
-        claims["iss"].as_str().unwrap_or("none named")
+        t!("sync-oauth-the-sign-ins-id-token-came", issuer = claims["iss"].as_str().unwrap_or(t!("sync-oauth-none-named")))
     );
     let audiences: Vec<&str> = match &claims["aud"] {
         serde_json::Value::String(a) => vec![a.as_str()],
@@ -1067,18 +1063,18 @@ fn checked_identity_at(
         // Step 3: this client among the audiences.
         ensure!(
             audiences.contains(&client_id),
-            "The sign-in's ID token was issued to another app."
+            t!("sync-oauth-the-sign-ins-id-token-was")
         );
         // Steps 4 and 5: with several audiences, the one it was given to
         // (`azp`) must be said, and wherever it is said, be this client.
         let azp = claims["azp"].as_str();
         ensure!(
             audiences.len() == 1 || azp.is_some(),
-            "The sign-in's ID token doesn't say which of its apps it was issued to."
+            t!("sync-oauth-the-sign-ins-id-token-doesnt")
         );
         ensure!(
             azp.is_none_or(|azp| azp == client_id),
-            "The sign-in's ID token was issued to another app."
+            t!("sync-oauth-the-sign-ins-id-token-was")
         );
     }
     // Step 9: `exp` is required, and must not have passed (give or take
@@ -1087,19 +1083,19 @@ fn checked_identity_at(
     let exp = claims["exp"]
         .as_i64()
         .or_else(|| claims["exp"].as_f64().map(|f| f as i64))
-        .context("The sign-in's ID token has no expiry.")?;
+        .with_context(|| t!("sync-oauth-the-sign-ins-id-token-has"))?;
     ensure!(
         exp + CLOCK_SKEW >= now,
-        "The sign-in's ID token has expired. Check this device's clock."
+        t!("sync-oauth-the-sign-ins-id-token-has-2")
     );
     if let Some(nonce) = nonce {
         ensure!(
             claims["nonce"].as_str() == Some(nonce),
-            "The sign-in's ID token doesn't belong to this sign-in."
+            t!("sync-oauth-the-sign-ins-id-token-doesnt-2")
         );
     }
     let subject = claims["sub"].as_str().unwrap_or_default().to_owned();
-    ensure!(!subject.is_empty(), "The sign-in's ID token names no account.");
+    ensure!(!subject.is_empty(), t!("sync-oauth-the-sign-ins-id-token-names"));
     Ok((identity_of(&claims), subject))
 }
 
@@ -1164,7 +1160,7 @@ pub fn authorize_with(account: &Account, more: &[&str], cancel: Arc<AtomicBool>)
     }
     ensure!(
         more.is_empty() || account.provider == Provider::Gmail,
-        "Only Google accounts are asked for calendar or contacts access this way."
+        t!("sync-oauth-only-google-accounts-are-asked-for")
     );
     let microsoft = account.provider == Provider::Outlook;
     let browser = Browser::new(if microsoft { "localhost" } else { "127.0.0.1" }, "/")?;
@@ -1229,8 +1225,7 @@ fn authorize_jmap(account: &Account, cancel: Arc<AtomicBool>) -> Result<Grant> {
         account.client_id.clone()
     } else {
         bail!(
-            "{} doesn't let mail apps sign in in the browser without registering them first. Use a password or an API token instead.",
-            account.incoming_host
+            t!("sync-oauth-doesnt-let-mail-apps-sign-in", host = account.incoming_host)
         );
     };
     let mut url = url::Url::parse(&metadata.authorization)?;
@@ -1287,7 +1282,7 @@ fn authorize_sso(
         registered(endpoint, &browser.redirect)?
     } else {
         bail!(
-            "Your organization's sign-in doesn't let mail apps register themselves. Ask your administrator for a client id for Picacho (a public client with a http://127.0.0.1 redirect) and enter it under Server settings."
+            t!("sync-oauth-your-organizations-sign-in-doesnt-let")
         );
     };
     let mut url = url::Url::parse(&metadata.authorization)?;
@@ -1393,8 +1388,7 @@ pub fn redeem(account: &Account, grant: &Grant) -> Result<(Secret, Identity)> {
             .collect();
         ensure!(
             missing.is_empty(),
-            "The sign-in didn't allow everything Picacho asked for ({} wasn't granted). Sign in again and allow it.",
-            missing.join(", ")
+            t!("sync-oauth-the-sign-in-didnt-allow-everything", scopes = missing.join(", "))
         );
     }
     let (who, _) = checked_identity(
@@ -1441,7 +1435,7 @@ fn pinal_endpoints(http: &reqwest::blocking::Client) -> Result<PinalEndpoints> {
         let response = http
             .get(format!("{origin}{path}"))
             .send()
-            .context("Could not reach Pinal Accounts. Check your connection.")?;
+            .with_context(|| t!("sync-oauth-could-not-reach-pinal-accounts-check"))?;
         if response.status().is_success()
             && let Ok(value) = bounded_json(response)
             && value["authorization_endpoint"].is_string()
@@ -1450,17 +1444,17 @@ fn pinal_endpoints(http: &reqwest::blocking::Client) -> Result<PinalEndpoints> {
             break;
         }
     }
-    let config = config.context("Pinal Accounts is not answering sign-in requests right now.")?;
+    let config = config.with_context(|| t!("sync-oauth-pinal-accounts-is-not-answering-sign"))?;
     let endpoint = |key: &str| -> Result<url::Url> {
         let url = url::Url::parse(
             config[key]
                 .as_str()
-                .context("Pinal Accounts is misconfigured")?,
+                .with_context(|| t!("sync-oauth-pinal-accounts-is-misconfigured"))?,
         )?;
         // Discovery must not send the code or token anywhere but Pinal.
         ensure!(
             url.origin().ascii_serialization() == origin,
-            "Pinal Accounts returned an unexpected sign-in address."
+            t!("sync-oauth-pinal-accounts-returned-an-unexpected-sign")
         );
         Ok(url)
     };
@@ -1599,13 +1593,13 @@ fn pinal_redeem(request: &PinalRequest, code: &str) -> Result<(Secret, Identity)
             .bearer_auth(&secret.access_token)
             .send()
             .and_then(|r| r.error_for_status())
-            .context("Could not reach Pinal Accounts. Check your connection.")?
+            .with_context(|| t!("sync-oauth-could-not-reach-pinal-accounts-check"))?
             .and_then_bounded_json()?;
         let text = |key: &str| info[key].as_str().unwrap_or_default().to_owned();
         // The same account as the ID token's (OpenID Connect Core §5.3.4).
         ensure!(
             subject.is_empty() || text("sub") == subject,
-            "Pinal Accounts answered for another account."
+            t!("sync-oauth-pinal-accounts-answered-for-another-account")
         );
         if info["email_verified"].as_bool() != Some(false) {
             who.email = text("email");
@@ -1621,20 +1615,18 @@ fn pinal_redeem(request: &PinalRequest, code: &str) -> Result<(Secret, Identity)
         .unwrap_or_default();
     ensure!(
         pinal_domains().contains(&domain),
-        "{} has no Pinal Mail address. Pinal Mail is for accounts made with a @{} address.",
-        if who.email.is_empty() {
-            "This Pinal account"
+        t!("sync-oauth-has-no-pinal-mail-address-pinal", account = if who.email.is_empty() {
+            t!("sync-oauth-this-pinal-account")
         } else {
             who.email.as_str()
-        },
-        pinal_domains()
+        }, domain = pinal_domains()
             .first()
             .map(String::as_str)
-            .unwrap_or("sonoran.exchange")
+            .unwrap_or("sonoran.exchange"))
     );
     ensure!(
         !secret.refresh_token.is_empty(),
-        "Pinal did not let Picacho stay signed in. Please try again."
+        t!("sync-oauth-pinal-did-not-let-picacho-stay")
     );
     Ok((secret, who))
 }
@@ -1651,7 +1643,7 @@ pub fn pinal(
     let code = request.browser.code(&request.url, &cancel)?;
     answered();
     let signed_in = pinal_redeem(&request, &code)?;
-    ensure!(!cancel.load(Ordering::Relaxed), "Sign-in cancelled.");
+    ensure!(!cancel.load(Ordering::Relaxed), t!("sync-oauth-sign-in-cancelled"));
     Ok(signed_in)
 }
 
@@ -1720,7 +1712,7 @@ fn exchange(
             .map(|n| format!(", AADSTS{n}"))
             .unwrap_or_default();
         let error = anyhow::anyhow!(
-            "Sign-in failed at the token step ({status}: {code}{aadsts}). Please try again."
+            t!("sync-oauth-sign-in-failed-at-the-token", status = status, code = code, aadsts = aadsts)
         );
         return Err(
             if matches!(
@@ -1735,7 +1727,7 @@ fn exchange(
     }
     let access_token = value["access_token"]
         .as_str()
-        .context("Provider did not return an access token")?
+        .with_context(|| t!("sync-oauth-provider-did-not-return-an-access"))?
         .to_string();
     // RFC 6749 §5.1 and §7.1: the token's type is required, and only a
     // bearer token (RFC 6750 §4, compared without case) is what the mail
@@ -1743,8 +1735,7 @@ fn exchange(
     let kind = value["token_type"].as_str().unwrap_or_default();
     ensure!(
         kind.eq_ignore_ascii_case("bearer"),
-        "The sign-in issued a {} token, which Picacho can't use; it needs a bearer token.",
-        if kind.is_empty() { "untyped" } else { kind }
+        t!("sync-oauth-the-sign-in-issued-a-token", kind = if kind.is_empty() { "untyped" } else { kind })
     );
     let secret = Secret {
         access_token,
@@ -1760,7 +1751,7 @@ pub fn refresh(account: &Account, secret: &mut Secret) -> Result<bool> {
     }
     if secret.refresh_token.is_empty() {
         return Err(
-            anyhow::anyhow!("Your sign-in expired. Reconnect the account.")
+            anyhow::anyhow!(t!("sync-oauth-your-sign-in-expired-reconnect-the"))
                 .context(crate::manage::status::AccessFailure::Authentication),
         );
     }

@@ -47,13 +47,13 @@ impl PartStat {
     /// The word a reply's subject starts with.
     pub fn verb(self) -> &'static str {
         match self {
-            Self::Accepted => "Accepted",
-            Self::Tentative => "Tentatively accepted",
-            Self::Declined => "Declined",
-            Self::NeedsAction => "Invitation",
-            Self::Delegated => "Delegated",
-            Self::Completed => "Completed",
-            Self::InProcess => "In progress",
+            Self::Accepted => t!("sync-ical-accepted"),
+            Self::Tentative => t!("sync-ical-tentatively-accepted"),
+            Self::Declined => t!("sync-ical-declined"),
+            Self::NeedsAction => t!("sync-ical-invitation"),
+            Self::Delegated => t!("sync-ical-delegated"),
+            Self::Completed => t!("sync-ical-completed"),
+            Self::InProcess => t!("sync-ical-in-progress"),
         }
     }
 }
@@ -313,19 +313,32 @@ impl Event {
     pub fn details(&self) -> Vec<(&'static str, String)> {
         let mut out = Vec::new();
         for c in &self.conferences {
-            let label = if c.label.is_empty() { c.features.join(", ").to_lowercase() } else { c.label.clone() };
-            out.push(("Join", if label.is_empty() { c.uri.clone() } else { format!("{label}: {}", c.uri) }));
+            let label = if c.label.is_empty() {
+                c.features.join(", ").to_lowercase()
+            } else {
+                c.label.clone()
+            };
+            out.push((
+                t!("sync-ical-join"),
+                if label.is_empty() {
+                    c.uri.clone()
+                } else {
+                    format!("{label}: {}", c.uri)
+                },
+            ));
         }
         if let Some((lat, lon)) = self.coordinates().filter(|_| self.location.is_empty()) {
-            out.push(("Where", format!("{lat:.5}, {lon:.5}")));
+            out.push((t!("sync-ical-where"), format!("{lat:.5}, {lon:.5}")));
         }
         if !self.categories.is_empty() {
-            out.push(("Categories", self.categories.join(", ")));
+            out.push((t!("sync-ical-categories"), self.categories.join(", ")));
         }
         match self.class.as_str() {
             "" | "PUBLIC" => {}
-            "CONFIDENTIAL" => out.push(("Privacy", "Confidential".into())),
-            _ => out.push(("Privacy", "Private".into())),
+            "CONFIDENTIAL" => {
+                out.push((t!("sync-ical-privacy"), t!("sync-ical-confidential").into()))
+            }
+            _ => out.push((t!("sync-ical-privacy"), t!("sync-ical-private").into())),
         }
         let others: Vec<String> = self
             .reminders()
@@ -338,15 +351,24 @@ impl Event {
                     _ => "other",
                 };
                 let minutes = a.before / 60;
-                let mut text = if minutes >= 0 { format!("{how} {minutes} min before") } else { format!("{how} {} min after", -minutes) };
+                let mut text = if minutes >= 0 {
+                    t!("sync-ical-min-before", how = how, minutes = minutes)
+                } else {
+                    t!("sync-ical-min-after", how = how, minutes = -minutes)
+                };
                 if a.repeat > 0 {
-                    text.push_str(&format!(", {} more every {} min", a.repeat, a.interval / 60));
+                    text = t!(
+                        "sync-ical-more-every-min",
+                        reminder = text,
+                        repeat = a.repeat,
+                        minutes = a.interval / 60
+                    );
                 }
                 text
             })
             .collect();
         if !others.is_empty() {
-            out.push(("Reminders", others.join("; ")));
+            out.push((t!("sync-ical-reminders"), others.join("; ")));
         }
         out
     }
@@ -1713,32 +1735,20 @@ impl Rule {
             "MONTHLY" => "month",
             _ => "year",
         };
-        let mut text = if self.interval == 1 {
-            format!("Every {unit}")
-        } else {
-            format!("Every {} {unit}s", self.interval)
-        };
-        let ordinal = |n: i32| match n {
-            -1 => "the last".to_owned(),
-            1 => "the first".to_owned(),
-            2 => "the second".to_owned(),
-            3 => "the third".to_owned(),
-            4 => "the fourth".to_owned(),
-            n if n < 0 => format!("#{n}"),
-            n => format!("the {n}th"),
-        };
+        let mut text = t!("sync-ical-every", unit = unit, interval = self.interval);
+        // Each detail is a phrase of its own ("on Monday", "until Nov 26"),
+        // joined to the rest as the language joins them.
+        let detail = |text: String, detail: String| t!("sync-ical-repeat-detail", repeat = text, detail = detail);
+        let end = |text: String, end: String| t!("sync-ical-repeat-end", repeat = text, end = end);
         if !self.by_month.is_empty() {
-            const MONTHS: [&str; 12] = [
-                "January", "February", "March", "April", "May", "June", "July", "August",
-                "September", "October", "November", "December",
-            ];
-            let months: Vec<&str> = self
+            let months: Vec<String> = self
                 .by_month
                 .iter()
-                .filter_map(|&m| MONTHS.get(m.checked_sub(1)? as usize).copied())
+                .filter(|&&m| (1..=12).contains(&m))
+                .map(|&m| t!("sync-ical-month-name", month = m))
                 .collect();
             if !months.is_empty() {
-                text.push_str(&format!(" in {}", months.join(", ")));
+                text = detail(text, t!("sync-ical-in-months", months = months.join(", ")));
             }
         }
         let weekdays_only = self.by_day.len() == 5
@@ -1761,55 +1771,39 @@ impl Rule {
         if let [pos] = self.by_set_pos.as_slice()
             && (weekdays_only || weekend_only)
         {
-            let kind = if weekdays_only { "weekday" } else { "weekend day" };
-            text.push_str(&format!(" on {} {kind}", ordinal(*pos)));
+            let kind = if weekdays_only { "weekday" } else { "weekend" };
+            text = detail(text, t!("sync-ical-on-the-nth-kind-of-day", pos = *pos, kind = kind));
         } else if !self.by_day.is_empty() {
             let days: Vec<String> = self
                 .by_day
                 .iter()
                 .map(|(n, d)| {
-                    let name = match d {
-                        chrono::Weekday::Mon => "Monday",
-                        chrono::Weekday::Tue => "Tuesday",
-                        chrono::Weekday::Wed => "Wednesday",
-                        chrono::Weekday::Thu => "Thursday",
-                        chrono::Weekday::Fri => "Friday",
-                        chrono::Weekday::Sat => "Saturday",
-                        chrono::Weekday::Sun => "Sunday",
-                    };
-                    match n {
-                        0 => name.to_owned(),
-                        -1 => format!("the last {name}"),
-                        1 => format!("the first {name}"),
-                        2 => format!("the second {name}"),
-                        3 => format!("the third {name}"),
-                        4 => format!("the fourth {name}"),
-                        n => format!("{name} #{n}"),
-                    }
+                    let day = t!("sync-ical-weekday-name", day = d.num_days_from_monday());
+                    t!("sync-ical-nth-weekday", pos = *n, day = day)
                 })
                 .collect();
-            text.push_str(&format!(" on {}", days.join(", ")));
+            text = detail(text, t!("sync-ical-on-days", days = days.join(", ")));
         } else if !self.by_month_day.is_empty() {
             let days: Vec<String> = self
                 .by_month_day
                 .iter()
                 .map(|&d| {
-                    if d == -1 {
-                        "the last day".to_owned()
-                    } else if d < 0 {
-                        format!("{} days before the end", -d)
-                    } else {
-                        format!("day {d}")
-                    }
+                    let kind = match d {
+                        -1 => "last",
+                        ..-1 => "before-end",
+                        _ => "day",
+                    };
+                    t!("sync-ical-month-day", kind = kind, day = d, before_end = -d)
                 })
                 .collect();
-            text.push_str(&format!(" on {}", days.join(", ")));
+            text = detail(text, t!("sync-ical-on-days", days = days.join(", ")));
         }
         if let Some(n) = self.count {
-            text.push_str(&format!(", {n} times"));
+            text = end(text, t!("sync-ical-times", count = n));
         } else if let Some(u) = self.until {
             let d = DateTime::from_timestamp(u, 0).unwrap_or_default();
-            text.push_str(&format!(", until {}", d.format("%b %-d, %Y")));
+            let date = crate::i18n::dates::format(&d, t!("dates-repeat-until"));
+            text = end(text, t!("sync-ical-until", date = date));
         }
         text
     }
@@ -2152,6 +2146,11 @@ pub fn to_store_all(series: &Event, overrides: &[Event]) -> String {
 /// When an event is, for an invitation's text: in the event's own zone
 /// when it has one, else in UTC, with the zone named.
 pub fn describe_when(e: &Event) -> String {
+    // Written into invitations sent by mail: in their language (Settings).
+    crate::i18n::in_outgoing(|| describe_when_here(e))
+}
+fn describe_when_here(e: &Event) -> String {
+    use crate::i18n::dates;
     let zone: chrono_tz::Tz = e.tzid.parse().unwrap_or(chrono_tz::UTC);
     let at = |t: i64| {
         DateTime::from_timestamp(t, 0)
@@ -2160,12 +2159,15 @@ pub fn describe_when(e: &Event) -> String {
     };
     let mut text = if e.all_day {
         let start = DateTime::from_timestamp(e.start, 0).unwrap_or_default();
-        format!("{}, all day", start.format("%A, %B %-d, %Y"))
+        t!(
+            "sync-ical-all-day",
+            date = dates::format(&start, t!("dates-long-date"))
+        )
     } else {
         format!(
             "{} – {} ({})",
-            at(e.start).format("%A, %B %-d, %Y, %H:%M"),
-            at(e.end).format("%H:%M"),
+            dates::format(&at(e.start), t!("dates-event-start")),
+            dates::format(&at(e.end), t!("dates-event-end")),
             zone.name()
         )
     };
@@ -2205,13 +2207,13 @@ pub fn request(series: &Event, overrides: &[Event], cancel: bool) -> String {
 pub fn reply(event: &Event, me: &str, my_name: &str, status: PartStat) -> Result<String> {
     ensure!(
         !event.uid.is_empty(),
-        "This invitation has no identifier to answer."
+        t!("sync-ical-this-invitation-has-no-identifier-to")
     );
     let organizer = event
         .organizer
         .as_ref()
         .filter(|o| !o.email.is_empty())
-        .ok_or_else(|| anyhow::anyhow!("This invitation doesn't say who to answer."))?;
+        .ok_or_else(|| anyhow::anyhow!(t!("sync-ical-this-invitation-doesnt-say-who-to")))?;
     let mut out = String::new();
     for line in [
         "BEGIN:VCALENDAR".to_owned(),
@@ -2285,14 +2287,17 @@ pub fn counter(
 ) -> Result<String> {
     ensure!(
         !event.uid.is_empty(),
-        "This invitation has no identifier to answer."
+        t!("sync-ical-this-invitation-has-no-identifier-to")
     );
-    ensure!(end >= start, "The time proposed ends before it starts.");
+    ensure!(
+        end >= start,
+        t!("sync-ical-the-time-proposed-ends-before-it")
+    );
     let organizer = event
         .organizer
         .as_ref()
         .filter(|o| !o.email.is_empty())
-        .ok_or_else(|| anyhow::anyhow!("This invitation doesn't say who to answer."))?;
+        .ok_or_else(|| anyhow::anyhow!(t!("sync-ical-this-invitation-doesnt-say-who-to")))?;
     let proposed = Event {
         start,
         end,

@@ -56,21 +56,21 @@ impl RecipientStatus {
     /// In a sentence, for showing: what happened and, for a failure or
     /// delay, why (the enhanced code's meaning where known).
     pub(crate) fn summary(&self) -> String {
-        let what = match self.action {
-            Action::Failed => "couldn't be delivered",
-            Action::Delayed => "is delayed; the server is still trying",
-            Action::Delivered => "was delivered",
-            Action::Relayed => "was passed on to a server that doesn't report delivery",
-            Action::Expanded => "was delivered and passed on to other addresses",
-            Action::Other => "has an unknown status",
+        let action = match self.action {
+            Action::Failed => "failed",
+            Action::Delayed => "delayed",
+            Action::Delivered => "delivered",
+            Action::Relayed => "relayed",
+            Action::Expanded => "expanded",
+            Action::Other => "other",
         };
         let why = self
             .status
             .and_then(|(c, s, d)| crate::sync::smtp::meaning(c, s, d))
             .filter(|_| matches!(self.action, Action::Failed | Action::Delayed));
         match why {
-            Some(why) => format!("{} {what}: {why}.", self.recipient),
-            None => format!("{} {what}.", self.recipient),
+            Some(why) => t!("sync-dsn-status-why", action = action, recipient = self.recipient, why = why),
+            None => t!("sync-dsn-status", action = action, recipient = self.recipient),
         }
     }
 }

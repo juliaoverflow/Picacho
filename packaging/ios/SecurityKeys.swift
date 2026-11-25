@@ -25,11 +25,15 @@ final class PicachoSecurityKeys: NSObject, NFCTagReaderSessionDelegate {
     private var session: NFCTagReaderSession?
     private var tag: NFCISO7816Tag?
     private var state = State.ended
+    /// What the sheet says when another tag is held to it, or the key
+    /// moved away too soon: Rust's words, in the app's language.
+    private var notKey = ""
+    private var holdStill = ""
 
     /// How long one exchange with the key may take.
     private static let exchange: TimeInterval = 30
 
-    func begin(message: String) -> Bool {
+    func begin(message: String, notKey: String, holdStill: String) -> Bool {
         guard NFCTagReaderSession.readingAvailable,
             let session = NFCTagReaderSession(pollingOption: .iso14443, delegate: self, queue: queue)
         else {
@@ -40,6 +44,8 @@ final class PicachoSecurityKeys: NSObject, NFCTagReaderSessionDelegate {
             self.session = session
             tag = nil
             state = .looking
+            self.notKey = notKey
+            self.holdStill = holdStill
             return earlier
         }
         earlier?.invalidate()
@@ -109,14 +115,14 @@ final class PicachoSecurityKeys: NSObject, NFCTagReaderSessionDelegate {
             return nil
         }.first
         guard let key else {
-            session.alertMessage = "That isn't a security key. Hold your security key near the top of your iPhone."
+            session.alertMessage = lock.withLock { notKey }
             session.restartPolling()
             return
         }
         session.connect(to: .iso7816(key)) { [weak self] error in
             guard let self else { return }
             if error != nil {
-                session.alertMessage = "Hold your security key still, near the top of your iPhone."
+                session.alertMessage = self.lock.withLock { self.holdStill }
                 session.restartPolling()
                 return
             }
@@ -147,8 +153,15 @@ public func picachoIosNfcAvailable() -> Bool {
 }
 
 @_cdecl("picacho_ios_nfc_begin")
-public func picachoIosNfcBegin(_ message: UnsafePointer<UInt8>?, _ len: Int) -> Bool {
-    PicachoSecurityKeys.shared.begin(message: picachoString(message, len))
+public func picachoIosNfcBegin(
+    _ message: UnsafePointer<UInt8>?, _ len: Int,
+    _ notKey: UnsafePointer<UInt8>?, _ notKeyLen: Int,
+    _ holdStill: UnsafePointer<UInt8>?, _ holdStillLen: Int
+) -> Bool {
+    PicachoSecurityKeys.shared.begin(
+        message: picachoString(message, len),
+        notKey: picachoString(notKey, notKeyLen),
+        holdStill: picachoString(holdStill, holdStillLen))
 }
 
 @_cdecl("picacho_ios_nfc_poll")

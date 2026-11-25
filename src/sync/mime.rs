@@ -906,11 +906,11 @@ pub enum Security {
 impl Security {
     pub fn label(self) -> &'static str {
         match self {
-            Security::EndToEnd => "End-to-end encryption",
-            Security::Undecrypted => "Encrypted, but not decrypted here",
-            Security::Tls => "Standard encryption (TLS)",
-            Security::Plain => "Not encrypted in transit",
-            Security::Unknown => "Not recorded",
+            Security::EndToEnd => t!("sync-mime-end-to-end-encryption"),
+            Security::Undecrypted => t!("sync-mime-encrypted-but-not-decrypted-here"),
+            Security::Tls => t!("sync-mime-standard-encryption-tls"),
+            Security::Plain => t!("sync-mime-not-encrypted-in-transit"),
+            Security::Unknown => t!("sync-mime-not-recorded"),
         }
     }
 }

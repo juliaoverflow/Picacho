@@ -44,8 +44,8 @@ pub enum KeyProblem {
 impl std::fmt::Display for KeyProblem {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
-            Self::Missing => "Picacho's local database is encrypted, but its key isn't in the system keychain. If the keychain was reset, or this folder came from another computer or account, the database can't be read.",
-            Self::Wrong => "Picacho's local database couldn't be decrypted with the key in the system keychain.",
+            Self::Missing => t!("manage-vault-picachos-local-database-is-encrypted-but"),
+            Self::Wrong => t!("manage-vault-picachos-local-database-couldnt-be-decrypted"),
         })
     }
 }
@@ -71,7 +71,7 @@ pub fn move_aside(dir: &Path) -> Result<std::path::PathBuf> {
     let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
     let aside = dir.join(format!("{DATABASE_FILE}.unreadable-{stamp}"));
     std::fs::rename(dir.join(DATABASE_FILE), &aside)
-        .context("Couldn't move the unreadable database aside")?;
+        .with_context(|| t!("manage-vault-couldnt-move-the-unreadable-database-aside"))?;
     for suffix in ["-wal", "-shm"] {
         let from = dir.join(format!("{DATABASE_FILE}{suffix}"));
         if from.exists() {
@@ -194,7 +194,7 @@ pub fn is_encrypted(file: &Path) -> Result<bool> {
     let mut f = match std::fs::File::open(file) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(e) => return Err(e).context("Couldn't read the local database"),
+        Err(e) => return Err(e).with_context(|| t!("manage-vault-couldnt-read-the-local-database")),
     };
     let mut read = 0;
     while read < header.len() {
@@ -213,7 +213,7 @@ fn key_name(dir: &Path) -> Result<Option<String>> {
         Ok(name) if !name.trim().is_empty() => Ok(Some(name.trim().to_owned())),
         Ok(_) => Ok(None),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e).context("Couldn't read which keychain entry has the database key"),
+        Err(e) => Err(e).with_context(|| t!("manage-vault-couldnt-read-which-keychain-entry-has")),
     }
 }
 
@@ -235,7 +235,7 @@ pub fn load_key(dir: &Path, keys: &dyn KeyStore) -> Result<DatabaseKey> {
     let name = key_name(dir)?.ok_or(KeyProblem::Missing)?;
     let hex = keys
         .load(&name)
-        .context("Picacho's local database is encrypted, and the system keychain didn't give its key. Unlock the keychain, or allow Picacho to use it, and try again.")?
+        .with_context(|| t!("manage-vault-picachos-local-database-is-encrypted-and"))?
         .ok_or(KeyProblem::Missing)?;
     DatabaseKey::from_hex(&hex)
 }
@@ -244,13 +244,13 @@ pub fn load_key(dir: &Path, keys: &dyn KeyStore) -> Result<DatabaseKey> {
 pub fn save_key(dir: &Path, keys: &dyn KeyStore, key: &DatabaseKey) -> Result<()> {
     let name = key_name_or_new(dir)?;
     keys.save(&name, &key.to_hex())
-        .context("Couldn't save the database key in the system keychain")?;
+        .with_context(|| t!("manage-vault-couldnt-save-the-database-key-in"))?;
     // Read back: a keychain that drops what it's given (a locked Secret
     // Service collection, say) would leave a database nobody can open.
     let back = keys.load(&name)?;
     if back.as_deref().map(|s| s.as_str()) != Some(key.to_hex().as_str()) {
         bail!(
-            "The system keychain didn't keep the database key, so the database wasn't encrypted."
+            t!("manage-vault-the-system-keychain-didnt-keep-the")
         );
     }
     Ok(())

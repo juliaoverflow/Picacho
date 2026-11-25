@@ -107,7 +107,7 @@ impl Parcel {
     pub fn title(&self) -> String {
         match (&self.tracking_number, &self.order) {
             (n, _) if !n.is_empty() => n.clone(),
-            (_, Some(order)) => format!("Order {order}"),
+            (_, Some(order)) => t!("manage-parcels-order", order = order),
             _ => String::new(),
         }
     }
@@ -182,15 +182,15 @@ impl Status {
     /// How the Summary names it.
     pub fn label(self) -> &'static str {
         match self {
-            Self::Processing => "Ordered",
-            Self::Shipped => "Shipped",
-            Self::InTransit => "In transit",
-            Self::OutForDelivery => "Out for delivery",
-            Self::PickupAvailable => "Ready for pickup",
-            Self::Delivered => "Delivered",
-            Self::Problem => "Delayed or a problem",
-            Self::Returned => "Returned",
-            Self::Cancelled => "Cancelled",
+            Self::Processing => t!("manage-parcels-ordered"),
+            Self::Shipped => t!("manage-parcels-shipped"),
+            Self::InTransit => t!("manage-parcels-in-transit"),
+            Self::OutForDelivery => t!("manage-parcels-out-for-delivery"),
+            Self::PickupAvailable => t!("manage-parcels-ready-for-pickup"),
+            Self::Delivered => t!("manage-parcels-delivered"),
+            Self::Problem => t!("manage-parcels-delayed-or-a-problem"),
+            Self::Returned => t!("manage-parcels-returned"),
+            Self::Cancelled => t!("manage-parcels-cancelled"),
         }
     }
 

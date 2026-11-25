@@ -497,7 +497,7 @@ fn send_due(
             return Err(Stopped);
         }
         let Some(a) = accounts.iter().find(|a| a.id == d.account) else {
-            let error = "Its account was removed.";
+            let error = t!("manage-background-its-account-was-removed");
             backend.schedule_failed(&d.id, error);
             announce(Announcement::ScheduledFailed {
                 account: &d.account,
@@ -708,7 +708,7 @@ impl Codes {
             Ok(detector) => otp::mask(subject, &detector.codes(subject, "")).into_owned(),
             // Without the model a code can't be told apart; leave the
             // subject out rather than show one.
-            Err(()) => "New message".to_owned(),
+            Err(()) => t!("manage-background-new-message").to_owned(),
         }
     }
 }

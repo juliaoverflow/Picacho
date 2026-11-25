@@ -13,6 +13,9 @@ same version in `Cargo.toml`.
 
 ### Added
 
+- The interface is ready for translation: its text is in Fluent message
+  files (`locales/`), shown in the system's language where Picacho has it
+  (English for now), with each language's plural rules.
 - iOS catches up with Android: system notifications for new mail with Mark
   as Read, Archive, Delete and Reply; checking for mail in the background
   through background app refresh (scheduled mail and snoozes too); Proton

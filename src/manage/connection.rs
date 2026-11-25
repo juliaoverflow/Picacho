@@ -166,7 +166,7 @@ impl Connection {
         let tap = self
             .tap
             .clone()
-            .context("This connection can't send messages that way.")?;
+            .with_context(|| t!("manage-connection-this-connection-cant-send-messages-that"))?;
         let line = tap.literals().command(parts);
         tap.start();
         let result = self.session.run_command_and_read_response(&line);
@@ -282,10 +282,10 @@ impl Connection {
         validity: u32,
         uid: u32,
     ) -> Result<String> {
-        ensure!(self.extensions()?.urlauth, "The server can't authorize URLs (no URLAUTH).");
+        ensure!(self.extensions()?.urlauth, t!("manage-connection-the-server-cant-authorize-urls-no"));
         ensure!(
             crate::sync::transport::reads_urlauth(),
-            "This build can't read the server's URL authorizations."
+            t!("manage-connection-this-build-cant-read-the-servers")
         );
         // RFC 5092: the user is `enc-user` (`@`, `/`, `;`, `:` escaped);
         // the port is given where it isn't IMAP's 143.
@@ -305,7 +305,7 @@ impl Connection {
             "GENURLAUTH {} INTERNAL",
             crate::sync::transport::quote(&url)?
         ))?;
-        authorized_url(&heard).context("The server didn't authorize the URL.")
+        authorized_url(&heard).with_context(|| t!("manage-connection-the-server-didnt-authorize-the-url"))
     }
     /// The server's folder for `folder` (Sent, Archive, Trash, Junk,
     /// Drafts), making it where there is none and the server can mark it
@@ -329,7 +329,7 @@ impl Connection {
         let wire = self.mailbox(&name)?;
         self.session
             .run_command_and_check_ok(format!("CREATE {wire} (USE ({special}))"))
-            .with_context(|| format!("The server has no {} folder and didn't make one.", folder.label()))?;
+            .with_context(|| t!("manage-connection-the-server-has-no-folder-and", label = folder.label()))?;
         let _ = self
             .session
             .run_command_and_check_ok(format!("SUBSCRIBE {wire}"));
@@ -508,7 +508,7 @@ impl Connection {
         if let Some(missing) = crate::sync::transport::lacks_rights(&rights, needed) {
             let label = crate::sync::transport::decode_name(mailbox);
             bail!(
-                "This account doesn't have permission to {what} in “{label}” (the server gives it “{rights}”, without “{missing}”). Ask the mailbox's owner or administrator."
+                t!("manage-connection-this-account-doesnt-have-permission-to", what = what, label = label, rights = rights, missing = missing)
             );
         }
         Ok(())
@@ -519,8 +519,7 @@ impl Connection {
     pub(super) fn require_writable(&self, what: &str) -> Result<()> {
         if let Some(s) = self.selected.as_ref().filter(|s| s.read_only) {
             bail!(
-                "“{}” can only be read on the server, so Picacho can't {what} there. Another mail app or the server's settings may be holding it.",
-                crate::sync::transport::decode_name(&s.name)
+                t!("manage-connection-can-only-be-read-on-the", folder = crate::sync::transport::decode_name(&s.name), what = what)
             );
         }
         Ok(())
@@ -530,14 +529,14 @@ impl Connection {
     /// marked deleted (EXPUNGE would take those too). Checked before any
     /// change, so a refusal changes nothing.
     pub(super) fn can_erase(&mut self, uids: &[u32]) -> Result<()> {
-        self.require_writable("remove messages")?;
+        self.require_writable(t!("manage-connection-remove-messages"))?;
         if self.extensions()?.uidplus {
             return Ok(());
         }
         let marked = self.uid_search("DELETED")?;
         ensure!(
             marked.iter().all(|uid| uids.contains(uid)),
-            "Other messages in this folder are already marked for deletion, and this server can't remove only some (no UIDPLUS). Remove or unmark them in another mail app first."
+            t!("manage-connection-other-messages-in-this-folder-are")
         );
         Ok(())
     }
@@ -641,10 +640,10 @@ impl Connection {
             .rsplit(':')
             .nth(1)
             .and_then(|s| s.parse::<u32>().ok())
-            .context("Cached message identity is invalid. Refresh this mailbox.")?;
+            .with_context(|| t!("manage-connection-cached-message-identity-is-invalid-refresh"))?;
         ensure!(
             expected > 0 && selected.validity == expected,
-            "The server reset this mailbox's message identities. Refresh before opening or changing this message."
+            t!("manage-connection-the-server-reset-this-mailboxs-message")
         );
         Ok(selected)
     }
@@ -694,7 +693,7 @@ impl Backend {
         {
             let mut seen = std::collections::HashSet::new();
             for alert in alerts.iter().filter(|t| seen.insert(t.as_str())) {
-                hear(a, "Message from your mail server", alert);
+                hear(a, t!("manage-connection-message-from-your-mail-server"), alert);
             }
         }
         match &result {
@@ -718,10 +717,7 @@ impl Backend {
             }),
             // A full mailbox (RFC 9208's [OVERQUOTA]) isn't a rate limit:
             // waiting won't help, making room will.
-            _ if crate::sync::transport::over_quota(&e) => e.context(
-                "The mailbox is full: the server's storage quota is used up. \
-                 Delete or archive mail to make room.",
-            ),
+            _ if crate::sync::transport::over_quota(&e) => e.context(t!("manage-connection-the-mailbox-is-full-the-servers")),
             // Other response codes, said plainly (the server's own words
             // stay in the chain).
             _ => match crate::sync::transport::response_code_meaning(&e) {

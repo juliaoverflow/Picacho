@@ -39,7 +39,7 @@ fn tokenize(text: &str) -> Result<Vec<Token>> {
                     i += 1;
                 }
                 // RFC 5228 §2.3: a bracketed comment ends with `*/`.
-                ensure!(i + 1 < chars.len(), "A comment in the script isn't closed.");
+                ensure!(i + 1 < chars.len(), t!("sync-sieve-parse-a-comment-in-the-script-isnt"));
                 i += 2;
             }
             '"' => {
@@ -52,7 +52,7 @@ fn tokenize(text: &str) -> Result<Vec<Token>> {
                     s.push(chars[i]);
                     i += 1;
                 }
-                ensure!(i < chars.len(), "A string in the script isn't closed.");
+                ensure!(i < chars.len(), t!("sync-sieve-parse-a-string-in-the-script-isnt"));
                 i += 1;
                 out.push(Token::Str(s.replace("\r\n", "\n")));
             }
@@ -118,7 +118,7 @@ fn tokenize(text: &str) -> Result<Vec<Token>> {
                             i += 1;
                         }
                         // RFC 5228 §2.4.2: it ends at a line of a lone dot.
-                        ensure!(i < chars.len(), "A text: string in the script isn't closed.");
+                        ensure!(i < chars.len(), t!("sync-sieve-parse-a-text-string-in-the-script"));
                         let line: String = chars[start..i].iter().collect();
                         let line = line.trim_end_matches('\r');
                         i += 1;
@@ -133,7 +133,7 @@ fn tokenize(text: &str) -> Result<Vec<Token>> {
                     out.push(Token::Identifier(word));
                 }
             }
-            other => bail!("The script has a character Sieve doesn't use: {other:?}"),
+            other => bail!(t!("sync-sieve-parse-the-script-has-a-character-sieve", character = format!("{:?}", other))),
         }
     }
     Ok(out)
@@ -178,7 +178,7 @@ impl Parser {
         t
     }
     fn commands(&mut self, depth: usize) -> Result<Vec<Command>> {
-        ensure!(depth < 32, "The script nests too deeply.");
+        ensure!(depth < 32, t!("sync-sieve-parse-the-script-nests-too-deeply"));
         let mut out = Vec::new();
         while let Some(t) = self.peek() {
             if *t == Token::Close('}') {
@@ -190,7 +190,7 @@ impl Parser {
     }
     fn command(&mut self, depth: usize) -> Result<Command> {
         let Some(Token::Identifier(name)) = self.next() else {
-            bail!("The script has something where a command should be.");
+            bail!(t!("sync-sieve-parse-the-script-has-something-where-a"));
         };
         let args = self.arguments()?;
         let mut tests = Vec::new();
@@ -203,10 +203,10 @@ impl Parser {
             Some(Token::Semicolon) => None,
             Some(Token::Open('{')) => {
                 let block = self.commands(depth + 1)?;
-                ensure!(self.next() == Some(Token::Close('}')), "A block in the script isn't closed.");
+                ensure!(self.next() == Some(Token::Close('}')), t!("sync-sieve-parse-a-block-in-the-script-isnt"));
                 Some(block)
             }
-            _ => bail!("A command in the script doesn't end with ; or a block."),
+            _ => bail!(t!("sync-sieve-parse-a-command-in-the-script-doesnt")),
         };
         Ok(Command { name, args, tests, block })
     }
@@ -234,7 +234,7 @@ impl Parser {
                             Some(Token::Str(s)) => list.push(s),
                             Some(Token::Comma) => {}
                             Some(Token::Close(']')) => break,
-                            _ => bail!("A list in the script isn't written right."),
+                            _ => bail!(t!("sync-sieve-parse-a-list-in-the-script-isnt")),
                         }
                     }
                     out.push(Arg::Strings(list));
@@ -245,22 +245,22 @@ impl Parser {
         Ok(out)
     }
     fn test_list(&mut self, depth: usize) -> Result<Vec<Test>> {
-        ensure!(self.next() == Some(Token::Open('(')), "A test list in the script isn't written right.");
+        ensure!(self.next() == Some(Token::Open('(')), t!("sync-sieve-parse-a-test-list-in-the-script"));
         let mut out = Vec::new();
         loop {
             out.push(self.test(depth)?);
             match self.next() {
                 Some(Token::Comma) => {}
                 Some(Token::Close(')')) => break,
-                _ => bail!("A test list in the script isn't written right."),
+                _ => bail!(t!("sync-sieve-parse-a-test-list-in-the-script")),
             }
         }
         Ok(out)
     }
     fn test(&mut self, depth: usize) -> Result<Test> {
-        ensure!(depth < 32, "The script nests too deeply.");
+        ensure!(depth < 32, t!("sync-sieve-parse-the-script-nests-too-deeply"));
         let Some(Token::Identifier(name)) = self.next() else {
-            bail!("The script has something where a test should be.");
+            bail!(t!("sync-sieve-parse-the-script-has-something-where-a-2"));
         };
         let args = self.arguments()?;
         let tests = match self.peek() {
@@ -287,7 +287,7 @@ pub fn read(text: &str) -> Result<Read> {
     let tokens = tokenize(text)?;
     let mut parser = Parser { tokens, at: 0 };
     let commands = parser.commands(0)?;
-    ensure!(parser.peek().is_none(), "The script has an unmatched closing brace.");
+    ensure!(parser.peek().is_none(), t!("sync-sieve-parse-the-script-has-an-unmatched-closing"));
     let mut out = Read::default();
     for c in &commands {
         match c.name.as_str() {

@@ -55,7 +55,7 @@ impl MailApp {
     /// The sidebar toggle, beside Compose (or above it in the rail).
     pub(super) fn sidebar_toggle(&self, collapsed: bool, cx: &Context<Self>) -> Stateful<Div> {
         let tip = shortcuts::tip(
-            if collapsed { "@Show sidebar" } else { "@Hide sidebar" },
+            if collapsed { t!("panes-show-sidebar") } else { t!("panes-hide-sidebar") },
             "toggle-sidebar",
             cx,
         );
@@ -100,7 +100,7 @@ impl MailApp {
         let sidebar = div()
             .id("sidebar")
             .role(Role::Navigation)
-            .aria_label("Mailboxes")
+            .aria_label(t!("panes-mailboxes"))
             .debug_selector(|| "sidebar".into())
             .relative()
             .flex_shrink_0()
@@ -180,19 +180,19 @@ impl MailApp {
             return vec![];
         };
         let provider = if a.provider == Provider::Gmail && a.oauth {
-            "Load from Google"
+            t!("panes-load-from-google")
         } else {
-            "Load from Gravatar"
+            t!("panes-load-from-gravatar")
         };
         let mut entries = vec![
             entry(provider, "cloud", Action::ProviderAvatar(id.into())),
             entry(
-                "Choose from Presets…",
+                t!("panes-choose-from-presets"),
                 "grid",
                 Action::AvatarPresets(id.into()),
             ),
             entry(
-                "Upload Your Own…",
+                t!("panes-upload-your-own"),
                 "upload",
                 Action::ChooseAvatar(id.into()),
             ),
@@ -200,7 +200,7 @@ impl MailApp {
         if self.avatars.contains_key(id) {
             entries.push(Entry::Separator);
             entries.push(danger(
-                "Remove Picture",
+                t!("panes-remove-picture"),
                 "trash",
                 Action::RemoveAvatar(id.into()),
             ));
@@ -212,16 +212,16 @@ impl MailApp {
         let Some(a) = self.accounts.iter().find(|a| a.id == id).cloned() else {
             return;
         };
-        self.notice("Looking for your picture…", false, cx);
+        self.notice(t!("panes-looking-for-your-picture"), false, cx);
         self.task(
             cx,
             move |b| b.provider_avatar(&a),
             move |this, result, cx| match result {
                 Ok(Some(path)) => {
                     this.avatars.insert(id, path);
-                    this.notice("Picture updated", false, cx);
+                    this.notice(t!("panes-picture-updated"), false, cx);
                 }
-                Ok(None) => this.notice("No picture was found for this address.", true, cx),
+                Ok(None) => this.notice(t!("panes-no-picture-was-found-for-this"), true, cx),
                 Err(e) => this.notice(format!("{e:#}"), true, cx),
             },
         );
@@ -305,7 +305,7 @@ impl MailApp {
             files: true,
             directories: false,
             multiple: false,
-            prompt: Some("Choose a picture".into()),
+            prompt: Some(t!("panes-choose-a-picture").into()),
         });
         let backend = self.backend.clone();
         cx.spawn(async move |this, cx| {
@@ -323,10 +323,10 @@ impl MailApp {
                     // isn't read into memory whole only to be refused.
                     anyhow::ensure!(
                         std::fs::metadata(&path)?.len() <= 20 << 20,
-                        "Choose a picture under 20 MB."
+                        t!("panes-choose-a-picture-under-20-mb")
                     );
                     let bytes = std::fs::read(&path)?;
-                    anyhow::ensure!(bytes.len() <= 20 << 20, "Choose a picture under 20 MB.");
+                    anyhow::ensure!(bytes.len() <= 20 << 20, t!("panes-choose-a-picture-under-20-mb"));
                     backend.set_avatar(&key, &bytes, "custom")
                 })
                 .await;
@@ -667,7 +667,7 @@ impl MailApp {
                 ))
                 .child(action(
                     "ribbon-reply-all",
-                    "@Reply all",
+                    t!("panes-reply-all"),
                     "reply-all",
                     Action::Reply(true),
                 ))
@@ -692,19 +692,19 @@ impl MailApp {
                 )
                 .child(action(
                     "ribbon-read",
-                    "@Mark read / unread",
+                    t!("panes-mark-read-unread"),
                     "mail",
                     Action::Read(m.id.clone()),
                 ))
                 .child(action(
                     "ribbon-archive",
-                    "@Archive message",
+                    t!("panes-archive-message"),
                     "archive",
                     Action::Move(Folder::Archive),
                 ))
                 .child(action(
                     "ribbon-trash",
-                    "@Move to trash",
+                    t!("panes-move-to-trash"),
                     "trash",
                     Action::Move(Folder::Trash),
                 ));
@@ -750,7 +750,7 @@ impl MailApp {
         let tile = tile
             .cursor_pointer()
             .hover(move |s| s.border_color(rgb(c.accent)))
-            .tooltip(|w, cx| Tooltip::new("Open the message here").build(w, cx))
+            .tooltip(|w, cx| Tooltip::new(t!("panes-open-the-message-here")).build(w, cx))
             .child(measure);
         if options.html
             && let Some(html) = &m.html
@@ -839,9 +839,9 @@ impl MailApp {
         self.button(
             "toggle-reader",
             if collapsed {
-                "@Show message"
+                t!("panes-show-message")
             } else {
-                "@Collapse message"
+                t!("panes-collapse-message")
             },
             if collapsed {
                 "panel-right-open"

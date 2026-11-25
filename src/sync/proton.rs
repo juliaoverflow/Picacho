@@ -151,7 +151,7 @@ fn explain(e: ProtonError) -> anyhow::Error {
         || e.status() == Some(401)
         || e.api().is_some_and(|a| a.code == 10013);
     if auth {
-        return anyhow!("Proton ended this session. Sign in again to keep using this account.")
+        return anyhow!(t!("sync-proton-proton-ended-this-session-sign-in"))
             .context(AccessFailure::Authentication);
     }
     // Human verification outside a sign-in: it is passed by signing in
@@ -160,21 +160,18 @@ fn explain(e: ProtonError) -> anyhow::Error {
         || e.api().is_some_and(|a| a.code == 9001)
     {
         return anyhow!(
-            "Proton wants to check that it's you. Sign in again to this account to pass its check."
+            t!("sync-proton-proton-wants-to-check-that-its")
         )
         .context(AccessFailure::Authentication);
     }
     if let ProtonError::Network(why) = &e {
-        return anyhow::Error::new(crate::sync::retry::Unreachable(format!(
-            "Couldn't reach Proton: {why}"
-        )));
+        return anyhow::Error::new(crate::sync::retry::Unreachable(t!("sync-proton-couldnt-reach-proton", why = why)));
     }
     if let Some(api) = e.api()
         && matches!(api.code, 5003 | 5005 | 2064)
     {
         return anyhow!(
-            "Proton didn't accept this app ({}). Proton Mail Bridge still works with this account.",
-            api.message
+            t!("sync-proton-proton-didnt-accept-this-app-proton", message = api.message)
         );
     }
     anyhow::Error::new(e)
@@ -190,17 +187,17 @@ fn explain_sign_in(e: ProtonError, step: &str) -> anyhow::Error {
     if !refused {
         return explain(e);
     }
-    let said = match e.api() {
-        Some(a) if !a.message.trim().is_empty() => format!(
-            " Proton said: “{}” (HTTP {}, code {}).",
-            a.message.trim(),
-            a.status,
-            a.code
+    anyhow!(match e.api() {
+        Some(a) if !a.message.trim().is_empty() => t!(
+            "sync-proton-proton-said-http-code",
+            step = step,
+            message = a.message.trim(),
+            status = a.status,
+            code = a.code
         ),
-        Some(a) => format!(" (HTTP {}, code {}).", a.status, a.code),
-        None => format!(" ({e})."),
-    };
-    anyhow!("Proton refused this sign-in {step}.{said} Start again with your password.")
+        Some(a) => t!("sync-proton-http-code", step = step, status = a.status, code = a.code),
+        None => t!("sync-proton-proton-refused-this-sign-in-start", step = step, error = e.to_string()),
+    })
 }
 
 trait Explained<T> {
@@ -349,7 +346,7 @@ fn verify_human(methods: &[String], token: &str, cancel: &AtomicBool) -> Result<
             token,
             methods: vec![kind],
         }),
-        None => bail!("Proton's check was closed before it finished. Sign in again to try it again."),
+        None => bail!(t!("sync-proton-protons-check-was-closed-before-it")),
     }
 }
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -361,10 +358,10 @@ fn verify_human(methods: &[String], token: &str, cancel: &AtomicBool) -> Result<
     #[cfg(windows)]
     if !crate::display::windows::has_webview2() {
         bail!(
-            "Proton wants to check that it's you, which needs Microsoft Edge WebView2. Install it from go.microsoft.com/fwlink/p/?LinkId=2124703 and sign in again."
+            t!("sync-proton-proton-wants-to-check-that-its-2")
         );
     }
-    let exe = std::env::current_exe().context("Couldn't find Picacho to show Proton's check")?;
+    let exe = std::env::current_exe().with_context(|| t!("sync-proton-couldnt-find-picacho-to-show-protons"))?;
     // The address (with Proton's token in it) goes on the window's standard
     // input: in its arguments, other users of this computer could read it
     // from the process list.
@@ -373,7 +370,7 @@ fn verify_human(methods: &[String], token: &str, cancel: &AtomicBool) -> Result<
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .spawn()
-        .context("Couldn't open a window for Proton's check")?;
+        .with_context(|| t!("sync-proton-couldnt-open-a-window-for-protons"))?;
     if let Some(mut input) = child.stdin.take() {
         use std::io::Write as _;
         let written = writeln!(input, "{}", verification_url(methods, token));
@@ -381,7 +378,7 @@ fn verify_human(methods: &[String], token: &str, cancel: &AtomicBool) -> Result<
         if let Err(e) = written {
             let _ = child.kill();
             let _ = child.wait();
-            return Err(e).context("Couldn't open a window for Proton's check");
+            return Err(e).with_context(|| t!("sync-proton-couldnt-open-a-window-for-protons"));
         }
     }
     // Read as it is written: a webview that logs to standard output could
@@ -399,7 +396,7 @@ fn verify_human(methods: &[String], token: &str, cancel: &AtomicBool) -> Result<
         if cancel.load(Ordering::Relaxed) {
             let _ = child.kill();
             let _ = child.wait();
-            bail!("Sign-in cancelled.");
+            bail!(t!("sync-proton-sign-in-cancelled"));
         }
         if let Some(status) = child.try_wait()? {
             break status;
@@ -410,9 +407,9 @@ fn verify_human(methods: &[String], token: &str, cancel: &AtomicBool) -> Result<
     match (status.code(), verified(&output)) {
         (Some(0), Some(hv)) => Ok(hv),
         (Some(64 | 70), _) => bail!(
-            "Proton wants to check that it's you, but its check couldn't be shown here. Use Proton Mail Bridge, or sign in once at account.proton.me and try again."
+            t!("sync-proton-proton-wants-to-check-that-its-3")
         ),
-        _ => bail!("Proton's check was closed before it finished. Sign in again to try it again."),
+        _ => bail!(t!("sync-proton-protons-check-was-closed-before-it")),
     }
 }
 
@@ -427,9 +424,6 @@ pub enum Next {
     /// Nothing more: the keys can be unlocked.
     Ready,
 }
-
-/// Why a sign-in step can't be taken: the sign-in was ended.
-const ENDED: &str = "This sign-in has ended. Start again with your password.";
 
 /// A Proton sign-in in progress, one step at a time: the password was
 /// accepted (`begin`), and Proton may still want a second factor and the
@@ -460,35 +454,35 @@ impl Login {
                     Err(ProtonError::HumanVerificationRequired { methods, token }) => {
                         if checks >= 3 {
                             bail!(
-                                "Proton still asks to check that it's you after {checks} tries. Wait a while, then sign in again."
+                                t!("sync-proton-proton-still-asks-to-check-that", checks = checks)
                             );
                         }
                         checks += 1;
                         verifying();
                         hv = Some(verify_human(&methods, &token, cancel)?);
                         if cancel.load(Ordering::Relaxed) {
-                            bail!("Sign-in cancelled.");
+                            bail!(t!("sync-proton-sign-in-cancelled"));
                         }
                     }
                     Err(e) if e.api().is_some_and(|a| a.code == 8002) => {
-                        bail!("Proton didn't accept this email address and password.")
+                        bail!(t!("sync-proton-proton-didnt-accept-this-email-address"))
                     }
                     Err(ProtonError::Srp(why)) => bail!(
-                        "Proton's sign-in couldn't be verified ({why}). Nothing was sent; try again."
+                        t!("sync-proton-protons-sign-in-couldnt-be-verified", why = why)
                     ),
                     Err(e) => {
-                        return Err(explain_sign_in(e, "at the password"))
-                            .context("Couldn't sign in to Proton");
+                        return Err(explain_sign_in(e, t!("sync-proton-at-the-password")))
+                            .with_context(|| t!("sync-proton-couldnt-sign-in-to-proton"));
                     }
                 }
             }
         })
     }
     fn pending(&self) -> Result<&auth::PendingLogin> {
-        self.pending.as_ref().context(ENDED)
+        self.pending.as_ref().with_context(|| t!("sync-proton-this-sign-in-has-ended"))
     }
     fn pending_mut(&mut self) -> Result<&mut auth::PendingLogin> {
-        self.pending.as_mut().context(ENDED)
+        self.pending.as_mut().with_context(|| t!("sync-proton-this-sign-in-has-ended"))
     }
     /// Whether the sign-in can't go on (Proton or the library ended it);
     /// it has to start again with the password.
@@ -516,14 +510,14 @@ impl Login {
         let code: String = code.chars().filter(|c| !c.is_whitespace()).collect();
         ensure!(
             !code.is_empty(),
-            "Enter the code from your authenticator app."
+            t!("sync-proton-enter-the-code-from-your-authenticator")
         );
         let pending = self.pending_mut()?;
         block_on(pending.submit_totp(&code)).map_err(|e| {
             if e.api().is_some_and(|a| a.status == 422 || a.code == 8002) {
-                anyhow!("Proton didn't accept that code. Enter the current one from your authenticator app.")
+                anyhow!(t!("sync-proton-proton-didnt-accept-that-code-enter"))
             } else {
-                explain_sign_in(e, "at the authenticator code")
+                explain_sign_in(e, t!("sync-proton-at-the-authenticator-code"))
             }
         })
     }
@@ -539,7 +533,7 @@ impl Login {
         let pending = self.pending_mut()?;
         let request = pending
             .fido2_request()
-            .map_err(|e| explain_sign_in(e, "at the security key"))?;
+            .map_err(|e| explain_sign_in(e, t!("sync-proton-at-the-security-key")))?;
         let options = crate::sync::fido::request_options(&request.options)?;
         block_on(async {
             let signed = crate::sync::fido::assert(
@@ -573,9 +567,9 @@ impl Login {
                 .await
                 .map_err(|e| {
                     if e.api().is_some_and(|a| a.status == 422 || a.code == 8002) {
-                        anyhow!("Proton didn't accept that security key or passkey. Use one registered with this account.")
+                        anyhow!(t!("sync-proton-proton-didnt-accept-that-security-key"))
                     } else {
-                        explain_sign_in(e, "at the security key")
+                        explain_sign_in(e, t!("sync-proton-at-the-security-key"))
                     }
                 })
         })
@@ -589,21 +583,21 @@ impl Login {
             .map(str::as_bytes)
             .filter(|m| !m.is_empty());
         if pending.needs_mailbox_password() && mailbox.is_none() {
-            bail!("Enter the mailbox password.");
+            bail!(t!("sync-proton-enter-the-mailbox-password"));
         }
         let done = match block_on(pending.finish(mailbox)) {
             Ok(done) => done,
             Err(ProtonError::KeyUnlock) => {
                 return Err(anyhow!(if pending.needs_mailbox_password() {
-                    "That mailbox password didn't unlock this account's keys."
+                    t!("sync-proton-that-mailbox-password-didnt-unlock-this")
                 } else {
-                    "The password signed in, but didn't unlock this account's keys."
+                    t!("sync-proton-the-password-signed-in-but-didnt")
                 }));
             }
             // The library signed the session out.
             Err(e) => {
                 self.pending = None;
-                return Err(explain_sign_in(e, "while unlocking the account"));
+                return Err(explain_sign_in(e, t!("sync-proton-while-unlocking-the-account")));
             }
         };
         // Signed in: the session is the account's now, not to be signed out.
@@ -725,12 +719,12 @@ impl Session {
     pub fn open(saved: &Saved) -> Result<Self> {
         use crate::manage::status::AccessFailure;
         if saved.uid.is_empty() || saved.refresh_token.is_empty() {
-            return Err(anyhow!("Sign in to Proton again.").context(AccessFailure::Authentication));
+            return Err(anyhow!(t!("sync-proton-sign-in-to-proton-again")).context(AccessFailure::Authentication));
         }
         let salted = base64::engine::general_purpose::STANDARD
             .decode(&saved.key)
             .map_err(|_| {
-                anyhow!("Sign in to Proton again.").context(AccessFailure::Authentication)
+                anyhow!(t!("sync-proton-sign-in-to-proton-again")).context(AccessFailure::Authentication)
             })?;
         let renewed = Arc::new(Mutex::new(None));
         let ctx = block_on(async {
@@ -745,7 +739,7 @@ impl Session {
             let (user, ring) = match auth::unlock_from_passphrase(&client, &salted).await {
                 Err(ProtonError::KeyUnlock) => {
                     return Err(anyhow!(
-                        "This account's keys changed at Proton (a new password?). Sign in again."
+                        t!("sync-proton-this-accounts-keys-changed-at-proton")
                     )
                     .context(AccessFailure::Authentication));
                 }
@@ -868,13 +862,13 @@ impl Session {
             let client = &self.ctx.client;
             let msg = client.get_message(id).await.map_err(|e| {
                 if protected_email_bridge::api::mail::is_unprocessable(&e) {
-                    anyhow!("This message is no longer at Proton.")
+                    anyhow!(t!("sync-proton-this-message-is-no-longer-at"))
                 } else {
                     explain(e)
                 }
             })?;
             let ring = self.ctx.keyring(&msg.metadata.address_id).map_err(|_| {
-                anyhow!("The keys of the address this message was sent to are locked or gone.")
+                anyhow!(t!("sync-proton-the-keys-of-the-address-this"))
             })?;
             let mut packets = Vec::with_capacity(msg.attachments.len());
             for a in &msg.attachments {
@@ -889,7 +883,7 @@ impl Session {
     pub fn text_only(&self, id: &str) -> Result<(Vec<u8>, Vec<AttachmentInfo>)> {
         let msg = block_on(self.ctx.client.get_message(id)).explained()?;
         let ring = self.ctx.keyring(&msg.metadata.address_id).map_err(|_| {
-            anyhow!("The keys of the address this message was sent to are locked or gone.")
+            anyhow!(t!("sync-proton-the-keys-of-the-address-this"))
         })?;
         let attachments = msg
             .attachments
@@ -919,7 +913,7 @@ impl Session {
                 .attachments
                 .iter()
                 .find(|a| a.id == attachment_id)
-                .context("That attachment is no longer at Proton.")?;
+                .with_context(|| t!("sync-proton-that-attachment-is-no-longer-at"))?;
             let ring = self.ctx.keyring(&msg.metadata.address_id).explained()?;
             let data = self
                 .ctx
@@ -929,7 +923,7 @@ impl Session {
                 .explained()?;
             let mut packets = base64::engine::general_purpose::STANDARD
                 .decode(&attachment.key_packets)
-                .context("Proton sent an attachment key that couldn't be read.")?;
+                .with_context(|| t!("sync-proton-proton-sent-an-attachment-key-that"))?;
             packets.extend_from_slice(&data);
             Ok(ring.decrypt(&packets).explained()?.data)
         })
@@ -987,7 +981,7 @@ impl Session {
         let old = self
             .ctx
             .label(id)
-            .context("That folder no longer exists at Proton.")?;
+            .with_context(|| t!("sync-proton-that-folder-no-longer-exists-at"))?;
         let parent = Some(old.parent_id.as_str()).filter(|p| !p.is_empty());
         let label =
             block_on(self.ctx.client.update_label(id, name, &old.color, parent)).explained()?;
@@ -1073,7 +1067,7 @@ impl Session {
         from.and_then(|f| self.ctx.owned_address(f))
             .filter(|a| a.is_enabled() && a.send)
             .or_else(|| self.ctx.primary_address())
-            .context("This Proton account has no address to write from.")
+            .with_context(|| t!("sync-proton-this-proton-account-has-no-address"))
     }
     /// Saves a draft written here (a whole MIME message) as a new Proton
     /// draft, encrypted with its address's key, attachments included, as
@@ -1134,7 +1128,7 @@ impl Session {
         use protected_email_bridge::api::mail::{ImportMetadata, ImportRequest};
         use protected_email_bridge::api::types::message_flag;
         let mut root = protected_email_bridge::mime::Part::parse(raw)
-            .context("The message couldn't be read to save it at Proton.")?;
+            .with_context(|| t!("sync-proton-the-message-couldnt-be-read-to"))?;
         let from = root.header.get("From").and_then(|f| {
             protected_email_bridge::mime::parse_address_list(&f)?
                 .into_iter()
@@ -1167,7 +1161,7 @@ impl Session {
         .explained()?;
         results
             .pop()
-            .context("Proton didn't say whether it kept the message.")?
+            .with_context(|| t!("sync-proton-proton-didnt-say-whether-it-kept"))?
             .explained()
     }
     /// Sends a finished MIME message from one of the account's addresses.
@@ -1177,7 +1171,7 @@ impl Session {
         let sender = self
             .ctx
             .owned_address(from)
-            .with_context(|| format!("{from} isn't one of this Proton account's addresses."))?;
+            .with_context(|| t!("sync-proton-isnt-one-of-this-proton-accounts", from = from))?;
         let submission = Submission {
             reverse_path: sender.email.clone(),
             recipients: recipients.to_vec(),
@@ -1244,7 +1238,7 @@ mod tests {
         let Err(error) = login.finish(Some("mailbox")) else {
             panic!("an ended sign-in finished");
         };
-        assert_eq!(error.to_string(), ENDED);
+        assert_eq!(error.to_string(), t!("sync-proton-this-sign-in-has-ended"));
         login.abort();
     }
 

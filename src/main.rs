@@ -2,6 +2,9 @@
 // window. Debug builds keep the console for their output.
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
+// First: `t!` (the interface's text) is for every module after it.
+#[macro_use]
+mod i18n;
 mod display;
 mod manage;
 mod sync;
@@ -35,7 +38,7 @@ fn main() -> anyhow::Result<()> {
     let widget_waybar_flag = first.as_deref() == Some(std::ffi::OsStr::new("--widget-waybar"));
     if widget_json_flag || widget_waybar_flag {
         let project = directories::ProjectDirs::from("tech", "pinal", "picacho")
-            .ok_or_else(|| anyhow::anyhow!("Cannot find the application data directory"))?;
+            .ok_or_else(|| anyhow::anyhow!(t!("main-cannot-find-the-application-data-directory")))?;
         let path = std::env::var_os("PICACHO_DATA_DIR")
             .or_else(|| std::env::var_os("PINAL_MAIL_DATA_DIR"))
             .map(std::path::PathBuf::from)
@@ -55,7 +58,7 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     }
     let project = directories::ProjectDirs::from("tech", "pinal", "picacho")
-        .ok_or_else(|| anyhow::anyhow!("Cannot find the application data directory"))?;
+        .ok_or_else(|| anyhow::anyhow!(t!("main-cannot-find-the-application-data-directory")))?;
     // The background process opens the window on the directory it used, and
     // direct launches may pass `mailto:` links or `.eml`/`.msg` files.
     let (chosen, requests) = display::launch::parse_args(std::env::args_os().skip(1));
@@ -86,7 +89,7 @@ fn main() -> anyhow::Result<()> {
         // Running already but not answering: opening the cache too would
         // have two processes check the same accounts.
         Some(display::instance::Claim::Busy) => {
-            anyhow::bail!("Picacho is already running but isn't responding. Quit it, then open Picacho again.")
+            anyhow::bail!(t!("main-picacho-is-already-running-but-isnt"))
         }
         Some(display::instance::Claim::Primary(listener)) => Some(listener),
         None => None,

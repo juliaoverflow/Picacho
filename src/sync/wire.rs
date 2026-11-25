@@ -58,7 +58,7 @@ impl Read for Wire {
         if self.remaining == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "Mail server response exceeds the 32 MB session-command limit",
+                t!("sync-wire-mail-server-response-exceeds-the-32"),
             ));
         }
         let remaining_time = self
@@ -66,7 +66,7 @@ impl Read for Wire {
             .checked_duration_since(Instant::now())
             .filter(|d| !d.is_zero())
             .ok_or_else(|| {
-                io::Error::new(io::ErrorKind::TimedOut, "Mail server command timed out")
+                io::Error::new(io::ErrorKind::TimedOut, t!("sync-wire-mail-server-command-timed-out"))
             })?;
         let idle = self.patience.unwrap_or(IDLE_TIMEOUT);
         self.socket

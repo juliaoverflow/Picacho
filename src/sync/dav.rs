@@ -105,15 +105,11 @@ pub struct Busy {
 }
 impl std::fmt::Display for Busy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "The server is busy; try again in {}.",
-            if self.seconds < 120 {
-                format!("{} seconds", self.seconds)
-            } else {
-                format!("{} minutes", self.seconds.div_ceil(60))
-            }
-        )
+        f.write_str(&if self.seconds < 120 {
+            t!("sync-dav-the-server-is-busy-seconds", seconds = self.seconds)
+        } else {
+            t!("sync-dav-the-server-is-busy-minutes", minutes = self.seconds.div_ceil(60))
+        })
     }
 }
 impl std::error::Error for Busy {}
@@ -124,7 +120,7 @@ impl std::error::Error for Busy {}
 pub struct TokenExpired;
 impl std::fmt::Display for TokenExpired {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("The server no longer knows what changed since the last sync.")
+        f.write_str(t!("sync-dav-the-server-no-longer-knows-what"))
     }
 }
 impl std::error::Error for TokenExpired {}
@@ -510,7 +506,7 @@ fn text_of(node: roxmltree::Node, name: &str) -> Option<String> {
 }
 
 fn parse(text: &str) -> Result<roxmltree::Document<'_>> {
-    roxmltree::Document::parse(text).context("The server's answer couldn't be read.")
+    roxmltree::Document::parse(text).with_context(|| t!("sync-dav-the-servers-answer-couldnt-be-read"))
 }
 
 impl Client {
@@ -621,7 +617,7 @@ impl Client {
                 request = request.header(*k, *v);
             }
             request.body(body).send().with_context(|| {
-                format!("Couldn't reach {}", url.host_str().unwrap_or("the server"))
+                t!("sync-dav-couldnt-reach", host = url.host_str().unwrap_or(t!("sync-dav-the-server")))
             })
         };
         let mut response = attempt(body.clone())?;
@@ -643,13 +639,13 @@ impl Client {
             return Err(Busy { seconds }.into());
         }
         if status == reqwest::StatusCode::INSUFFICIENT_STORAGE {
-            bail!("The server is out of storage for your account. Free some space there and retry.");
+            bail!(t!("sync-dav-the-server-is-out-of-storage"));
         }
         if status == reqwest::StatusCode::UNAUTHORIZED {
-            bail!("The server didn't accept the user name and password.");
+            bail!(t!("sync-dav-the-server-didnt-accept-the-user"));
         }
         if status == reqwest::StatusCode::PRECONDITION_FAILED {
-            bail!("This was changed on the server meanwhile. Read it again and retry.");
+            bail!(t!("sync-dav-this-was-changed-on-the-server"));
         }
         if status == reqwest::StatusCode::FORBIDDEN {
             // Only the start: the reason (a precondition element) is there.
@@ -670,10 +666,7 @@ impl Client {
         {
             bail!(Moved(to));
         }
-        ensure!(
-            status.is_success() || status.as_u16() == 207,
-            "The server answered {status}."
-        );
+        ensure!(status.is_success() || status.as_u16() == 207, Answered(status));
         Ok(response)
     }
 
@@ -697,18 +690,17 @@ impl Client {
                     if let Some(Moved(to)) = e.downcast_ref::<Moved>() {
                         ensure!(
                             to.scheme() == "https" || cfg!(test),
-                            "The server sent Picacho to an address without encryption."
+                            t!("sync-dav-the-server-sent-picacho-to-an")
                         );
                         ensure!(
                             same_domain(start.host_str().unwrap_or(""), to.host_str().unwrap_or("")),
-                            "The server sent Picacho to {}, outside its domain; enter that address instead if it's right.",
-                            to.host_str().unwrap_or("another server")
+                            t!("sync-dav-the-server-sent-picacho-to-outside", host = to.host_str().unwrap_or(t!("sync-dav-another-server")))
                         );
                         at = to.clone();
                         continue;
                     }
                     let well_known = at.path().starts_with("/.well-known/");
-                    if well_known && !tried_root && (e.is::<NotFound>() || e.to_string().contains("answered")) {
+                    if well_known && !tried_root && (e.is::<NotFound>() || e.is::<Answered>()) {
                         tried_root = true;
                         at.set_path("/");
                         continue;
@@ -717,7 +709,7 @@ impl Client {
                 }
             }
         }
-        bail!("The server redirected too many times.")
+        bail!(t!("sync-dav-the-server-redirected-too-many-times"))
     }
 
     fn xml(&self, method: &str, url: &url::Url, depth: &str, body: &str) -> Result<String> {
@@ -999,7 +991,7 @@ impl Client {
     pub fn home(&self, given: &str, service: &str, home_set: &str, namespace: &str) -> Result<url::Url> {
         let (_, principal) = self.principal(&start_url(given, service)?)?;
         self.find_href(&principal, home_set, namespace)?
-            .context("This server doesn't say where your collections go.")
+            .with_context(|| t!("sync-dav-this-server-doesnt-say-where-your"))
     }
     /// The compliance classes in a resource's `DAV:` header (OPTIONS),
     /// lowercase: `calendar-auto-schedule` says the server schedules
@@ -1020,7 +1012,7 @@ impl Client {
     pub fn outbox(&self, given: &str) -> Result<url::Url> {
         let (_, principal) = self.principal(&start_url(given, "caldav")?)?;
         self.find_href(&principal, "schedule-outbox-URL", CALDAV)?
-            .context("This server can't say when people are free (no scheduling outbox).")
+            .with_context(|| t!("sync-dav-this-server-cant-say-when-people"))
     }
     /// POSTs a scheduling message to an outbox (RFC 6638 §5), returning
     /// the server's answer.
@@ -1073,7 +1065,7 @@ impl Client {
         if !refused.is_empty() {
             // A plain collection was made, not an address book: taken back.
             let _ = self.delete(href, "");
-            bail!("The server refused {}.", refused.join(", "));
+            bail!(t!("sync-dav-the-server-refused", properties = refused.join(", ")));
         }
         Ok(())
     }
@@ -1145,11 +1137,11 @@ impl Client {
                 if refused.is_empty() {
                     return Err(e);
                 }
-                bail!("The server refused {}.", refused.join(", "));
+                bail!(t!("sync-dav-the-server-refused", properties = refused.join(", ")));
             }
         };
         let refused = refused_properties(&text);
-        ensure!(refused.is_empty(), "The server refused {}.", refused.join(", "));
+        ensure!(refused.is_empty(), t!("sync-dav-the-server-refused", properties = refused.join(", ")));
         Ok(())
     }
     /// Writes a resource: a new one (`etag` empty, which must not exist
@@ -1222,7 +1214,7 @@ impl Client {
                 text_of(r, "schedule-tag").unwrap_or_default(),
             )
         });
-        found.context("The server didn't say the saved version's ETag.")
+        found.with_context(|| t!("sync-dav-the-server-didnt-say-the-saved"))
     }
     /// Changes a collection's name and (a calendar's) colour (PROPPATCH,
     /// RFC 4918 §9.2). An empty `color` leaves it as it is.
@@ -1248,7 +1240,7 @@ impl Client {
             .filter(|n| is(n, "propstat"))
             .filter_map(|p| p.children().find(|c| is(c, "status")).and_then(|s| s.text()))
             .any(|s| !s.split_whitespace().nth(1).is_some_and(|c| c.starts_with('2')));
-        ensure!(!refused, "The server didn't accept the new name or colour.");
+        ensure!(!refused, t!("sync-dav-the-server-didnt-accept-the-new"));
         Ok(())
     }
     /// Removes a whole collection (a calendar or address book) and what is
@@ -1276,7 +1268,7 @@ impl Client {
     pub fn inbox(&self, given: &str) -> Result<url::Url> {
         let (_, principal) = self.principal(&start_url(given, "caldav")?)?;
         self.find_href(&principal, "schedule-inbox-URL", CALDAV)?
-            .context("This server has no scheduling inbox.")
+            .with_context(|| t!("sync-dav-this-server-has-no-scheduling-inbox"))
     }
     /// Adds, replaces or removes a managed attachment (RFC 8607 §3.4–§3.6),
     /// for the whole event or only the occurrences `rids` names (§3.4:
@@ -1318,16 +1310,16 @@ impl Client {
             request = request.header("If-Match", etag);
         }
         let response = request.send().with_context(|| {
-            format!("Couldn't reach {}", url.host_str().unwrap_or("the server"))
+            t!("sync-dav-couldnt-reach", host = url.host_str().unwrap_or(t!("sync-dav-the-server")))
         })?;
         let status = response.status();
         if status == reqwest::StatusCode::PRECONDITION_FAILED {
-            bail!("This was changed on the server meanwhile. Read it again and retry.");
+            bail!(t!("sync-dav-this-was-changed-on-the-server"));
         }
         if status == reqwest::StatusCode::INSUFFICIENT_STORAGE
             || status == reqwest::StatusCode::PAYLOAD_TOO_LARGE
         {
-            bail!("The server has no room for this attachment.");
+            bail!(t!("sync-dav-the-server-has-no-room-for"));
         }
         if status == reqwest::StatusCode::FORBIDDEN || status == reqwest::StatusCode::CONFLICT {
             // RFC 8607 §3.8: a precondition says which limit it was.
@@ -1335,19 +1327,19 @@ impl Client {
             bail!(
                 "{}",
                 if body.contains("max-attachment-size") {
-                    "This file is larger than the calendar server takes."
+                    t!("sync-dav-this-file-is-larger-than-the")
                 } else if body.contains("max-attachments-per-resource") {
-                    "This event has as many attachments as the server allows."
+                    t!("sync-dav-this-event-has-as-many-attachments")
                 } else if body.contains("valid-managed-id") {
-                    "That attachment is no longer on the event. Read it again."
+                    t!("sync-dav-that-attachment-is-no-longer-on")
                 } else if body.contains("valid-rid") {
-                    "That occurrence isn't part of the event."
+                    t!("sync-dav-that-occurrence-isnt-part-of-the")
                 } else {
-                    "The calendar server refused the attachment."
+                    t!("sync-dav-the-calendar-server-refused-the-attachment")
                 }
             );
         }
-        ensure!(status.is_success(), "The server didn't change the attachment ({status}).");
+        ensure!(status.is_success(), t!("sync-dav-the-server-didnt-change-the-attachment", status = status));
         let header = |name: &str| {
             response
                 .headers()
@@ -1384,7 +1376,7 @@ impl Client {
     /// (`Overwrite: F`, §10.6), and only if it is still the version with
     /// `etag`. Returns the ETag at `to`, where the server says.
     pub fn transfer(&self, from: &url::Url, to: &url::Url, etag: &str, keep_original: bool) -> Result<String> {
-        ensure!(from.origin() == to.origin(), "A copy or move stays on one server.");
+        ensure!(from.origin() == to.origin(), t!("sync-dav-a-copy-or-move-stays-on"));
         let mut headers = vec![("Destination", to.as_str()), ("Overwrite", "F")];
         if !etag.is_empty() && !etag.starts_with("W/") {
             headers.push(("If-Match", etag));
@@ -1397,7 +1389,7 @@ impl Client {
             let failed = responses(&doc).any(|(_, r)| {
                 r.children().find(|c| is(c, "status")).and_then(|s| s.text()).is_some_and(|s| !s.split_whitespace().nth(1).is_some_and(|c| c.starts_with('2')))
             });
-            ensure!(!failed, "The server didn't {} all of it.", if keep_original { "copy" } else { "move" });
+            ensure!(!failed, t!("sync-dav-the-server-didnt-all-of-it", action = if keep_original { "copy" } else { "move" }));
             return Ok(String::new());
         }
         Ok(response.headers().get("ETag").and_then(|v| v.to_str().ok()).unwrap_or_default().to_owned())
@@ -1433,7 +1425,7 @@ impl Client {
             let token = doc.descendants().find(|n| is(n, "locktoken"))?;
             token.descendants().find(|n| is(n, "href"))?.text().map(|t| t.trim().to_owned())
         });
-        token.context("The server didn't say the lock's token.")
+        token.with_context(|| t!("sync-dav-the-server-didnt-say-the-locks"))
     }
     // Backend-only until the UI calls it (see `lock`).
     #[allow(dead_code)]
@@ -1468,13 +1460,13 @@ const MOST_BODY: u64 = 256 * 1024 * 1024;
 fn body_text(response: reqwest::blocking::Response) -> Result<String> {
     use std::io::Read;
     if response.content_length().is_some_and(|n| n > MOST_BODY) {
-        bail!("The server's answer is too large.");
+        bail!(t!("sync-dav-the-servers-answer-is-too-large"));
     }
     let mut data = Vec::new();
     response.take(MOST_BODY + 1).read_to_end(&mut data)?;
     ensure!(
         data.len() as u64 <= MOST_BODY,
-        "The server's answer is too large."
+        t!("sync-dav-the-servers-answer-is-too-large")
     );
     Ok(match String::from_utf8(data) {
         Ok(text) => text,
@@ -1527,7 +1519,7 @@ fn parse_changes(collection: &url::Url, text: &str) -> Result<(Changes, bool)> {
         .unwrap_or_default()
         .trim()
         .to_owned();
-    ensure!(!out.token.is_empty(), "The server's changes came without a sync token.");
+    ensure!(!out.token.is_empty(), t!("sync-dav-the-servers-changes-came-without-a"));
     Ok((out, truncated))
 }
 
@@ -1565,7 +1557,7 @@ pub struct CollectionSetup {
 pub struct Forbidden(pub String);
 impl std::fmt::Display for Forbidden {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("The server doesn't allow this change.")
+        f.write_str(t!("sync-dav-the-server-doesnt-allow-this-change"))
     }
 }
 impl std::error::Error for Forbidden {}
@@ -1617,7 +1609,7 @@ pub(crate) fn content_disposition(name: &str) -> String {
 pub struct Moved(pub url::Url);
 impl std::fmt::Display for Moved {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "The server moved this to {}.", self.0.host_str().unwrap_or("another address"))
+        f.write_str(&t!("sync-dav-the-server-moved-this-to", host = self.0.host_str().unwrap_or(t!("sync-dav-another-address"))))
     }
 }
 impl std::error::Error for Moved {}
@@ -1648,16 +1640,16 @@ fn same_domain(from: &str, to: &str) -> bool {
 /// `/.well-known/<service>` (§5).
 pub fn start_url(given: &str, service: &str) -> Result<url::Url> {
     let given = given.trim();
-    ensure!(!given.is_empty(), "Enter the server's address.");
+    ensure!(!given.is_empty(), t!("sync-dav-enter-the-servers-address"));
     let given = if given.contains("://") {
         given.to_owned()
     } else {
         format!("https://{given}")
     };
-    let mut start = url::Url::parse(&given).context("The server's address isn't valid.")?;
+    let mut start = url::Url::parse(&given).with_context(|| t!("sync-dav-the-servers-address-isnt-valid"))?;
     ensure!(
         start.scheme() == "https" || cfg!(test),
-        "The server's address must start with https://."
+        t!("sync-dav-the-servers-address-must-start-with")
     );
     if start.path() == "/" || start.path().is_empty() {
         if !cfg!(test)
@@ -1676,10 +1668,20 @@ pub fn start_url(given: &str, service: &str) -> Result<url::Url> {
 pub struct NotFound;
 impl std::fmt::Display for NotFound {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("The server has no such item (404).")
+        f.write_str(t!("sync-dav-the-server-has-no-such-item"))
     }
 }
 impl std::error::Error for NotFound {}
+
+/// The server answered with a status other than success.
+#[derive(Debug)]
+pub struct Answered(reqwest::StatusCode);
+impl std::fmt::Display for Answered {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&t!("sync-dav-the-server-answered", status = self.0))
+    }
+}
+impl std::error::Error for Answered {}
 
 /// Finds the user's collections of `kind` (`addressbook` in CardDAV's
 /// `addressbook-home-set`, or `calendar` in CalDAV's `calendar-home-set`)
@@ -1700,7 +1702,7 @@ pub fn discover(
         // RFC 4791 §6.2.1, RFC 6352 §7.1.1: a home set may list several
         // homes; the collections in each are the account's.
         let homes = client.find_hrefs(&principal, home_set, namespace)?;
-        ensure!(!homes.is_empty(), "This server doesn't list any for your account.");
+        ensure!(!homes.is_empty(), t!("sync-dav-this-server-doesnt-list-any-for"));
         let mut failed = None;
         for home in &homes {
             match client.collections(home, kind) {
@@ -1723,7 +1725,7 @@ pub fn discover(
     }
     ensure!(
         !found.is_empty(),
-        "Nothing was found on the server for your account."
+        t!("sync-dav-nothing-was-found-on-the-server")
     );
     Ok(found)
 }

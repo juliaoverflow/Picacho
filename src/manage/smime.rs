@@ -143,24 +143,22 @@ pub enum Signature {
 impl Signature {
     pub fn label(&self) -> String {
         match self {
-            Self::None => "Not signed".into(),
-            Self::Good(who) => format!("Signed by {who} (S/MIME)"),
+            Self::None => t!("manage-smime-not-signed").into(),
+            Self::Good(who) => t!("manage-smime-signed-by-s-mime", who = who),
             Self::Untrusted(who) => {
-                format!(
-                    "Signed by {who} (S/MIME), with a certificate no trusted authority vouches for"
-                )
+                t!("manage-smime-signed-by-s-mime-with-a", who = who)
             }
             Self::OtherSender(who) => {
-                format!("Signed by {who} (S/MIME), who isn't the sender shown")
+                t!("manage-smime-signed-by-s-mime-who-isnt", who = who)
             }
             Self::Revoked(who) => {
-                format!("Signed by {who} (S/MIME), whose certificate has been revoked")
+                t!("manage-smime-signed-by-s-mime-whose-certificate", who = who)
             }
             Self::Unverified => {
-                "Signed with S/MIME, by a certificate the message doesn't include: it couldn't be checked".into()
+                t!("manage-smime-signed-with-s-mime-by-a").into()
             }
             Self::Bad => {
-                "The S/MIME signature doesn't match: the message may have been changed".into()
+                t!("manage-smime-the-s-mime-signature-doesnt-match").into()
             }
         }
     }
@@ -264,7 +262,7 @@ impl Certificates {
     pub fn load() -> Result<Self> {
         Ok(match store::read_secret_text(ENTRY)? {
             Some(json) => {
-                serde_json::from_str(&json).context("The S/MIME certificates couldn't be read.")?
+                serde_json::from_str(&json).with_context(|| t!("manage-smime-the-s-mime-certificates-couldnt-be"))?
             }
             None => Self::default(),
         })
@@ -304,25 +302,25 @@ impl Certificates {
     /// Imports a PKCS#12 file (your certificate and key) with its password.
     pub fn import_identity(&mut self, der: &[u8], password: &str) -> Result<CertInfo> {
         let pkcs12 = openssl::pkcs12::Pkcs12::from_der(der)
-            .context("That isn't a PKCS#12 file (.p12 or .pfx).")?;
+            .with_context(|| t!("manage-smime-that-isnt-a-pkcs-12-file"))?;
         let parsed = match pkcs12.parse2(password) {
             Ok(parsed) => parsed,
             // Older files use RC2 or triple DES, which OpenSSL 3 keeps in
             // its legacy provider: loaded, and tried again.
             Err(_) if legacy_provider() => pkcs12
                 .parse2(password)
-                .map_err(|_| anyhow::anyhow!("The password is wrong, or the file is damaged."))?,
-            Err(_) => bail!("The password is wrong, or the file is damaged."),
+                .map_err(|_| anyhow::anyhow!(t!("manage-smime-the-password-is-wrong-or-the")))?,
+            Err(_) => bail!(t!("manage-smime-the-password-is-wrong-or-the")),
         };
-        let cert = parsed.cert.context("The file has no certificate.")?;
-        let key = parsed.pkey.context("The file has no private key.")?;
+        let cert = parsed.cert.with_context(|| t!("manage-smime-the-file-has-no-certificate"))?;
+        let key = parsed.pkey.with_context(|| t!("manage-smime-the-file-has-no-private-key"))?;
         ensure!(
             cert.public_key()?.public_eq(&key),
-            "The file's key doesn't belong to its certificate."
+            t!("manage-smime-the-files-key-doesnt-belong-to")
         );
         ensure!(
             !emails(&cert).is_empty(),
-            "The certificate names no email address."
+            t!("manage-smime-the-certificate-names-no-email-address")
         );
         let mut chain = String::from_utf8(cert.to_pem()?)?;
         for extra in parsed.ca.into_iter().flatten() {
@@ -339,10 +337,10 @@ impl Certificates {
     pub fn import_certificate(&mut self, data: &[u8]) -> Result<CertInfo> {
         let cert = X509::from_pem(data)
             .or_else(|_| X509::from_der(data))
-            .context("That isn't a certificate (.pem, .crt or .cer).")?;
+            .with_context(|| t!("manage-smime-that-isnt-a-certificate-pem-crt"))?;
         ensure!(
             !emails(&cert).is_empty(),
-            "The certificate names no email address."
+            t!("manage-smime-the-certificate-names-no-email-address")
         );
         let info = info(&cert, false);
         self.add_other(&cert)?;
@@ -817,7 +815,7 @@ pub fn protect_with_options(
     let outer = if hide_subject { obscured_subject(&outer) } else { outer };
     if sign {
         let (cert, chain, key) = own.as_ref().with_context(|| {
-            format!("There's no S/MIME certificate of yours for {from}. Import one in Settings → Encryption, or turn off Sign.")
+            t!("manage-smime-theres-no-s-mime-certificate-of", from = from)
         })?;
         content = sign_part(cert, chain, key, &content)?;
     }
@@ -836,8 +834,7 @@ pub fn protect_with_options(
         }
         ensure!(
             missing.is_empty(),
-            "There's no S/MIME certificate for {}. They need to send you signed mail first, or you can import theirs in Settings → Encryption.",
-            missing.join(", ")
+            t!("manage-smime-theres-no-s-mime-certificate-for", addresses = missing.join(", "))
         );
         if let Some((cert, _, _)) = &own {
             recipients.push(cert.clone())?;
@@ -879,7 +876,7 @@ fn encrypt_part(recipients: &Stack<X509>, content: &[u8], cipher: ContentCipher)
     // BINARY: the content is already canonical (RFC 8551 §3.1.1), so its
     // line ends aren't translated again.
     let enveloped = CmsContentInfo::encrypt(recipients, content, openssl_cipher, CMSOptions::BINARY)
-        .context("The message couldn't be encrypted with S/MIME.")?;
+        .with_context(|| t!("manage-smime-the-message-couldnt-be-encrypted-with"))?;
     let encoded = base64::engine::general_purpose::STANDARD.encode(enveloped.to_der()?);
     // RFC 8551 §3.2.1, §3.2.2: the smime-type names the CMS type, and the
     // name and filename end in .p7m.
@@ -989,12 +986,11 @@ impl CrlCheck {
             // or holds a NUL: refused here instead.
             ensure!(
                 file.to_str().is_some_and(|f| !f.contains('\0')),
-                "A revocation list's path can't be read: {}",
-                file.display()
+                t!("manage-smime-a-revocation-lists-path-cant-be", file = file.display())
             );
             lookup
                 .load_crl_file(file, openssl::ssl::SslFiletype::PEM)
-                .with_context(|| format!("{} isn't a revocation list (PEM).", file.display()))?;
+                .with_context(|| t!("manage-smime-isnt-a-revocation-list-pem", file = file.display()))?;
         }
         builder.set_flags(openssl::x509::verify::X509VerifyFlags::CRL_CHECK)?;
         Ok(builder.build())
@@ -1329,7 +1325,7 @@ fn check_signers(
         let address = cert
             .as_ref()
             .and_then(|c| emails(c).into_iter().next())
-            .unwrap_or_else(|| "an unknown signer".into());
+            .unwrap_or_else(|| t!("manage-smime-an-unknown-signer").into());
         let result = match &cert {
             None => SignerResult::Unverified,
             Some(cert) => match check_one(&signed.with_signers(&[signer_info.raw]), detached, cert, store) {
@@ -1412,7 +1408,7 @@ pub fn learn(certs: &mut Certificates, signer: &X509, verdict: &Signature, from:
     }
     let addresses = emails(signer);
     if addresses.is_empty() {
-        bail!("The signer's certificate names no address.");
+        bail!(t!("manage-smime-the-signers-certificate-names-no-address"));
     }
     let from = from.trim().to_lowercase();
     if from.is_empty() || !addresses.contains(&from) {

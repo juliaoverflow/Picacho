@@ -169,12 +169,12 @@ pub(super) fn mailbox_id(places: &[Place], mailbox: &Mailbox) -> Result<String> 
             .iter()
             .find(|p| p.folder == Some(*folder))
             .map(|p| p.id.clone())
-            .with_context(|| format!("This account has no {} folder.", folder.label())),
+            .with_context(|| t!("manage-jmap-this-account-has-no-folder", label = folder.label())),
         Mailbox::Remote(name) => places
             .iter()
             .find(|p| p.folder.is_none() && &p.path == name)
             .map(|p| p.id.clone())
-            .with_context(|| format!("The folder “{name}” no longer exists on the server.")),
+            .with_context(|| t!("manage-jmap-the-folder-no-longer-exists-on", name = name)),
     }
 }
 
@@ -345,8 +345,7 @@ fn patch_for(places: &[Place], change: &Change) -> Result<Map<String, Value>> {
         Change::Move(folder) => {
             ensure!(
                 !folder.is_virtual() && *folder != Folder::Other,
-                "Mail can't be moved to {}.",
-                folder.label()
+                t!("manage-jmap-mail-cant-be-moved-to", label = folder.label())
             );
             let id = mailbox_id(places, &Mailbox::Standard(*folder))?;
             p.insert("mailboxIds".into(), json!({ id: true }));
@@ -437,7 +436,7 @@ impl Backend {
     /// The other JMAP accounts with mail that `a`'s sign-in reaches (shared
     /// with it), not added yet: (id at the server, name).
     pub fn jmap_shared(&self, a: &Account) -> Result<Vec<(String, String)>> {
-        ensure!(a.provider == Provider::Jmap, "Only JMAP accounts are shared this way.");
+        ensure!(a.provider == Provider::Jmap, t!("manage-jmap-only-jmap-accounts-are-shared-this"));
         let added: Vec<String> = self
             .store
             .accounts()?
@@ -461,7 +460,7 @@ impl Backend {
     pub fn add_jmap_shared(&self, owner: &Account, jmap_id: &str, name: &str) -> Result<Account> {
         ensure!(
             owner.provider == Provider::Jmap && owner.credentials_of.is_empty(),
-            "Only a JMAP account's own sign-in has accounts shared with it."
+            t!("manage-jmap-only-a-jmap-accounts-own-sign")
         );
         ensure!(
             !self
@@ -469,7 +468,7 @@ impl Backend {
                 .accounts()?
                 .iter()
                 .any(|o| o.credentials_of == owner.id && o.jmap_account == jmap_id),
-            "This shared account is already added."
+            t!("manage-jmap-this-shared-account-is-already-added")
         );
         let mut shared = owner.clone();
         shared.id = uuid::Uuid::new_v4().to_string();
@@ -826,7 +825,7 @@ impl Backend {
 
     /// Downloads one message's source and caches it.
     pub(super) fn download_jmap(&self, a: &Account, m: &Mail) -> Result<Vec<u8>> {
-        let id = jmap_id(a, m).context("This message isn't from this JMAP account.")?;
+        let id = jmap_id(a, m).with_context(|| t!("manage-jmap-this-message-isnt-from-this-jmap"))?;
         let raw = self.with_jmap(a, |s| s.source(id, large::MAX_DOWNLOAD))?;
         self.note_traffic(a, raw.len());
         self.store.save_raw(&m.id, &raw)?;
@@ -836,7 +835,7 @@ impl Backend {
     /// A message too large to download whole: its text is read alone, and
     /// each attachment downloads when it is saved (`jmap_attachment`).
     pub(super) fn read_jmap_parts(&self, a: &Account, m: &Mail) -> Result<Mail> {
-        let id = jmap_id(a, m).context("This message isn't from this JMAP account.")?;
+        let id = jmap_id(a, m).with_context(|| t!("manage-jmap-this-message-isnt-from-this-jmap"))?;
         let parts = self.with_jmap(a, |s| s.parts(id))?;
         let mut next = m.clone();
         next.body = Some(if parts.text.is_empty() {
@@ -870,7 +869,7 @@ impl Backend {
         if a.provider != Provider::Jmap {
             return Ok(None);
         }
-        let id = jmap_id(a, m).context("This message isn't from this JMAP account.")?;
+        let id = jmap_id(a, m).with_context(|| t!("manage-jmap-this-message-isnt-from-this-jmap"))?;
         let lock = self.account_lock(&a.id);
         let _operation = lock.lock().unwrap();
         self.with_jmap(a, |s| s.header_block(id))
@@ -1070,14 +1069,14 @@ impl Backend {
         raw: &[u8],
         options: &jmap::SendOptions,
     ) -> Result<jmap::Submitted> {
-        ensure!(!to.is_empty(), "Add at least one recipient.");
+        ensure!(!to.is_empty(), t!("manage-jmap-add-at-least-one-recipient"));
         self.with_jmap(a, |s| {
             let identity = s
                 .identities()?
                 .into_iter()
                 .find(|i| i.covers(from))
                 .with_context(|| {
-                    format!("The server has no sending identity for {from}. Add it in your mail service's settings.")
+                    t!("manage-jmap-the-server-has-no-sending-identity", from = from)
                 })?;
             let places = self.jmap_places(a, s, false)?;
             let id = |f: Folder| mailbox_id(&places, &Mailbox::Standard(f)).ok();
@@ -1116,7 +1115,7 @@ impl Backend {
             let message = smtp::build_to(a, &visible, false, only_to, Some(&message_id))?;
             let raw = smtp::protected(&message, &visible, &keys)?;
             let envelope = message.envelope();
-            let from = envelope.from().map(|f| f.to_string()).context("The message has no sender.")?;
+            let from = envelope.from().map(|f| f.to_string()).with_context(|| t!("manage-jmap-the-message-has-no-sender"))?;
             let to: Vec<String> = envelope.to().iter().map(|t| t.to_string()).collect();
             let submitted = self.send_jmap(a, &from, &to, &raw, &options)?;
             self.note_submission(a, &message_id, &submitted.id);
@@ -1131,13 +1130,13 @@ impl Backend {
             let sent = submit(Some(&address));
             let (raw, submitted) = match first {
                 Some(_) => sent.with_context(|| {
-                    format!("The message went to its other recipients, but not to {address}.")
+                    t!("manage-jmap-the-message-went-to-its-other", address = address)
                 })?,
                 None => sent?,
             };
             first.get_or_insert((raw, submitted.receipts));
         }
-        let (raw, receipts) = first.context("Add at least one recipient.")?;
+        let (raw, receipts) = first.with_context(|| t!("manage-jmap-add-at-least-one-recipient"))?;
         // The sender's copy shows whom it also went to. Sent once every
         // copy is: from here on a failure is noted, never an error that
         // would invite sending it again.
@@ -1153,7 +1152,7 @@ impl Backend {
     /// Messages the JMAP server holds to send later (handed over with
     /// HOLDUNTIL) or is still trying: (submission id, subject, when).
     pub fn held_submissions(&self, a: &Account) -> Result<Vec<HeldSubmission>> {
-        ensure!(a.provider == Provider::Jmap, "Only JMAP servers hold messages this way.");
+        ensure!(a.provider == Provider::Jmap, t!("manage-jmap-only-jmap-servers-hold-messages-this"));
         let lock = self.account_lock(&a.id);
         let _operation = lock.lock().unwrap();
         self.with_jmap(a, |s| {
@@ -1200,7 +1199,7 @@ impl Backend {
     /// Takes back a message the JMAP server holds to send later: it isn't
     /// sent, and goes back to Drafts. False if it had already gone.
     pub fn cancel_held(&self, a: &Account, submission: &str) -> Result<bool> {
-        ensure!(a.provider == Provider::Jmap, "Only JMAP servers hold messages this way.");
+        ensure!(a.provider == Provider::Jmap, t!("manage-jmap-only-jmap-servers-hold-messages-this"));
         let lock = self.account_lock(&a.id);
         let _operation = lock.lock().unwrap();
         let taken = self.with_jmap(a, |s| {
@@ -1242,7 +1241,7 @@ impl Backend {
         a: &Account,
         since: &str,
     ) -> Result<Option<crate::sync::jmap::ThreadChanges>> {
-        ensure!(a.provider == Provider::Jmap, "Only JMAP servers keep threads.");
+        ensure!(a.provider == Provider::Jmap, t!("manage-jmap-only-jmap-servers-keep-threads"));
         let lock = self.account_lock(&a.id);
         let _operation = lock.lock().unwrap();
         self.with_jmap(a, |s| {
@@ -1257,7 +1256,7 @@ impl Backend {
     /// `since` (EmailSubmission/changes), mapped to their Message-IDs, and
     /// the new state.
     pub fn jmap_delivery_changes(&self, a: &Account, since: &str) -> Result<Option<(Vec<String>, String)>> {
-        ensure!(a.provider == Provider::Jmap, "Only JMAP servers report this.");
+        ensure!(a.provider == Provider::Jmap, t!("manage-jmap-only-jmap-servers-report-this"));
         let lock = self.account_lock(&a.id);
         let _operation = lock.lock().unwrap();
         // Without a state yet: the current one, to ask from.
@@ -1311,14 +1310,14 @@ impl Backend {
         a: &Account,
         submission: &str,
     ) -> Result<Option<crate::sync::jmap::SubmissionStatus>> {
-        ensure!(a.provider == Provider::Jmap, "Only JMAP servers report this.");
+        ensure!(a.provider == Provider::Jmap, t!("manage-jmap-only-jmap-servers-report-this"));
         let lock = self.account_lock(&a.id);
         let _operation = lock.lock().unwrap();
         self.with_jmap(a, |s| s.submission_status(submission))
     }
     /// The account's sending identities on the JMAP server.
     pub fn jmap_identities(&self, a: &Account) -> Result<Vec<crate::sync::jmap::Identity>> {
-        ensure!(a.provider == Provider::Jmap, "Only JMAP servers keep identities.");
+        ensure!(a.provider == Provider::Jmap, t!("manage-jmap-only-jmap-servers-keep-identities"));
         let lock = self.account_lock(&a.id);
         let _operation = lock.lock().unwrap();
         // Once read, only what changed since (Identity/changes).
@@ -1347,21 +1346,21 @@ impl Backend {
         id: &str,
         change: &crate::sync::jmap::IdentityChange,
     ) -> Result<()> {
-        ensure!(a.provider == Provider::Jmap, "Only JMAP servers keep identities.");
+        ensure!(a.provider == Provider::Jmap, t!("manage-jmap-only-jmap-servers-keep-identities"));
         let lock = self.account_lock(&a.id);
         let _operation = lock.lock().unwrap();
         self.with_jmap(a, |s| s.update_identity(id, change))
     }
     /// Adds a sending identity on the JMAP server.
     pub fn create_jmap_identity(&self, a: &Account, email: &str, name: &str) -> Result<String> {
-        ensure!(a.provider == Provider::Jmap, "Only JMAP servers keep identities.");
+        ensure!(a.provider == Provider::Jmap, t!("manage-jmap-only-jmap-servers-keep-identities"));
         let lock = self.account_lock(&a.id);
         let _operation = lock.lock().unwrap();
         self.with_jmap(a, |s| s.create_identity(email, name))
     }
     /// Removes a sending identity from the JMAP server.
     pub fn destroy_jmap_identity(&self, a: &Account, id: &str) -> Result<()> {
-        ensure!(a.provider == Provider::Jmap, "Only JMAP servers keep identities.");
+        ensure!(a.provider == Provider::Jmap, t!("manage-jmap-only-jmap-servers-keep-identities"));
         let lock = self.account_lock(&a.id);
         let _operation = lock.lock().unwrap();
         self.with_jmap(a, |s| s.destroy_identity(id))
@@ -1370,11 +1369,11 @@ impl Backend {
     /// across mailboxes: messages not listed here yet are fetched (listing
     /// only) and kept, and all of them returned oldest first.
     pub fn jmap_conversation(&self, a: &Account, m: &Mail) -> Result<Vec<Mail>> {
-        ensure!(a.provider == Provider::Jmap, "Only JMAP servers keep threads.");
+        ensure!(a.provider == Provider::Jmap, t!("manage-jmap-only-jmap-servers-keep-threads"));
         let thread = m
             .thread_id()
             .strip_prefix("jmap:")
-            .context("This message has no conversation on the server.")?
+            .with_context(|| t!("manage-jmap-this-message-has-no-conversation-on"))?
             .to_owned();
         let lock = self.account_lock(&a.id);
         let _operation = lock.lock().unwrap();
@@ -1414,12 +1413,12 @@ impl Backend {
     ) -> Result<usize> {
         ensure!(
             from.provider == Provider::Jmap && a.provider == Provider::Jmap,
-            "Only JMAP accounts copy between themselves on the server."
+            t!("manage-jmap-only-jmap-accounts-copy-between-themselves")
         );
         let same_sign_in = |x: &Account| if x.credentials_of.is_empty() { x.id.clone() } else { x.credentials_of.clone() };
         ensure!(
             same_sign_in(from) == same_sign_in(a),
-            "These accounts don't share a sign-in, so the server can't copy between them."
+            t!("manage-jmap-these-accounts-dont-share-a-sign")
         );
         let ids: Vec<String> = mails
             .iter()
@@ -1438,7 +1437,7 @@ impl Backend {
         let lock = self.account_lock(&a.id);
         let _operation = lock.lock().unwrap();
         let from_account = from.jmap_account.clone();
-        ensure!(!from_account.is_empty() || from.credentials_of.is_empty(), "The account to copy from isn't known.");
+        ensure!(!from_account.is_empty() || from.credentials_of.is_empty(), t!("manage-jmap-the-account-to-copy-from-isnt"));
         let copied = self.with_jmap(a, |s| {
             let from_account = if from_account.is_empty() {
                 // The sign-in's own account.
@@ -1478,7 +1477,7 @@ impl Backend {
             .iter()
             .find(|x| x.part == part)
             .cloned()
-            .context("Attachment not found")?;
+            .with_context(|| t!("manage-jmap-attachment-not-found"))?;
         if a.provider == Provider::Jmap
             && !attachment.section.is_empty()
             && self.store.raw(&m.id)?.is_none()
@@ -1691,7 +1690,7 @@ impl Backend {
     ) -> Result<FolderChange> {
         ensure!(
             !leaf.trim().is_empty() && !leaf.contains('/'),
-            "Enter a folder name without “/”."
+            t!("manage-jmap-enter-a-folder-name-without")
         );
         self.with_jmap(a, |s| {
             let places = self.jmap_places(a, s, false)?;
@@ -1716,7 +1715,7 @@ impl Backend {
     ) -> Result<FolderChange> {
         ensure!(
             !leaf.trim().is_empty() && !leaf.contains('/'),
-            "Enter a folder name without “/”."
+            t!("manage-jmap-enter-a-folder-name-without")
         );
         let change = self.with_jmap(a, |s| {
             let before = self.jmap_places(a, s, false)?;
@@ -1750,7 +1749,7 @@ impl Backend {
     // Backend-only until the UI calls it: moving a JMAP folder under another (Mailbox/set parentId).
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn move_folder_jmap(&self, a: &Account, name: &str, parent: Option<&str>) -> Result<FolderChange> {
-        ensure!(a.provider == Provider::Jmap, "Only JMAP folders are moved this way.");
+        ensure!(a.provider == Provider::Jmap, t!("manage-jmap-only-jmap-folders-are-moved-this"));
         let lock = self.account_lock(&a.id);
         let _operation = lock.lock().unwrap();
         let change = self.with_jmap(a, |s| {
@@ -1761,11 +1760,11 @@ impl Backend {
                     let pid = mailbox_id(&before, &Mailbox::Remote(p.to_owned()))?;
                     ensure!(
                         !(p == name || p.starts_with(&format!("{name}/"))),
-                        "A folder can't go inside itself."
+                        t!("manage-jmap-a-folder-cant-go-inside-itself")
                     );
                     ensure!(
                         before.iter().find(|x| x.id == pid).is_none_or(|x| x.nestable),
-                        "You may not make folders inside “{p}”."
+                        t!("manage-jmap-you-may-not-make-folders-inside", folder = p)
                     );
                     Some(pid)
                 }
@@ -1797,7 +1796,7 @@ impl Backend {
     // Backend-only until the UI calls it: subscribing to a JMAP folder (Mailbox isSubscribed).
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn subscribe_folder_jmap(&self, a: &Account, name: &str, subscribed: bool) -> Result<()> {
-        ensure!(a.provider == Provider::Jmap, "Only JMAP folders are subscribed to this way.");
+        ensure!(a.provider == Provider::Jmap, t!("manage-jmap-only-jmap-folders-are-subscribed-to"));
         let lock = self.account_lock(&a.id);
         let _operation = lock.lock().unwrap();
         self.with_jmap(a, |s| {
@@ -1811,7 +1810,7 @@ impl Backend {
     // Backend-only until the UI calls it: listing subscribed JMAP folders (Mailbox/query, Mailbox/queryChanges).
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn subscribed_folders_jmap(&self, a: &Account) -> Result<Vec<String>> {
-        ensure!(a.provider == Provider::Jmap, "Only JMAP folders are listed this way.");
+        ensure!(a.provider == Provider::Jmap, t!("manage-jmap-only-jmap-folders-are-listed-this"));
         let lock = self.account_lock(&a.id);
         let _operation = lock.lock().unwrap();
         let key = format!("jmap_subscribed:{}", a.id);
@@ -1905,7 +1904,7 @@ impl Backend {
             if s.sieve_extensions().is_none() && s.has_vacation() {
                 ensure!(
                     filters.rules.is_empty(),
-                    "This JMAP server has no server filters, only an away reply."
+                    t!("manage-jmap-this-jmap-server-has-no-server")
                 );
                 let reply = vacation_response(&filters.vacation);
                 s.set_vacation(&reply)?;
@@ -1914,7 +1913,7 @@ impl Backend {
             let extensions = s.sieve_extensions().unwrap_or_default().to_vec();
             ensure!(
                 s.sieve_extensions().is_some(),
-                "This JMAP server doesn't offer server filters (JMAP for Sieve Scripts)."
+                t!("manage-jmap-this-jmap-server-doesnt-offer-server")
             );
             let text = sieve::script(filters, &extensions, addresses)?;
             let scripts = s.sieve_scripts()?;

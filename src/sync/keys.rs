@@ -73,7 +73,7 @@ fn limited(response: reqwest::blocking::Response) -> Result<Vec<u8>> {
     use std::io::Read as _;
     let mut bytes = Vec::new();
     response.take(MAX_KEY_BYTES + 1).read_to_end(&mut bytes)?;
-    anyhow::ensure!(bytes.len() as u64 <= MAX_KEY_BYTES, "The key found is too large.");
+    anyhow::ensure!(bytes.len() as u64 <= MAX_KEY_BYTES, t!("sync-keys-the-key-found-is-too-large"));
     Ok(bytes)
 }
 
@@ -91,9 +91,9 @@ pub enum Source {
 impl Source {
     pub fn label(self) -> &'static str {
         match self {
-            Self::Wkd => "the address's own domain (WKD)",
-            Self::Dane { dnssec_validated: true } => "the address's domain's DNSSEC-signed DNS (OPENPGPKEY)",
-            Self::Dane { dnssec_validated: false } => "the address's domain's DNS (OPENPGPKEY, unverified)",
+            Self::Wkd => t!("sync-keys-the-addresss-own-domain-wkd"),
+            Self::Dane { dnssec_validated: true } => t!("sync-keys-the-addresss-domains-dnssec-signed-dns"),
+            Self::Dane { dnssec_validated: false } => t!("sync-keys-the-addresss-domains-dns-openpgpkey-unverified"),
             Self::KeysOpenpgpOrg => "keys.openpgp.org",
         }
     }
@@ -162,7 +162,7 @@ pub fn lookup(email: &str, tls: native_tls::TlsConnector) -> Result<Option<(Vec<
     let response = client
         .get(&url)
         .send()
-        .context("keys.openpgp.org couldn't be reached.")?;
+        .with_context(|| t!("sync-keys-keys-openpgp-org-couldnt-be-reached"))?;
     match response.status().as_u16() {
         200 => Ok(Some((limited(response)?, Source::KeysOpenpgpOrg))),
         // Not on keys.openpgp.org. HKP keyservers (keyserver.ubuntu.com and
@@ -170,7 +170,7 @@ pub fn lookup(email: &str, tls: native_tls::TlsConnector) -> Result<Option<(Vec<
         // uploader claims, without checking it, so a key found there could
         // be anyone's, and encrypting to it would give them the mail.
         404 => Ok(None),
-        status => bail!("keys.openpgp.org answered {status}."),
+        status => bail!(t!("sync-keys-keys-openpgp-org-answered", status = status)),
     }
 }
 
@@ -179,7 +179,7 @@ pub fn lookup(email: &str, tls: native_tls::TlsConnector) -> Result<Option<(Vec<
 /// HTTPS `/pks/add` endpoint. Plain HTTP is refused.
 pub fn hkp_add_url(server: &str) -> Result<String> {
     let raw = server.trim();
-    anyhow::ensure!(!raw.is_empty(), "Enter a keyserver address.");
+    anyhow::ensure!(!raw.is_empty(), t!("sync-keys-enter-a-keyserver-address"));
     let with_scheme = if raw.contains("://") {
         if let Some(rest) = raw
             .strip_prefix("hkps://")
@@ -192,12 +192,12 @@ pub fn hkp_add_url(server: &str) -> Result<String> {
     } else {
         format!("https://{raw}")
     };
-    let mut url = url::Url::parse(&with_scheme).context("That isn't a valid keyserver address.")?;
+    let mut url = url::Url::parse(&with_scheme).with_context(|| t!("sync-keys-that-isnt-a-valid-keyserver-address"))?;
     anyhow::ensure!(
         url.scheme() == "https",
-        "Keyservers must use HTTPS (or hkps://)."
+        t!("sync-keys-keyservers-must-use-https-or-hkps")
     );
-    anyhow::ensure!(url.host_str().is_some(), "Keyserver address has no host.");
+    anyhow::ensure!(url.host_str().is_some(), t!("sync-keys-keyserver-address-has-no-host"));
     url.set_path("/pks/add");
     url.set_query(None);
     url.set_fragment(None);
@@ -219,10 +219,10 @@ pub fn publish_hkp(server: &str, armored: &str, tls: native_tls::TlsConnector) -
         .post(&url)
         .form(&[("keytext", armored)])
         .send()
-        .with_context(|| format!("{host} couldn't be reached."))?;
+        .with_context(|| t!("sync-keys-couldnt-be-reached", host = host))?;
     let status = response.status();
     if !status.is_success() {
-        bail!("{host} answered {}.", status.as_u16());
+        bail!(t!("sync-keys-answered", host = host, status = status.as_u16()));
     }
     Ok(host)
 }
@@ -263,7 +263,7 @@ pub fn export_wkd(
     }
     anyhow::ensure!(
         !roots.is_empty(),
-        "No email addresses on your keys could be exported for WKD."
+        t!("sync-keys-no-email-addresses-on-your-keys")
     );
     Ok(roots)
 }
@@ -285,14 +285,14 @@ pub fn publish(armored: &str, addresses: &[String], tls: native_tls::TlsConnecto
         .post("https://keys.openpgp.org/vks/v1/upload")
         .json(&serde_json::json!({ "keytext": armored }))
         .send()
-        .context("keys.openpgp.org couldn't be reached.")?;
+        .with_context(|| t!("sync-keys-keys-openpgp-org-couldnt-be-reached"))?;
     let status = response.status();
     let answer: serde_json::Value = serde_json::from_slice(&limited(response)?).unwrap_or_default();
     if !status.is_success() {
-        let why = answer["error"].as_str().unwrap_or("it refused the key");
-        bail!("keys.openpgp.org answered {}: {why}", status.as_u16());
+        let why = answer["error"].as_str().unwrap_or(t!("sync-keys-it-refused-the-key"));
+        bail!(t!("sync-keys-keys-openpgp-org-answered-2", status = status.as_u16(), why = why));
     }
-    let token = answer["token"].as_str().context("keys.openpgp.org didn't answer as expected.")?;
+    let token = answer["token"].as_str().with_context(|| t!("sync-keys-keys-openpgp-org-didnt-answer-as"))?;
     let mut out = Published::default();
     let mut ask = Vec::new();
     if let Some(states) = answer["status"].as_object() {
@@ -311,9 +311,9 @@ pub fn publish(armored: &str, addresses: &[String], tls: native_tls::TlsConnecto
             .post("https://keys.openpgp.org/vks/v1/request-verify")
             .json(&serde_json::json!({ "token": token, "addresses": ask, "locale": ["en"] }))
             .send()
-            .context("keys.openpgp.org couldn't be reached.")?;
+            .with_context(|| t!("sync-keys-keys-openpgp-org-couldnt-be-reached"))?;
         if !response.status().is_success() {
-            bail!("keys.openpgp.org couldn't send the confirmation email ({}).", response.status().as_u16());
+            bail!(t!("sync-keys-keys-openpgp-org-couldnt-send-the", status = response.status().as_u16()));
         }
         out.confirming.extend(ask);
     }
@@ -473,15 +473,15 @@ pub fn lookup_fingerprint(fingerprint: &str, tls: native_tls::TlsConnector) -> R
     let fp: String = fingerprint.chars().filter(|c| c.is_ascii_hexdigit()).collect();
     anyhow::ensure!(
         fp.len() == 40 || fp.len() == 64,
-        "A whole fingerprint is needed to look up a key."
+        t!("sync-keys-a-whole-fingerprint-is-needed-to")
     );
     let client = http(tls)?;
     let url = format!("https://keys.openpgp.org/pks/lookup?op=get&options=mr&search=0x{fp}");
-    let response = client.get(&url).send().context("keys.openpgp.org couldn't be reached.")?;
+    let response = client.get(&url).send().with_context(|| t!("sync-keys-keys-openpgp-org-couldnt-be-reached"))?;
     match response.status().as_u16() {
         200 => Ok(Some(limited(response)?)),
         404 => Ok(None),
-        status => bail!("keys.openpgp.org answered {status}."),
+        status => bail!(t!("sync-keys-keys-openpgp-org-answered", status = status)),
     }
 }
 

@@ -72,7 +72,8 @@ final class AppLock {
     /** Called from Rust; answers request {@code id} later, on the UI thread. */
     static void authenticate(int id, String title, String subtitle, String cancel) {
         if (Build.VERSION.SDK_INT < 29) {
-            Native.answer(id, "error:This phone's Android is too old for fingerprint or face unlock.");
+            // Rust says why, in the app's language.
+            Native.answer(id, "unsupported");
             return;
         }
         PicachoActivity activity = PicachoActivity.current();

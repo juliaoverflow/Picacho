@@ -55,7 +55,7 @@ impl MailApp {
                                         .text_color(rgb(c.muted))
                                         .truncate()
                                         .child(if identity.name.is_empty() {
-                                            "No name".to_owned()
+                                            t!("jmap-extras-no-name").to_owned()
                                         } else {
                                             identity.name.clone()
                                         }),
@@ -63,7 +63,7 @@ impl MailApp {
                         )
                         .child(self.button(
                             SharedString::from(format!("server-identity-name-{}-{i}", a.id)),
-                            "Use Name Below",
+                            t!("jmap-extras-use-name-below"),
                             "check",
                             Action::RenameServerIdentity(a.id.clone(), identity.id.clone()),
                             false,
@@ -72,7 +72,7 @@ impl MailApp {
                         .when(identity.may_delete, |d| {
                             d.child(self.button(
                                 SharedString::from(format!("server-identity-remove-{}-{i}", a.id)),
-                                "Remove",
+                                t!("jmap-extras-remove"),
                                 "trash",
                                 Action::RemoveServerIdentity(a.id.clone(), identity.id.clone()),
                                 false,
@@ -89,14 +89,14 @@ impl MailApp {
                 .flex_col()
                 .gap_2()
                 .child(self.setting(
-                    "Addresses on the server",
-                    "The addresses your mail service lets this account send as. Changes here are made on the server, for every app.",
+                    t!("jmap-extras-addresses-on-the-server"),
+                    t!("jmap-extras-the-addresses-your-mail-service-lets"),
                     div()
                         .flex()
                         .gap_2()
                         .child(self.button(
                             SharedString::from(format!("server-identities-load-{}", a.id)),
-                            if loaded.is_some() { "Read Again" } else { "Show" },
+                            if loaded.is_some() { t!("jmap-extras-read-again") } else { t!("jmap-extras-show") },
                             "refresh",
                             Action::LoadServerIdentities(a.id.clone()),
                             false,
@@ -119,7 +119,7 @@ impl MailApp {
                             )
                             .child(self.button(
                                 SharedString::from(format!("server-identity-add-{}", a.id)),
-                                "Add Address",
+                                t!("jmap-extras-add-address"),
                                 "plus",
                                 Action::AddServerIdentity(a.id.clone()),
                                 false,
@@ -228,7 +228,7 @@ impl MailApp {
             None => div()
                 .mt_3()
                 .flex()
-                .child(self.button("delivery-check", "Delivery", "send", Action::CheckDelivery, false, cx))
+                .child(self.button("delivery-check", t!("jmap-extras-delivery"), "send", Action::CheckDelivery, false, cx))
                 .into_any_element(),
         })
     }
@@ -257,7 +257,7 @@ impl MailApp {
             move |b| b.delivery_of(&a, &m),
             move |this, result, cx| {
                 let text = match result {
-                    Ok(None) => "The server no longer says what became of this message.".to_owned(),
+                    Ok(None) => t!("jmap-extras-the-server-no-longer-says-what").to_owned(),
                     Ok(Some(status)) => {
                         let mut parts: Vec<String> = status
                             .delivery
@@ -265,18 +265,18 @@ impl MailApp {
                             .map(|(to, delivered, _)| {
                                 let what = match delivered.as_str() {
                                     "yes" => "delivered",
-                                    "no" => "not delivered",
-                                    "queued" => "on its way",
-                                    _ => "sent (no report)",
+                                    "no" => t!("jmap-extras-not-delivered"),
+                                    "queued" => t!("jmap-extras-on-its-way"),
+                                    _ => t!("jmap-extras-sent-no-report"),
                                 };
                                 format!("{to}: {what}")
                             })
                             .collect();
                         if status.undo == "pending" {
-                            parts.insert(0, "Waiting to be sent".into());
+                            parts.insert(0, t!("jmap-extras-waiting-to-be-sent").into());
                         }
                         if parts.is_empty() {
-                            "Sent.".into()
+                            t!("jmap-extras-sent").into()
                         } else {
                             parts.join(" · ")
                         }
@@ -334,7 +334,7 @@ impl MailApp {
             cx,
             move |b| b.copy_between_jmap(&from, &[m], &target, &Mailbox::Standard(Folder::Inbox)),
             |this, result, cx| match result {
-                Ok(n) => this.notice(format!("Copied {n} to the other account's inbox"), false, cx),
+                Ok(n) => this.notice(t!("jmap-extras-copied-to-the-other-accounts-inbox", n = n), false, cx),
                 Err(e) => this.notice(format!("{e:#}"), true, cx),
             },
         );

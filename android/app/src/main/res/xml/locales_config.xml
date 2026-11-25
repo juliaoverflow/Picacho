@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The languages Picacho has (locales/ at the top of the repository), for
+     Android 13's per-app language setting. A test (src/i18n/tests.rs) keeps
+     this list the same as Picacho's. -->
+<locale-config xmlns:android="http://schemas.android.com/apk/res/android">
+    <locale android:name="en" />
+</locale-config>

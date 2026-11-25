@@ -250,9 +250,9 @@ impl Render for MessageWindow {
                         .cursor_pointer()
                         .child("•••")
                         .child(if open {
-                            "Hide quoted text"
+                            t!("message-window-hide-quoted-text")
                         } else {
-                            "Show quoted text"
+                            t!("message-window-show-quoted-text")
                         })
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.quotes_open = !this.quotes_open;
@@ -288,14 +288,14 @@ impl Render for MessageWindow {
                     .font_weight(FontWeight::SEMIBOLD)
                     .child(subject.clone()),
             )
-            .child(self.button("w-reply", "Reply", "reply", cx, |t, _, cx| t.reply(1, cx)))
+            .child(self.button("w-reply", t!("message-window-reply"), "reply", cx, |t, _, cx| t.reply(1, cx)))
             .child(
-                self.button("w-reply-all", "Reply all", "reply-all", cx, |t, _, cx| {
+                self.button("w-reply-all", t!("message-window-reply-all"), "reply-all", cx, |t, _, cx| {
                     t.reply(2, cx)
                 }),
             )
             .child(
-                self.button("w-forward", "Forward", "forward", cx, |t, _, cx| {
+                self.button("w-forward", t!("message-window-forward"), "forward", cx, |t, _, cx| {
                     t.reply(3, cx)
                 }),
             )
@@ -304,9 +304,9 @@ impl Render for MessageWindow {
                 d.child(self.button(
                     "w-remote",
                     if blocked {
-                        "Load images"
+                        t!("message-window-load-images")
                     } else {
-                        "Block images"
+                        t!("message-window-block-images")
                     },
                     if blocked { "image-off" } else { "image" },
                     cx,
@@ -385,15 +385,11 @@ impl Render for MessageWindow {
                                     )
                                     .child(
                                         div().text_size(px(11.)).text_color(rgb(c.muted)).child(
-                                            format!(
-                                                "to {}{}",
-                                                to.join(", "),
-                                                if cc.is_empty() {
-                                                    String::new()
-                                                } else {
-                                                    format!(" · cc {}", cc.join(", "))
-                                                }
-                                            ),
+                                            if cc.is_empty() {
+                                                t!("message-window-to", to = to.join(", "))
+                                            } else {
+                                                t!("message-window-to-cc", to = to.join(", "), cc = cc.join(", "))
+                                            },
                                         ),
                                     ),
                             )
@@ -482,7 +478,7 @@ impl MailApp {
                 mail.unread = false;
                 self.show_mail_window(mail, w, cx);
             }
-            Err(e) => self.notice(format!("Couldn't open {}: {e:#}", path.display()), true, cx),
+            Err(e) => self.notice(t!("message-window-couldnt-open", path = path.display(), e = format!("{:#}", e)), true, cx),
         }
     }
 

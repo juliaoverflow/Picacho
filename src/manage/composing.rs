@@ -1,4 +1,5 @@
 //! Application-wide composing preferences, saved as one Store preference.
+use crate::i18n::dates::Local as _;
 use serde::{Deserialize, Serialize};
 
 /// Where a reply to the open message is written.
@@ -183,17 +184,67 @@ pub fn swap_signature(body: &str, old: &str, new: &str) -> Option<String> {
 
 /// Where a reply's quote or a forwarded message starts in `body`.
 fn quote_start(body: &str) -> Option<usize> {
-    let forwarded = body.find("\n\n---------- Forwarded message ----------");
-    let quoted = body.match_indices("\n\nOn ").map(|(i, _)| i).find(|&i| {
-        body[i + 2..]
-            .lines()
-            .next()
-            .is_some_and(|l| l.trim_end().ends_with("wrote:"))
-    });
+    // Each line break that ends a blank line (overlapping: "\n\n\n").
+    let after_blank = || {
+        body.as_bytes()
+            .windows(2)
+            .enumerate()
+            .filter(|(_, pair)| pair == b"\n\n")
+            .map(|(i, _)| i)
+    };
+    let forwarded =
+        after_blank().find(|&i| body[i + 2..].lines().next().is_some_and(starts_forward));
+    let quoted =
+        after_blank().find(|&i| body[i + 2..].lines().next().is_some_and(introduces_quote));
     match (forwarded, quoted) {
         (Some(a), Some(b)) => Some(a.min(b)),
         (a, b) => a.or(b),
     }
+}
+
+/// The "On …, … wrote:" line Picacho writes before a reply's quote, in each
+/// language it has: its text before the date and name, and after them.
+fn attributions() -> &'static [(String, String)] {
+    static ALL: std::sync::LazyLock<Vec<(String, String)>> = std::sync::LazyLock::new(|| {
+        let mut all = crate::i18n::in_every_language(|| {
+            let line = t!("outgoing-wrote", date = "\u{1}", name = "\u{2}");
+            let first = line.find(['\u{1}', '\u{2}']).unwrap_or(0);
+            let last = line.rfind(['\u{1}', '\u{2}']).map_or(line.len(), |i| i + 1);
+            (
+                line[..first].trim_start().to_owned(),
+                line[last..].trim_end().to_owned(),
+            )
+        });
+        // A line naming only the date and name would match any line.
+        all.retain(|(before, after)| !before.is_empty() || !after.is_empty());
+        all.dedup();
+        all
+    });
+    &ALL
+}
+
+/// Whether `line` introduces a reply's quote, as Picacho writes it (in any
+/// of its languages): "On Mon, Nov 23, Ana wrote:".
+pub fn introduces_quote(line: &str) -> bool {
+    let line = line.trim();
+    attributions().iter().any(|(before, after)| {
+        line.len() > before.len() + after.len()
+            && line.starts_with(before.as_str())
+            && line.ends_with(after.as_str())
+    })
+}
+
+/// Whether `line` starts a forwarded message's header, as Picacho writes it
+/// (in any of its languages): "---------- Forwarded message ----------".
+pub fn starts_forward(line: &str) -> bool {
+    static ALL: std::sync::LazyLock<Vec<String>> = std::sync::LazyLock::new(|| {
+        let mut all =
+            crate::i18n::in_every_language(|| t!("outgoing-forwarded-message").trim().to_owned());
+        all.dedup();
+        all
+    });
+    let line = line.trim();
+    ALL.iter().any(|marker| line == marker)
 }
 
 /// What a template's placeholders stand for, as it is inserted.
@@ -385,7 +436,7 @@ pub fn mentions_attachment(body: &str) -> bool {
     // Quoted text is someone else's; only what was written now counts.
     let written: String = body
         .lines()
-        .take_while(|l| !(l.starts_with("On ") && l.trim_end().ends_with("wrote:")))
+        .take_while(|l| !introduces_quote(l))
         .filter(|l| !l.trim_start().starts_with('>'))
         .collect::<Vec<_>>()
         .join("\n")
@@ -418,15 +469,15 @@ pub fn later_choices<Tz: chrono::TimeZone>(now: chrono::DateTime<Tz>) -> Vec<(St
     if now.hour() < 17
         && let Some(t) = at(0, now.hour() + 3)
     {
-        out.push(("Later today".to_owned(), t));
+        out.push((t!("manage-composing-later-today").to_owned(), t));
     }
-    out.extend(at(1, 8).map(|t| ("Tomorrow morning".to_owned(), t)));
-    out.extend(at(1, 13).map(|t| ("Tomorrow afternoon".to_owned(), t)));
+    out.extend(at(1, 8).map(|t| (t!("manage-composing-tomorrow-morning").to_owned(), t)));
+    out.extend(at(1, 13).map(|t| (t!("manage-composing-tomorrow-afternoon").to_owned(), t)));
     // Next Monday (a week on, if today is Monday); tomorrow already covers
     // a Sunday.
     let to_monday = (7 - now.weekday().num_days_from_monday()) as u64;
     if to_monday > 1 {
-        out.extend(at(to_monday, 8).map(|t| ("Monday morning".to_owned(), t)));
+        out.extend(at(to_monday, 8).map(|t| (t!("manage-composing-monday-morning").to_owned(), t)));
     }
     out
 }
@@ -446,17 +497,19 @@ pub fn snooze_choices<Tz: chrono::TimeZone>(now: chrono::DateTime<Tz>) -> Vec<(S
     };
     let mut out = Vec::new();
     if now.hour() < 18 {
-        out.extend(at(0, now.hour() + 3).map(|t| ("Later today".to_owned(), t)));
+        out.extend(
+            at(0, now.hour() + 3).map(|t| (t!("manage-composing-later-today").to_owned(), t)),
+        );
     }
     if now.hour() < 17 {
-        out.extend(at(0, 19).map(|t| ("This evening".to_owned(), t)));
+        out.extend(at(0, 19).map(|t| (t!("manage-composing-this-evening").to_owned(), t)));
     }
-    out.extend(at(1, 8).map(|t| ("Tomorrow".to_owned(), t)));
+    out.extend(at(1, 8).map(|t| (t!("manage-composing-tomorrow").to_owned(), t)));
     let weekday = now.weekday().num_days_from_monday() as u64;
     if weekday < 4 {
-        out.extend(at(5 - weekday, 8).map(|t| ("This weekend".to_owned(), t)));
+        out.extend(at(5 - weekday, 8).map(|t| (t!("manage-composing-this-weekend").to_owned(), t)));
     }
-    out.extend(at(7 - weekday, 8).map(|t| ("Next week".to_owned(), t)));
+    out.extend(at(7 - weekday, 8).map(|t| (t!("manage-composing-next-week").to_owned(), t)));
     out.dedup_by_key(|(_, t)| *t);
     out
 }
@@ -471,17 +524,21 @@ where
     let Some(at) =
         chrono::DateTime::from_timestamp(when, 0).map(|t| t.with_timezone(&now.timezone()))
     else {
-        return "later".into();
+        return t!("manage-composing-later").to_owned();
     };
-    let time = at.format("%-H:%M");
+    let time = at.local(t!("dates-later-time"));
     let day = at.date_naive();
     let today = now.date_naive();
     if day == today {
-        format!("today at {time}")
+        t!("manage-composing-today-at", time = time)
     } else if Some(day) == today.checked_add_days(Days::new(1)) {
-        format!("tomorrow at {time}")
+        t!("manage-composing-tomorrow-at", time = time)
     } else {
-        format!("{} at {time}", at.format("%a, %b %-d"))
+        t!(
+            "manage-composing-at",
+            day = at.local(t!("dates-weekday-month-day")),
+            time = time
+        )
     }
 }
 

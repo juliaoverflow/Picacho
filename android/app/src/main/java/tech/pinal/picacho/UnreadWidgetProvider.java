@@ -50,6 +50,11 @@ public final class UnreadWidgetProvider extends AppWidgetProvider {
         int onAccent = WidgetStore.onAccentColor(context);
 
         RemoteViews views = new RemoteViews(context.getPackageName(), R.layout.widget_unread);
+        // The layout's own text, in Picacho's language (the launcher would
+        // read the layout in the phone's).
+        Context text = Lang.of(context);
+        views.setTextViewText(R.id.widget_unread_label, text.getString(R.string.widget_all_inboxes));
+        views.setContentDescription(R.id.widget_unread_compose, text.getString(R.string.widget_compose));
         views.setInt(R.id.widget_unread_logo, "setColorFilter", accent);
         views.setInt(R.id.widget_unread_compose_bg, "setColorFilter", accent);
         views.setInt(R.id.widget_unread_compose_icon, "setColorFilter", onAccent);
@@ -75,10 +80,14 @@ public final class UnreadWidgetProvider extends AppWidgetProvider {
             views.setViewVisibility(R.id.widget_unread_preview, View.VISIBLE);
             views.setTextViewText(
                     R.id.widget_unread_sender,
-                    latest.sender.isEmpty() ? "(Unknown sender)" : latest.sender);
+                    latest.sender.isEmpty()
+                            ? Lang.of(context).getString(R.string.widget_unknown_sender)
+                            : latest.sender);
             views.setTextViewText(
                     R.id.widget_unread_subject,
-                    latest.subject.isEmpty() ? "(No subject)" : latest.subject);
+                    latest.subject.isEmpty()
+                            ? Lang.of(context).getString(R.string.widget_no_subject)
+                            : latest.subject);
             views.setOnClickPendingIntent(
                     R.id.widget_unread_preview,
                     WidgetStore.openIntent(

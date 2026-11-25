@@ -65,15 +65,17 @@ public final class ReceiptsWidgetService extends RemoteViewsService {
             RemoteViews row = new RemoteViews(context.getPackageName(), R.layout.widget_receipts_item);
 
             row.setTextViewText(
-                    R.id.widget_rcpt_item_merchant, r.merchant.isEmpty() ? "Receipt" : r.merchant);
+                    R.id.widget_rcpt_item_merchant, r.merchant.isEmpty() ? Lang.of(context).getString(R.string.widget_receipt) : r.merchant);
             row.setViewVisibility(R.id.widget_rcpt_item_refund, r.refund ? View.VISIBLE : View.GONE);
+            row.setTextViewText(
+                    R.id.widget_rcpt_item_refund, Lang.of(context).getString(R.string.widget_refund_tag));
             if (r.refund) {
                 row.setTextColor(R.id.widget_rcpt_item_refund, accent);
             }
 
             StringBuilder detail = new StringBuilder();
             if (!r.order.isEmpty()) {
-                detail.append("Order ").append(r.order);
+                detail.append(Lang.of(context).getString(R.string.widget_order, r.order));
             }
             String date = WidgetStore.formatMessageDate(context, r.updated > 0 ? r.updated : r.date);
             if (!date.isEmpty()) {

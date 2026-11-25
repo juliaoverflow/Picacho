@@ -94,7 +94,7 @@ impl Service {
             Self::Zoho => "Zoho Mail",
             Self::ProtonBridge => "Proton Mail Bridge",
             Self::Proton => "Proton Mail",
-            Self::Other => "Other",
+            Self::Other => t!("manage-model-other"),
         }
     }
     pub fn provider(self) -> Provider {
@@ -133,19 +133,19 @@ impl Service {
             return None;
         }
         match self {
-            Self::Fastmail => Some("API token"),
-            Self::Gmail => Some("app password"),
+            Self::Fastmail => Some(t!("manage-model-api-token")),
+            Self::Gmail => Some(t!("manage-model-app-password")),
             _ => None,
         }
     }
     pub fn password_label(self) -> &'static str {
         match self {
-            Self::Gmail | Self::Outlook | Self::Zoho => "App password",
-            Self::Fastmail => "API token",
-            Self::ICloud => "App-specific password",
-            Self::ProtonBridge => "Bridge password",
-            Self::Proton => "Proton password",
-            _ => "Password",
+            Self::Gmail | Self::Outlook | Self::Zoho => t!("manage-model-app-password-2"),
+            Self::Fastmail => t!("manage-model-api-token"),
+            Self::ICloud => t!("manage-model-app-specific-password"),
+            Self::ProtonBridge => t!("manage-model-bridge-password"),
+            Self::Proton => t!("manage-model-proton-password"),
+            _ => t!("manage-model-password"),
         }
     }
     /// Why this build can't offer browser sign-in for a service that
@@ -157,10 +157,10 @@ impl Service {
         }
         match self {
             Self::Gmail => Some(
-                "This copy of Picacho was built without Google sign-in, so an app password is the only way to connect Gmail.",
+                t!("manage-model-this-copy-of-picacho-was-built"),
             ),
             Self::Outlook => Some(
-                "This copy of Picacho was built without Microsoft sign-in, so an app password is the only way to connect Outlook.",
+                t!("manage-model-this-copy-of-picacho-was-built-2"),
             ),
             _ => None,
         }
@@ -169,31 +169,31 @@ impl Service {
     pub fn password_help(self) -> Option<(&'static str, &'static str)> {
         match self {
             Self::Gmail => Some((
-                "Turn on 2-Step Verification in your Google Account, then make an app password and paste it here. Spaces are ignored.",
+                t!("manage-model-turn-on-2-step-verification-in"),
                 "https://myaccount.google.com/apppasswords",
             )),
             Self::ICloud => Some((
-                "iCloud needs an app-specific password, made in your Apple Account.",
+                t!("manage-model-icloud-needs-an-app-specific-password"),
                 "https://account.apple.com/account/manage",
             )),
             Self::Fastmail => Some((
-                "Picacho talks to Fastmail over JMAP. Make an API token with access to mail (and to sending and filters, to use them here), then paste it here.",
+                t!("manage-model-picacho-talks-to-fastmail-over-jmap"),
                 "https://app.fastmail.com/settings/security/tokens",
             )),
             Self::Zoho => Some((
-                "Turn on IMAP in Zoho Mail settings, then make an app password.",
+                t!("manage-model-turn-on-imap-in-zoho-mail"),
                 "https://accounts.zoho.com/home#security/app_password",
             )),
             Self::ProtonBridge => Some((
-                "Open Proton Mail Bridge, choose your account and copy its mailbox password. Bridge must be running, with its certificate trusted.",
+                t!("manage-model-open-proton-mail-bridge-choose-your"),
                 "https://proton.me/support/apple-mail-certificate",
             )),
             Self::Proton => Some((
-                "Picacho signs in to Proton directly; Proton Mail Bridge isn't needed. Mail is decrypted on this computer with your keys, which never leave it.",
+                t!("manage-model-picacho-signs-in-to-proton-directly"),
                 "https://account.proton.me/",
             )),
             Self::Outlook => Some((
-                "Turn on two-step verification in your Microsoft account, then make an app password and paste it here. Work and school accounts can use one only if their admin allows it.",
+                t!("manage-model-turn-on-two-step-verification-in"),
                 "https://account.live.com/proofs/AppPassword",
             )),
             _ => None,
@@ -475,23 +475,23 @@ impl Identity {
     pub fn validate(&self) -> anyhow::Result<()> {
         anyhow::ensure!(
             self.email.trim().parse::<lettre::Address>().is_ok(),
-            "Enter a valid email address."
+            t!("manage-model-enter-a-valid-email-address")
         );
         anyhow::ensure!(
             !self.name.contains(['\r', '\n']),
-            "Enter a name without line breaks."
+            t!("manage-model-enter-a-name-without-line-breaks")
         );
         crate::sync::smtp::recipients(&self.reply_to)
-            .map_err(|_| anyhow::anyhow!("Enter a valid Reply-To address."))?;
+            .map_err(|_| anyhow::anyhow!(t!("manage-model-enter-a-valid-reply-to-address")))?;
         if let Some(s) = &self.smtp {
             anyhow::ensure!(
                 !s.host.is_empty() && !s.host.contains(['\r', '\n', ' ', '/', ':']),
-                "Enter a valid outgoing server hostname."
+                t!("manage-model-enter-a-valid-outgoing-server-hostname")
             );
-            anyhow::ensure!(s.port > 0, "Ports must be between 1 and 65535.");
+            anyhow::ensure!(s.port > 0, t!("manage-model-ports-must-be-between-1-and"));
             anyhow::ensure!(
                 !s.username.contains(['\r', '\n']),
-                "Enter a sign-in name without line breaks."
+                t!("manage-model-enter-a-sign-in-name-without")
             );
         }
         Ok(())
@@ -587,19 +587,19 @@ impl Account {
     pub fn validate(&self) -> anyhow::Result<()> {
         anyhow::ensure!(
             self.email.parse::<lettre::Address>().is_ok(),
-            "Enter a valid email address."
+            t!("manage-model-enter-a-valid-email-address")
         );
         // JMAP sends through the same server it reads from.
         let smtp = (self.provider != Provider::Jmap).then_some(&self.smtp_host);
         for host in std::iter::once(&self.incoming_host).chain(smtp) {
             anyhow::ensure!(
                 !host.is_empty() && !host.contains(['\r', '\n', ' ', '/', ':']),
-                "Enter valid incoming and SMTP server hostnames."
+                t!("manage-model-enter-valid-incoming-and-smtp-server")
             );
         }
         anyhow::ensure!(
             self.incoming_port > 0 && self.smtp_port > 0,
-            "Ports must be between 1 and 65535."
+            t!("manage-model-ports-must-be-between-1-and")
         );
         // A JMAP server or an organization's sign-in may register Picacho
         // as it signs in.
@@ -608,8 +608,7 @@ impl Account {
                 || !self.client_id.is_empty()
                 || self.provider == Provider::Jmap
                 || self.sso.is_some(),
-            "Browser sign-in isn't set up for {} in this build.",
-            self.provider.label()
+            t!("manage-model-browser-sign-in-isnt-set-up", label = self.provider.label())
         );
         anyhow::ensure!(
             !self.oauth
@@ -619,49 +618,49 @@ impl Account {
                 )
                 || self.service == Service::Pinal
                 || (self.sso.is_some() && matches!(self.provider, Provider::Imap | Provider::Pop3)),
-            "OAuth is available for Pinal Mail, Gmail, Outlook, JMAP servers, and IMAP and POP3 servers with an organization's sign-in."
+            t!("manage-model-oauth-is-available-for-pinal-mail")
         );
         if let Some(sso) = &self.sso {
-            anyhow::ensure!(self.oauth, "Single sign-on needs browser sign-in.");
+            anyhow::ensure!(self.oauth, t!("manage-model-single-sign-on-needs-browser-sign"));
             anyhow::ensure!(
                 matches!(self.provider, Provider::Imap | Provider::Pop3),
-                "Single sign-on is for IMAP and POP3 accounts."
+                t!("manage-model-single-sign-on-is-for-imap")
             );
-            anyhow::ensure!(!self.kerberos, "Choose Kerberos or single sign-on, not both.");
+            anyhow::ensure!(!self.kerberos, t!("manage-model-choose-kerberos-or-single-sign-on"));
             let issuer = url::Url::parse(sso.issuer.trim())
-                .map_err(|_| anyhow::anyhow!("Enter the sign-in service's address (its issuer URL)."))?;
+                .map_err(|_| anyhow::anyhow!(t!("manage-model-enter-the-sign-in-services-address")))?;
             anyhow::ensure!(
                 issuer.scheme() == "https" && issuer.host_str().is_some(),
-                "The sign-in service's address must start with https://."
+                t!("manage-model-the-sign-in-services-address-must")
             );
             anyhow::ensure!(
                 !sso.scope.chars().any(char::is_control),
-                "The sign-in scopes can't contain line breaks."
+                t!("manage-model-the-sign-in-scopes-cant-contain")
             );
         }
         // STARTTLS is an upgrade of IMAP or POP3; other protocols start
         // with TLS (JMAP is HTTPS).
         anyhow::ensure!(
             !self.incoming_starttls || !matches!(self.provider, Provider::Proton | Provider::Jmap),
-            "STARTTLS is only used for IMAP and POP3."
+            t!("manage-model-starttls-is-only-used-for-imap")
         );
         anyhow::ensure!(
             !self.username.chars().any(char::is_control),
-            "The sign-in name can't contain line breaks."
+            t!("manage-model-the-sign-in-name-cant-contain")
         );
         anyhow::ensure!(
             !self.kerberos
                 || (matches!(self.provider, Provider::Imap | Provider::Pop3) && !self.oauth),
-            "Kerberos sign-in is for IMAP and POP3 accounts."
+            t!("manage-model-kerberos-sign-in-is-for-imap")
         );
         anyhow::ensure!(
             !self.kerberos || !cfg!(any(target_os = "android", target_os = "ios")),
-            "Kerberos sign-in isn't available on phones and tablets."
+            t!("manage-model-kerberos-sign-in-isnt-available-on")
         );
         anyhow::ensure!(
             self.reply_to.trim().is_empty()
                 || crate::sync::smtp::recipients(&self.reply_to).is_ok_and(|r| !r.is_empty()),
-            "Enter a valid Reply-To address."
+            t!("manage-model-enter-a-valid-reply-to-address")
         );
         Ok(())
     }
@@ -700,15 +699,15 @@ impl Folder {
     }
     pub fn label(self) -> &'static str {
         match self {
-            Self::Inbox => "Inbox",
-            Self::Starred => "Starred",
-            Self::Sent => "Sent",
-            Self::Drafts => "Drafts",
-            Self::Archive => "Archive",
-            Self::Junk => "Spam",
-            Self::Trash => "Trash",
-            Self::Other => "Folder",
-            Self::All => "All Mail",
+            Self::Inbox => t!("manage-model-inbox"),
+            Self::Starred => t!("manage-model-starred"),
+            Self::Sent => t!("manage-model-sent"),
+            Self::Drafts => t!("manage-model-drafts"),
+            Self::Archive => t!("manage-model-archive"),
+            Self::Junk => t!("manage-model-spam"),
+            Self::Trash => t!("manage-model-trash"),
+            Self::Other => t!("manage-model-folder"),
+            Self::All => t!("manage-model-all-mail"),
         }
     }
     pub fn key(self) -> &'static str {

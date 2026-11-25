@@ -10,36 +10,4 @@
     <color name="widget_accent_soft_default">#DCEBE2</color>
     <color name="widget_on_accent_default">#FFFFFF</color>
     <color name="widget_star">#D48B14</color>
-
-    <string name="widget_inbox_label">Inbox</string>
-    <string name="widget_inbox_description">Recent inbox messages, unread count, and quick compose</string>
-    <string name="widget_unread_label">Unread Mail</string>
-    <string name="widget_unread_description">Unread count, latest message, and quick compose</string>
-    <string name="widget_calendar_label">Calendar</string>
-    <string name="widget_calendar_description">Upcoming calendar events</string>
-    <string name="widget_packages_label">Packages</string>
-    <string name="widget_packages_description">Your recent tracked packages and delivery progress</string>
-    <string name="widget_receipts_label">Receipts</string>
-    <string name="widget_receipts_description">Your recent receipts and refunds</string>
-    <string name="widget_view_all">View all %1$d</string>
-
-    <string name="widget_all_inboxes">All Inboxes</string>
-    <string name="widget_all_accounts">All Accounts</string>
-    <string name="widget_inbox_title">Inbox</string>
-    <string name="widget_unread_title">Unread</string>
-    <string name="widget_compose">Compose</string>
-    <string name="widget_refresh">Refresh</string>
-    <string name="widget_empty_inbox">No messages in Inbox</string>
-    <string name="widget_empty_unread">All caught up</string>
-    <string name="widget_empty_accounts">Open Picacho to add an account</string>
-    <string name="widget_empty_calendar">No upcoming events</string>
-    <string name="widget_no_calendar">Connect a calendar in Settings</string>
-    <string name="widget_empty_packages">No recent packages</string>
-    <string name="widget_empty_receipts">No recent receipts</string>
-    <string name="widget_refund_tag">Refund</string>
-    <string name="widget_config_title">Widget settings</string>
-    <string name="widget_config_account">Account</string>
-    <string name="widget_config_unread_only">Show unread messages only</string>
-    <string name="widget_config_done">Save</string>
-    <string name="widget_config_cancel">Cancel</string>
 </resources>

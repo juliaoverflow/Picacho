@@ -42,6 +42,7 @@
         android:dataExtractionRules="@xml/data_extraction_rules"
         android:extractNativeLibs="false"
         android:supportsRtl="true"
+        android:localeConfig="@xml/locales_config"
         android:enableOnBackInvokedCallback="true">
 
         <!-- The app is Rust: PicachoActivity is a NativeActivity that loads

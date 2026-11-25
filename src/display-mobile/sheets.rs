@@ -144,7 +144,7 @@ impl MailApp {
             .font_weight(FontWeight::SEMIBOLD)
             .text_color(rgb(c.accent))
             .active(move |s| s.bg(rgb(c.border)))
-            .child("Cancel")
+            .child(t!("mobile-sheets-cancel"))
             .on_click(cx.listener(|this, _, _, cx| {
                 this.menu = None;
                 cx.notify();
@@ -299,7 +299,7 @@ impl MailApp {
                     .font_weight(FontWeight::BOLD)
                     .text_color(rgb(c.danger))
                     .text_center()
-                    .child("Be careful with this link"),
+                    .child(t!("mobile-sheets-be-careful-with-this-link")),
             )
             .child(
                 div()
@@ -308,8 +308,7 @@ impl MailApp {
                     .text_center()
                     .line_height(relative(1.4))
                     .child(
-                        "Links in email are the most common way to steal passwords and money. \
-                         This one takes you to:",
+                        t!("mobile-sheets-links-in-email-are-the-most"),
                     ),
             )
             .child(destination)
@@ -341,18 +340,17 @@ impl MailApp {
                     .line_height(relative(1.4))
                     .text_center()
                     .child(
-                        "Open it only if you expected this email and know the site. \
-                         Never sign in or pay on a page a link took you to: go to the site yourself.",
+                        t!("mobile-sheets-open-it-only-if-you-expected"),
                     ),
             )
             .child(
-                row_button("link-sheet-back", "Go Back".into(), c.on_accent, true)
+                row_button("link-sheet-back", t!("mobile-sheets-go-back").into(), c.on_accent, true)
                     .w_full()
                     .bg(rgb(c.accent))
                     .on_click(choose(LinkChoice::Cancel)),
             )
             .child(
-                row_button("link-sheet-open", "Open Anyway".into(), c.danger, true)
+                row_button("link-sheet-open", t!("mobile-sheets-open-anyway").into(), c.danger, true)
                     .w_full()
                     .border_1()
                     .border_color(rgb(c.danger))
@@ -365,7 +363,7 @@ impl MailApp {
                 d.child(
                     row_button(
                         "link-sheet-trust",
-                        format!("Always Trust {}", confirm.site),
+                        t!("mobile-sheets-always-trust", site = confirm.site),
                         c.text,
                         false,
                     )
@@ -374,7 +372,7 @@ impl MailApp {
                 )
             })
             .child(
-                row_button("link-sheet-copy", "Copy Link".into(), c.muted, false)
+                row_button("link-sheet-copy", t!("mobile-sheets-copy-link").into(), c.muted, false)
                     .w_full()
                     .on_click(choose(LinkChoice::Copy)),
             );

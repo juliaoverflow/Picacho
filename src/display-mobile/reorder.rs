@@ -45,7 +45,7 @@ impl MailApp {
         Some(
             self.touch_text(
                 "mobile-reorder",
-                if on { "Done" } else { "Edit" },
+                if on { t!("mobile-reorder-done") } else { t!("mobile-reorder-edit") },
                 on,
                 Rc::new(move |this: &mut MailApp, _, cx: &mut Context<MailApp>| {
                     this.mobile_set_reordering(!on, cx)
@@ -69,7 +69,7 @@ impl MailApp {
             .flex()
             .flex_col()
             .child(self.reorder_follower(cx))
-            .child(self.group_label("Accounts"))
+            .child(self.group_label(t!("mobile-reorder-accounts")))
             .child(self.group(rows))
             .child(
                 div()
@@ -77,7 +77,7 @@ impl MailApp {
                     .px(px(GUTTER))
                     .text_size(px(13.))
                     .text_color(rgb(c.muted))
-                    .child("Drag ≡ to change the order. All Accounts stays first."),
+                    .child(t!("mobile-reorder-drag-to-change-the-order-all")),
             )
             .into_any_element()
     }

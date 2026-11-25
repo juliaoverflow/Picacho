@@ -105,7 +105,7 @@ impl MailApp {
     /// mustn't set what isn't shown).
     pub(super) fn compose_mailto(&mut self, link: &str, w: &mut Window, cx: &mut Context<Self>) {
         let Some(m) = super::links::Mailto::parse(link) else {
-            self.notice("That email link isn't valid.", true, cx);
+            self.notice(t!("compose-that-email-link-isnt-valid"), true, cx);
             return;
         };
         self.compose_with(0, None, None, Some(m.to.clone()), None, w, cx);
@@ -299,25 +299,31 @@ impl MailApp {
                     // The message itself goes as an attachment.
                     String::new()
                 } else if forward {
-                    format!(
-                        "\n\n---------- Forwarded message ----------\nFrom: {} <{}>\nDate: {}\nSubject: {}\nTo: {}\n{}\n{}",
-                        sender,
-                        masked(&m.from),
-                        date_full(m.date),
-                        m.subject,
-                        recipients(&m.to),
-                        if m.cc().is_empty() {
-                            String::new()
-                        } else {
-                            format!("Cc: {}\n", recipients(m.cc()))
-                        },
-                        quoted
-                    )
+                    // In the language of mail Picacho writes (Settings).
+                    let header = crate::i18n::in_outgoing(|| {
+                        let mut lines = vec![
+                            t!("outgoing-forwarded-message").to_owned(),
+                            t!(
+                                "outgoing-forward-header",
+                                name = sender,
+                                address = masked(&m.from),
+                                date = date_full(m.date),
+                                subject = m.subject,
+                                to = recipients(&m.to),
+                            ),
+                        ];
+                        if !m.cc().is_empty() {
+                            lines.push(t!("outgoing-forward-cc", cc = recipients(m.cc())));
+                        }
+                        lines.join("\n")
+                    });
+                    format!("\n\n{header}\n\n{quoted}")
                 } else if options.quote_original {
+                    let intro = crate::i18n::in_outgoing(|| {
+                        t!("outgoing-wrote", date = date_full(m.date), name = sender)
+                    });
                     format!(
-                        "\n\nOn {}, {} wrote:\n{}",
-                        date_full(m.date),
-                        sender,
+                        "\n\n{intro}\n{}",
                         quoted
                             .lines()
                             // Nested quotes stay compact: ">>", not "> >".
@@ -374,10 +380,12 @@ impl MailApp {
     /// Opens a saved draft where new messages open.
     pub(super) fn open_draft(&mut self, draft: Draft, w: &mut Window, cx: &mut Context<Self>) {
         // Here, or by the background monitor as the window opened.
-        if self.scheduled_sending.contains(&draft.id)
-            || self.backend.sending_scheduled(&draft.id)
-        {
-            self.notice("This scheduled message is being sent now.", false, cx);
+        if self.scheduled_sending.contains(&draft.id) || self.backend.sending_scheduled(&draft.id) {
+            self.notice(
+                t!("compose-this-scheduled-message-is-being-sent"),
+                false,
+                cx,
+            );
             return;
         }
         if let Some(open) = self
@@ -466,7 +474,7 @@ impl MailApp {
                 .open_window(
                     window::detached_options(
                         SharedString::from(if draft.subject.is_empty() {
-                            "New Message".to_string()
+                            t!("compose-new-message").to_string()
                         } else {
                             draft.subject.clone()
                         }),
@@ -807,7 +815,7 @@ impl MailApp {
         else {
             self.send_failed(
                 id,
-                "Connect an account before sending. Your draft is saved.".into(),
+                t!("compose-connect-an-account-before-sending-your").into(),
                 cx,
             );
             return;
@@ -839,9 +847,13 @@ impl MailApp {
                             Arc::new(fwd::reverse_contacts(&this.backend.store));
                         this.outbox.retain(|o| o.id != id);
                         if notes.is_empty() {
-                            this.notice("Message sent", false, cx);
+                            this.notice(t!("compose-message-sent"), false, cx);
                         } else {
-                            this.notice(format!("Message sent. {}", notes.join(" ")), false, cx);
+                            this.notice(
+                                t!("compose-message-sent-2", notes = notes.join(" ")),
+                                false,
+                                cx,
+                            );
                         }
                         this.refresh_drafts(cx);
                         this.sync_drafts_soon(&account_id, cx);
@@ -868,7 +880,7 @@ impl MailApp {
         self.scheduled_retry.remove(&id);
         self.close_composer(&composer, cx);
         let when = crate::manage::composing::describe_later(at, chrono::Local::now());
-        self.notice(format!("Scheduled to send {when}."), false, cx);
+        self.notice(t!("compose-scheduled-to-send", when = when), false, cx);
         self.refresh_drafts(cx);
         self.sync_drafts_soon(&account, cx);
         // Handed to a server that holds it until then, where the account
@@ -887,13 +899,17 @@ impl MailApp {
                 move |this, result, cx| {
                     match result {
                         Ok(true) => this.notice(
-                            format!("Handed to the server, which sends it {when}, even with Picacho closed."),
+                            t!("compose-handed-to-the-server-which-sends", when = when),
                             false,
                             cx,
                         ),
                         Ok(false) => {}
                         Err(e) => this.notice(
-                            format!("The server couldn't take it ({e:#}); Picacho sends it {when}."),
+                            t!(
+                                "compose-the-server-couldnt-take-it-picacho",
+                                e = format!("{:#}", e),
+                                when = when
+                            ),
                             true,
                             cx,
                         ),
@@ -951,7 +967,7 @@ impl MailApp {
 
     fn send_scheduled(&mut self, d: Draft, cx: &mut Context<Self>) {
         let Some(a) = self.accounts.iter().find(|a| a.id == d.account).cloned() else {
-            self.schedule_failed(d.id, "Its account was removed.".into(), cx);
+            self.schedule_failed(d.id, t!("compose-its-account-was-removed").into(), cx);
             return;
         };
         if self.account_blocked(&a.id) {
@@ -972,7 +988,7 @@ impl MailApp {
                     Ok(Some((_, notes))) => {
                         this.scheduled_retry.remove(&id);
                         this.notice(
-                            format!("Scheduled message sent. {}", notes.join(" "))
+                            t!("compose-scheduled-message-sent", notes = notes.join(" "))
                                 .trim()
                                 .to_owned(),
                             false,
@@ -1000,7 +1016,7 @@ impl MailApp {
         self.scheduled_retry.remove(&id);
         self.backend.schedule_failed(&id, &error);
         self.notice(
-            format!("A scheduled message wasn't sent: {error} It's in Drafts."),
+            t!("compose-a-scheduled-message-wasnt-sent-its", error = error),
             true,
             cx,
         );
@@ -1033,7 +1049,11 @@ impl MailApp {
         }
         self.send_failed(
             id,
-            format!("{gone} From was reset to {from}."),
+            t!(
+                "compose-from-was-reset-to",
+                gone = gone.to_string(),
+                from = from
+            ),
             cx,
         );
         // It was out of the list of open composers while sending.
@@ -1254,9 +1274,9 @@ impl MailApp {
                 .text_size(px(13.))
                 .child(spinner(14., c.bg))
                 .child(if count > 1 {
-                    format!("Sending {count} messages…")
+                    t!("compose-sending-messages", count = count)
                 } else {
-                    "Sending…".to_string()
+                    t!("compose-sending").to_string()
                 })
                 .when(waiting, |d| {
                     d.child(
@@ -1272,7 +1292,7 @@ impl MailApp {
                             .text_color(rgb(c.soft))
                             .cursor_pointer()
                             .hover(|s| s.opacity(0.8))
-                            .child("Undo")
+                            .child(t!("compose-undo"))
                             .on_click(cx.listener(move |this, _, w, cx| {
                                 this.handle(Action::UndoSend(id), w, cx)
                             })),

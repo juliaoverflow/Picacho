@@ -72,7 +72,7 @@ pub(super) fn cover(c: Colors, window: &Window) -> AnyElement {
         .font_family(".SystemUIFont")
         .text_size(px(13.))
         .child(icon_el("lock", 28., c.muted))
-        .child("Picacho is locked")
+        .child(t!("applock-picacho-is-locked"))
         .into_any_element()
 }
 
@@ -135,10 +135,10 @@ impl LockUi {
             checking: false,
             error: None,
             biometry: biometric::available(),
-            passcode: input("Passcode", true, window, cx),
-            current: input("Current passcode", true, window, cx),
-            new_code: input("New passcode", true, window, cx),
-            confirm: input("New passcode again", true, window, cx),
+            passcode: input(t!("applock-passcode"), true, window, cx),
+            current: input(t!("applock-current-passcode"), true, window, cx),
+            new_code: input(t!("applock-new-passcode"), true, window, cx),
+            confirm: input(t!("applock-new-passcode-again"), true, window, cx),
             form: None,
             form_error: None,
             saving: false,
@@ -196,7 +196,7 @@ impl MailApp {
             LockAction::Unlock => self.unlock_with_passcode(w, cx),
             LockAction::UseBiometrics => self.unlock_with_biometrics(w, cx),
             LockAction::LockNow if !self.lock.settings.enabled() => self.notice(
-                "Turn on the app lock in Settings → Privacy first",
+                t!("applock-turn-on-the-app-lock-in"),
                 false,
                 cx,
             ),
@@ -243,7 +243,7 @@ impl MailApp {
         match settings.save(&self.backend.store) {
             Ok(()) => self.lock.settings = settings,
             Err(e) => self.notice(
-                format!("Couldn't save the app lock's settings: {e:#}"),
+                t!("applock-couldnt-save-the-app-locks-settings", e = format!("{:#}", e)),
                 true,
                 cx,
             ),
@@ -337,7 +337,7 @@ impl MailApp {
                         this.retry_later(until - now, cx);
                         wait_message(until - now)
                     }
-                    _ => "That isn't the passcode.".into(),
+                    _ => t!("applock-that-isnt-the-passcode").into(),
                 });
                 Self::set(&this.lock.passcode, "", w, cx);
                 cx.notify();
@@ -350,6 +350,9 @@ impl MailApp {
     /// Clears the wait's message once it is over.
     fn retry_later(&self, seconds: i64, cx: &mut Context<Self>) {
         let wait = Duration::from_secs(seconds.max(0) as u64 + 1);
+        // The message `wait_message(seconds)` set just before (compared
+        // whole: its words are the reader's language).
+        let shown = wait_message(seconds);
         cx.spawn(async move |this, cx| {
             cx.background_executor().timer(wait).await;
             let _ = this.update(cx, |this, cx| {
@@ -357,7 +360,7 @@ impl MailApp {
                     .lock
                     .error
                     .as_deref()
-                    .is_some_and(|e| e.starts_with("Too many"))
+                    .is_some_and(|e| *e == shown)
                 {
                     this.lock.error = None;
                     cx.notify();
@@ -373,7 +376,7 @@ impl MailApp {
         }
         self.lock.authenticating = true;
         self.lock.error = None;
-        let answer = biometric::authenticate("unlock your mail");
+        let answer = biometric::authenticate(t!("applock-unlock-your-mail"));
         cx.spawn_in(w, async move |this, cx| {
             let answer = answer.await.unwrap_or(Err(Failure::Cancelled));
             let _ = this.update_in(cx, |this, w, cx| {
@@ -399,7 +402,7 @@ impl MailApp {
     fn set_hide_contents(&mut self, on: bool, cx: &mut Context<Self>) {
         let store = self.backend.store.clone();
         if let Err(e) = applock::set_hides_contents(&store, on) {
-            self.notice(format!("Couldn't save the setting: {e:#}"), true, cx);
+            self.notice(t!("applock-couldnt-save-the-setting", e = format!("{:#}", e)), true, cx);
             return;
         }
         self.lock.hide_contents = on;
@@ -504,12 +507,12 @@ impl MailApp {
                 return;
             }
             if *new_code != *confirm {
-                self.lock.form_error = Some("The two new passcodes aren't the same.".into());
+                self.lock.form_error = Some(t!("applock-the-two-new-passcodes-arent-the").into());
                 return;
             }
         }
         if form != LockForm::Enable && current.is_empty() {
-            self.lock.form_error = Some("Enter the current passcode.".into());
+            self.lock.form_error = Some(t!("applock-enter-the-current-passcode").into());
             return;
         }
         self.lock.saving = true;
@@ -518,7 +521,7 @@ impl MailApp {
         let biometrics = self.lock.biometry.is_some();
         let work = cx.background_spawn(async move {
             if form != LockForm::Enable && !before.verify(&current) {
-                anyhow::bail!("That isn't the current passcode.");
+                anyhow::bail!(t!("applock-that-isnt-the-current-passcode"));
             }
             Ok(match form {
                 LockForm::Disable => LockSettings {
@@ -557,9 +560,9 @@ impl MailApp {
                         this.lock_action(LockAction::Form(None), w, cx);
                         this.notice(
                             match form {
-                                LockForm::Enable => "Picacho will ask for its passcode",
-                                LockForm::Change => "The passcode was changed",
-                                LockForm::Disable => "The app lock is off",
+                                LockForm::Enable => t!("applock-picacho-will-ask-for-its-passcode"),
+                                LockForm::Change => t!("applock-the-passcode-was-changed"),
+                                LockForm::Disable => t!("applock-the-app-lock-is-off"),
                             },
                             false,
                             cx,
@@ -585,7 +588,7 @@ impl MailApp {
         let store = self.backend.store.clone();
         let (tx, rx) = futures::channel::oneshot::channel();
         let started = std::thread::Builder::new()
-            .name("encrypt database".into())
+            .name(t!("applock-encrypt-database").into())
             .spawn(move || {
                 let _ = tx.send(store.set_encrypted(on));
             });
@@ -597,7 +600,7 @@ impl MailApp {
         cx.spawn(async move |this, cx| {
             let result = rx
                 .await
-                .unwrap_or_else(|_| Err(anyhow::anyhow!("Encrypting stopped part way.")));
+                .unwrap_or_else(|_| Err(anyhow::anyhow!(t!("applock-encrypting-stopped-part-way"))));
             let _ = this.update(cx, |this, cx| {
                 this.lock.encrypting = false;
                 this.lock.encrypted = this.backend.store.encrypted();
@@ -608,9 +611,9 @@ impl MailApp {
                 match result {
                     Ok(()) => this.notice(
                         if on {
-                            "The local database is encrypted"
+                            t!("applock-the-local-database-is-encrypted")
                         } else {
-                            "The local database is no longer encrypted"
+                            t!("applock-the-local-database-is-no-longer")
                         },
                         false,
                         cx,
@@ -665,7 +668,7 @@ impl MailApp {
                     .text_size(px(20.))
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(rgb(c.text))
-                    .child("Picacho is locked"),
+                    .child(t!("applock-picacho-is-locked")),
             )
             .child(
                 div()
@@ -673,8 +676,8 @@ impl MailApp {
                     .text_color(rgb(c.muted))
                     .text_center()
                     .child(match biometrics {
-                        Some(b) => format!("Use {} or enter your passcode.", b.label()),
-                        None => "Enter your passcode.".into(),
+                        Some(b) => t!("applock-use-or-enter-your-passcode", label = b.label()),
+                        None => t!("applock-enter-your-passcode").into(),
                     }),
             )
             .child(
@@ -699,9 +702,9 @@ impl MailApp {
                 self.button(
                     "unlock",
                     if self.lock.checking {
-                        "Checking…"
+                        t!("applock-checking")
                     } else {
-                        "Unlock"
+                        t!("applock-unlock")
                     },
                     "",
                     Action::Lock(LockAction::Unlock),
@@ -715,7 +718,7 @@ impl MailApp {
             column = column.child(
                 self.button(
                     "unlock-biometrics",
-                    &format!("Use {}", b.title()),
+                    &t!("applock-use", title = b.title()),
                     b.icon(),
                     Action::Lock(LockAction::UseBiometrics),
                     false,
@@ -764,17 +767,17 @@ impl MailApp {
                 .child(text.to_owned())
         };
         let unlocks = match lock.biometry {
-            Some(b) => format!("your passcode or {}", b.label()),
-            None => "your passcode".into(),
+            Some(b) => t!("applock-your-passcode-or", label = b.label()),
+            None => t!("applock-your-passcode").into(),
         };
         let mut page = div()
             .flex()
             .flex_col()
             .gap_5()
-            .child(self.section("App Lock"))
+            .child(self.section(t!("applock-app-lock")))
             .child(self.switch_setting(
-                "Lock Picacho",
-                &format!("Ask for {unlocks} when Picacho opens and when you come back to it. Mail is still checked, and new mail announced, while it's locked."),
+                t!("applock-lock-picacho"),
+                &t!("applock-ask-for-when-picacho-opens-and", unlocks = unlocks),
                 "app-lock".into(),
                 on,
                 Action::Lock(LockAction::Form(Some(if on { LockForm::Disable } else { LockForm::Enable }))),
@@ -786,8 +789,8 @@ impl MailApp {
         if on {
             if let Some(b) = lock.biometry {
                 page = page.child(self.switch_setting(
-                    &format!("Unlock with {}", b.title()),
-                    &format!("{} unlocks Picacho as well as its passcode.", b.title()),
+                    &t!("applock-unlock-with", title = b.title()),
+                    &t!("applock-unlocks-picacho-as-well-as-its", title = b.title()),
                     "app-lock-biometrics".into(),
                     lock.settings.biometrics,
                     Action::Lock(LockAction::SetBiometrics(!lock.settings.biometrics)),
@@ -799,13 +802,13 @@ impl MailApp {
                 target_os = "android"
             )) {
                 page = page.child(caption(
-                    "Set up Touch ID, Face ID or fingerprint or face unlock in your device's settings to unlock Picacho with it.",
+                    t!("applock-set-up-touch-id-face-id"),
                 ));
             }
             page = page
                 .child(self.setting(
-                    "Require the passcode",
-                    "How long Picacho can be in the background, or behind other apps, before it asks again.",
+                    t!("applock-require-the-passcode"),
+                    t!("applock-how-long-picacho-can-be-in"),
                     self.segmented(
                         "app-lock-after",
                         applock::AFTER_CHOICES
@@ -829,7 +832,7 @@ impl MailApp {
                         .child(
                             self.button(
                                 "app-lock-change",
-                                "Change Passcode…",
+                                t!("applock-change-passcode"),
                                 "",
                                 Action::Lock(LockAction::Form(Some(LockForm::Change))),
                                 false,
@@ -841,7 +844,7 @@ impl MailApp {
                         .child(
                             self.button(
                                 "app-lock-now",
-                                "Lock Now",
+                                t!("applock-lock-now"),
                                 "lock",
                                 Action::Lock(LockAction::LockNow),
                                 false,
@@ -856,17 +859,17 @@ impl MailApp {
             }
         }
         page = page.child(self.switch_setting(
-            "Hide mail outside Picacho",
-            "Notifications and widgets say how much new mail there is, but not who it's from, what it's about, or what your events, packages and receipts are. Turned on with the app lock or encryption.",
+            t!("applock-hide-mail-outside-picacho"),
+            t!("applock-notifications-and-widgets-say-how-much"),
             "hide-contents".into(),
             lock.hide_contents,
             Action::Lock(LockAction::SetHideContents(!lock.hide_contents)),
             cx,
         ));
         let encrypted = lock.encrypted;
-        page = page.child(self.section("Local Database")).child(self.switch_setting(
-            "Encrypt the local database",
-            "Mail, drafts, contacts, calendars and settings saved on this device are encrypted, with a key kept in the system keychain. Picacho opens it without asking, so mail is still checked in the background; use the app lock to keep others out of the app itself.",
+        page = page.child(self.section(t!("applock-local-database"))).child(self.switch_setting(
+            t!("applock-encrypt-the-local-database"),
+            t!("applock-mail-drafts-contacts-calendars-and-settings"),
             "encrypt-database".into(),
             encrypted,
             Action::Lock(LockAction::AskEncrypt(Some(!encrypted))),
@@ -875,22 +878,22 @@ impl MailApp {
         if lock.encrypting {
             page = page.child(div().text_size(px(12.)).text_color(rgb(c.accent)).child(
                 if encrypted {
-                    "Decrypting the local database…"
+                    t!("applock-decrypting-the-local-database")
                 } else {
-                    "Encrypting the local database…"
+                    t!("applock-encrypting-the-local-database")
                 },
             ));
         }
         if let Some(on) = lock.confirm_encrypt {
             let (text, label) = if on {
                 (
-                    "Encrypting copies the whole database, which can take a minute for a large one. If the system keychain ever loses the key, the local copy can't be read: mail on your servers is downloaded again, but drafts saved only here, and mail that only this device kept (POP accounts that remove it from the server), would be lost. Widgets keep their own short list of recent mail outside the database; Hide mail outside Picacho (turned on with encryption) keeps what it says out of it.",
-                    "Encrypt",
+                    t!("applock-encrypting-copies-the-whole-database-which"),
+                    t!("applock-encrypt"),
                 )
             } else {
                 (
-                    "The database will be stored without encryption, and its key removed from the system keychain.",
-                    "Decrypt",
+                    t!("applock-the-database-will-be-stored-without"),
+                    t!("applock-decrypt"),
                 )
             };
             page = page.child(
@@ -912,7 +915,7 @@ impl MailApp {
                             .gap_2()
                             .child(self.button(
                                 "encrypt-database-cancel",
-                                "Cancel",
+                                t!("applock-cancel"),
                                 "",
                                 Action::Lock(LockAction::AskEncrypt(None)),
                                 false,
@@ -949,14 +952,14 @@ impl MailApp {
         };
         let (title, submit) = match form {
             LockForm::Enable => (
-                "Choose a passcode of at least 4 characters. If you forget it, Picacho can't be unlocked without removing its data.",
-                "Turn On",
+                t!("applock-choose-a-passcode-of-at-least"),
+                t!("applock-turn-on"),
             ),
             LockForm::Change => (
-                "Enter the current passcode, then the new one.",
-                "Change Passcode",
+                t!("applock-enter-the-current-passcode-then-the"),
+                t!("applock-change-passcode-2"),
             ),
-            LockForm::Disable => ("Enter the passcode to turn the app lock off.", "Turn Off"),
+            LockForm::Disable => (t!("applock-enter-the-passcode-to-turn-the"), t!("applock-turn-off")),
         };
         div()
             .id("app-lock-form")
@@ -988,7 +991,7 @@ impl MailApp {
                     .gap_2()
                     .child(self.button(
                         "app-lock-cancel",
-                        "Cancel",
+                        t!("applock-cancel"),
                         "",
                         Action::Lock(LockAction::Form(None)),
                         false,
@@ -997,7 +1000,7 @@ impl MailApp {
                     .child(
                         self.button(
                             "app-lock-submit",
-                            if lock.saving { "Saving…" } else { submit },
+                            if lock.saving { t!("applock-saving") } else { submit },
                             "",
                             Action::Lock(LockAction::SubmitForm),
                             true,
@@ -1025,9 +1028,9 @@ impl MailApp {
 
 fn wait_message(seconds: i64) -> String {
     let wait = if seconds >= 120 {
-        format!("{} minutes", (seconds + 59) / 60)
+        t!("applock-minutes", minutes = (seconds + 59) / 60)
     } else {
-        format!("{seconds} seconds")
+        t!("applock-seconds", seconds = seconds)
     };
-    format!("Too many wrong passcodes. Try again in {wait}.")
+    t!("applock-too-many-wrong-passcodes-try-again", wait = wait)
 }

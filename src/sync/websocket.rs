@@ -48,11 +48,11 @@ fn agreed_deflate(answer: &str) -> Result<bool> {
     if answer.trim().is_empty() {
         return Ok(false);
     }
-    ensure!(!answer.contains(','), "The JMAP server agreed to more than one WebSocket extension.");
+    ensure!(!answer.contains(','), t!("sync-websocket-the-jmap-server-agreed-to-more"));
     let mut parts = answer.split(';').map(str::trim);
     ensure!(
         parts.next().is_some_and(|n| n.eq_ignore_ascii_case("permessage-deflate")),
-        "The JMAP server turned on a WebSocket extension that wasn't asked for."
+        t!("sync-websocket-the-jmap-server-turned-on-a")
     );
     let mut server_no_takeover = false;
     for p in parts {
@@ -62,12 +62,12 @@ fn agreed_deflate(answer: &str) -> Result<bool> {
             "client_no_context_takeover" => {}
             // 15 is the largest window, which the inflater assumes.
             "server_max_window_bits" | "client_max_window_bits" => {
-                ensure!(value.is_empty() || value == "15", "The JMAP server asked for a smaller compression window than Picacho uses.")
+                ensure!(value.is_empty() || value == "15", t!("sync-websocket-the-jmap-server-asked-for-a"))
             }
-            _ => bail!("The JMAP server agreed to WebSocket compression with a setting Picacho doesn't know."),
+            _ => bail!(t!("sync-websocket-the-jmap-server-agreed-to-websocket")),
         }
     }
-    ensure!(server_no_takeover, "The JMAP server agreed to WebSocket compression without what was asked.");
+    ensure!(server_no_takeover, t!("sync-websocket-the-jmap-server-agreed-to-websocket-2"));
     Ok(true)
 }
 
@@ -98,8 +98,8 @@ fn decompress(data: &[u8]) -> Result<Vec<u8>> {
         out.reserve(16 * 1024);
         let before = (d.total_in(), d.total_out());
         d.decompress_vec(&input[d.total_in() as usize..], &mut out, flate2::FlushDecompress::Sync)
-            .context("The JMAP server sent a WebSocket message that doesn't inflate.")?;
-        ensure!(out.len() as u64 <= MOST, "The JMAP server sent too large a WebSocket message.");
+            .with_context(|| t!("sync-websocket-the-jmap-server-sent-a-websocket"))?;
+        ensure!(out.len() as u64 <= MOST, t!("sync-websocket-the-jmap-server-sent-too-large"));
         if d.total_in() as usize >= input.len() || (d.total_in(), d.total_out()) == before {
             break;
         }
@@ -124,14 +124,14 @@ pub(crate) fn connect(
     tls: &native_tls::TlsConnector,
     timeout: Duration,
 ) -> Result<Socket<native_tls::TlsStream<std::net::TcpStream>>> {
-    let parsed = url::Url::parse(url).context("The WebSocket address isn't valid.")?;
+    let parsed = url::Url::parse(url).with_context(|| t!("sync-websocket-the-websocket-address-isnt-valid"))?;
     ensure!(
         parsed.scheme() == "wss",
-        "The WebSocket address doesn't use wss://."
+        t!("sync-websocket-the-websocket-address-doesnt-use-wss")
     );
     let host = parsed
         .host_str()
-        .context("The WebSocket address has no host.")?;
+        .with_context(|| t!("sync-websocket-the-websocket-address-has-no-host"))?;
     let port = parsed.port_or_known_default().unwrap_or(443);
     let tcp = open(host, port)?;
     // Reads wait this long for the server before coming back `Idle`.
@@ -139,7 +139,7 @@ pub(crate) fn connect(
     tcp.set_write_timeout(Some(Duration::from_secs(30)))?;
     let stream = tls
         .connect(host, tcp)
-        .map_err(|e| anyhow::anyhow!("TLS with {host} failed: {e}"))?;
+        .map_err(|e| anyhow::anyhow!(t!("sync-websocket-tls-with-failed", host = host, error = e.to_string())))?;
     let mut path = parsed.path().to_owned();
     if let Some(q) = parsed.query() {
         path.push('?');
@@ -158,19 +158,14 @@ fn open(host: &str, port: u16) -> Result<std::net::TcpStream> {
     let mut last = None;
     for addr in (host, port)
         .to_socket_addrs()
-        .context(crate::sync::retry::Unreachable(format!(
-            "{host} could not be resolved"
-        )))?
+        .context(crate::sync::retry::Unreachable(t!("sync-websocket-could-not-be-resolved", host = host)))?
     {
         match std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(10)) {
             Ok(s) => return Ok(s),
             Err(e) => last = Some(e),
         }
     }
-    Err(crate::sync::retry::Unreachable(format!(
-        "Could not connect to {host}:{port}: {}",
-        last.map(|e| e.to_string()).unwrap_or_default()
-    ))
+    Err(crate::sync::retry::Unreachable(t!("sync-websocket-could-not-connect-to", host = host, port = port, error = last.map(|e| e.to_string()).unwrap_or_default()))
     .into())
 }
 
@@ -186,7 +181,7 @@ pub(crate) fn handshake<S: Read + Write>(
     // names the address) would add headers of its own.
     ensure!(
         ![authority, path, protocol, authorization].iter().any(|v| v.contains(['\r', '\n'])),
-        "The JMAP server's WebSocket address isn't valid."
+        t!("sync-websocket-the-jmap-servers-websocket-address-isnt")
     );
     let key = STANDARD.encode(rand::random::<[u8; 16]>());
     let mut stream = BufReader::new(stream);
@@ -202,13 +197,12 @@ pub(crate) fn handshake<S: Read + Write>(
     if code == "401" || code == "403" {
         return Err(
             anyhow::Error::new(crate::manage::status::AccessFailure::Authentication)
-                .context("The JMAP server no longer accepts the sign-in."),
+                .context(t!("sync-websocket-the-jmap-server-no-longer-accepts")),
         );
     }
     ensure!(
         code == "101",
-        "The JMAP server didn't open the WebSocket: {}",
-        status.trim()
+        t!("sync-websocket-the-jmap-server-didnt-open-the", reply = status.trim())
     );
     let mut accept = None;
     let mut chosen = None;
@@ -248,20 +242,20 @@ pub(crate) fn handshake<S: Read + Write>(
     }
     // More headers than that, or the connection's end: the rest would have
     // been read as frames.
-    ensure!(ended, "The JMAP server's WebSocket answer is too long.");
+    ensure!(ended, t!("sync-websocket-the-jmap-servers-websocket-answer-is"));
     // RFC 6455 §4.1: the answer must upgrade to WebSocket.
     ensure!(
         upgrade && connection,
-        "The JMAP server's answer didn't upgrade to a WebSocket."
+        t!("sync-websocket-the-jmap-servers-answer-didnt-upgrade")
     );
     let deflate = agreed_deflate(&extensions)?;
     ensure!(
         accept.as_deref() == Some(accept_for(&key).as_str()),
-        "The JMAP server's WebSocket answer doesn't match the request."
+        t!("sync-websocket-the-jmap-servers-websocket-answer-doesnt")
     );
     ensure!(
         chosen.as_deref() == Some(protocol),
-        "The JMAP server didn't agree to speak JMAP over the WebSocket."
+        t!("sync-websocket-the-jmap-server-didnt-agree-to")
     );
     Ok(Socket { stream, deflate })
 }
@@ -351,11 +345,11 @@ impl<S: Read + Write> Socket<S> {
             let rsv1 = head[0] & 0x40 != 0;
             ensure!(
                 head[0] & 0x30 == 0 && (!rsv1 || (self.deflate && matches!(opcode, 0x1 | 0x2))),
-                "The JMAP server sent a WebSocket frame with reserved bits set."
+                t!("sync-websocket-the-jmap-server-sent-a-websocket-2")
             );
             ensure!(
                 head[1] & 0x80 == 0,
-                "The JMAP server sent a masked WebSocket frame."
+                t!("sync-websocket-the-jmap-server-sent-a-masked")
             );
             let len = match head[1] & 0x7f {
                 126 => {
@@ -372,13 +366,13 @@ impl<S: Read + Write> Socket<S> {
             };
             ensure!(
                 len <= MOST && message.len() as u64 + len <= MOST,
-                "The JMAP server sent too large a WebSocket message."
+                t!("sync-websocket-the-jmap-server-sent-too-large")
             );
             // Control frames (close, ping, pong) are short and whole (RFC 6455
             // §5.5): one claiming a megabyte is held, and echoed, otherwise.
             ensure!(
                 opcode < 0x8 || (len <= 125 && fin),
-                "The JMAP server sent an invalid WebSocket control frame."
+                t!("sync-websocket-the-jmap-server-sent-an-invalid")
             );
             let mut payload = vec![0u8; len as usize];
             self.stream.read_exact(&mut payload)?;
@@ -401,12 +395,12 @@ impl<S: Read + Write> Socket<S> {
                     // only after the last ended (RFC 6455 §5.4).
                     let kind = match (opcode, started) {
                         (0x0, Some(kind)) => kind,
-                        (0x0, None) => bail!("The JMAP server sent a WebSocket continuation without a message."),
-                        (_, Some(_)) => bail!("The JMAP server started a WebSocket message inside another."),
+                        (0x0, None) => bail!(t!("sync-websocket-the-jmap-server-sent-a-websocket-3")),
+                        (_, Some(_)) => bail!(t!("sync-websocket-the-jmap-server-started-a-websocket")),
                         (kind, None) => kind,
                     };
                     if kind == 0x2 {
-                        bail!("The JMAP server sent a binary WebSocket message.");
+                        bail!(t!("sync-websocket-the-jmap-server-sent-a-binary"));
                     }
                     if started.is_none() {
                         compressed = rsv1;
@@ -419,11 +413,11 @@ impl<S: Read + Write> Socket<S> {
                         }
                         return Ok(Incoming::Text(
                             String::from_utf8(message)
-                                .context("The JMAP server sent text that isn't UTF-8.")?,
+                                .with_context(|| t!("sync-websocket-the-jmap-server-sent-text-that"))?,
                         ));
                     }
                 }
-                _ => bail!("The JMAP server sent an unknown WebSocket frame."),
+                _ => bail!(t!("sync-websocket-the-jmap-server-sent-an-unknown")),
             }
         }
     }

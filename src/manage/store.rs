@@ -404,7 +404,7 @@ impl Store {
                     "PRAGMA converted.auto_vacuum=INCREMENTAL;
                      SELECT sqlcipher_export('converted');",
                 )
-                .context("Couldn't copy the local database");
+                .with_context(|| t!("manage-store-couldnt-copy-the-local-database"));
             let detached = held.writer.execute_batch("DETACH DATABASE converted;");
             exported?;
             detached?;
@@ -427,7 +427,7 @@ impl Store {
         drop(std::mem::replace(&mut *held.prefs, closed()?));
         let old_key = self.key.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let replaced = (|| -> Result<()> {
-            std::fs::rename(&converting, &file).context("Couldn't replace the local database")?;
+            std::fs::rename(&converting, &file).with_context(|| t!("manage-store-couldnt-replace-the-local-database"))?;
             // The old file's log and index, now empty, are not the new one's.
             for suffix in ["-wal", "-shm"] {
                 let mut name = file.clone().into_os_string();
@@ -466,7 +466,7 @@ impl Store {
         if !on && let Err(e) = vault::forget_key(&self.path, &*self.keys) {
             eprintln!("Picacho: couldn't remove the old database key from the keychain: {e:#}");
         }
-        reopened.context("Couldn't open the local database again")
+        reopened.with_context(|| t!("manage-store-couldnt-open-the-local-database-again"))
     }
     /// Every connection, held: for replacing the file under them. Taken
     /// all at once or not at all, so this never waits holding one that a
@@ -1113,7 +1113,7 @@ impl Store {
         } = snapshot;
         ensure!(
             *validity > 0,
-            "The server did not supply a valid UIDVALIDITY"
+            t!("manage-store-the-server-did-not-supply-a")
         );
         let prefix = format!("{account}:{remote}:{validity}:");
         let keep: std::collections::HashSet<_> = ids.iter().collect();
@@ -1122,7 +1122,7 @@ impl Store {
                 && m.remote_folder == *remote
                 && m.id.starts_with(&prefix)
                 && keep.contains(&m.id)),
-            "Invalid mailbox snapshot"
+            t!("manage-store-invalid-mailbox-snapshot")
         );
         let mut db = self.write();
         let tx = db.transaction()?;
@@ -2103,7 +2103,7 @@ impl Store {
         {
             let week = 7 * 24 * 60 * 60;
             db.execute(PUT_PREFERENCE, params![RETRY, (now + week).to_string()])?;
-            return Err(e).context("Couldn't compact the mail cache");
+            return Err(e).with_context(|| t!("manage-store-couldnt-compact-the-mail-cache"));
         }
         Ok(true)
     }
@@ -2419,7 +2419,7 @@ impl Store {
             fresh
                 .iter()
                 .all(|m| m.account == account && m.id.starts_with(prefix)),
-            "Invalid mailbox update"
+            t!("manage-store-invalid-mailbox-update")
         );
         let mut db = self.write();
         let tx = db.transaction()?;
@@ -2720,7 +2720,7 @@ impl Store {
             }
             if !state.busy(key) {
                 return match state.failed.get(key) {
-                    Some(why) => Err(anyhow::anyhow!("Couldn't save this setting: {why}")),
+                    Some(why) => Err(anyhow::anyhow!(t!("manage-store-couldnt-save-this-setting", why = why))),
                     None => Ok(()),
                 };
             }
@@ -2731,7 +2731,7 @@ impl Store {
                 .unwrap_or_else(|e| e.into_inner());
             state = next;
             if timeout.timed_out() && state.busy(key) {
-                anyhow::bail!("Couldn't save this setting: the cache stayed busy");
+                anyhow::bail!(t!("manage-store-couldnt-save-this-setting-the-cache"));
             }
         }
     }
@@ -3027,10 +3027,10 @@ fn inflate(packed: &[u8], limit: u64, whole: bool) -> Result<Vec<u8>> {
     flate2::read::DeflateDecoder::new(packed)
         .take(limit.saturating_add(u64::from(whole)))
         .read_to_end(&mut raw)
-        .context("A saved message source is damaged")?;
+        .with_context(|| t!("manage-store-a-saved-message-source-is-damaged"))?;
     ensure!(
         !whole || raw.len() as u64 <= limit,
-        "A saved message source is damaged: it inflates past {limit} bytes"
+        t!("manage-store-a-saved-message-source-is-damaged-2", limit = limit)
     );
     Ok(raw)
 }
@@ -3134,7 +3134,7 @@ fn write_preferences(db: &Mutex<Connection>, queue: &PrefQueue, rx: mpsc::Receiv
 const SECRET_SERVICE: &str = "com.pinal.native-mail";
 #[cfg(not(any(target_os = "ios", target_os = "android")))]
 pub fn secret_entry(id: &str) -> Result<keyring::Entry> {
-    keyring::Entry::new(SECRET_SERVICE, id).context("Cannot access the system keychain")
+    keyring::Entry::new(SECRET_SERVICE, id).with_context(|| t!("manage-store-cannot-access-the-system-keychain"))
 }
 /// iOS keeps credentials in the app's own Keychain (Protected Data); Android
 /// keeps them in the app's SharedPreferences, encrypted with a key held by the
@@ -3153,17 +3153,17 @@ pub fn secret_entry(id: &str) -> Result<keyring_core::Entry> {
                 .map_err(|e| e.to_string())
         });
     if let Err(e) = &*STORE {
-        anyhow::bail!("Cannot access the system keychain: {e}");
+        anyhow::bail!(t!("manage-store-cannot-access-the-system-keychain-2", error = e));
     }
-    keyring_core::Entry::new(SECRET_SERVICE, id).context("Cannot access the system keychain")
+    keyring_core::Entry::new(SECRET_SERVICE, id).with_context(|| t!("manage-store-cannot-access-the-system-keychain"))
 }
 pub fn read_secret(id: &str) -> Result<Secret> {
     serde_json::from_str(
         &secret_entry(id)?
             .get_password()
-            .context("The keychain entry is missing, locked, or access was denied")?,
+            .with_context(|| t!("manage-store-the-keychain-entry-is-missing-locked"))?,
     )
-    .context("Saved credentials could not be read")
+    .with_context(|| t!("manage-store-saved-credentials-could-not-be-read"))
 }
 #[cfg(not(any(target_os = "ios", target_os = "android")))]
 use keyring::Error as KeychainError;
@@ -3182,7 +3182,7 @@ pub fn read_secret_text(id: &str) -> Result<Option<String>> {
     for i in 1..=parts {
         text.push_str(
             &read_one_secret(&format!("{id}#{i}"))?
-                .context("A part of a keychain entry is missing")?,
+                .with_context(|| t!("manage-store-a-part-of-a-keychain-entry"))?,
         );
     }
     Ok(Some(text))
@@ -3192,7 +3192,7 @@ fn read_one_secret(id: &str) -> Result<Option<String>> {
         Ok(text) => Ok(Some(text)),
         Err(KeychainError::NoEntry) => Ok(None),
         Err(e) => Err(anyhow::Error::new(e)
-            .context("The keychain entry is locked, or access was denied")),
+            .context(t!("manage-store-the-keychain-entry-is-locked-or"))),
     }
 }
 /// What begins an entry kept in parts, followed by how many there are.
@@ -3208,7 +3208,7 @@ pub fn write_secret_text(id: &str, text: &str) -> Result<()> {
     let entry = |name: &str, value: &str| {
         secret_entry(name)?
             .set_password(value)
-            .context("Could not securely save to the system keychain")
+            .with_context(|| t!("manage-store-could-not-securely-save-to-the"))
     };
     if text.len() <= PART && !text.starts_with(SPLIT) {
         entry(id, text)?;
@@ -3250,13 +3250,13 @@ fn remove_parts_after(id: &str, kept: usize) {
 pub fn delete_secret(id: &str) -> Result<()> {
     match secret_entry(id)?.delete_credential() {
         Ok(()) | Err(KeychainError::NoEntry) => Ok(()),
-        Err(e) => Err(anyhow::Error::new(e).context("Could not remove a keychain entry")),
+        Err(e) => Err(anyhow::Error::new(e).context(t!("manage-store-could-not-remove-a-keychain-entry"))),
     }
 }
 pub fn write_secret(id: &str, s: &Secret) -> Result<()> {
     secret_entry(id)?
         .set_password(&serde_json::to_string(s)?)
-        .context("Could not securely save credentials to the system keychain")
+        .with_context(|| t!("manage-store-could-not-securely-save-credentials-to"))
 }
 
 #[cfg(test)]

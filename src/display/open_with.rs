@@ -62,7 +62,7 @@ pub(crate) fn open_in(app: &OpenWithApp, file: &Path) -> anyhow::Result<()> {
         all(unix, not(any(target_os = "macos", target_os = "android", target_os = "ios")))
     )))]
     {
-        anyhow::bail!("Open With isn't available here.")
+        anyhow::bail!(t!("open-with-open-with-isnt-available-here"))
     }
 }
 
@@ -353,9 +353,9 @@ mod desktop {
 
     pub(super) fn launch(entry: &Path, file: &Path) -> anyhow::Result<()> {
         let text = std::fs::read_to_string(entry)?;
-        let parsed = parse(&text).ok_or_else(|| anyhow::anyhow!("That app can't be started."))?;
+        let parsed = parse(&text).ok_or_else(|| anyhow::anyhow!(t!("open-with-that-app-cant-be-started")))?;
         let args = command(&parsed.exec, &parsed.name, file);
-        let (program, rest) = args.split_first().ok_or_else(|| anyhow::anyhow!("That app can't be started."))?;
+        let (program, rest) = args.split_first().ok_or_else(|| anyhow::anyhow!(t!("open-with-that-app-cant-be-started")))?;
         std::process::Command::new(program)
             .args(rest)
             .stdin(std::process::Stdio::null())

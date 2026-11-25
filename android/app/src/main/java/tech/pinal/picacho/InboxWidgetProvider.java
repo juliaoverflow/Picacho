@@ -54,6 +54,12 @@ public final class InboxWidgetProvider extends AppWidgetProvider {
         int onAccent = WidgetStore.onAccentColor(context);
 
         RemoteViews views = new RemoteViews(context.getPackageName(), R.layout.widget_inbox);
+        // The layout's own text, in Picacho's language (the launcher would
+        // read the layout in the phone's).
+        Context text = Lang.of(context);
+        views.setContentDescription(R.id.widget_inbox_refresh, text.getString(R.string.widget_refresh));
+        views.setContentDescription(R.id.widget_inbox_compose, text.getString(R.string.widget_compose));
+        views.setTextViewText(R.id.widget_inbox_empty, text.getString(R.string.widget_empty_inbox));
         views.setInt(R.id.widget_inbox_logo, "setColorFilter", accent);
         views.setInt(R.id.widget_inbox_compose_bg, "setColorFilter", accent);
         views.setInt(R.id.widget_inbox_compose_icon, "setColorFilter", onAccent);
@@ -64,7 +70,7 @@ public final class InboxWidgetProvider extends AppWidgetProvider {
 
         String title = snap.labelFor(context, accountId);
         if (unreadOnly) {
-            title = title + " · " + context.getString(R.string.widget_unread_title);
+            title = title + " · " + Lang.of(context).getString(R.string.widget_unread_title);
         }
         views.setTextViewText(R.id.widget_inbox_title, title);
 

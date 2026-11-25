@@ -112,10 +112,7 @@ pub struct FromMismatch {
 impl FromMismatch {
     /// RFC 9788 §4.4.2: a warning that shows both From fields.
     pub fn label(&self) -> String {
-        format!(
-            "Warning: the sender inside the message ({}) isn't the sender shown ({}), and no signature proves it",
-            self.protected, self.outer
-        )
+        t!("manage-openpgp-warning-the-sender-inside-the-message", protected = self.protected, outer = self.outer)
     }
 }
 
@@ -154,13 +151,13 @@ pub enum Signature {
 impl Signature {
     pub fn label(&self) -> String {
         match self {
-            Self::None => "Not signed".into(),
-            Self::Good(who) => format!("Signed by {who}"),
+            Self::None => t!("manage-openpgp-not-signed").into(),
+            Self::Good(who) => t!("manage-openpgp-signed-by", who = who),
             Self::OtherSender(who) => {
-                format!("Signed by {who}, who isn't the sender shown")
+                t!("manage-openpgp-signed-by-who-isnt-the-sender", who = who)
             }
-            Self::UnknownKey => "Signed, by a key you haven't imported".into(),
-            Self::Bad => "The signature doesn't match: the message may have been changed".into(),
+            Self::UnknownKey => t!("manage-openpgp-signed-by-a-key-you-havent").into(),
+            Self::Bad => t!("manage-openpgp-the-signature-doesnt-match-the-message").into(),
         }
     }
 }
@@ -199,7 +196,7 @@ impl Keyring {
     pub fn load() -> Result<Self> {
         Ok(match store::read_secret_text(KEYRING)? {
             Some(json) => {
-                serde_json::from_str(&json).context("The OpenPGP keyring couldn't be read.")?
+                serde_json::from_str(&json).with_context(|| t!("manage-openpgp-the-openpgp-keyring-couldnt-be-read"))?
             }
             None => Self::default(),
         })
@@ -266,14 +263,14 @@ impl Keyring {
     pub fn import(&mut self, armored: &str, passphrase: &str) -> Result<usize> {
         let mut added = 0;
         let text = armored.trim();
-        ensure!(!text.is_empty(), "Paste or choose an armored OpenPGP key.");
+        ensure!(!text.is_empty(), t!("manage-openpgp-paste-or-choose-an-armored-openpgp"));
         if text.contains("PRIVATE KEY BLOCK") {
             let (keys, _) = SignedSecretKey::from_armor_many(text.as_bytes())
-                .context("That secret key couldn't be read.")?;
+                .with_context(|| t!("manage-openpgp-that-secret-key-couldnt-be-read"))?;
             for key in keys {
-                let key = key.context("That secret key couldn't be read.")?;
+                let key = key.with_context(|| t!("manage-openpgp-that-secret-key-couldnt-be-read"))?;
                 key.verify_bindings()
-                    .context("That key's signatures don't check out.")?;
+                    .with_context(|| t!("manage-openpgp-that-keys-signatures-dont-check-out"))?;
                 let key = unprotect(key, passphrase)?;
                 let fp = fingerprint(&SignedPublicKey::from(key.clone()));
                 self.secret.retain(|k| {
@@ -288,11 +285,11 @@ impl Keyring {
         }
         if text.contains("PUBLIC KEY BLOCK") {
             let (keys, _) = SignedPublicKey::from_armor_many(text.as_bytes())
-                .context("That public key couldn't be read.")?;
+                .with_context(|| t!("manage-openpgp-that-public-key-couldnt-be-read"))?;
             for key in keys {
-                let key = key.context("That public key couldn't be read.")?;
+                let key = key.with_context(|| t!("manage-openpgp-that-public-key-couldnt-be-read"))?;
                 key.verify_bindings()
-                    .context("That key's signatures don't check out.")?;
+                    .with_context(|| t!("manage-openpgp-that-keys-signatures-dont-check-out"))?;
                 // A revocation certificate for one of your own keys goes
                 // onto that key, rather than beside it as someone's.
                 if self.revoke_own(&key)? {
@@ -323,7 +320,7 @@ impl Keyring {
         }
         ensure!(
             added > 0,
-            "No OpenPGP keys were found. Keys start with -----BEGIN PGP PUBLIC KEY BLOCK----- or -----BEGIN PGP PRIVATE KEY BLOCK-----."
+            t!("manage-openpgp-no-openpgp-keys-were-found-keys")
         );
         Ok(added)
     }
@@ -342,7 +339,7 @@ impl Keyring {
         let key = keys
             .into_iter()
             .find(|k| has_address(k, email) && k.verify_bindings().is_ok())
-            .with_context(|| format!("No usable key for {email} was found."))?;
+            .with_context(|| t!("manage-openpgp-no-usable-key-for-was-found", email = email))?;
         let fp = fingerprint(&key);
         let kept = self.public.iter().any(|k| {
             SignedPublicKey::from_string(k).is_ok_and(|(k, _)| {
@@ -409,11 +406,11 @@ impl Keyring {
             .to_ascii_uppercase();
         ensure!(
             given.len() >= 32,
-            "Paste the whole fingerprint (40 characters); a short key id can be faked."
+            t!("manage-openpgp-paste-the-whole-fingerprint-40-characters")
         );
         ensure!(
             given == fp.to_ascii_uppercase(),
-            "That fingerprint doesn't match this key. Don't use the key until you know why: it may not be theirs."
+            t!("manage-openpgp-that-fingerprint-doesnt-match-this-key")
         );
         self.verify(fp);
         Ok(())
@@ -515,9 +512,9 @@ fn unprotect(key: SignedSecretKey, passphrase: &str) -> Result<SignedSecretKey> 
     let mut test = key.primary_key.clone();
     if test.remove_password(&password).is_err() || test.secret_params().is_encrypted() {
         if passphrase.is_empty() {
-            bail!("This key has a passphrase. Enter it to import the key.");
+            bail!(t!("manage-openpgp-this-key-has-a-passphrase-enter"));
         }
-        bail!("The passphrase is wrong.");
+        bail!(t!("manage-openpgp-the-passphrase-is-wrong"));
     }
     if passphrase.is_empty() {
         return Ok(key);
@@ -525,11 +522,11 @@ fn unprotect(key: SignedSecretKey, passphrase: &str) -> Result<SignedSecretKey> 
     let mut key = key;
     key.primary_key
         .remove_password(&password)
-        .context("The key couldn't be unlocked.")?;
+        .with_context(|| t!("manage-openpgp-the-key-couldnt-be-unlocked"))?;
     for sub in &mut key.secret_subkeys {
         sub.key
             .remove_password(&password)
-            .context("A subkey couldn't be unlocked.")?;
+            .with_context(|| t!("manage-openpgp-a-subkey-couldnt-be-unlocked"))?;
     }
     Ok(key)
 }
@@ -1061,7 +1058,7 @@ pub fn protect(
     let mut content = part.clone();
     if how.sign {
         let key = own.as_ref().with_context(|| {
-            format!("There's no OpenPGP key of yours for {from}. Import one in Settings → Encryption, or turn off Sign.")
+            t!("manage-openpgp-theres-no-openpgp-key-of-yours", from = from)
         })?;
         // A subkey made for signing, as most keys have; else the primary key.
         let signing_sub = key
@@ -1110,8 +1107,7 @@ pub fn protect(
         }
         ensure!(
             missing.is_empty(),
-            "There's no OpenPGP key for {}. Import theirs in Settings → Encryption, or turn off Encrypt.",
-            missing.join(", ")
+            t!("manage-openpgp-theres-no-openpgp-key-for-import", addresses = missing.join(", "))
         );
         if let Some(own) = &own {
             keys.push(SignedPublicKey::from(own.clone()));
@@ -1273,7 +1269,7 @@ pub fn generate_key(
 ) -> Result<SignedSecretKey> {
     use pgp::composed::{EncryptionCaps, KeyType, SecretKeyParamsBuilder, SubkeyParamsBuilder};
     use pgp::crypto::ecc_curve::ECCCurve;
-    ensure!(email.contains('@'), "Enter the address the key is for.");
+    ensure!(email.contains('@'), t!("manage-openpgp-enter-the-address-the-key-is"));
     let name = name.replace(['<', '>', '\r', '\n'], "");
     let uid = if name.trim().is_empty() {
         format!("<{}>", email.trim())
@@ -1283,7 +1279,7 @@ pub fn generate_key(
     if version == KeyVersion::V6 {
         let key = v6_key_params(uid)?
             .generate(rand08::thread_rng())
-            .context("The key couldn't be made.")?;
+            .with_context(|| t!("manage-openpgp-the-key-couldnt-be-made"))?;
         return keys::expiring(key, lasts);
     }
     let mut sign = SubkeyParamsBuilder::default();
@@ -1306,14 +1302,14 @@ pub fn generate_key(
             vec![SymmetricKeyAlgorithm::AES256, SymmetricKeyAlgorithm::AES128].into(),
         )
         .subkeys(vec![
-            sign.build().context("The key couldn't be made.")?,
-            encrypt.build().context("The key couldn't be made.")?,
+            sign.build().with_context(|| t!("manage-openpgp-the-key-couldnt-be-made"))?,
+            encrypt.build().with_context(|| t!("manage-openpgp-the-key-couldnt-be-made"))?,
         ]);
     let key = params
         .build()
-        .context("The key couldn't be made.")?
+        .with_context(|| t!("manage-openpgp-the-key-couldnt-be-made"))?
         .generate(rand08::thread_rng())
-        .context("The key couldn't be made.")?;
+        .with_context(|| t!("manage-openpgp-the-key-couldnt-be-made"))?;
     keys::expiring(key, lasts)
 }
 /// A version 6 key for `uid` (RFC 9580 §5.5.2.3): an Ed25519 certifying
@@ -1360,10 +1356,10 @@ fn v6_key_params(uid: String) -> Result<pgp::composed::SecretKeyParams> {
         .feature_seipd_v1(true)
         .feature_seipd_v2(true)
         .subkeys(vec![
-            sign.build().context("The key couldn't be made.")?,
-            encrypt.build().context("The key couldn't be made.")?,
+            sign.build().with_context(|| t!("manage-openpgp-the-key-couldnt-be-made"))?,
+            encrypt.build().with_context(|| t!("manage-openpgp-the-key-couldnt-be-made"))?,
         ]);
-    params.build().context("The key couldn't be made.")
+    params.build().with_context(|| t!("manage-openpgp-the-key-couldnt-be-made"))
 }
 /// The armored, password-encrypted key an Autocrypt Setup Message
 /// carries (Autocrypt 1.1 §4.4: a message with `Autocrypt-Setup-Message:
@@ -1393,9 +1389,9 @@ impl Keyring {
     /// its setup code (the 36 digits shown where it was made; dashes and
     /// spaces don't matter). Returns how many keys were added.
     pub fn import_setup_message(&mut self, raw: &[u8], code: &str) -> Result<usize> {
-        let armored = setup_message_payload(raw).context("This isn't an Autocrypt Setup Message.")?;
+        let armored = setup_message_payload(raw).with_context(|| t!("manage-openpgp-this-isnt-an-autocrypt-setup-message"))?;
         let digits: String = code.chars().filter(|c| c.is_ascii_digit()).collect();
-        ensure!(digits.len() == 36, "Enter the setup code's 36 digits.");
+        ensure!(digits.len() == 36, t!("manage-openpgp-enter-the-setup-codes-36-digits"));
         // The code as it was made: nine groups of four, dashes between.
         let code = digits
             .as_bytes()
@@ -1403,17 +1399,17 @@ impl Keyring {
             .map(|c| String::from_utf8_lossy(c).into_owned())
             .collect::<Vec<_>>()
             .join("-");
-        let (message, _) = Message::from_string(&armored).context("The setup message can't be read.")?;
+        let (message, _) = Message::from_string(&armored).with_context(|| t!("manage-openpgp-the-setup-message-cant-be-read"))?;
         let mut opened = message
             .decrypt_with_password(&Password::from(code.as_str()))
-            .map_err(|_| anyhow::anyhow!("That setup code doesn't open it."))?;
+            .map_err(|_| anyhow::anyhow!(t!("manage-openpgp-that-setup-code-doesnt-open-it")))?;
         let mut text = String::new();
         {
             use std::io::Read as _;
             (&mut opened)
                 .take(1 << 20)
                 .read_to_string(&mut text)
-                .context("The setup message can't be read.")?;
+                .with_context(|| t!("manage-openpgp-the-setup-message-cant-be-read"))?;
         }
         self.import(&text, "")
     }

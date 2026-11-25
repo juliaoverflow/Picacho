@@ -59,10 +59,10 @@ impl RuleField {
     pub const ALL: [Self; 4] = [Self::From, Self::To, Self::Subject, Self::Anywhere];
     pub fn label(self) -> &'static str {
         match self {
-            Self::From => "From",
-            Self::To => "To or Cc",
-            Self::Subject => "Subject",
-            Self::Anywhere => "Anywhere",
+            Self::From => t!("manage-organize-from"),
+            Self::To => t!("manage-organize-to-or-cc"),
+            Self::Subject => t!("manage-organize-subject"),
+            Self::Anywhere => t!("manage-organize-anywhere"),
         }
     }
 }
@@ -85,13 +85,13 @@ pub enum RuleAction {
 impl RuleAction {
     pub fn label(&self) -> String {
         match self {
-            Self::MarkRead => "Mark as read".into(),
-            Self::Star => "Star".into(),
-            Self::Archive => "Archive".into(),
-            Self::Spam => "Move to Spam".into(),
-            Self::Trash => "Move to Trash".into(),
-            Self::MoveTo(f) => format!("Move to “{f}”"),
-            Self::Label(l) => format!("Label “{l}”"),
+            Self::MarkRead => t!("manage-organize-mark-as-read").into(),
+            Self::Star => t!("manage-organize-star").into(),
+            Self::Archive => t!("manage-organize-archive").into(),
+            Self::Spam => t!("manage-organize-move-to-spam").into(),
+            Self::Trash => t!("manage-organize-move-to-trash").into(),
+            Self::MoveTo(f) => t!("manage-organize-move-to", folder = f),
+            Self::Label(l) => t!("manage-organize-label", label = l),
         }
     }
     /// The change it makes on the server.

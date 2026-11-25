@@ -188,7 +188,7 @@ impl Tracked {
             return s.label();
         }
         if self.assumed {
-            return "Probably delivered";
+            return t!("manage-parcels-summary-probably-delivered");
         }
         self.history
             .iter()

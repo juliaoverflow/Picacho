@@ -86,14 +86,14 @@ public final class WidgetStore {
                 if (accounts.size() == 1) {
                     return accounts.get(0).name;
                 }
-                return context.getString(R.string.widget_all_inboxes);
+                return Lang.of(context).getString(R.string.widget_all_inboxes);
             }
             for (Account a : accounts) {
                 if (accountId.equals(a.id)) {
                     return a.name;
                 }
             }
-            return context.getString(R.string.widget_inbox_title);
+            return Lang.of(context).getString(R.string.widget_inbox_title);
         }
 
         String accountLabelFor(Context context, String accountId) {
@@ -101,14 +101,14 @@ public final class WidgetStore {
                 if (accounts.size() == 1) {
                     return accounts.get(0).name;
                 }
-                return context.getString(R.string.widget_all_accounts);
+                return Lang.of(context).getString(R.string.widget_all_accounts);
             }
             for (Account a : accounts) {
                 if (accountId.equals(a.id)) {
                     return a.name;
                 }
             }
-            return context.getString(R.string.widget_all_accounts);
+            return Lang.of(context).getString(R.string.widget_all_accounts);
         }
 
         List<Message> filteredMessages(String accountId, boolean unreadOnly, int limit) {
@@ -719,20 +719,27 @@ public final class WidgetStore {
         Calendar then = Calendar.getInstance();
         then.setTime(date);
         if (sameDay(now, then)) {
-            return android.text.format.DateFormat.getTimeFormat(context).format(date);
+            return android.text.format.DateFormat.getTimeFormat(Lang.of(context)).format(date);
         }
         long diffDays = (now.getTimeInMillis() - then.getTimeInMillis()) / 86_400_000L;
         if (diffDays >= 0 && diffDays < 6) {
-            return new SimpleDateFormat("EEE", Locale.getDefault()).format(date);
+            return localDate(context, "EEE").format(date);
         }
         if (now.get(Calendar.YEAR) == then.get(Calendar.YEAR)) {
-            return new SimpleDateFormat("MMM d", Locale.getDefault()).format(date);
+            return localDate(context, "MMMd").format(date);
         }
-        return new SimpleDateFormat("MMM d, yyyy", Locale.getDefault()).format(date);
+        return localDate(context, "yMMMd").format(date);
     }
 
-    static String formatTodayHeader() {
-        return new SimpleDateFormat("EEE, MMM d", Locale.getDefault()).format(new Date());
+    static String formatTodayHeader(Context context) {
+        return localDate(context, "EEEMMMd").format(new Date());
+    }
+
+    /** A date format with these fields, in the order and words of the phone's language. */
+    private static SimpleDateFormat localDate(Context context, String skeleton) {
+        Locale locale = Lang.locale(context);
+        return new SimpleDateFormat(
+                android.text.format.DateFormat.getBestDateTimePattern(locale, skeleton), locale);
     }
 
     static String formatEventTime(Context context, Event ev) {
@@ -743,14 +750,14 @@ public final class WidgetStore {
         if (ev.allDay) {
             Calendar startUtc = Calendar.getInstance(TimeZone.getTimeZone("UTC"));
             startUtc.setTimeInMillis(ev.start * 1000L);
-            String day = dayLabel(now, tomorrow, startUtc);
-            return day + " · All day";
+            String day = dayLabel(context, now, tomorrow, startUtc);
+            return day + " · " + Lang.of(context).getString(R.string.widget_all_day);
         }
         Date start = new Date(ev.start * 1000L);
         Calendar startCal = Calendar.getInstance();
         startCal.setTime(start);
-        String day = dayLabel(now, tomorrow, startCal);
-        DateFormat tf = android.text.format.DateFormat.getTimeFormat(context);
+        String day = dayLabel(context, now, tomorrow, startCal);
+        DateFormat tf = android.text.format.DateFormat.getTimeFormat(Lang.of(context));
         if (ev.end > ev.start) {
             Date end = new Date(ev.end * 1000L);
             return day + " · " + tf.format(start) + " – " + tf.format(end);
@@ -758,14 +765,15 @@ public final class WidgetStore {
         return day + " · " + tf.format(start);
     }
 
-    private static String dayLabel(Calendar today, Calendar tomorrow, Calendar target) {
+    private static String dayLabel(
+            Context context, Calendar today, Calendar tomorrow, Calendar target) {
         if (sameDay(today, target)) {
-            return "Today";
+            return Lang.of(context).getString(R.string.widget_today);
         }
         if (sameDay(tomorrow, target)) {
-            return "Tomorrow";
+            return Lang.of(context).getString(R.string.widget_tomorrow);
         }
-        SimpleDateFormat fmt = new SimpleDateFormat("EEE, MMM d", Locale.getDefault());
+        SimpleDateFormat fmt = localDate(context, "EEEMMMd");
         fmt.setTimeZone(target.getTimeZone());
         return fmt.format(target.getTime());
     }

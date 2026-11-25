@@ -68,7 +68,7 @@ impl KeySearch {
             )?
             .i()
         })
-        .ok_or_else(|| anyhow!("Security keys can't be used on this phone."))?;
+        .ok_or_else(|| anyhow!(t!("android-keys-security-keys-cant-be-used-on")))?;
         Ok(Self {
             nfc: match state {
                 2 => Nfc::On,
@@ -84,7 +84,7 @@ impl KeySearch {
         let deadline = Instant::now() + wait;
         loop {
             if cancel.load(Ordering::Relaxed) {
-                bail!("Sign-in cancelled.");
+                bail!(t!("android-keys-sign-in-cancelled"));
             }
             if Instant::now() >= deadline {
                 bail!(if self.nfc == Nfc::On {
@@ -100,9 +100,7 @@ impl KeySearch {
             match found {
                 Some(1) => return Ok(KeyToken::new(Link::Usb, cancel)),
                 Some(2) => return Ok(KeyToken::new(Link::Nfc, cancel)),
-                Some(3) => bail!(
-                    "Picacho wasn't allowed to use the security key. Plug it in again, and allow Picacho to use it."
-                ),
+                Some(3) => bail!(t!("android-keys-picacho-wasnt-allowed-to-use-the")),
                 _ => std::thread::sleep(Duration::from_millis(150)),
             }
         }
@@ -455,7 +453,7 @@ pub fn passkey(
         .map(drop)
     });
     if started.is_none() {
-        bail!("Passkeys can't be used on this phone.");
+        bail!(t!("android-keys-passkeys-cant-be-used-on-this"));
     }
     let answer = match pending.next(cancel, Instant::now() + Duration::from_secs(5 * 60)) {
         Waited::Answer(answer) => answer.unwrap_or_default(),
@@ -469,31 +467,26 @@ pub fn passkey(
                 )
                 .map(drop)
             });
-            bail!("Sign-in cancelled.");
+            bail!(t!("android-keys-sign-in-cancelled"));
         }
     };
     let (kind, detail) = answer.split_once(':').unwrap_or((answer.as_str(), ""));
     match kind {
         "ok" => assertion(detail, client_data_json, challenge),
-        "cancelled" => bail!("Using a passkey was cancelled."),
-        "none" => bail!(
-            "No passkey for this Proton account was found. Use another way, or the code from your authenticator app."
-        ),
-        "unsupported" => bail!(
-            "Passkeys need Android 14 or later here. Use a security key, or the code from your authenticator app."
-        ),
-        "refused" => bail!(
-            "Your password manager didn't let Picacho use your Proton passkey: it only lets browsers it knows ask for another site's passkeys. Use a security key, or the code from your authenticator app."
-        ),
-        _ if detail.is_empty() => bail!("The passkey didn't work."),
-        _ => bail!("The passkey didn't work ({detail})."),
+        "cancelled" => bail!(t!("android-keys-using-a-passkey-was-cancelled")),
+        "closed" => bail!(t!("android-keys-open-picacho-to-use-a-passkey")),
+        "none" => bail!(t!("android-keys-no-passkey-for-this-proton-account")),
+        "unsupported" => bail!(t!("android-keys-passkeys-need-android-14-or-later")),
+        "refused" => bail!(t!("android-keys-your-password-manager-didnt-let-picacho")),
+        _ if detail.is_empty() => bail!(t!("android-keys-the-passkey-didnt-work")),
+        _ => bail!(t!("android-keys-the-passkey-didnt-work-2", detail = detail)),
     }
 }
 
 /// What the passkey signed, from Credential Manager's WebAuthn JSON.
 fn assertion(response: &str, client_data_json: &[u8], challenge: &[u8]) -> Result<Assertion> {
-    let response: Value =
-        serde_json::from_str(response).map_err(|_| anyhow!("The passkey's answer couldn't be read."))?;
+    let response: Value = serde_json::from_str(response)
+        .map_err(|_| anyhow!(t!("android-keys-the-passkeys-answer-couldnt-be-read")))?;
     let bytes = |v: &Value| {
         let text = v.as_str()?;
         URL_SAFE_NO_PAD
@@ -507,7 +500,7 @@ fn assertion(response: &str, client_data_json: &[u8], challenge: &[u8]) -> Resul
         bytes(&signed["authenticatorData"]),
         bytes(&signed["signature"]),
     ) else {
-        bail!("The passkey's answer was incomplete.");
+        bail!(t!("android-keys-the-passkeys-answer-was-incomplete"));
     };
     // Given Proton's hash, the password manager signs it and may answer
     // with placeholder client data; one that made its own (for this

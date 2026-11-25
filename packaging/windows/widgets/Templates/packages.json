@@ -16,7 +16,7 @@
           "items": [
             {
               "type": "TextBlock",
-              "text": "Packages",
+              "text": "${heading}",
               "weight": "Bolder",
               "size": "Medium"
             }
@@ -100,7 +100,7 @@
     },
     {
       "type": "TextBlock",
-      "text": "No recent packages",
+      "text": "${emptyText}",
       "isSubtle": true,
       "horizontalAlignment": "Center",
       "spacing": "Large",
@@ -110,12 +110,12 @@
   "actions": [
     {
       "type": "Action.OpenUrl",
-      "title": "All Packages",
+      "title": "${openText}",
       "url": "${packagesUrl}"
     },
     {
       "type": "Action.Execute",
-      "title": "Refresh",
+      "title": "${refreshText}",
       "verb": "refresh"
     }
   ]

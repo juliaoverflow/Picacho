@@ -69,7 +69,7 @@ impl Find {
     pub(super) fn new(window: &mut Window, cx: &mut App) -> Self {
         Self {
             open: false,
-            input: input("Find in message", false, window, cx),
+            input: input(t!("tools-find-in-message"), false, window, cx),
             current: 0,
             count: Cell::new(0),
             reveal: Cell::new(false),
@@ -290,19 +290,19 @@ fn decode_image_preview(bytes: Vec<u8>, mime: &str, name: &str) -> anyhow::Resul
             ..Default::default()
         };
         let tree = resvg::usvg::Tree::from_data(&bytes, &opt)
-            .map_err(|e| anyhow::anyhow!("Couldn't read SVG image: {e}"))?;
+            .map_err(|e| anyhow::anyhow!(t!("tools-couldnt-read-svg-image", error = e.to_string())))?;
         let size = tree.size();
         let (w, h) = (size.width().max(1.), size.height().max(1.));
         let scale = (MAX_SVG_DIM / w.max(h)).clamp(0.01, 2.);
         let pw = (w * scale).ceil().clamp(1., MAX_SVG_DIM) as u32;
         let ph = (h * scale).ceil().clamp(1., MAX_SVG_DIM) as u32;
         let mut pixmap = resvg::tiny_skia::Pixmap::new(pw, ph)
-            .ok_or_else(|| anyhow::anyhow!("SVG image size is invalid"))?;
+            .ok_or_else(|| anyhow::anyhow!(t!("tools-svg-image-size-is-invalid")))?;
         let tx = resvg::tiny_skia::Transform::from_scale(pw as f32 / w, ph as f32 / h);
         resvg::render(&tree, tx, &mut pixmap.as_mut());
         let png = pixmap
             .encode_png()
-            .map_err(|e| anyhow::anyhow!("Couldn't encode SVG preview: {e}"))?;
+            .map_err(|e| anyhow::anyhow!(t!("tools-couldnt-encode-svg-preview", error = e.to_string())))?;
         return Ok((ImageFormat::Png, png));
     }
 
@@ -357,7 +357,7 @@ fn decode_image_preview(bytes: Vec<u8>, mime: &str, name: &str) -> anyhow::Resul
             if let Ok(png) = convert_with_sips(&bytes, name) {
                 return Ok((ImageFormat::Png, png));
             }
-            Err(anyhow::anyhow!("Can't preview this image: {err}"))
+            Err(anyhow::anyhow!(t!("tools-cant-preview-this-image", error = err.to_string())))
         }
     }
 }
@@ -388,7 +388,7 @@ fn convert_with_sips(bytes: &[u8], name: &str) -> anyhow::Result<Vec<u8>> {
         None
     };
     let _ = std::fs::remove_dir_all(&dir);
-    png.ok_or_else(|| anyhow::anyhow!("sips couldn't convert image"))
+    png.ok_or_else(|| anyhow::anyhow!(t!("tools-sips-couldnt-convert-image")))
 }
 
 impl MailApp {
@@ -429,9 +429,9 @@ impl MailApp {
         let status = if !has_query {
             String::new()
         } else if count == 0 {
-            "No matches".into()
+            t!("tools-no-matches").into()
         } else {
-            format!("{} of {}", self.find.current.min(count - 1) + 1, count)
+            t!("tools-of", current = self.find.current.min(count - 1) + 1, count = count)
         };
         div()
             .id("find-bar")
@@ -456,7 +456,7 @@ impl MailApp {
             )
             .child(self.button(
                 "find-previous",
-                "@Previous match · ⇧Enter",
+                t!("tools-previous-match-enter"),
                 "chevron-up",
                 Action::Tools(ToolAction::FindPrevious),
                 false,
@@ -464,7 +464,7 @@ impl MailApp {
             ))
             .child(self.button(
                 "find-next",
-                "@Next match · Enter",
+                t!("tools-next-match-enter"),
                 "chevron-down",
                 Action::Tools(ToolAction::FindNext),
                 false,
@@ -472,7 +472,7 @@ impl MailApp {
             ))
             .child(self.button(
                 "find-close",
-                "@Close · Esc",
+                t!("tools-close-esc"),
                 "close",
                 Action::Tools(ToolAction::FindClose),
                 false,
@@ -525,7 +525,7 @@ impl MailApp {
                 let title = m.subject.clone();
                 #[cfg(target_os = "macos")]
                 let title_mac = title.clone();
-                this.notice("Preparing to print…", false, cx);
+                this.notice(t!("tools-preparing-to-print"), false, cx);
                 this.task(
                     cx,
                     move |_| {
@@ -545,16 +545,16 @@ impl MailApp {
                             #[cfg(target_os = "macos")]
                             Ok((pdf, None)) => {
                                 if let Err(e) = crate::display::html::print::print_pdf_macos(&pdf, &title_mac) {
-                                    this.notice(format!("Couldn't print the message: {e:#}"), true, cx);
+                                    this.notice(t!("tools-couldnt-print-the-message", e = format!("{:#}", e)), true, cx);
                                 }
                             }
                             Ok((_, Some(Printed::Viewer))) => this.notice(
-                                "Opened the message as a PDF: print it from there.",
+                                t!("tools-opened-the-message-as-a-pdf"),
                                 false,
                                 cx,
                             ),
                             Ok(_) => {}
-                            Err(e) => this.notice(format!("Couldn't print the message: {e:#}"), true, cx),
+                            Err(e) => this.notice(t!("tools-couldnt-print-the-message", e = format!("{:#}", e)), true, cx),
                         }
                     },
                 );
@@ -569,14 +569,14 @@ impl MailApp {
                 let date = date_full(m.date).to_string();
                 let name = safe_file_name(&format!(
                     "{}.pdf",
-                    if m.subject.is_empty() { "Message" } else { &m.subject }
+                    if m.subject.is_empty() { t!("tools-message") } else { &m.subject }
                 ));
                 let start = this.save_start();
                 let picker = cx.prompt_for_new_path(&start, Some(&name));
                 cx.spawn(async move |this, cx| {
                     if let Ok(Ok(Some(path))) = picker.await {
                         let _ = this.update(cx, |this, cx| {
-                            this.notice("Saving PDF…", false, cx);
+                            this.notice(t!("tools-saving-pdf"), false, cx);
                             this.task(
                                 cx,
                                 move |_| {
@@ -585,8 +585,8 @@ impl MailApp {
                                     Ok(())
                                 },
                                 |this, result: anyhow::Result<()>, cx| match result {
-                                    Ok(()) => this.notice("Saved as PDF", false, cx),
-                                    Err(e) => this.notice(format!("Couldn't save the PDF: {e:#}"), true, cx),
+                                    Ok(()) => this.notice(t!("tools-saved-as-pdf"), false, cx),
+                                    Err(e) => this.notice(t!("tools-couldnt-save-the-pdf", e = format!("{:#}", e)), true, cx),
                                 },
                             );
                         });
@@ -679,7 +679,7 @@ impl MailApp {
                                 .collect();
                             entries.push(Entry::Separator);
                             entries.push(entry(
-                                if cfg!(target_os = "macos") { "Show in Finder" } else { "Show in Folder" },
+                                if cfg!(target_os = "macos") { t!("tools-show-in-finder") } else { t!("tools-show-in-folder") },
                                 "download",
                                 Action::Tools(ToolAction::RevealAttachment(i)),
                             ));
@@ -693,7 +693,7 @@ impl MailApp {
             }
             ToolAction::OpenAttachmentIn(path, app) => {
                 if let Err(e) = crate::display::open_with::open_in(&app, &path) {
-                    self.notice(format!("Couldn't open in {}: {e:#}", app.name), true, cx);
+                    self.notice(t!("tools-couldnt-open-in", name = app.name, e = format!("{:#}", e)), true, cx);
                 }
             }
             ToolAction::PreviewImage(i) => {
@@ -751,13 +751,13 @@ impl MailApp {
             }
             ToolAction::PublishKeys => {
                 let addresses: Vec<String> = self.accounts.iter().map(|a| a.email.clone()).collect();
-                self.notice("Publishing your public key on keys.openpgp.org…", false, cx);
+                self.notice(t!("tools-publishing-your-public-key-on-keys"), false, cx);
                 self.task(
                     cx,
                     move |b| {
                         let ring = b.keyring();
                         let keys = ring.secret_keys();
-                        anyhow::ensure!(!keys.is_empty(), "You have no OpenPGP key of your own to publish.");
+                        anyhow::ensure!(!keys.is_empty(), t!("tools-you-have-no-openpgp-key-of"));
                         let mut done = crate::sync::keys::Published::default();
                         for key in keys {
                             let armored = pgp::composed::SignedPublicKey::from(key)
@@ -770,19 +770,16 @@ impl MailApp {
                     },
                     |this, result: anyhow::Result<crate::sync::keys::Published>, cx| match result {
                         Ok(p) if !p.confirming.is_empty() => this.notice(
-                            format!(
-                                "keys.openpgp.org emailed {} a link: follow it to list your key under that address.",
-                                p.confirming.join(", ")
-                            ),
+                            t!("tools-keys-openpgp-org-emailed-a-link", addresses = p.confirming.join(", ")),
                             false,
                             cx,
                         ),
                         Ok(p) if !p.listed.is_empty() => this.notice(
-                            format!("Your key is listed on keys.openpgp.org for {}", p.listed.join(", ")),
+                            t!("tools-your-key-is-listed-on-keys", addresses = p.listed.join(", ")),
                             false,
                             cx,
                         ),
-                        Ok(_) => this.notice("Uploaded to keys.openpgp.org", false, cx),
+                        Ok(_) => this.notice(t!("tools-uploaded-to-keys-openpgp-org"), false, cx),
                         Err(e) => this.notice(format!("{e:#}"), true, cx),
                     },
                 );
@@ -800,16 +797,12 @@ impl MailApp {
                 }
                 // HKP keyservers list every address on the key at once and
                 // never take a key down again: asked first.
-                let detail = format!(
-                    "{server} will list your public key and every email address on it right away, \
-                     without asking those addresses first. Keyservers share keys with each other \
-                     and can't remove them later."
-                );
+                let detail = t!("tools-will-list-your-public-key-and", server = server);
                 let answer = w.prompt(
                     PromptLevel::Warning,
-                    "Publish your public key for good?",
+                    t!("tools-publish-your-public-key-for-good"),
                     Some(&detail),
-                    &["Publish", "Cancel"],
+                    &[t!("tools-publish"), t!("tools-cancel")],
                     cx,
                 );
                 cx.spawn(async move |this, cx| {
@@ -824,7 +817,7 @@ impl MailApp {
                     files: false,
                     directories: true,
                     multiple: false,
-                    prompt: Some("Choose folder for WKD export".into()),
+                    prompt: Some(t!("tools-choose-folder-for-wkd-export").into()),
                 });
                 cx.spawn(async move |this, cx| {
                     if let Ok(Ok(Some(paths))) = picker.await
@@ -839,7 +832,7 @@ impl MailApp {
                                     let keys = ring.secret_keys();
                                     anyhow::ensure!(
                                         !keys.is_empty(),
-                                        "You have no OpenPGP key of your own to export."
+                                        t!("tools-you-have-no-openpgp-key-of-2")
                                     );
                                     // Each address's file holds the key with that
                                     // address's user ID alone, so a domain's
@@ -872,11 +865,7 @@ impl MailApp {
                                             .filter_map(|d| d.file_name().map(|n| n.to_string_lossy().into_owned()))
                                             .collect();
                                         this.notice(
-                                            format!(
-                                                "Exported WKD files for {n} address{}: put the contents of each domain's folder ({}) in that domain's web root.",
-                                                if n == 1 { "" } else { "es" },
-                                                names.join(", ")
-                                            ),
+                                            t!("tools-exported-wkd-files-for-address-put", n = n, domains = names.join(", ")),
                                             false,
                                             cx,
                                         );
@@ -929,7 +918,7 @@ impl MailApp {
     }
 
     fn publish_keys_hkp(&mut self, server: String, cx: &mut Context<Self>) {
-        self.notice(format!("Publishing your public key on {server}…"), false, cx);
+        self.notice(t!("tools-publishing-your-public-key-on", server = server), false, cx);
         self.task(
             cx,
             move |b| {
@@ -937,7 +926,7 @@ impl MailApp {
                 let keys = ring.secret_keys();
                 anyhow::ensure!(
                     !keys.is_empty(),
-                    "You have no OpenPGP key of your own to publish."
+                    t!("tools-you-have-no-openpgp-key-of")
                 );
                 let mut host = server.clone();
                 for key in keys {
@@ -949,7 +938,7 @@ impl MailApp {
             },
             |this, result: anyhow::Result<String>, cx| match result {
                 Ok(host) => this.notice(
-                    format!("Published your public key on {host} — it is listed right away."),
+                    t!("tools-published-your-public-key-on-it", host = host),
                     false,
                     cx,
                 ),
@@ -1189,7 +1178,7 @@ impl MailApp {
             buttons.push(
                 self.button(
                     format!("attachment-image-{i}"),
-                    if shown { "Hide" } else { "Preview" },
+                    if shown { t!("tools-hide") } else { t!("tools-preview") },
                     "image",
                     Action::Tools(ToolAction::PreviewImage(i)),
                     false,
@@ -1201,7 +1190,7 @@ impl MailApp {
         buttons.push(
             self.button(
                 format!("attachment-open-{i}"),
-                "Open",
+                t!("tools-open"),
                 "external",
                 Action::Tools(ToolAction::OpenAttachment(i)),
                 false,
@@ -1211,15 +1200,15 @@ impl MailApp {
         );
         let more: Vec<Entry> = [
             cfg!(target_os = "macos")
-                .then(|| entry("Quick Look", "preview", Action::Tools(ToolAction::QuickLook(i)))),
+                .then(|| entry(t!("tools-quick-look"), "preview", Action::Tools(ToolAction::QuickLook(i)))),
             cfg!(not(any(target_os = "android", target_os = "ios")))
-                .then(|| entry("Open With…", "external", Action::Tools(ToolAction::OpenWith(i)))),
+                .then(|| entry(t!("tools-open-with"), "external", Action::Tools(ToolAction::OpenWith(i)))),
             Some(entry(
-                if cfg!(target_os = "macos") { "Show in Finder" } else { "Show in Folder" },
+                if cfg!(target_os = "macos") { t!("tools-show-in-finder") } else { t!("tools-show-in-folder") },
                 "download",
                 Action::Tools(ToolAction::RevealAttachment(i)),
             )),
-            Some(entry("Save…", "download", Action::SaveAttachment(i))),
+            Some(entry(t!("tools-save"), "download", Action::SaveAttachment(i))),
         ]
         .into_iter()
         .flatten()
@@ -1236,7 +1225,7 @@ impl MailApp {
                 .cursor_pointer()
                 .hover(move |s| s.bg(rgb(c.raised)))
                 .child(icon_el("ellipsis", 16., c.muted))
-                .tooltip(|w, cx| Tooltip::new("More").build(w, cx))
+                .tooltip(|w, cx| Tooltip::new(t!("tools-more")).build(w, cx))
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |this, e: &MouseDownEvent, _, cx| {
@@ -1324,7 +1313,7 @@ fn set_default_mail_app() -> anyhow::Result<(String, Option<bool>)> {
     {
         crate::display::windows::open_default_apps()?;
         Ok((
-            "Opened Windows Default apps to Picacho — click Set default there to finish.".into(),
+            t!("tools-opened-windows-default-apps-to-picacho").into(),
             Some(crate::display::windows::is_default_mail_app()),
         ))
     }
@@ -1348,10 +1337,10 @@ fn set_default_mail_app() -> anyhow::Result<(String, Option<bool>)> {
             || settings.as_ref().is_ok_and(|s| s.success());
         anyhow::ensure!(
             ok,
-            "Could not set default email app (xdg-mime / xdg-settings not available)."
+            t!("tools-could-not-set-default-email-app")
         );
         Ok((
-            "Picacho is now your default email app for mailto: links, .eml and .msg files.".into(),
+            t!("tools-picacho-is-now-your-default-email").into(),
             Some(true),
         ))
     }
@@ -1363,13 +1352,13 @@ fn set_default_mail_app() -> anyhow::Result<(String, Option<bool>)> {
             .stderr(std::process::Stdio::null())
             .spawn();
         Ok((
-            "In Apple Mail, choose Settings → General → Default email reader → Picacho.".into(),
+            t!("tools-in-apple-mail-choose-settings-general").into(),
             is_default_mail_app(),
         ))
     }
     #[cfg(any(target_os = "android", target_os = "ios"))]
     {
-        anyhow::bail!("Choose your default email app in your phone's Settings.")
+        anyhow::bail!(t!("tools-choose-your-default-email-app-in"))
     }
 }
 

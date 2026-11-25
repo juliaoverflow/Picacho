@@ -36,11 +36,11 @@ pub fn is_msg(bytes: &[u8]) -> bool {
 /// indexer reads attached `.msg` files of received mail).
 pub fn to_eml(bytes: &[u8]) -> Result<Vec<u8>> {
     std::panic::catch_unwind(|| to_eml_depth(bytes, 0))
-        .unwrap_or_else(|_| bail!("This .msg file couldn't be read."))
+        .unwrap_or_else(|_| bail!(t!("sync-msg-this-msg-file-couldnt-be-read")))
 }
 
 fn to_eml_depth(bytes: &[u8], depth: usize) -> Result<Vec<u8>> {
-    ensure!(depth <= MAX_DEPTH, "Embedded .msg files are nested too deeply.");
+    ensure!(depth <= MAX_DEPTH, t!("sync-msg-embedded-msg-files-are-nested-too"));
     let cf = CompoundFile::parse(bytes)?;
     let msg = parse_storage(&cf, 0, depth)?;
     Ok(build_eml(&msg))
@@ -100,7 +100,7 @@ struct CompoundFile<'a> {
 fn u16_le(b: &[u8], off: usize) -> Result<u16> {
     let s: [u8; 2] = b
         .get(off..off + 2)
-        .context("Unexpected end of .msg file")?
+        .with_context(|| t!("sync-msg-unexpected-end-of-msg-file"))?
         .try_into()?;
     Ok(u16::from_le_bytes(s))
 }
@@ -108,7 +108,7 @@ fn u16_le(b: &[u8], off: usize) -> Result<u16> {
 fn u32_le(b: &[u8], off: usize) -> Result<u32> {
     let s: [u8; 4] = b
         .get(off..off + 4)
-        .context("Unexpected end of .msg file")?
+        .with_context(|| t!("sync-msg-unexpected-end-of-msg-file"))?
         .try_into()?;
     Ok(u32::from_le_bytes(s))
 }
@@ -116,24 +116,24 @@ fn u32_le(b: &[u8], off: usize) -> Result<u32> {
 fn u64_le(b: &[u8], off: usize) -> Result<u64> {
     let s: [u8; 8] = b
         .get(off..off + 8)
-        .context("Unexpected end of .msg file")?
+        .with_context(|| t!("sync-msg-unexpected-end-of-msg-file"))?
         .try_into()?;
     Ok(u64::from_le_bytes(s))
 }
 
 impl<'a> CompoundFile<'a> {
     fn parse(raw: &'a [u8]) -> Result<Self> {
-        ensure!(is_msg(raw), "Not a valid Outlook .msg file (missing OLE2 header).");
+        ensure!(is_msg(raw), t!("sync-msg-not-a-valid-outlook-msg-file"));
         let major_ver = u16_le(raw, 26)?;
         let sector_shift = u16_le(raw, 30)?;
         let mini_shift = u16_le(raw, 32)?;
         ensure!(
             sector_shift == 9 || sector_shift == 12,
-            "Unsupported .msg sector size."
+            t!("sync-msg-unsupported-msg-sector-size")
         );
         ensure!(
             (3..=sector_shift).contains(&mini_shift),
-            "Unsupported .msg mini-sector size."
+            t!("sync-msg-unsupported-msg-mini-sector-size")
         );
         let sector_size = 1usize << sector_shift;
         let mini_sector_size = 1usize << mini_shift;
@@ -204,7 +204,7 @@ impl<'a> CompoundFile<'a> {
                 size,
             });
         }
-        ensure!(!entries.is_empty(), "Empty .msg directory.");
+        ensure!(!entries.is_empty(), t!("sync-msg-empty-msg-directory"));
 
         // Read MiniFAT.
         let mut mini_fat = Vec::new();
@@ -279,13 +279,13 @@ impl<'a> CompoundFile<'a> {
     }
 
     fn read_stream(&self, idx: usize) -> Result<Vec<u8>> {
-        let e = self.entries.get(idx).context("Missing .msg stream")?;
+        let e = self.entries.get(idx).with_context(|| t!("sync-msg-missing-msg-stream"))?;
         let size = (e.size as usize).min(MAX_STREAM_BYTES);
         if size == 0 || e.start_sector == ENDOFCHAIN || e.start_sector == FREESECT {
             return Ok(Vec::new());
         }
         let left = self.budget.get();
-        ensure!(size <= left, "This .msg file is larger than it says.");
+        ensure!(size <= left, t!("sync-msg-this-msg-file-is-larger-than"));
         self.budget.set(left - size);
         let mut data = if e.size < self.mini_cutoff as u64 && !self.mini_stream.is_empty() {
             read_mini_chain(
@@ -307,10 +307,10 @@ fn sector_slice(raw: &[u8], sector_size: usize, sector: u32) -> Result<&[u8]> {
     // Sector 0 starts immediately after the 512-byte header (or 1 sector for v4).
     let header_len = sector_size.max(512);
     let offset = header_len
-        .checked_add((sector as usize).checked_mul(sector_size).context("Sector overflow")?)
-        .context("Sector overflow")?;
-    let end = offset.checked_add(sector_size).context("Sector overflow")?;
-    raw.get(offset..end).context("Truncated .msg sector")
+        .checked_add((sector as usize).checked_mul(sector_size).with_context(|| t!("sync-msg-sector-overflow"))?)
+        .with_context(|| t!("sync-msg-sector-overflow"))?;
+    let end = offset.checked_add(sector_size).with_context(|| t!("sync-msg-sector-overflow"))?;
+    raw.get(offset..end).with_context(|| t!("sync-msg-truncated-msg-sector"))
 }
 
 fn read_fat_chain(
@@ -361,10 +361,10 @@ fn read_mini_chain(
     {
         let off = (cur as usize)
             .checked_mul(mini_sector_size)
-            .context("Mini-sector overflow")?;
+            .with_context(|| t!("sync-msg-mini-sector-overflow"))?;
         let end = off
             .checked_add(mini_sector_size)
-            .context("Mini-sector overflow")?;
+            .with_context(|| t!("sync-msg-mini-sector-overflow"))?;
         let Some(slice) = mini_stream.get(off..end) else {
             break;
         };
@@ -487,7 +487,7 @@ fn format_mailbox(name: &str, email: &str) -> String {
 fn parse_storage(cf: &CompoundFile<'_>, storage_idx: usize, depth: usize) -> Result<ParsedMsg> {
     ensure!(
         cf.parsed.borrow_mut().insert(storage_idx),
-        "An embedded message in this .msg file loops back on itself."
+        t!("sync-msg-an-embedded-message-in-this-msg")
     );
     let (strings, binaries) = read_props(cf, storage_idx);
 
@@ -730,16 +730,16 @@ fn parse_storage(cf: &CompoundFile<'_>, storage_idx: usize, depth: usize) -> Res
 
 /// Decompresses Outlook's LZFu-compressed RTF (`PR_RTF_COMPRESSED`, MS-OXRTFCP).
 fn decompress_rtf(data: &[u8]) -> Result<String> {
-    ensure!(data.len() >= 16, "Truncated compressed RTF");
+    ensure!(data.len() >= 16, t!("sync-msg-truncated-compressed-rtf"));
     let raw_size = u32_le(data, 4)? as usize;
     let magic = &data[8..12];
-    ensure!(raw_size <= MAX_STREAM_BYTES, "Compressed RTF too large");
+    ensure!(raw_size <= MAX_STREAM_BYTES, t!("sync-msg-compressed-rtf-too-large"));
     if magic == b"MELA" {
         let end = (16 + raw_size).min(data.len());
         return Ok(decode_ansi(&data[16..end]));
     }
     if magic != b"LZFu" {
-        bail!("Unsupported compressed RTF magic");
+        bail!(t!("sync-msg-unsupported-compressed-rtf-magic"));
     }
     // Pre-populated 4096-byte ring dictionary (MS-OXRTFCP §2.1.3.1).
     const INIT: &[u8] = b"{\\rtf1\\ansi\\mac\\deff0\\deftab720{\\fonttbl;}{\\f0\\fnil \\froman \\fswiss \\fmodern \\fscript \\fdecor MS Sans SerifSymbolArialTimes New RomanCourier{\\colortbl\\red0\\green0\\blue0\r\n\\par \\pard\\plain\\f0\\fs20\\b\\i\\u\\tab\\tx";

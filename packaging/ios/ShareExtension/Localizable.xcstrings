@@ -1,0 +1,12 @@
+{
+  "sourceLanguage" : "en",
+  "strings" : {
+    "Open Picacho to finish your message." : {},
+    "Picacho couldn't take this. Open Picacho once, then share again." : {},
+    "Picacho couldn't take this: %@" : {
+      "comment" : "After the colon: why, from the system"
+    },
+    "Starting a message in Picacho…" : {}
+  },
+  "version" : "1.0"
+}

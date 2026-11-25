@@ -278,7 +278,7 @@ impl Model {
             .collect();
         ensure!(
             bytes.len() as u64 == self.size && digest == self.sha256,
-            "The downloaded model isn't the published one, so it wasn't installed."
+            t!("manage-local-ai-the-downloaded-model-isnt-the-published")
         );
         let dir = models_dir(store);
         std::fs::create_dir_all(&dir)?;
@@ -305,13 +305,7 @@ impl Model {
     fn read_local(&self, received: &AtomicU64) -> Result<Vec<u8>> {
         let path = local_dir(self).join(self.file);
         let bytes = std::fs::read(&path).with_context(|| {
-            format!(
-                "The {} isn't published yet, and {} isn't there to install it from \
-                 (train it with models/{}/train.py)",
-                self.label.to_lowercase(),
-                path.display(),
-                self.id
-            )
+            t!("manage-local-ai-the-isnt-published-yet-and-isnt", model = self.label.to_lowercase(), path = path.display(), id = self.id)
         })?;
         received.store(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
         Ok(bytes)
@@ -346,16 +340,16 @@ impl Model {
     /// The installed model, ready to score.
     pub fn load(&self, store: &Store) -> Result<Box<dyn runtime::Scorer>> {
         let path = self.path(store);
-        ensure!(path.exists(), "{} isn't installed.", self.label);
+        ensure!(path.exists(), t!("manage-local-ai-isnt-installed", label = self.label));
         #[cfg(target_os = "macos")]
         let scorer: Box<dyn runtime::Scorer> = Box::new(
             coreml::CoreMlModel::load(&path, self.dim)
-                .context("Core ML couldn't load the model")?,
+                .with_context(|| t!("manage-local-ai-core-ml-couldnt-load-the-model"))?,
         );
         #[cfg(not(target_os = "macos"))]
         let scorer: Box<dyn runtime::Scorer> = {
             let model = runtime::NativeModel::load(&path)?;
-            ensure!(model.threshold.is_finite(), "The model has no threshold");
+            ensure!(model.threshold.is_finite(), t!("manage-local-ai-the-model-has-no-threshold"));
             Box::new(model)
         };
         Ok(scorer)
@@ -364,7 +358,7 @@ impl Model {
     /// The installed labeller (a `Kind::Tagger` model).
     pub fn load_tagger(&self, store: &Store) -> Result<runtime::NativeTagger> {
         let path = self.path(store);
-        ensure!(path.exists(), "{} isn't installed.", self.label);
+        ensure!(path.exists(), t!("manage-local-ai-isnt-installed", label = self.label));
         runtime::NativeTagger::load(&path)
     }
 
@@ -383,7 +377,7 @@ impl Model {
         } else {
             Ok(())
         }
-        .with_context(|| format!("Couldn't delete {}", path.display()))
+        .with_context(|| t!("manage-local-ai-couldnt-delete", path = path.display()))
     }
 }
 
@@ -429,7 +423,7 @@ pub fn remove_stale(store: &Store) -> Result<()> {
         } else {
             std::fs::remove_file(&path)
         }
-        .with_context(|| format!("Couldn't delete {}", path.display()))?;
+        .with_context(|| t!("manage-local-ai-couldnt-delete", path = path.display()))?;
     }
     Ok(())
 }
@@ -439,7 +433,7 @@ pub fn remove_all(store: &Store) -> Result<()> {
     let dir = models_dir(store);
     if dir.exists() {
         std::fs::remove_dir_all(&dir)
-            .with_context(|| format!("Couldn't delete {}", dir.display()))?;
+            .with_context(|| t!("manage-local-ai-couldnt-delete-2", dir = dir.display()))?;
     }
     Ok(())
 }

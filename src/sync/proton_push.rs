@@ -259,9 +259,7 @@ impl RegistrationObserver for Observer {
         session_uid: Option<&str>,
         error: &protected_email_bridge::Error,
     ) {
-        note(&format!(
-            "Proton didn't register this device for pushes: {error}"
-        ));
+        note(&format!("Proton didn't register this device for pushes: {error}"));
         // Without a session, the step failed before reaching one (reading
         // the sessions, which can't fail here): nothing to attribute.
         if let Some(account) = session_uid.and_then(account_of) {
@@ -363,14 +361,14 @@ pub fn start(store: Arc<crate::manage::store::Store>, deliver: Deliver, status: 
     if running.is_some() {
         return Ok(());
     }
-    let config = firebase().context("This copy of Picacho has no Firebase project for push.")?;
+    let config = firebase().with_context(|| t!("sync-proton-push-this-copy-of-picacho-has-no"))?;
     let runtime = super::proton::runtime();
     let _entered = runtime.enter();
     // Made (and kept) before anything registers, so the device key is the
     // keychain's from now on.
     c.keys
         .get_or_create()
-        .map_err(|e| anyhow!("Couldn't make the push device key: {e}"))?;
+        .map_err(|e| anyhow!(t!("sync-proton-push-couldnt-make-the-push-device-key", error = e.to_string())))?;
     let (envelopes, received) = mpsc::unbounded_channel();
     let provider = FcmPushProvider::start(
         config,
@@ -387,7 +385,7 @@ pub fn start(store: Arc<crate::manage::store::Store>, deliver: Deliver, status: 
         }),
         envelopes,
     )
-    .map_err(|e| anyhow!("Couldn't start receiving pushes: {e}"))?;
+    .map_err(|e| anyhow!(t!("sync-proton-push-couldnt-start-receiving-pushes", error = e.to_string())))?;
     let registrar = Registrar::new(
         c.sessions.clone(),
         c.keys.clone(),

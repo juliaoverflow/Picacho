@@ -149,7 +149,14 @@ rusqlite = { version = "0.42", features = ["bundled-sqlcipher", "fallible_uint",
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha1 = "0.11"
+# The system's language: the interface's (i18n), and typed dates' and print
+# page sizes'.
 sys-locale = "0.3.2"
+# The interface's text in each language (src/i18n, locales/): Fluent
+# messages, with each language's plural rules.
+fluent-bundle = "0.16"
+unic-langid = "0.9"
+fluent-langneg = "0.13"
 sha2 = "0.11"
 unicode-normalization = "0.1"
 url = "2"
@@ -163,6 +170,8 @@ zeroize = "1"
 
 [dev-dependencies]
 gpui = { package = "gpui-pre", version = "=0.3.12", features = ["test-support"] }
+# The i18n tests read the message files' syntax (src/i18n/tests.rs).
+fluent-syntax = "0.12"
 
 [features]
 # Offers a fictional sample inbox from onboarding, for development and screenshots.

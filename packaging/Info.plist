@@ -2,6 +2,12 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
   <key>CFBundleName</key><string>Picacho</string>
+  <key>CFBundleDevelopmentRegion</key><string>en</string>
+  <!-- The languages Picacho has (locales/), so macOS offers them in its
+       per-app language setting. A test (src/i18n/tests.rs) keeps this list
+       the same as Picacho's; packaging/macos/<language>.lproj has the
+       words below in each. -->
+  <key>CFBundleLocalizations</key><array><string>en</string></array>
   <key>CFBundleDisplayName</key><string>Picacho</string>
   <key>CFBundleIdentifier</key><string>tech.pinal.picacho</string>
   <key>CFBundleExecutable</key><string>picacho</string>

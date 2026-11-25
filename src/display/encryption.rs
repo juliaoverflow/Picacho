@@ -18,9 +18,9 @@ impl KeyExpiry {
     const CHOICES: [Self; 4] = [Self::Never, Self::Years(1), Self::Years(2), Self::Years(5)];
     fn label(self) -> String {
         match self {
-            Self::Never => "Never".into(),
-            Self::Years(1) => "1 year".into(),
-            Self::Years(n) => format!("{n} years"),
+            Self::Never => t!("encryption-never").into(),
+            Self::Years(1) => t!("encryption-1-year").into(),
+            Self::Years(n) => t!("encryption-years", n = n),
         }
     }
     /// How long from now: `None` for never.
@@ -45,11 +45,11 @@ pub(super) fn listed_signers(verdict: &crate::manage::smime::Verdict) -> Vec<cra
 fn signer_result_label(result: crate::manage::smime::SignerResult) -> (&'static str, bool) {
     use crate::manage::smime::SignerResult;
     match result {
-        SignerResult::Good => ("Good", true),
-        SignerResult::Untrusted => ("Untrusted: no trusted authority vouches for the certificate", false),
-        SignerResult::Unverified => ("Unverified: the message doesn't include the certificate", false),
-        SignerResult::Revoked => ("Revoked: the certificate was withdrawn", false),
-        SignerResult::Bad => ("Bad: the signature doesn't match", false),
+        SignerResult::Good => (t!("encryption-good"), true),
+        SignerResult::Untrusted => (t!("encryption-untrusted-no-trusted-authority-vouches-for"), false),
+        SignerResult::Unverified => (t!("encryption-unverified-the-message-doesnt-include-the"), false),
+        SignerResult::Revoked => (t!("encryption-revoked-the-certificate-was-withdrawn"), false),
+        SignerResult::Bad => (t!("encryption-bad-the-signature-doesnt-match"), false),
     }
 }
 
@@ -74,11 +74,11 @@ fn import_carried_certificates(
 /// "expires Mar 3, 2027" or "expired Mar 3, 2025", for a key that does.
 fn expiry_text(expires: Option<i64>) -> Option<String> {
     let at = expires?;
-    let date = chrono::DateTime::from_timestamp(at, 0)?.format("%b %-d, %Y").to_string();
+    let date = chrono::DateTime::from_timestamp(at, 0)?.local(t!("dates-month-day-year"));
     Some(if at <= chrono::Utc::now().timestamp() {
-        format!("expired {date}")
+        t!("encryption-expired", date = date)
     } else {
-        format!("expires {date}")
+        t!("encryption-expires", date = date)
     })
 }
 
@@ -99,12 +99,15 @@ impl MailApp {
             div()
                 .id(SharedString::from(format!("openpgp-key-{fp}")))
                 .role(Role::ListItem)
-                .aria_label(format!(
-                    "{}, {}{}",
-                    key.users.join(", "),
-                    if key.secret { "your key" } else { "public key" },
-                    if key.revoked { ", revoked" } else { "" }
-                ))
+                .aria_label({
+                    let users = key.users.join(", ");
+                    let kind = if key.secret { t!("encryption-your-key") } else { t!("encryption-public-key") };
+                    let mut said = vec![users.as_str(), kind];
+                    if key.revoked {
+                        said.push(t!("encryption-revoked"));
+                    }
+                    said.join(", ")
+                })
                 .flex()
                 .items_center()
                 .gap_3()
@@ -130,7 +133,7 @@ impl MailApp {
                                 .font_weight(FontWeight::MEDIUM)
                                 .truncate()
                                 .child(if key.users.is_empty() {
-                                    "(no name)".to_owned()
+                                    t!("encryption-no-name").to_owned()
                                 } else {
                                     key.users.join(", ")
                                 }),
@@ -140,20 +143,28 @@ impl MailApp {
                                 .text_size(px(11.))
                                 .text_color(rgb(if key.revoked { c.danger } else { c.muted }))
                                 .truncate()
-                                .child(format!(
-                                    "{}{}{} · {short}",
-                                    if key.revoked { "Revoked · " } else { "" },
-                                    expiry_text(key.expires).map(|e| format!("{e} · ")).unwrap_or_default(),
-                                    if key.secret {
-                                        "Your key"
-                                    } else if key.found && key.verified {
-                                        "Found automatically, checked by you"
-                                    } else if key.found {
-                                        "Found automatically, not checked: compare the fingerprint with its owner"
-                                    } else {
-                                        "Public key"
+                                .child({
+                                    // Its facts, one after another: "Revoked · expires … · Your key · ABCD 1234".
+                                    let mut facts = Vec::new();
+                                    if key.revoked {
+                                        facts.push(t!("encryption-revoked-2").to_owned());
                                     }
-                                )),
+                                    facts.extend(expiry_text(key.expires));
+                                    facts.push(
+                                        if key.secret {
+                                            t!("encryption-your-key-2")
+                                        } else if key.found && key.verified {
+                                            t!("encryption-found-automatically-checked-by-you")
+                                        } else if key.found {
+                                            t!("encryption-found-automatically-not-checked-compare-the")
+                                        } else {
+                                            t!("encryption-public-key-2")
+                                        }
+                                        .to_owned(),
+                                    );
+                                    facts.push(short.clone());
+                                    facts.join(" · ")
+                                }),
                         )
                         .when(key.secret && !key.revoked, |d| {
                             d.child(self.revocation_certificate_control(&fp, cx))
@@ -162,9 +173,9 @@ impl MailApp {
                 .when(key.secret && !key.revoked, |row| {
                     // Renewing for "Never" takes the end date away.
                     let label = if self.key_expiry == KeyExpiry::Never {
-                        "Remove Expiry"
+                        t!("encryption-remove-expiry")
                     } else {
-                        "Renew…"
+                        t!("encryption-renew")
                     };
                     row.when(key.expires.is_some() || self.key_expiry != KeyExpiry::Never, |row| {
                         row.child(self.button(
@@ -180,11 +191,11 @@ impl MailApp {
                 .child(self.button(
                     format!("openpgp-check-{fp}"),
                     if key.secret {
-                        "Show"
+                        t!("encryption-show")
                     } else if key.verified {
-                        "Fingerprint"
+                        t!("encryption-fingerprint")
                     } else {
-                        "Check…"
+                        t!("encryption-check")
                     },
                     "",
                     Action::CheckKey(fp.clone()),
@@ -193,7 +204,7 @@ impl MailApp {
                 ))
                 .child(self.button(
                     format!("openpgp-remove-{fp}"),
-                    "Remove",
+                    t!("encryption-remove"),
                     "trash",
                     Action::RemoveKey(fp),
                     false,
@@ -210,7 +221,7 @@ impl MailApp {
                 .py_3()
                 .text_size(px(12.))
                 .text_color(rgb(c.muted))
-                .child("No keys yet.")
+                .child(t!("encryption-no-keys-yet"))
                 .into_any_element()
         } else {
             div()
@@ -218,7 +229,7 @@ impl MailApp {
                 .flex()
                 .flex_col()
                 .role(Role::List)
-                .aria_label("OpenPGP keys")
+                .aria_label(t!("encryption-openpgp-keys"))
                 .children(keys.iter().map(row))
                 .into_any_element()
         };
@@ -231,7 +242,7 @@ impl MailApp {
                 div()
                     .text_size(px(12.))
                     .text_color(rgb(c.muted))
-                    .child("With your key, Picacho opens mail encrypted to you and signs what you send; with others' public keys, it checks their signatures and encrypts to them. Choose Sign or Encrypt in the composer's menu. Pinal Mail's own encryption needs nothing here."),
+                    .child(t!("encryption-with-your-key-picacho-opens-mail")),
             )
             .child(
                 div()
@@ -243,8 +254,8 @@ impl MailApp {
                     .child(list),
             )
             .child(self.setting(
-                "Import keys",
-                "Choose armored key files (.asc). A secret key with a passphrase needs it once: it's then kept, without the passphrase, in the system keychain.",
+                t!("encryption-import-keys"),
+                t!("encryption-choose-armored-key-files-asc-a"),
                 div()
                     .flex()
                     .flex_col()
@@ -265,7 +276,7 @@ impl MailApp {
                                     .text_size(px(12.))
                                     .text_color(rgb(c.muted))
                                     .flex_shrink_0()
-                                    .child("New and renewed keys expire:"),
+                                    .child(t!("encryption-new-and-renewed-keys-expire")),
                             )
                             .child(self.segmented(
                                 "openpgp-expiry",
@@ -279,14 +290,14 @@ impl MailApp {
                     .child(self.key_version_choice(cx))
                     .child(div().flex().gap_2().child(self.button(
                         "openpgp-import",
-                        "Import Keys…",
+                        t!("encryption-import-keys-2"),
                         "upload",
                         Action::ImportKeys,
                         true,
                         cx,
                     )).child(self.button(
                         "openpgp-create",
-                        "Create a Key",
+                        t!("encryption-create-a-key"),
                         "lock",
                         Action::CreateKey,
                         false,
@@ -295,8 +306,8 @@ impl MailApp {
             ))
             .when(ring.secret.iter().len() > 0, |page| {
                 page.child(self.setting(
-                    "Share your public key",
-                    "Save it to send to people who'll write to you encrypted, publish it on keys.openpgp.org (which lists an address only once its owner confirms it by email) or on an HKP keyserver (which lists every address on it at once, for good), or export Web Key Directory (WKD) files to host on your own domain.",
+                    t!("encryption-share-your-public-key"),
+                    t!("encryption-save-it-to-send-to-people"),
                     div()
                         .flex()
                         .flex_col()
@@ -308,7 +319,7 @@ impl MailApp {
                                 .gap_2()
                                 .child(self.button(
                                     "openpgp-export",
-                                    "Save Public Keys…",
+                                    t!("encryption-save-public-keys"),
                                     "download",
                                     Action::ExportPublicKeys,
                                     false,
@@ -316,7 +327,7 @@ impl MailApp {
                                 ))
                                 .child(self.button(
                                     "openpgp-publish",
-                                    "Publish on keys.openpgp.org",
+                                    t!("encryption-publish-on-keys-openpgp-org"),
                                     "upload",
                                     Action::Tools(super::tools::ToolAction::PublishKeys),
                                     false,
@@ -324,7 +335,7 @@ impl MailApp {
                                 ))
                                 .child(self.button(
                                     "openpgp-export-wkd",
-                                    "Export for WKD…",
+                                    t!("encryption-export-for-wkd"),
                                     "download",
                                     Action::Tools(super::tools::ToolAction::ExportWkd),
                                     false,
@@ -344,7 +355,7 @@ impl MailApp {
                                 )
                                 .child(self.button(
                                     "openpgp-publish-custom-hkp",
-                                    "Publish on Keyserver…",
+                                    t!("encryption-publish-on-keyserver"),
                                     "upload",
                                     Action::Tools(super::tools::ToolAction::PublishKeysCustomHkp),
                                     false,
@@ -356,8 +367,8 @@ impl MailApp {
             // Autocrypt 1.1 §2.2: prefer-encrypt per account, off by default.
             .children(self.accounts.iter().filter(|a| ring.own_key(&a.email).is_some()).map(|a| {
                 self.switch_setting(
-                    &format!("Ask for encrypted replies ({})", a.email),
-                    "Tells people's mail apps (in the Autocrypt header of mail you send) that you'd like them to encrypt to you by default. Their app decides; apps that don't use Autocrypt ignore it.",
+                    &t!("encryption-ask-for-encrypted-replies", email = a.email),
+                    t!("encryption-tells-peoples-mail-apps-in-the"),
                     format!("autocrypt-mutual-{}", a.id),
                     ring.prefers_mutual(&a.email),
                     Action::ToggleAutocryptMutual(a.email.clone()),
@@ -366,14 +377,14 @@ impl MailApp {
             }))
             .children(checking.map(|k| self.key_check_panel(k, cx)))
             .child(self.setting(
-                "Find keys",
-                "Look up the keys of people you've written to or heard from, on their domain (WKD) and keys.openpgp.org. Picacho also looks when you send encrypted mail to someone without a key, and keeps the keys people's mail apps send along (Autocrypt). Keys you imported yourself are never replaced.",
+                t!("encryption-find-keys"),
+                t!("encryption-look-up-the-keys-of-people"),
                 div().flex().gap_2().child(
                     div().w(px(260.)).child(field(Input::new(&self.key_lookup), c, self.key_busy)),
                 ).child(
                     self.button(
                         "openpgp-find",
-                        if self.key_busy { "Looking…" } else { "Find Key" },
+                        if self.key_busy { t!("encryption-looking") } else { t!("encryption-find-key") },
                         "search",
                         Action::FindKey,
                         false,
@@ -387,15 +398,15 @@ impl MailApp {
                 div()
                     .text_size(px(12.))
                     .text_color(rgb(c.muted))
-                    .child("Certificates many companies and authorities issue. Import yours as a .p12 or .pfx file (with its password); others' certificates are kept from the signed mail they send you, or imported as .pem, .crt or .cer. In the composer, choose S/MIME in place of OpenPGP."),
+                    .child(t!("encryption-certificates-many-companies-and-authorities-issue")),
             )
             .child(self.certificate_list(cx))
             .child(self.setting(
-                "Import certificates",
-                "Your own (.p12, .pfx) with the password above, or someone else's (.pem, .crt, .cer).",
+                t!("encryption-import-certificates"),
+                t!("encryption-your-own-p12-pfx-with-the"),
                 div().flex().child(self.button(
                     "smime-import",
-                    "Import Certificates…",
+                    t!("encryption-import-certificates-2"),
                     "upload",
                     Action::ImportCertificates,
                     false,
@@ -424,7 +435,7 @@ impl MailApp {
             .id("smime-signers")
             .debug_selector(|| "smime-signers".into())
             .role(Role::List)
-            .aria_label("Signers")
+            .aria_label(t!("encryption-signers"))
             .flex()
             .flex_col()
             .gap(px(3.))
@@ -465,7 +476,7 @@ impl MailApp {
                 .id("smime-carried-certificates")
                 .debug_selector(|| "smime-carried-certificates".into())
                 .role(Role::Region)
-                .aria_label("Certificates in this message")
+                .aria_label(t!("encryption-certificates-in-this-message"))
                 .m_3()
                 .p_3()
                 .flex()
@@ -475,20 +486,16 @@ impl MailApp {
                 .border_1()
                 .border_color(rgb(c.border))
                 .bg(rgb(c.raised))
-                .child(div().font_weight(FontWeight::MEDIUM).child(if count == 1 {
-                    "This message carries 1 certificate".to_owned()
-                } else {
-                    format!("This message carries {count} certificates")
-                }))
+                .child(div().font_weight(FontWeight::MEDIUM).child(t!("encryption-this-message-carries-certificates", count = count)))
                 .child(
                     div()
                         .text_size(px(12.))
                         .text_color(rgb(c.muted))
-                        .child("Imported, they let you write to their owners encrypted. Importing vouches for nothing: anyone can send a certificate, and a signature by one is trusted only when an authority your system trusts issued it."),
+                        .child(t!("encryption-imported-they-let-you-write-to")),
                 )
                 .child(div().flex().child(self.button(
                     "smime-import-carried",
-                    "Import Certificates",
+                    t!("encryption-import-certificates-3"),
                     "upload",
                     Action::ImportCarriedCertificates(m.id.clone()),
                     false,
@@ -505,8 +512,8 @@ impl MailApp {
         let lists = self.backend.crl_list();
         let now = chrono::Utc::now().timestamp();
         self.setting(
-            "Revocation lists (CRL)",
-            "Lists of withdrawn certificates, as your organization or a certificate authority publishes them (.crl or .pem). Signatures are then checked against them; a copy of each is kept here, so update it by adding the new one.",
+            t!("encryption-revocation-lists-crl"),
+            t!("encryption-lists-of-withdrawn-certificates-as-your"),
             div()
                 .flex()
                 .flex_col()
@@ -516,7 +523,7 @@ impl MailApp {
                     div()
                         .id("smime-crls")
                         .role(Role::List)
-                        .aria_label("Revocation lists")
+                        .aria_label(t!("encryption-revocation-lists"))
                         .flex()
                         .flex_col()
                         .gap_1()
@@ -525,17 +532,15 @@ impl MailApp {
                             let next = list
                                 .next_update
                                 .and_then(|t| chrono::DateTime::from_timestamp(t, 0))
-                                .map(|t| t.format("%b %-d, %Y").to_string());
-                            let detail = format!(
-                                "{} revoked{}",
-                                list.revoked,
-                                match (next, stale) {
-                                    (Some(d), true) => format!(" · out of date since {d}: add a newer one"),
-                                    (Some(d), false) => format!(" · next update {d}"),
-                                    (None, _) => String::new(),
-                                }
-                            );
-                            let issuer = if list.issuer.is_empty() { "An unnamed issuer".to_owned() } else { list.issuer.clone() };
+                                .map(|t| t.local(t!("dates-month-day-year")));
+                            let mut facts = vec![t!("encryption-revoked-3", revoked = list.revoked)];
+                            match (next, stale) {
+                                (Some(d), true) => facts.push(t!("encryption-out-of-date-since-add-a", d = d)),
+                                (Some(d), false) => facts.push(t!("encryption-next-update", d = d)),
+                                (None, _) => {}
+                            }
+                            let detail = facts.join(" · ");
+                            let issuer = if list.issuer.is_empty() { t!("encryption-an-unnamed-issuer").to_owned() } else { list.issuer.clone() };
                             div()
                                 .id(SharedString::from(format!("smime-crl-{}", list.id)))
                                 .role(Role::ListItem)
@@ -560,7 +565,7 @@ impl MailApp {
                                 )
                                 .child(self.button(
                                     format!("smime-crl-remove-{}", list.id),
-                                    "Remove",
+                                    t!("encryption-remove"),
                                     "trash",
                                     Action::RemoveCrl(list.id.clone()),
                                     false,
@@ -570,7 +575,7 @@ impl MailApp {
                 )
                 .child(div().flex().child(self.button(
                     "smime-crl-add",
-                    "Add Revocation Lists…",
+                    t!("encryption-add-revocation-lists"),
                     "upload",
                     Action::AddCrls,
                     false,
@@ -592,7 +597,7 @@ impl MailApp {
             .gap_2()
             .child(self.button(
                 format!("openpgp-revocation-{fp}"),
-                "Save Revocation Certificate…",
+                t!("encryption-save-revocation-certificate"),
                 "download",
                 Action::SaveRevocationCertificate(fp.to_owned()),
                 false,
@@ -604,7 +609,7 @@ impl MailApp {
                     .min_w(px(160.))
                     .text_size(px(11.))
                     .text_color(rgb(c.muted))
-                    .child("Keep it somewhere safe, away from this device. Importing it, here or in any app, revokes this key for good: use it only if the key is lost or someone else may have it."),
+                    .child(t!("encryption-keep-it-somewhere-safe-away-from")),
             )
             .into_any_element()
     }
@@ -620,7 +625,7 @@ impl MailApp {
             div()
                 .id("autocrypt-setup")
                 .role(Role::Region)
-                .aria_label("Autocrypt setup message")
+                .aria_label(t!("encryption-autocrypt-setup-message"))
                 .m_3()
                 .p_3()
                 .flex()
@@ -630,12 +635,12 @@ impl MailApp {
                 .border_1()
                 .border_color(rgb(c.border))
                 .bg(rgb(c.raised))
-                .child(div().font_weight(FontWeight::MEDIUM).child("Your encryption key, from another mail app"))
+                .child(div().font_weight(FontWeight::MEDIUM).child(t!("encryption-your-encryption-key-from-another-mail")))
                 .child(
                     div()
                         .text_size(px(12.))
                         .text_color(rgb(c.muted))
-                        .child("Type the setup code that app showed you (36 digits) to use the same key here."),
+                        .child(t!("encryption-type-the-setup-code-that-app")),
                 )
                 .child(
                     div()
@@ -644,7 +649,7 @@ impl MailApp {
                         .child(div().w(px(320.)).child(field(Input::new(&self.key_passphrase), c, false)))
                         .child(self.button(
                             "autocrypt-setup-import",
-                            "Import Key",
+                            t!("encryption-import-key"),
                             "lock",
                             Action::ImportSetupMessage(m.id.clone()),
                             true,
@@ -670,7 +675,7 @@ impl MailApp {
                     files: true,
                     directories: false,
                     multiple: true,
-                    prompt: Some("Import".into()),
+                    prompt: Some(t!("encryption-import").into()),
                 });
                 cx.spawn(async move |this, cx| {
                     let Ok(Ok(Some(paths))) = picker.await else {
@@ -686,7 +691,7 @@ impl MailApp {
                                 for path in &paths {
                                     let text =
                                         std::fs::read_to_string(path).with_context(|| {
-                                            format!("{} isn't an armored key file.", path.display())
+                                            t!("encryption-isnt-an-armored-key-file", path = path.display())
                                         })?;
                                     added += ring.import(&text, &passphrase)?;
                                 }
@@ -695,7 +700,7 @@ impl MailApp {
                             },
                             |this, result, cx| match result {
                                 Ok(n) => this.notice(
-                                    format!("Imported {n} {}", if n == 1 { "key" } else { "keys" }),
+                                    t!("encryption-imported-keys", n = n),
                                     false,
                                     cx,
                                 ),
@@ -724,14 +729,14 @@ impl MailApp {
                         Ok(n)
                     },
                     |this, result, cx| match result {
-                        Ok(_) => this.notice("Your key from the other app is ready to use", false, cx),
+                        Ok(_) => this.notice(t!("encryption-your-key-from-the-other-app"), false, cx),
                         Err(e) => this.notice(format!("{e:#}"), true, cx),
                     },
                 );
             }
             Action::CreateKey => {
                 let Some(a) = self.current_account() else {
-                    self.key_error = Some("Add an account first: the key is for its address.".into());
+                    self.key_error = Some(t!("encryption-add-an-account-first-the-key").into());
                     return;
                 };
                 self.key_error = None;
@@ -744,14 +749,14 @@ impl MailApp {
                         let mut ring = Keyring::clone(&b.keyring());
                         anyhow::ensure!(
                             ring.own_key(&email).is_none(),
-                            "You already have a key for {email}."
+                            t!("encryption-you-already-have-a-key-for", email = email)
                         );
                         let fp = ring.create(&name, &email, lasts, version)?;
                         b.set_keyring(ring)?;
                         Ok(fp)
                     },
                     |this, result, cx| match result {
-                        Ok(_) => this.notice("Your new key is ready. Save your public key to share it.", false, cx),
+                        Ok(_) => this.notice(t!("encryption-your-new-key-is-ready-save"), false, cx),
                         Err(e) => this.key_error = Some(format!("{e:#}")),
                     },
                 );
@@ -767,7 +772,7 @@ impl MailApp {
                 {
                     // Others have the key as it was until they get it again.
                     Ok(()) => self.notice(
-                        "Renewed. Share your public key again so others see the new date.",
+                        t!("encryption-renewed-share-your-public-key-again"),
                         false,
                         cx,
                     ),
@@ -789,7 +794,7 @@ impl MailApp {
                 {
                     Ok(()) => {
                         self.key_checking = None;
-                        self.notice("The fingerprints match: the key is checked", false, cx);
+                        self.notice(t!("encryption-the-fingerprints-match-the-key-is"), false, cx);
                     }
                     Err(e) => self.key_error = Some(format!("{e:#}")),
                 }
@@ -799,7 +804,7 @@ impl MailApp {
                 let mut ring = Keyring::clone(&self.backend.keyring());
                 ring.verify(&fp);
                 match self.backend.set_keyring(ring) {
-                    Ok(()) => self.notice("Key marked as checked", false, cx),
+                    Ok(()) => self.notice(t!("encryption-key-marked-as-checked"), false, cx),
                     Err(e) => self.key_error = Some(format!("{e:#}")),
                 }
             }
@@ -815,7 +820,7 @@ impl MailApp {
                 let mut ring = Keyring::clone(&self.backend.keyring());
                 ring.remove(&fp);
                 match self.backend.set_keyring(ring) {
-                    Ok(()) => self.notice("Key removed", false, cx),
+                    Ok(()) => self.notice(t!("encryption-key-removed"), false, cx),
                     Err(e) => self.key_error = Some(format!("{e:#}")),
                 }
             }
@@ -837,7 +842,7 @@ impl MailApp {
                     }
                     let result = std::fs::write(&path, text);
                     let _ = this.update(cx, |this, cx| match result {
-                        Ok(()) => this.notice("Public key saved", false, cx),
+                        Ok(()) => this.notice(t!("encryption-public-key-saved"), false, cx),
                         Err(e) => this.notice(format!("{e:#}"), true, cx),
                     });
                 })
@@ -861,7 +866,7 @@ impl MailApp {
                         .revocation_certificate(&fp, crate::manage::openpgp::keys::RevocationReason::Unspecified, "")
                         .and_then(|text| Ok(std::fs::write(&path, text)?));
                     let _ = this.update(cx, |this, cx| match result {
-                        Ok(()) => this.notice("Revocation certificate saved. Keep it somewhere safe.", false, cx),
+                        Ok(()) => this.notice(t!("encryption-revocation-certificate-saved-keep-it-somewhere"), false, cx),
                         Err(e) => this.notice(format!("{e:#}"), true, cx),
                     });
                 })
@@ -881,12 +886,12 @@ impl MailApp {
                         move |b| {
                             let tls = b.tls_connector_pub()?;
                             let data = crate::sync::keys::lookup_fingerprint(&hex, tls)?
-                                .context("No key with that fingerprint was found.")?;
+                                .with_context(|| t!("encryption-no-key-with-that-fingerprint-was"))?;
                             let mut ring = Keyring::clone(&b.keyring());
-                            let text = String::from_utf8(data).context("The key found couldn't be read.")?;
+                            let text = String::from_utf8(data).with_context(|| t!("encryption-the-key-found-couldnt-be-read"))?;
                             ring.import(&text, "")?;
                             b.set_keyring(ring)?;
-                            Ok("Found the key on keys.openpgp.org".to_owned())
+                            Ok(t!("encryption-found-the-key-on-keys-openpgp").to_owned())
                         },
                         |this, result, cx| {
                             this.key_busy = false;
@@ -899,7 +904,7 @@ impl MailApp {
                     return;
                 }
                 if !email.contains('@') {
-                    self.key_error = Some("Enter an email address or a key's fingerprint to look it up.".into());
+                    self.key_error = Some(t!("encryption-enter-an-email-address-or-a").into());
                     cx.notify();
                     return;
                 }
@@ -910,14 +915,14 @@ impl MailApp {
                     move |b| {
                         let tls = b.tls_connector_pub()?;
                         let found = crate::sync::keys::lookup(&email, tls)?
-                            .with_context(|| format!("No key was found for {email}."))?;
+                            .with_context(|| t!("encryption-no-key-was-found-for", email = email))?;
                         let mut ring = Keyring::clone(&b.keyring());
                         anyhow::ensure!(
                             ring.add_found_from(&email, &found.0, found.1)?,
-                            "You already have a key for {email} that you imported yourself."
+                            t!("encryption-you-already-have-a-key-for-2", email = email)
                         );
                         b.set_keyring(ring)?;
-                        Ok(format!("Found the key for {email} on {}", found.1.label()))
+                        Ok(t!("encryption-found-the-key-for-on", email = email, label = found.1.label()))
                     },
                     |this, result, cx| {
                         this.key_busy = false;
@@ -936,7 +941,7 @@ impl MailApp {
                     files: true,
                     directories: false,
                     multiple: true,
-                    prompt: Some("Import".into()),
+                    prompt: Some(t!("encryption-import").into()),
                 });
                 cx.spawn(async move |this, cx| {
                     let Ok(Ok(Some(paths))) = picker.await else {
@@ -965,14 +970,7 @@ impl MailApp {
                             },
                             |this, result, cx| match result {
                                 Ok(n) => this.notice(
-                                    format!(
-                                        "Imported {n} {}",
-                                        if n == 1 {
-                                            "certificate"
-                                        } else {
-                                            "certificates"
-                                        }
-                                    ),
+                                    t!("encryption-imported-certificates", n = n),
                                     false,
                                     cx,
                                 ),
@@ -1009,13 +1007,13 @@ impl MailApp {
                     },
                     |this, result, cx| match result {
                         Ok((imported, skipped)) => {
-                            let noun = |n: usize| if n == 1 { "certificate" } else { "certificates" };
-                            let mut text = format!("Imported {imported} {}", noun(imported));
+                            let mut text = t!("encryption-imported-certificates", n = imported);
                             if skipped > 0 {
-                                text.push_str(&format!(
-                                    "; {skipped} {} without an email address (an authority's) left out",
-                                    noun(skipped)
-                                ));
+                                text = t!(
+                                    "encryption-imported-and-left-out",
+                                    imported = text,
+                                    left_out = t!("encryption-without-an-email-address-an-authoritys", skipped = skipped)
+                                );
                             }
                             this.notice(text, imported == 0, cx)
                         }
@@ -1028,7 +1026,7 @@ impl MailApp {
                     files: true,
                     directories: false,
                     multiple: true,
-                    prompt: Some("Add".into()),
+                    prompt: Some(t!("encryption-add").into()),
                 });
                 cx.spawn(async move |this, cx| {
                     let Ok(Ok(Some(paths))) = picker.await else {
@@ -1044,13 +1042,13 @@ impl MailApp {
                                     let data = std::fs::read(path)?;
                                     added += b
                                         .add_crl_file(&data)
-                                        .with_context(|| format!("{} couldn't be added.", path.display()))?;
+                                        .with_context(|| t!("encryption-couldnt-be-added", path = path.display()))?;
                                 }
                                 Ok(added)
                             },
                             |this, result, cx| match result {
                                 Ok(n) => this.notice(
-                                    format!("Added {n} revocation {}", if n == 1 { "list" } else { "lists" }),
+                                    t!("encryption-added-revocation", n = n),
                                     false,
                                     cx,
                                 ),
@@ -1062,7 +1060,7 @@ impl MailApp {
                 .detach();
             }
             Action::RemoveCrl(id) => match self.backend.remove_crl_file(&id) {
-                Ok(()) => self.notice("Revocation list removed", false, cx),
+                Ok(()) => self.notice(t!("encryption-revocation-list-removed"), false, cx),
                 Err(e) => self.key_error = Some(format!("{e:#}")),
             },
             Action::RemoveCertificate(fp) => {
@@ -1070,7 +1068,7 @@ impl MailApp {
                     crate::manage::smime::Certificates::clone(&self.backend.certificates());
                 certs.remove(&fp);
                 match self.backend.set_certificates(certs) {
-                    Ok(()) => self.notice("Certificate removed", false, cx),
+                    Ok(()) => self.notice(t!("encryption-certificate-removed"), false, cx),
                     Err(e) => self.key_error = Some(format!("{e:#}")),
                 }
             }
@@ -1105,7 +1103,7 @@ impl MailApp {
             .id("openpgp-check-panel")
             .debug_selector(|| "openpgp-check-panel".into())
             .role(Role::Region)
-            .aria_label(format!("Fingerprint of {who}"))
+            .aria_label(t!("encryption-fingerprint-of", who = who))
             .p_4()
             .rounded(px(12.))
             .border_1()
@@ -1115,18 +1113,18 @@ impl MailApp {
             .flex_col()
             .gap_3()
             .child(div().text_size(px(14.)).font_weight(FontWeight::SEMIBOLD).child(if key.secret {
-                "Your fingerprint".to_owned()
+                t!("encryption-your-fingerprint").to_owned()
             } else {
-                format!("Check {who}")
+                t!("encryption-check-2", who = who)
             }))
             .child(
                 div()
                     .text_size(px(12.))
                     .text_color(rgb(c.muted))
                     .child(if key.secret {
-                        "Read it out to people who write to you encrypted, or let them scan the code, so they know the key they have is yours."
+                        t!("encryption-read-it-out-to-people-who")
                     } else {
-                        "Ask them for their fingerprint (in person, on a call, or anywhere other than this mail) and compare. If they paste it to you, paste it below."
+                        t!("encryption-ask-them-for-their-fingerprint-in")
                     }),
             )
             .child(
@@ -1147,7 +1145,7 @@ impl MailApp {
                             .font_family("monospace")
                             .text_size(px(15.))
                             .id("openpgp-fingerprint")
-                            .aria_label(format!("Fingerprint {}", groups.join(" ")))
+                            .aria_label(t!("encryption-fingerprint-2", fingerprint = groups.join(" ")))
                             .children(groups.iter().map(|g| div().child(g.clone()))),
                     )
                     .child(
@@ -1158,7 +1156,7 @@ impl MailApp {
                             .size(px(140.))
                             .id("openpgp-fingerprint-qr")
                             .role(Role::Image)
-                            .aria_label("QR code of this key's fingerprint")
+                            .aria_label(t!("encryption-qr-code-of-this-keys-fingerprint"))
                             .child(super::proton_login::qr_code(&format!("OPENPGP4FPR:{fp}"), 124.)),
                     ),
             )
@@ -1170,10 +1168,10 @@ impl MailApp {
                         .gap_2()
                         .items_center()
                         .child(div().id("openpgp-check-input").w(px(360.)).child(field(Input::new(&self.key_check_input), c, false)))
-                        .child(self.button("openpgp-match", "Compare", "check", Action::MatchFingerprint(fp.clone()), true, cx))
+                        .child(self.button("openpgp-match", t!("encryption-compare"), "check", Action::MatchFingerprint(fp.clone()), true, cx))
                         .child(self.button(
                             format!("openpgp-verify-{fp}"),
-                            "They Match (compared in person)",
+                            t!("encryption-they-match-compared-in-person"),
                             "",
                             Action::VerifyKey(fp.clone()),
                             false,
@@ -1193,7 +1191,7 @@ impl MailApp {
                 .py_3()
                 .text_size(px(12.))
                 .text_color(rgb(c.muted))
-                .child("No certificates yet.")
+                .child(t!("encryption-no-certificates-yet"))
                 .into_any_element()
         } else {
             div()
@@ -1202,20 +1200,13 @@ impl MailApp {
                 .children(certs.into_iter().map(|cert| {
                     let fp = cert.fingerprint.clone();
                     let expires = chrono::DateTime::from_timestamp(cert.expires, 0)
-                        .map(|t| t.format("%b %-d, %Y").to_string())
+                        .map(|t| t.local(t!("dates-month-day-year")))
                         .unwrap_or_default();
                     let who = cert.emails.join(", ");
                     div()
                         .id(SharedString::from(format!("smime-cert-{fp}")))
                         .role(Role::ListItem)
-                        .aria_label(format!(
-                            "{who}, {}, expires {expires}",
-                            if cert.own {
-                                "your certificate"
-                            } else {
-                                "certificate"
-                            }
-                        ))
+                        .aria_label(t!("encryption-expires-2", who = who, own = if cert.own { "yes" } else { "no" }, expires = expires))
                         .flex()
                         .items_center()
                         .gap_3()
@@ -1247,24 +1238,20 @@ impl MailApp {
                                         .text_size(px(11.))
                                         .text_color(rgb(c.muted))
                                         .truncate()
-                                        .child(format!(
-                                            "{} · issued by {} · expires {expires}",
-                                            if cert.own {
-                                                "Your certificate"
+                                        .child(t!("encryption-issued-by-expires", kind = if cert.own {
+                                                t!("encryption-your-certificate-2")
                                             } else {
-                                                "Certificate"
-                                            },
-                                            if cert.issuer.is_empty() {
-                                                "an unnamed issuer".to_owned()
+                                                t!("encryption-certificate")
+                                            }, issuer = if cert.issuer.is_empty() {
+                                                t!("encryption-an-unnamed-issuer-2").to_owned()
                                             } else {
                                                 cert.issuer.clone()
-                                            },
-                                        )),
+                                            }, expires = expires)),
                                 ),
                         )
                         .child(self.button(
                             format!("smime-remove-{fp}"),
-                            "Remove",
+                            t!("encryption-remove"),
                             "trash",
                             Action::RemoveCertificate(fp),
                             false,
@@ -1276,7 +1263,7 @@ impl MailApp {
         div()
             .id("smime-certificates")
             .role(Role::List)
-            .aria_label("S/MIME certificates")
+            .aria_label(t!("encryption-s-mime-certificates"))
             .rounded(px(12.))
             .border_1()
             .border_color(rgb(c.border))
@@ -1295,7 +1282,7 @@ impl MailApp {
     /// older and most mail apps can't use v6 keys yet.
     fn key_version_choice(&self, cx: &Context<Self>) -> Div {
         let c = self.colors();
-        let choices = [(KeyVersion::V4, "Standard (v4)"), (KeyVersion::V6, "Modern (v6)")];
+        let choices = [(KeyVersion::V4, t!("encryption-standard-v4")), (KeyVersion::V6, t!("encryption-modern-v6"))];
         div()
             .flex()
             .flex_col()
@@ -1310,7 +1297,7 @@ impl MailApp {
                             .text_size(px(12.))
                             .text_color(rgb(c.muted))
                             .flex_shrink_0()
-                            .child("Key type:"),
+                            .child(t!("encryption-key-type")),
                     )
                     .child(self.segmented(
                         "openpgp-key-version",
@@ -1325,7 +1312,7 @@ impl MailApp {
                 div()
                     .text_size(px(12.))
                     .text_color(rgb(c.muted))
-                    .child("Modern keys aren't yet readable by many mail apps. Choose Standard unless your correspondents use OpenPGP v6."),
+                    .child(t!("encryption-modern-keys-arent-yet-readable-by")),
             )
     }
 }

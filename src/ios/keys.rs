@@ -27,9 +27,18 @@ use webauthn_rs_proto::AuthenticatorTransport;
 unsafe extern "C" {
     /// Whether this device can read NFC tags (not iPads, nor the Simulator).
     fn picacho_ios_nfc_available() -> bool;
-    /// Starts looking for a key, showing `message` on the system's sheet.
-    /// False when this device can't read NFC tags (iPads, the Simulator).
-    fn picacho_ios_nfc_begin(message: *const u8, len: usize) -> bool;
+    /// Starts looking for a key, showing `message` on the system's sheet;
+    /// `not_key` and `hold_still` are what it says when another tag is held
+    /// to it, or the key moved away too soon. False when this device can't
+    /// read NFC tags (iPads, the Simulator).
+    fn picacho_ios_nfc_begin(
+        message: *const u8,
+        len: usize,
+        not_key: *const u8,
+        not_key_len: usize,
+        hold_still: *const u8,
+        hold_still_len: usize,
+    ) -> bool;
     /// 0 still looking, 1 a key is connected, 2 the sheet was cancelled,
     /// 3 the session ended (it timed out, or failed).
     fn picacho_ios_nfc_poll() -> i32;
@@ -61,11 +70,21 @@ pub struct NfcSearch {
 
 impl NfcSearch {
     pub fn start(message: &str) -> Result<Self> {
-        // Safety: `message` is valid for the call.
-        if !unsafe { picacho_ios_nfc_begin(message.as_ptr(), message.len()) } {
-            bail!(
-                "This device can't read security keys: it has no NFC. Use a passkey on another device, or the code from your authenticator app."
-            );
+        let not_key = t!("ios-keys-that-isnt-a-security-key");
+        let hold_still = t!("ios-keys-hold-your-security-key-still");
+        // Safety: the strings are valid for the call; Swift copies them.
+        let began = unsafe {
+            picacho_ios_nfc_begin(
+                message.as_ptr(),
+                message.len(),
+                not_key.as_ptr(),
+                not_key.len(),
+                hold_still.as_ptr(),
+                hold_still.len(),
+            )
+        };
+        if !began {
+            bail!(t!("ios-keys-this-device-cant-read-security-keys"));
         }
         Ok(Self { ended: false })
     }
@@ -76,20 +95,16 @@ impl NfcSearch {
         let deadline = Instant::now() + wait;
         loop {
             if cancel.load(Ordering::Relaxed) {
-                bail!("Sign-in cancelled.");
+                bail!(t!("ios-keys-sign-in-cancelled"));
             }
             if Instant::now() >= deadline {
-                bail!(
-                    "No security key was found. Hold it flat against the top of your iPhone, and try again."
-                );
+                bail!(t!("ios-keys-no-security-key-was-found-hold"));
             }
             // Safety: no arguments.
             match unsafe { picacho_ios_nfc_poll() } {
                 1 => return Ok(NfcToken { cancel }),
-                2 => bail!("Using the security key was cancelled."),
-                3 => bail!(
-                    "No security key was found. Hold it flat against the top of your iPhone, and try again."
-                ),
+                2 => bail!(t!("ios-keys-using-the-security-key-was-cancelled")),
+                3 => bail!(t!("ios-keys-no-security-key-was-found-hold")),
                 _ => std::thread::sleep(Duration::from_millis(100)),
             }
         }

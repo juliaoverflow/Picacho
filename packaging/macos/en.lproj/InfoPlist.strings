@@ -1,0 +1,9 @@
+/* Info.plist's words (packaging/Info.plist), in English. To translate,
+   copy this folder to packaging/macos/<language>.lproj (for example
+   de.lproj) and translate the text on the right of each "=". */
+
+/* Why Picacho asks to use Bluetooth: a passkey on a phone, by QR code */
+"NSBluetoothAlwaysUsageDescription" = "Picacho uses Bluetooth to check that your phone is nearby when you sign in with a passkey on it.";
+
+/* The kind of file an .eml or .msg file is, in Finder */
+"Email Message" = "Email Message";

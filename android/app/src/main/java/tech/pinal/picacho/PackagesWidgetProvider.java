@@ -51,13 +51,18 @@ public final class PackagesWidgetProvider extends AppWidgetProvider {
         int accent = WidgetStore.accentColor(context, snap);
 
         RemoteViews views = new RemoteViews(context.getPackageName(), R.layout.widget_packages);
+        // The layout's own text, in Picacho's language (the launcher would
+        // read the layout in the phone's).
+        Context text = Lang.of(context);
+        views.setContentDescription(R.id.widget_pkg_refresh, text.getString(R.string.widget_refresh));
+        views.setTextViewText(R.id.widget_pkg_empty, text.getString(R.string.widget_empty_packages));
         views.setInt(R.id.widget_pkg_icon, "setColorFilter", accent);
         views.setInt(
                 R.id.widget_pkg_refresh,
                 "setColorFilter",
                 context.getColor(R.color.widget_text_muted));
 
-        String baseTitle = context.getString(R.string.widget_packages_label);
+        String baseTitle = Lang.of(context).getString(R.string.widget_packages_label);
         String title = (accountId != null && !accountId.isEmpty())
                 ? baseTitle + " · " + snap.accountLabelFor(context, accountId)
                 : baseTitle;
@@ -73,7 +78,8 @@ public final class PackagesWidgetProvider extends AppWidgetProvider {
         if (total > 0) {
             views.setViewVisibility(R.id.widget_pkg_view_all, View.VISIBLE);
             views.setTextViewText(
-                    R.id.widget_pkg_view_all, context.getString(R.string.widget_view_all, total));
+                    R.id.widget_pkg_view_all,
+                    Lang.of(context).getResources().getQuantityString(R.plurals.widget_view_all, total, total));
             views.setTextColor(R.id.widget_pkg_view_all, accent);
             views.setOnClickPendingIntent(R.id.widget_pkg_view_all, openPackages);
         } else {

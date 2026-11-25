@@ -130,7 +130,7 @@ public sealed class WidgetProvider : IWidgetProvider
             var only = snap.Accounts[0];
             return string.IsNullOrWhiteSpace(only.Name) ? only.Email : only.Name;
         }
-        return "All Accounts";
+        return L.Get("AllAccounts");
     }
 
     private static void EnsureWatcher()
@@ -201,11 +201,11 @@ public sealed class WidgetProvider : IWidgetProvider
     private static object BuildInboxData(WidgetSnapshot snap, WidgetSize size)
     {
         int limit = RowsFor(size);
-        var label = snap.Accounts.Count == 1 ? snap.Accounts[0].Name : "All Inboxes";
+        var label = snap.Accounts.Count == 1 ? snap.Accounts[0].Name : L.Get("AllInboxes");
         var rows = snap.Messages.Take(limit).Select(m => new
         {
-            sender = string.IsNullOrWhiteSpace(m.Sender) ? "(Unknown sender)" : m.Sender,
-            subject = string.IsNullOrWhiteSpace(m.Subject) ? "(No subject)" : m.Subject,
+            sender = string.IsNullOrWhiteSpace(m.Sender) ? L.Get("UnknownSender") : m.Sender,
+            subject = string.IsNullOrWhiteSpace(m.Subject) ? L.Get("NoSubject") : m.Subject,
             snippet = size == WidgetSize.Small ? "" : (m.Snippet ?? ""),
             date = FormatShortDate(m.Date),
             unread = m.Unread,
@@ -214,32 +214,40 @@ public sealed class WidgetProvider : IWidgetProvider
 
         return new
         {
-            title = string.IsNullOrWhiteSpace(label) ? "Inbox" : label,
+            title = string.IsNullOrWhiteSpace(label) ? L.Get("Inbox") : label,
+            composeText = L.Get("Compose"),
+            refreshText = L.Get("Refresh"),
             unreadCount = snap.TotalUnread,
             badgeText = snap.TotalUnread > 999 ? "999+" : snap.TotalUnread.ToString(CultureInfo.InvariantCulture),
             inboxUrl = "picacho://widget/inbox",
             composeUrl = "picacho://widget/compose",
             hasMessages = rows.Count > 0,
-            emptyText = snap.Accounts.Count == 0 ? "Open Picacho to add an account" : "No messages in Inbox",
+            emptyText = snap.Accounts.Count == 0 ? L.Get("OpenToAddAccount") : L.Get("NoMessagesInInbox"),
             messages = rows
         };
     }
 
     private static object BuildUnreadData(WidgetSnapshot snap)
     {
-        var label = snap.Accounts.Count == 1 ? snap.Accounts[0].Name : "All Inboxes";
+        var label = snap.Accounts.Count == 1 ? snap.Accounts[0].Name : L.Get("AllInboxes");
         var latest = snap.Messages.FirstOrDefault(m => m.Unread);
         return new
         {
-            accountLabel = string.IsNullOrWhiteSpace(label) ? "Inbox" : label,
+            accountLabel = string.IsNullOrWhiteSpace(label) ? L.Get("Inbox") : label,
+            composeText = L.Get("Compose"),
             unreadCount = snap.TotalUnread,
             unreadText = snap.TotalUnread > 999 ? "999+" : snap.TotalUnread.ToString(CultureInfo.InvariantCulture),
-            subtitle = snap.TotalUnread == 0 ? "All caught up" : (snap.TotalUnread == 1 ? "unread message" : "unread messages"),
+            subtitle = snap.TotalUnread == 0
+                ? L.Get("AllCaughtUp")
+                // Picacho's words for this count (by the language's plural rules), else ours.
+                : snap.Labels.TryGetValue($"unread:{snap.TotalUnread}", out var unread)
+                    ? unread
+                    : L.Get(snap.TotalUnread == 1 ? "UnreadMessage" : "UnreadMessages"),
             inboxUrl = "picacho://widget/inbox",
             composeUrl = "picacho://widget/compose",
             hasLatest = latest != null,
             latestSender = latest?.Sender ?? "",
-            latestSubject = string.IsNullOrWhiteSpace(latest?.Subject) ? "(No subject)" : latest!.Subject,
+            latestSubject = string.IsNullOrWhiteSpace(latest?.Subject) ? L.Get("NoSubject") : latest!.Subject,
             latestUrl = latest == null
                 ? "picacho://widget/inbox"
                 : $"picacho://widget/message?account={Uri.EscapeDataString(latest.AccountId)}&id={Uri.EscapeDataString(latest.Id)}"
@@ -255,7 +263,7 @@ public sealed class WidgetProvider : IWidgetProvider
             .Take(limit)
             .Select(e => new
             {
-                title = string.IsNullOrWhiteSpace(e.Title) ? "(No title)" : e.Title,
+                title = string.IsNullOrWhiteSpace(e.Title) ? L.Get("NoTitle") : e.Title,
                 time = FormatEventTime(e),
                 location = size == WidgetSize.Small ? "" : (e.Location ?? "")
             })
@@ -263,9 +271,12 @@ public sealed class WidgetProvider : IWidgetProvider
 
         return new
         {
-            todayLabel = DateTime.Now.ToString("ddd, MMM d", CultureInfo.CurrentCulture),
+            heading = L.Get("Calendar"),
+            openText = L.Get("OpenCalendar"),
+            refreshText = L.Get("Refresh"),
+            todayLabel = DateTime.Now.ToString("ddd, " + MonthDay, L.Culture),
             hasEvents = events.Count > 0,
-            emptyText = snap.CalendarConnected ? "No upcoming events" : "Connect a calendar in Settings",
+            emptyText = snap.CalendarConnected ? L.Get("NoUpcomingEvents") : L.Get("ConnectCalendar"),
             events
         };
     }
@@ -313,7 +324,7 @@ public sealed class WidgetProvider : IWidgetProvider
             var parts = new List<string>();
             if (!string.IsNullOrWhiteSpace(p.Status)) parts.Add(p.Status);
             if (!string.IsNullOrWhiteSpace(p.Carrier)) parts.Add(p.Carrier);
-            if (!string.IsNullOrWhiteSpace(p.Expected)) parts.Add($"Expected {p.Expected}");
+            if (!string.IsNullOrWhiteSpace(p.Expected)) parts.Add(L.Format("Expected", p.Expected));
             else
             {
                 var d = FormatShortDate(p.Updated);
@@ -325,7 +336,7 @@ public sealed class WidgetProvider : IWidgetProvider
                 : packagesUrl;
             return new
             {
-                title = string.IsNullOrWhiteSpace(p.Title) ? "Package" : p.Title,
+                title = string.IsNullOrWhiteSpace(p.Title) ? L.Get("Package") : p.Title,
                 detail = string.Join(" · ", parts),
                 url
             };
@@ -333,12 +344,15 @@ public sealed class WidgetProvider : IWidgetProvider
 
         return new
         {
+            heading = L.Get("Packages"),
+            openText = L.Get("AllPackages"),
+            refreshText = L.Get("Refresh"),
+            emptyText = L.Get("NoRecentPackages"),
             accountLabel = AccountLabelFor(snap, accountId),
             hasMultipleAccounts = snap.Accounts.Count > 1,
             packagesUrl,
             hasPackages = rows.Count > 0,
-            viewAllText = "View all " + SummaryTotal(snap, accountId, true, matching.Count)
-                .ToString(CultureInfo.InvariantCulture),
+            viewAllText = L.Format("ViewAll", SummaryTotal(snap, accountId, true, matching.Count)),
             packages = rows
         };
     }
@@ -362,7 +376,7 @@ public sealed class WidgetProvider : IWidgetProvider
         var rows = matching.Take(limit).Select(r =>
         {
             var parts = new List<string>();
-            if (!string.IsNullOrWhiteSpace(r.Order)) parts.Add($"Order {r.Order}");
+            if (!string.IsNullOrWhiteSpace(r.Order)) parts.Add(L.Format("Order", r.Order));
             var d = FormatShortDate(r.Updated > 0 ? r.Updated : r.Date);
             if (!string.IsNullOrEmpty(d)) parts.Add(d);
             if (showAccount && !string.IsNullOrWhiteSpace(r.AccountLabel)) parts.Add(r.AccountLabel);
@@ -371,7 +385,7 @@ public sealed class WidgetProvider : IWidgetProvider
                 : receiptsUrl;
             return new
             {
-                merchant = string.IsNullOrWhiteSpace(r.Merchant) ? "Receipt" : r.Merchant,
+                merchant = string.IsNullOrWhiteSpace(r.Merchant) ? L.Get("Receipt") : r.Merchant,
                 detail = string.Join(" · ", parts),
                 amount = string.IsNullOrWhiteSpace(r.Amount) ? "—" : r.Amount,
                 refund = r.Refund,
@@ -381,12 +395,15 @@ public sealed class WidgetProvider : IWidgetProvider
 
         return new
         {
+            heading = L.Get("Receipts"),
+            openText = L.Get("AllReceipts"),
+            refreshText = L.Get("Refresh"),
+            emptyText = L.Get("NoRecentReceipts"),
             accountLabel = AccountLabelFor(snap, accountId),
             hasMultipleAccounts = snap.Accounts.Count > 1,
             receiptsUrl,
             hasReceipts = rows.Count > 0,
-            viewAllText = "View all " + SummaryTotal(snap, accountId, false, matching.Count)
-                .ToString(CultureInfo.InvariantCulture),
+            viewAllText = L.Format("ViewAll", SummaryTotal(snap, accountId, false, matching.Count)),
             receipts = rows
         };
     }
@@ -408,7 +425,10 @@ public sealed class WidgetProvider : IWidgetProvider
             if (File.Exists(path))
             {
                 var json = File.ReadAllText(path);
-                return JsonSerializer.Deserialize<WidgetSnapshot>(json, JsonOptions) ?? new WidgetSnapshot();
+                var snap = JsonSerializer.Deserialize<WidgetSnapshot>(json, JsonOptions) ?? new WidgetSnapshot();
+                // The widgets' words and dates in the language Picacho shows.
+                L.Use(snap.Language);
+                return snap;
             }
         }
         catch
@@ -418,16 +438,19 @@ public sealed class WidgetProvider : IWidgetProvider
         return new WidgetSnapshot();
     }
 
+    /// <summary>A day and short month, in the order the language writes them ("MMM d", "d. MMM").</summary>
+    private static string MonthDay => L.Culture.DateTimeFormat.MonthDayPattern.Replace("MMMM", "MMM");
+
     private static string FormatShortDate(long epochSeconds)
     {
         if (epochSeconds <= 0) return "";
         var local = DateTimeOffset.FromUnixTimeSeconds(epochSeconds).LocalDateTime;
         var now = DateTime.Now;
-        if (local.Date == now.Date) return local.ToString("t", CultureInfo.CurrentCulture);
-        if ((now.Date - local.Date).TotalDays is >= 0 and < 6) return local.ToString("ddd", CultureInfo.CurrentCulture);
+        if (local.Date == now.Date) return local.ToString("t", L.Culture);
+        if ((now.Date - local.Date).TotalDays is >= 0 and < 6) return local.ToString("ddd", L.Culture);
         return local.Year == now.Year
-            ? local.ToString("MMM d", CultureInfo.CurrentCulture)
-            : local.ToString("MMM d, yyyy", CultureInfo.CurrentCulture);
+            ? local.ToString(MonthDay, L.Culture)
+            : local.ToString(L.Culture.DateTimeFormat.ShortDatePattern, L.Culture);
     }
 
     private static string FormatEventTime(WidgetEvent ev)
@@ -437,24 +460,24 @@ public sealed class WidgetProvider : IWidgetProvider
         if (ev.AllDay)
         {
             var utc = DateTimeOffset.FromUnixTimeSeconds(ev.Start).UtcDateTime.Date;
-            return $"{DayLabel(today, tomorrow, utc)} · All day";
+            return $"{DayLabel(today, tomorrow, utc)} · {L.Get("AllDay")}";
         }
         var start = DateTimeOffset.FromUnixTimeSeconds(ev.Start).LocalDateTime;
         var day = DayLabel(today, tomorrow, start.Date);
-        var startStr = start.ToString("t", CultureInfo.CurrentCulture);
+        var startStr = start.ToString("t", L.Culture);
         if (ev.End > ev.Start)
         {
             var end = DateTimeOffset.FromUnixTimeSeconds(ev.End).LocalDateTime;
-            return $"{day} · {startStr} – {end.ToString("t", CultureInfo.CurrentCulture)}";
+            return $"{day} · {startStr} – {end.ToString("t", L.Culture)}";
         }
         return $"{day} · {startStr}";
     }
 
     private static string DayLabel(DateTime today, DateTime tomorrow, DateTime date)
     {
-        if (date == today) return "Today";
-        if (date == tomorrow) return "Tomorrow";
-        return date.ToString("ddd, MMM d", CultureInfo.CurrentCulture);
+        if (date == today) return L.Get("Today");
+        if (date == tomorrow) return L.Get("Tomorrow");
+        return date.ToString("ddd, " + MonthDay, L.Culture);
     }
 
     private sealed record WidgetInfo(string Id, string DefinitionId, WidgetSize Size, string AccountId);
@@ -468,6 +491,10 @@ public sealed class WidgetProvider : IWidgetProvider
         [JsonPropertyName("events")] public List<WidgetEvent> Events { get; set; } = new();
         [JsonPropertyName("packages")] public List<WidgetPackage> Packages { get; set; } = new();
         [JsonPropertyName("receipts")] public List<WidgetReceipt> Receipts { get; set; } = new();
+        /// <summary>The language Picacho shows (BCP 47).</summary>
+        [JsonPropertyName("language")] public string Language { get; set; } = "";
+        /// <summary>Picacho's own words for the widgets, in that language (src/manage/widgets.rs).</summary>
+        [JsonPropertyName("labels")] public Dictionary<string, string> Labels { get; set; } = new();
     }
 
     private sealed class AccountSummary

@@ -266,7 +266,7 @@ impl Exchange {
         self.steps += 1;
         ensure!(
             self.steps <= MAX_STEPS,
-            "The server kept asking for more during sign-in."
+            t!("sync-sasl-the-server-kept-asking-for-more")
         );
         let Credentials {
             user,
@@ -327,7 +327,7 @@ impl Exchange {
                 let header = if m.plus() {
                     ensure!(
                         !self.credentials.binding.is_empty(),
-                        "The connection's channel binding isn't known."
+                        t!("sync-sasl-the-connections-channel-binding-isnt-known")
                     );
                     format!("p=tls-server-end-point,{authzid},")
                 } else {
@@ -380,7 +380,7 @@ impl Exchange {
             // largest message, wrapped; Picacho takes none (TLS protects the
             // connection) and answers with the user to act as.
             (Mechanism::Gssapi, State::GssOffer(_)) if challenge.is_empty() => {
-                bail!("The server's Kerberos sign-in didn't offer its security layers.")
+                bail!(t!("sync-sasl-the-servers-kerberos-sign-in-didnt"))
             }
             (Mechanism::Gssapi, State::GssLayer(mut context) | State::GssOffer(mut context)) => {
                 if challenge.is_empty() {
@@ -392,11 +392,11 @@ impl Exchange {
                     let offer = context.unwrap(challenge)?;
                     ensure!(
                         offer.len() == 4,
-                        "The server's Kerberos security-layer offer is malformed."
+                        t!("sync-sasl-the-servers-kerberos-security-layer-offer")
                     );
                     ensure!(
                         offer[0] & 0x01 != 0,
-                        "The server requires a Kerberos security layer Picacho doesn't use (it offers none without one)."
+                        t!("sync-sasl-the-server-requires-a-kerberos-security")
                     );
                     let mut answer = vec![0x01, 0, 0, 0];
                     // The user to sign in as: the ticket's own unless a
@@ -425,7 +425,7 @@ impl Exchange {
                 let header = if m.plus() {
                     ensure!(
                         !self.credentials.binding.is_empty(),
-                        "The connection's channel binding isn't known."
+                        t!("sync-sasl-the-connections-channel-binding-isnt-known")
                     );
                     format!("p=tls-server-end-point,{authzid},")
                 } else {
@@ -450,33 +450,32 @@ impl Exchange {
             }
             (m, State::ScramFinal { signature }) if m.scram().is_some() => {
                 let text = std::str::from_utf8(challenge)
-                    .context("The server's SCRAM reply isn't text.")?;
+                    .with_context(|| t!("sync-sasl-the-servers-scram-reply-isnt-text"))?;
                 let fields = scram_fields(text);
                 if let Some(error) = fields.iter().find(|(k, _)| *k == 'e') {
-                    bail!("The server refused the sign-in ({}).", error.1);
+                    bail!(t!("sync-sasl-the-server-refused-the-sign-in", error = error.1));
                 }
                 let v = fields
                     .iter()
                     .find(|(k, _)| *k == 'v')
-                    .context("The server's SCRAM reply has no signature.")?;
+                    .with_context(|| t!("sync-sasl-the-servers-scram-reply-has-no"))?;
                 let theirs = STANDARD
                     .decode(v.1)
-                    .context("The server's SCRAM signature isn't base64.")?;
+                    .with_context(|| t!("sync-sasl-the-servers-scram-signature-isnt-base64"))?;
                 // Compared in constant time: how long it takes says nothing
                 // about how much of a forged signature matched.
                 let same = theirs.len() == signature.len()
                     && theirs.iter().zip(&signature).fold(0u8, |acc, (a, b)| acc | (a ^ b)) == 0;
                 ensure!(
                     same,
-                    "The server couldn't prove it knows your password (SCRAM signature mismatch); not signed in."
+                    t!("sync-sasl-the-server-couldnt-prove-it-knows")
                 );
                 (Vec::new(), State::Done)
             }
             (_, state) => {
                 self.state = state;
                 bail!(
-                    "The server sent an unexpected {} challenge.",
-                    self.mechanism.name()
+                    t!("sync-sasl-the-server-sent-an-unexpected-challenge", name = self.mechanism.name())
                 );
             }
         };
@@ -501,10 +500,10 @@ impl Exchange {
         }
         match &self.state {
             State::ScramFinal { .. } => bail!(
-                "The server didn't prove it knows your password (no SCRAM signature); not signed in."
+                t!("sync-sasl-the-server-didnt-prove-it-knows")
             ),
             _ if self.unfinished_gss() => bail!(
-                "The server accepted the Kerberos sign-in before proving who it is; not signed in."
+                t!("sync-sasl-the-server-accepted-the-kerberos-sign")
             ),
             _ => Ok(()),
         }
@@ -584,7 +583,7 @@ fn hex(bytes: &[u8]) -> String {
 /// as GS2 sends it (RFC 5801 §4). Kerberos' must name Kerberos 5's OID.
 fn unframed(token: &[u8]) -> Result<&[u8]> {
     const KRB5_OID: [u8; 11] = [0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x12, 0x01, 0x02, 0x02];
-    let malformed = || anyhow::anyhow!("Kerberos made a malformed first token.");
+    let malformed = || anyhow::anyhow!(t!("sync-sasl-kerberos-made-a-malformed-first-token"));
     let rest = token.strip_prefix(&[0x60]).ok_or_else(malformed)?;
     let (&first, rest) = rest.split_first().ok_or_else(malformed)?;
     // DER: a short length, or 0x8n and n big-endian bytes of it.
@@ -632,31 +631,31 @@ fn scram_proof(
     binding: &[u8],
 ) -> Result<(String, Vec<u8>)> {
     let server_first =
-        std::str::from_utf8(server_first).context("The server's SCRAM challenge isn't text.")?;
+        std::str::from_utf8(server_first).with_context(|| t!("sync-sasl-the-servers-scram-challenge-isnt-text"))?;
     let fields = scram_fields(server_first);
     let get = |key: char| fields.iter().find(|(k, _)| *k == key).map(|(_, v)| *v);
     if let Some(error) = get('e') {
-        bail!("The server refused the sign-in ({error}).");
+        bail!(t!("sync-sasl-the-server-refused-the-sign-in-2", error = error));
     }
     ensure!(
         get('m').is_none(),
-        "The server asked for a SCRAM extension Picacho doesn't know."
+        t!("sync-sasl-the-server-asked-for-a-scram")
     );
-    let combined = get('r').context("The server's SCRAM challenge has no nonce.")?;
+    let combined = get('r').with_context(|| t!("sync-sasl-the-servers-scram-challenge-has-no"))?;
     ensure!(
         combined.starts_with(nonce) && combined.len() > nonce.len(),
-        "The server's SCRAM nonce doesn't extend Picacho's; not signed in."
+        t!("sync-sasl-the-servers-scram-nonce-doesnt-extend")
     );
     let salt = STANDARD
-        .decode(get('s').context("The server's SCRAM challenge has no salt.")?)
-        .context("The server's SCRAM salt isn't base64.")?;
+        .decode(get('s').with_context(|| t!("sync-sasl-the-servers-scram-challenge-has-no-2"))?)
+        .with_context(|| t!("sync-sasl-the-servers-scram-salt-isnt-base64"))?;
     let iterations: u32 = get('i')
-        .context("The server's SCRAM challenge has no iteration count.")?
+        .with_context(|| t!("sync-sasl-the-servers-scram-challenge-has-no-3"))?
         .parse()
-        .context("The server's SCRAM iteration count isn't a number.")?;
+        .with_context(|| t!("sync-sasl-the-servers-scram-iteration-count-isnt"))?;
     ensure!(
         (1..=MAX_ITERATIONS).contains(&iterations),
-        "The server asked for {iterations} SCRAM iterations; Picacho allows up to {MAX_ITERATIONS}."
+        t!("sync-sasl-the-server-asked-for-scram-iterations", iterations = iterations, max_iterations = MAX_ITERATIONS)
     );
     // SASLprep (RFC 4013): non-ASCII spaces as a space, characters mapped
     // to nothing (soft hyphens, joiners) left out, then NFKC; prohibited
@@ -696,7 +695,7 @@ fn saslprep(text: &str) -> Result<String> {
     let normalized: String = mapped.nfkc().collect();
     ensure!(
         !normalized.chars().any(|c| c.is_control() || ('\u{E000}'..='\u{F8FF}').contains(&c) || ('\u{FFF9}'..='\u{FFFD}').contains(&c)),
-        "The password has a character SCRAM sign-in can't use."
+        t!("sync-sasl-the-password-has-a-character-scram")
     );
     Ok(normalized)
 }
@@ -711,7 +710,7 @@ fn token_error(challenge: &[u8]) -> String {
     // RFC 7628 §3.2.2: the scope the token needs, said with the status
     // (`insufficient_scope`), is worth telling.
     match v["scope"].as_str().filter(|s| !s.is_empty()) {
-        Some(scope) => format!("{status}; it needs: {scope}"),
+        Some(scope) => t!("sync-sasl-it-needs", status = status, scope = scope),
         None => status,
     }
 }
@@ -728,7 +727,7 @@ pub(crate) fn decode(text: &str) -> Result<Vec<u8>> {
     }
     STANDARD
         .decode(text)
-        .context("The server's sign-in challenge isn't base64.")
+        .with_context(|| t!("sync-sasl-the-servers-sign-in-challenge-isnt"))
 }
 
 /// The server's side of SCRAM-SHA-256 (RFC 5802 §5), for mock servers in

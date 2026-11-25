@@ -172,7 +172,7 @@ impl Backend {
         let wire = c.mailbox(name)?;
         allowed(
             c.session.run_command_and_check_ok(format!("CREATE {wire}")),
-            || format!("create the “{label}” folder"),
+            || t!("manage-snooze-create-the-folder", label = label),
         )?;
         subscribe(c, name)
     }
@@ -181,20 +181,20 @@ impl Backend {
     pub fn snooze(&self, a: &Account, mails: &[Mail], until: i64) -> Result<String> {
         ensure!(
             a.provider != Provider::Pop3,
-            "Snoozing needs mail kept on the server."
+            t!("manage-snooze-snoozing-needs-mail-kept-on-the")
         );
         ensure!(
             until > chrono::Utc::now().timestamp(),
-            "Choose a time in the future."
+            t!("manage-snooze-choose-a-time-in-the-future")
         );
-        ensure!(!mails.is_empty(), "Choose messages to snooze.");
+        ensure!(!mails.is_empty(), t!("manage-snooze-choose-messages-to-snooze"));
         ensure!(
             mails.iter().all(|m| m.account == a.id),
-            "Message belongs to another account"
+            t!("manage-snooze-message-belongs-to-another-account")
         );
         ensure!(
             mails.iter().all(|m| !m.message_id.trim().is_empty()),
-            "This message has no Message-ID, so it couldn't be found again to wake it."
+            t!("manage-snooze-this-message-has-no-message-id")
         );
         let lock = self.account_lock(&a.id);
         let _operation = lock.lock().unwrap();
@@ -315,7 +315,7 @@ impl Backend {
                 s.folders()
                     .into_iter()
                     .find(|f| f.id == id)
-                    .context("Proton didn't keep the new folder.")
+                    .with_context(|| t!("manage-snooze-proton-didnt-keep-the-new-folder"))
             };
             // Picacho's folder: the one there, or a new one.
             let parent = match s
@@ -463,7 +463,7 @@ impl Backend {
                     super::jmap::places(&s.mailboxes()?)
                         .into_iter()
                         .find(|p| p.id == id)
-                        .context("The server didn't keep the new folder.")?
+                        .with_context(|| t!("manage-snooze-the-server-didnt-keep-the-new"))?
                 }
             };
             let inside = format!("{}/{FOLDER}", parent.path);
@@ -607,7 +607,7 @@ impl Backend {
             return Ok(false);
         }
         let set = if saved && ext.moves { "$".to_owned() } else { uid_ranges(&uids) };
-        c.require_writable("move snoozed mail back")?;
+        c.require_writable(t!("manage-snooze-move-snoozed-mail-back"))?;
         c.session.uid_store(&set, "-FLAGS.SILENT (\\Seen)")?;
         let inbox = c.mailbox("INBOX")?;
         if c.extensions()?.moves {

@@ -29,14 +29,14 @@ pub(super) enum AliasField {
 impl AliasField {
     fn label(self) -> &'static str {
         match self {
-            Self::Note => "Description",
-            Self::Name => "Display name",
+            Self::Note => t!("forwarding-description"),
+            Self::Name => t!("forwarding-display-name"),
         }
     }
     fn placeholder(self) -> &'static str {
         match self {
-            Self::Note => "Description",
-            Self::Name => "The name recipients see, like Jane Doe",
+            Self::Note => t!("forwarding-description"),
+            Self::Name => t!("forwarding-the-name-recipients-see-like-jane"),
         }
     }
 }
@@ -60,20 +60,20 @@ impl ContactRow {
     fn new(contact: ReverseAlias) -> Self {
         Self {
             title: if contact.contact.is_empty() {
-                "Unknown contact".into()
+                t!("forwarding-unknown-contact").into()
             } else {
                 contact.contact.clone().into()
             },
             hidden: fwd::obscure(&contact.address).into(),
             when: contact
                 .last_sent
-                .map(|ts| format!("Last written {}", date_short(ts)))
+                .map(|ts| t!("forwarding-last-written", date = date_short(ts)))
                 .unwrap_or_default()
                 .into(),
-            received: Self::count("Received", contact.stats.map(|s| {
+            received: Self::count(t!("forwarding-received"), contact.stats.map(|s| {
                 (s.received_recent, s.received, s.partial)
             })),
-            sent: Self::count("Sent", contact.stats.map(|s| (s.sent_recent, s.sent, s.partial))),
+            sent: Self::count(t!("forwarding-sent"), contact.stats.map(|s| (s.sent_recent, s.sent, s.partial))),
             search: contact.contact.to_lowercase(),
             contact,
         }
@@ -83,11 +83,7 @@ impl ContactRow {
     fn count(what: &str, counts: Option<(u64, u64, bool)>) -> SharedString {
         counts
             .map(|(recent, total, partial)| {
-                format!(
-                    "{what} {recent} ({}d) · {total}{} total",
-                    fwd::CONTACT_RECENT_DAYS,
-                    if partial { "+" } else { "" }
-                )
+                t!("forwarding-d-total", what = what, recent = recent, contact_recent_days = fwd::CONTACT_RECENT_DAYS, total = total, partial = if partial { "yes" } else { "no" })
             })
             .unwrap_or_default()
             .into()
@@ -259,7 +255,7 @@ impl MailApp {
             )
             .child(self.small_button(
                 format!("{id}-cancel"),
-                "Cancel",
+                t!("forwarding-cancel"),
                 "",
                 Action::CancelForwardingConfirm,
                 cx,
@@ -294,12 +290,12 @@ impl MailApp {
             .flex()
             .flex_col()
             .gap_4()
-            .child(self.section("Forwarding"))
+            .child(self.section(t!("forwarding-forwarding")))
             .child(
                 div()
                     .text_size(px(12.))
                     .text_color(rgb(c.muted))
-                    .child("Manage your SimpleLogin, addy.io and Firefox Relay aliases. Their mail can stay in its mailbox or appear as an account of its own."),
+                    .child(t!("forwarding-manage-your-simplelogin-addy-io-and")),
             )
             .child(list)
             .into_any_element()
@@ -325,7 +321,7 @@ impl MailApp {
             .text_color(rgb(c.accent))
             .hover(move |s| s.bg(rgb(c.raised)))
             .child(icon_el("plus", 14., c.accent))
-            .child("Add Service")
+            .child(t!("forwarding-add-service"))
             .on_click(cx.listener(|this, _, w, cx| this.handle(Action::AddForwarding, w, cx)))
             .into_any_element()
     }
@@ -348,13 +344,13 @@ impl MailApp {
                             .flex_1()
                             .text_size(px(14.))
                             .font_weight(FontWeight::SEMIBOLD)
-                            .child(if first { "Add a Service" } else { "Add Service" }),
+                            .child(if first { t!("forwarding-add-a-service") } else { t!("forwarding-add-service") }),
                     )
                     .when(!first, |d| {
                         d.child(self.fwd_icon_button(
                             "forwarding-add-close".into(),
                             "close",
-                            "Cancel",
+                            t!("forwarding-cancel"),
                             Action::AddForwarding,
                             cx,
                         ))
@@ -401,7 +397,7 @@ impl MailApp {
                     .flex()
                     .flex_col()
                     .gap_1()
-                    .child(label("API key"))
+                    .child(label(t!("forwarding-api-key")))
                     .child(
                         div()
                             .id("forwarding-key")
@@ -419,7 +415,7 @@ impl MailApp {
                             .child(help)
                             .child(self.link(
                                 "forwarding-key-help",
-                                "Open",
+                                t!("forwarding-open"),
                                 Action::OpenUrl(url.into()),
                                 cx,
                             )),
@@ -430,7 +426,7 @@ impl MailApp {
                     .flex()
                     .flex_col()
                     .gap_1()
-                    .child(label("Server"))
+                    .child(label(t!("forwarding-server")))
                     .child(div().id("forwarding-server").max_w(px(420.)).child(field(
                         Input::new(&self.fwd_server),
                         c,
@@ -440,10 +436,7 @@ impl MailApp {
                         div()
                             .text_size(px(11.))
                             .text_color(rgb(c.muted))
-                            .child(format!(
-                                "Only for a self-hosted server; blank uses {}. The key is kept in the system keychain.",
-                                service.default_server()
-                            )),
+                            .child(t!("forwarding-only-for-a-self-hosted-server", default_server = service.default_server())),
                     ),
             )
             .when_some(self.fwd_error.clone(), |d, e| {
@@ -459,7 +452,7 @@ impl MailApp {
                 div().flex().child(
                     self.button(
                         "forwarding-connect",
-                        if busy { "Connecting…" } else { "Connect" },
+                        if busy { t!("forwarding-connecting") } else { t!("forwarding-connect") },
                         "plus",
                         Action::ConnectForwarding,
                         true,
@@ -478,13 +471,10 @@ impl MailApp {
         let removing = self.fwd_confirm.as_deref() == Some(f.id.as_str());
         let open = self.fwd_open.contains(&f.id);
         let count = f.aliases.len();
-        let mut caption = vec![format!(
-            "{count} alias{}",
-            if count == 1 { "" } else { "es" }
-        )];
+        let mut caption = vec![t!("forwarding-alias", count = count)];
         caption.push(match self.deliver_label(f) {
-            Some(email) => format!("to {email}"),
-            None => "to any mailbox".into(),
+            Some(email) => t!("forwarding-to", email = email),
+            None => t!("forwarding-to-any-mailbox").into(),
         });
         // A self-hosted server is named; the service's own is implied.
         if !f.server.is_empty() {
@@ -544,7 +534,7 @@ impl MailApp {
             .child(self.fwd_icon_button(
                 format!("forwarding-menu-{}", f.id),
                 "ellipsis",
-                "More",
+                t!("forwarding-more"),
                 Action::ServiceMenu(f.id.clone()),
                 cx,
             ))
@@ -564,11 +554,8 @@ impl MailApp {
             .when(removing, |d| {
                 d.child(self.confirm_strip(
                     format!("forwarding-remove-{}", f.id),
-                    format!(
-                        "Remove {}? Its aliases keep working; Picacho stops managing them.",
-                        f.service.label()
-                    ),
-                    "Remove",
+                    t!("forwarding-remove-its-aliases-keep-working-picacho", label = f.service.label()),
+                    t!("forwarding-remove"),
                     Action::RemoveForwarding(f.id.clone()),
                     cx,
                 ))
@@ -584,7 +571,7 @@ impl MailApp {
                 .iter()
                 .find(|a| &a.id == id)
                 .map(|a| a.email.clone())
-                .unwrap_or_else(|| "a removed mailbox".into()),
+                .unwrap_or_else(|| t!("forwarding-a-removed-mailbox").into()),
         )
     }
     /// A service's toolbar, new alias form and aliases.
@@ -619,11 +606,11 @@ impl MailApp {
                     .flex_1()
                     .min_w_0()
                     .truncate()
-                    .child(self.deliver_label(f).unwrap_or_else(|| "Any mailbox".into())),
+                    .child(self.deliver_label(f).unwrap_or_else(|| t!("forwarding-any-mailbox").into())),
             )
             .child(icon_el("chevrons-up-down", 12., c.muted))
             .tooltip(|w, cx| {
-                Tooltip::new("Where the aliases' mail arrives. Any mailbox looks in every account.")
+                Tooltip::new(t!("forwarding-where-the-aliases-mail-arrives-any"))
                     .build(w, cx)
             })
             .on_click(cx.listener({
@@ -631,17 +618,10 @@ impl MailApp {
                 move |this, _, w, cx| this.handle(action.clone(), w, cx)
             }));
         let sending: SharedString = if f.service.can_send() {
-            format!(
-                "Send as an alias by choosing it in From. It goes out from {}, which must be a verified mailbox at {}.",
-                self.deliver_label(f)
-                    .unwrap_or_else(|| "the mailbox you write from".into()),
-                f.service.label()
-            )
+            t!("forwarding-send-as-an-alias-by-choosing", mailbox = self.deliver_label(f)
+                    .unwrap_or_else(|| t!("forwarding-the-mailbox-you-write-from").into()), label = f.service.label())
         } else {
-            format!(
-                "{} only relays replies to mail it forwarded; new messages can't be sent as an alias.",
-                f.service.label()
-            )
+            t!("forwarding-only-relays-replies-to-mail-it", label = f.service.label())
         }
         .into();
         let info = div()
@@ -666,7 +646,7 @@ impl MailApp {
                     .flex_shrink_0()
                     .text_size(px(12.))
                     .text_color(rgb(c.muted))
-                    .child("Forwards to"),
+                    .child(t!("forwarding-forwards-to")),
             )
             .child(deliver)
             .child(info)
@@ -688,7 +668,7 @@ impl MailApp {
             .child(if creating {
                 self.small_button(
                     format!("alias-new-{}", f.id),
-                    "Cancel",
+                    t!("forwarding-cancel"),
                     "",
                     Action::NewAlias(f.id.clone()),
                     cx,
@@ -696,7 +676,7 @@ impl MailApp {
             } else {
                 self.button(
                     format!("alias-new-{}", f.id),
-                    "New Alias",
+                    t!("forwarding-new-alias"),
                     "plus",
                     Action::NewAlias(f.id.clone()),
                     true,
@@ -713,13 +693,9 @@ impl MailApp {
             .collect();
         let aliases_only = f.service.can_send().then(|| {
             let mailboxes = if protected.is_empty() {
-                "No mailbox here receives its aliases yet; choose one in Forwards to.".to_owned()
+                t!("forwarding-no-mailbox-here-receives-its-aliases").to_owned()
             } else {
-                format!(
-                    "{} can't write as {}: new mail and replies go out as an alias, and the alias used is shown wherever its address was, in received and sent mail.",
-                    protected.join(", "),
-                    if protected.len() > 1 { "themselves" } else { "itself" }
-                )
+                t!("forwarding-cant-write-as-new-mail-and", aliases = protected.join(", "), count = protected.len())
             };
             div()
                 .px_4()
@@ -750,7 +726,7 @@ impl MailApp {
                             div()
                                 .text_size(px(13.))
                                 .font_weight(FontWeight::MEDIUM)
-                                .child("Send only as aliases"),
+                                .child(t!("forwarding-send-only-as-aliases")),
                         )
                         .child(
                             div()
@@ -819,9 +795,9 @@ impl MailApp {
                         c.muted,
                     ))
                     .child(if f.aliases.is_empty() {
-                        "No aliases yet."
+                        t!("forwarding-no-aliases-yet")
                     } else {
-                        "No alias matches."
+                        t!("forwarding-no-alias-matches")
                     }),
             );
         }
@@ -831,7 +807,7 @@ impl MailApp {
                 &format!("aliases-{}", f.id),
                 page,
                 pages,
-                format!("{}–{} of {} aliases", start + 1, end, matching.len()),
+                t!("forwarding-of-aliases", first = start + 1, end = end, count = matching.len()),
                 move |p| Action::AliasPage(id.clone(), p),
                 cx,
             ));
@@ -870,8 +846,8 @@ impl MailApp {
             .flex()
             .items_center()
             .gap_3()
-            .child(side(page > 0, "first", "« First", 0))
-            .child(side(page > 0, "prev", "‹ Previous", page.saturating_sub(1)))
+            .child(side(page > 0, "first", t!("forwarding-first"), 0))
+            .child(side(page > 0, "prev", t!("forwarding-previous"), page.saturating_sub(1)))
             .child(
                 div()
                     .flex_1()
@@ -879,10 +855,10 @@ impl MailApp {
                     .justify_center()
                     .text_size(px(12.))
                     .text_color(rgb(c.muted))
-                    .child(format!("Page {} of {pages} · {label}", page + 1)),
+                    .child(t!("forwarding-page-of", page = page + 1, pages = pages, label = label)),
             )
-            .child(side(page + 1 < pages, "next", "Next ›", page + 1))
-            .child(side(page + 1 < pages, "last", "Last »", pages - 1))
+            .child(side(page + 1 < pages, "next", t!("forwarding-next"), page + 1))
+            .child(side(page + 1 < pages, "last", t!("forwarding-last"), pages - 1))
     }
     /// The new alias form, laid out like the address it makes: a prefix
     /// (typed, suggested or random) and a domain where the service lets
@@ -897,16 +873,16 @@ impl MailApp {
         let prefix_ok = domain.is_none_or(|d| d.custom_prefix);
         let prefix = fwd::clean_prefix(&Self::value(&self.fwd_prefix, cx));
         let random = match self.fwd_format {
-            Some(format) => format!("a {} prefix", format.label().to_lowercase()),
-            None => "a random prefix".into(),
+            Some(format) => t!("forwarding-a-prefix", to_lowercase = format.label().to_lowercase()),
+            None => t!("forwarding-a-random-prefix").into(),
         };
         let preview = domain.map(|d| {
             if prefix_ok && !prefix.is_empty() {
-                format!("Creates {prefix}{}", d.suffix)
+                t!("forwarding-creates", prefix = prefix, suffix = d.suffix)
             } else if prefix_ok {
-                format!("Creates {random} with {}", d.suffix)
+                t!("forwarding-creates-with", random = random, suffix = d.suffix)
             } else {
-                format!("Creates {random} with {}. This domain only takes random aliases.", d.suffix)
+                t!("forwarding-creates-with-this-domain-only-takes", random = random, suffix = d.suffix)
             }
         });
         let domain_button = div()
@@ -937,8 +913,8 @@ impl MailApp {
                     .truncate()
                     .child(match domain {
                         Some(d) => d.suffix.clone(),
-                        None if loading => "Loading domains…".into(),
-                        None => "Default domain".to_string(),
+                        None if loading => t!("forwarding-loading-domains").into(),
+                        None => t!("forwarding-default-domain").to_string(),
                     }),
             )
             .when_some(domain, |d, domain| {
@@ -977,7 +953,7 @@ impl MailApp {
         }
         if matches!(options, Some(Ok(o)) if !o.can_create) {
             hints = hints.child(hint(
-                format!("{} won't make more aliases on this plan.", f.service.label()),
+                t!("forwarding-wont-make-more-aliases-on-this", label = f.service.label()),
                 c.danger,
             ));
         }
@@ -988,12 +964,12 @@ impl MailApp {
                     .flex_wrap()
                     .gap_2()
                     .child(hint(
-                        format!("Couldn't list domains: {e}. New aliases use the default domain."),
+                        t!("forwarding-couldnt-list-domains-new-aliases-use", e = e),
                         c.danger,
                     ))
                     .child(self.link(
                         &format!("alias-domains-retry-{id}"),
-                        "Try Again",
+                        t!("forwarding-try-again"),
                         Action::DomainMenu(id.clone()),
                         cx,
                     )),
@@ -1020,7 +996,7 @@ impl MailApp {
                         div()
                             .text_size(px(13.))
                             .font_weight(FontWeight::SEMIBOLD)
-                            .child("New alias"),
+                            .child(t!("forwarding-new-alias-2")),
                     )
                     .child(div().flex_1())
                     .when_some(mailbox, |d, email| {
@@ -1030,7 +1006,7 @@ impl MailApp {
                                 .truncate()
                                 .text_size(px(11.))
                                 .text_color(rgb(c.muted))
-                                .child(format!("Forwards to {email}")),
+                                .child(t!("forwarding-forwards-to-2", email = email)),
                         )
                     }),
             )
@@ -1057,7 +1033,7 @@ impl MailApp {
                             self.fwd_icon_button(
                                 format!("alias-prefix-menu-{id}"),
                                 "ellipsis",
-                                "Random prefix",
+                                t!("forwarding-random-prefix"),
                                 Action::PrefixMenu(id.clone()),
                                 cx,
                             )
@@ -1083,7 +1059,7 @@ impl MailApp {
                     .child(
                         self.button(
                             format!("alias-create-{id}"),
-                            if busy { "Creating…" } else { "Create" },
+                            if busy { t!("forwarding-creating") } else { t!("forwarding-create") },
                             "",
                             Action::CreateAlias(id.clone()),
                             true,
@@ -1129,7 +1105,7 @@ impl MailApp {
                 Action::SetAliasEnabled(f.id.clone(), a.id.clone(), !a.enabled),
                 cx,
             )
-            .tooltip(|w, cx| Tooltip::new("Forward mail sent to this alias").build(w, cx));
+            .tooltip(|w, cx| Tooltip::new(t!("forwarding-forward-mail-sent-to-this-alias")).build(w, cx));
         let details = !a.enabled || separate || !a.note.is_empty() || !a.name.is_empty();
         let row = div()
             .id(SharedString::from(format!("alias-{key}")))
@@ -1174,8 +1150,8 @@ impl MailApp {
                                 .min_w_0()
                                 .text_size(px(12.))
                                 .text_color(rgb(c.muted))
-                                .when(!a.enabled, |d| d.child(self.pill("Off", Tone::Danger)))
-                                .when(separate, |d| d.child(self.pill("Own account", Tone::Accent)))
+                                .when(!a.enabled, |d| d.child(self.pill(t!("forwarding-off"), Tone::Danger)))
+                                .when(separate, |d| d.child(self.pill(t!("forwarding-own-account"), Tone::Accent)))
                                 .when(!a.name.is_empty(), |d| {
                                     d.child(
                                         div()
@@ -1199,7 +1175,7 @@ impl MailApp {
             .child(self.fwd_icon_button(
                 format!("alias-menu-{key}"),
                 "ellipsis",
-                "More",
+                t!("forwarding-more"),
                 Action::AliasMenu(f.id.clone(), a.id.clone()),
                 cx,
             ));
@@ -1231,7 +1207,7 @@ impl MailApp {
                         )
                         .child(self.small_button(
                             format!("alias-note-cancel-{key}"),
-                            "Cancel",
+                            t!("forwarding-cancel"),
                             "",
                             Action::CancelAliasEdit,
                             cx,
@@ -1239,7 +1215,7 @@ impl MailApp {
                         .child(
                             self.button(
                                 format!("alias-note-save-{key}"),
-                                "Save",
+                                t!("forwarding-save"),
                                 "",
                                 Action::SaveAliasEdit,
                                 true,
@@ -1252,8 +1228,8 @@ impl MailApp {
             .when(deleting, |d| {
                 d.child(self.confirm_strip(
                     format!("alias-delete-{key}"),
-                    format!("Delete {}? Mail sent to it will be refused.", a.email),
-                    "Delete",
+                    t!("forwarding-delete-mail-sent-to-it-will", email = a.email),
+                    t!("forwarding-delete"),
                     Action::DeleteAlias(f.id.clone(), a.id.clone()),
                     cx,
                 ))
@@ -1278,7 +1254,7 @@ impl MailApp {
             .text_color(rgb(c.accent))
             .hover(|s| s.opacity(0.75))
             .child(icon_el("arrow-left", 13., c.accent))
-            .child("Forwarding")
+            .child(t!("forwarding-forwarding"))
             .on_click(cx.listener({
                 let action = Action::ToggleReverseAliases(f.id.clone(), a.id.clone());
                 move |this, _, w, cx| this.handle(action.clone(), w, cx)
@@ -1311,7 +1287,7 @@ impl MailApp {
                                 div()
                                     .text_size(px(15.))
                                     .font_weight(FontWeight::SEMIBOLD)
-                                    .child("Reverse Aliases"),
+                                    .child(t!("forwarding-reverse-aliases")),
                             )
                             .when_some(total, |d, n| {
                                 d.child(self.pill(n.to_string(), Tone::Muted))
@@ -1332,7 +1308,7 @@ impl MailApp {
             .child(self.fwd_icon_button(
                 format!("reverse-refresh-{key}"),
                 "refresh",
-                "Refresh",
+                t!("forwarding-refresh"),
                 Action::LoadReverseAliases(f.id.clone(), a.id.clone()),
                 cx,
             ));
@@ -1380,10 +1356,10 @@ impl MailApp {
                 div()
                     .text_size(px(11.))
                     .text_color(rgb(c.muted))
-                    .child("Writing to one of these from your mailbox sends as the alias. They're partly hidden here; copy one to use it."),
+                    .child(t!("forwarding-writing-to-one-of-these-from")),
             );
         let list = match state {
-            None => return panel.child(note("Loading…".into(), c.muted)),
+            None => return panel.child(note(t!("forwarding-loading").into(), c.muted)),
             Some(Err(e)) => {
                 return panel.child(
                     div()
@@ -1394,7 +1370,7 @@ impl MailApp {
                         .child(div().text_color(rgb(c.danger)).child(e.clone()))
                         .child(self.link(
                             &format!("reverse-retry-{key}"),
-                            "Try Again",
+                            t!("forwarding-try-again"),
                             Action::LoadReverseAliases(f.id.clone(), a.id.clone()),
                             cx,
                         )),
@@ -1432,7 +1408,7 @@ impl MailApp {
                 .child(
                     self.small_button(
                         format!("reverse-add-{key}"),
-                        if adding { "Adding…" } else { "Add" },
+                        if adding { t!("forwarding-adding") } else { t!("forwarding-add") },
                         "plus",
                         Action::AddContact(f.id.clone(), a.id.clone()),
                         cx,
@@ -1451,11 +1427,8 @@ impl MailApp {
         if let Some(row) = confirm {
             panel = panel.child(div().child(self.confirm_strip(
                 format!("reverse-delete-{key}"),
-                format!(
-                    "Delete the contact {}? Its reverse alias stops working.",
-                    row.title
-                ),
-                "Delete",
+                t!("forwarding-delete-the-contact-its-reverse-alias", title = row.title),
+                t!("forwarding-delete"),
                 Action::DeleteContact(f.id.clone(), a.id.clone(), row.contact.id.clone()),
                 cx,
             ).mx_0().mb_0()));
@@ -1463,9 +1436,9 @@ impl MailApp {
         if list.shown.is_empty() {
             return panel.child(note(
                 if list.rows.is_empty() {
-                    "None yet. SimpleLogin makes one for each person who writes to this alias, or whom you write to from it; add one above to write to someone new.".into()
+                    t!("forwarding-none-yet-simplelogin-makes-one-for").into()
                 } else {
-                    "No contact matches.".into()
+                    t!("forwarding-no-contact-matches").into()
                 },
                 c.muted,
             ));
@@ -1494,7 +1467,7 @@ impl MailApp {
                 &format!("reverse-pages-{key}"),
                 page,
                 pages,
-                format!("{}–{} of {total_shown} contacts", start + 1, end),
+                t!("forwarding-of-contacts", first = start + 1, end = end, total_shown = total_shown),
                 Action::ContactPage,
                 cx,
             ).px_0())
@@ -1548,7 +1521,7 @@ impl MailApp {
                             .text_size(px(11.))
                             .text_color(rgb(c.muted))
                             .child(div().min_w_0().truncate().child(row.hidden.clone()))
-                            .when(blocked, |d| d.child(self.pill("Blocked", Tone::Danger)))
+                            .when(blocked, |d| d.child(self.pill(t!("forwarding-blocked"), Tone::Danger)))
                             .when(!row.when.is_empty(), |d| {
                                 d.child(div().flex_shrink_0().child(row.when.clone()))
                             }),
@@ -1572,14 +1545,14 @@ impl MailApp {
             .child(self.fwd_icon_button(
                 format!("reverse-copy-{key}-{index}"),
                 "copy",
-                "Copy reverse alias",
+                t!("forwarding-copy-reverse-alias"),
                 Action::CopyText(row.contact.address.clone()),
                 cx,
             ))
             .child(self.fwd_icon_button(
                 format!("reverse-menu-{key}-{index}"),
                 "ellipsis",
-                "More",
+                t!("forwarding-more"),
                 Action::ContactMenu(service.into(), alias.into(), row.contact.id.clone()),
                 cx,
             ))
@@ -1694,22 +1667,22 @@ impl MailApp {
         };
         vec![
             entry(
-                "Copy Reverse Alias",
+                t!("forwarding-copy-reverse-alias-2"),
                 "copy",
                 Action::CopyText(row.contact.address.clone()),
             ),
             entry(
                 if row.contact.blocked {
-                    "Unblock Contact"
+                    t!("forwarding-unblock-contact")
                 } else {
-                    "Block Contact"
+                    t!("forwarding-block-contact")
                 },
                 "ban",
                 Action::ToggleContactBlock(id.into(), alias.into(), contact.into()),
             ),
             Entry::Separator,
             danger(
-                "Delete Contact…",
+                t!("forwarding-delete-contact"),
                 "trash",
                 Action::DeleteContact(id.into(), alias.into(), contact.into()),
             ),
@@ -1794,7 +1767,7 @@ impl MailApp {
                         if let Some(Ok(list)) = this.fwd_contacts.get_mut(&key) {
                             list.remove(&contact, &query);
                         }
-                        this.notice("Contact deleted", false, cx);
+                        this.notice(t!("forwarding-contact-deleted"), false, cx);
                     }
                     Err(e) => this.notice(format!("{e:#}"), true, cx),
                 }
@@ -1814,7 +1787,7 @@ impl MailApp {
         let key = format!("{id}:{alias}");
         let address = Self::value(&self.fwd_contact_new, cx).trim().to_owned();
         if !address.contains('@') {
-            self.notice("Enter the address you want to write to.", true, cx);
+            self.notice(t!("forwarding-enter-the-address-you-want-to"), true, cx);
             return;
         }
         let Some(account) = self.forwarding.iter().find(|f| f.id == id).cloned() else {
@@ -1847,7 +1820,7 @@ impl MailApp {
                             Arc::new(fwd::reverse_contacts(&this.backend.store));
                         cx.write_to_clipboard(ClipboardItem::new_string(contact.address.clone()));
                         this.notice(
-                            format!("Reverse alias for {} ready · copied", contact.contact),
+                            t!("forwarding-reverse-alias-for-ready-copied", contact = contact.contact),
                             false,
                             cx,
                         );
@@ -1968,7 +1941,7 @@ impl MailApp {
         let mut entries = Vec::new();
         if f.service == ForwardingService::Addy {
             entries.push(checked(
-                "Default recipient",
+                t!("forwarding-default-recipient"),
                 a.mailboxes.is_empty(),
                 Action::ToggleAliasMailbox(id.into(), alias.into(), String::new()),
             ));
@@ -2009,7 +1982,7 @@ impl MailApp {
             next.push(mailbox);
         }
         if next.is_empty() && service == ForwardingService::SimpleLogin {
-            self.notice("An alias needs at least one mailbox.", true, cx);
+            self.notice(t!("forwarding-an-alias-needs-at-least-one"), true, cx);
             return;
         }
         let ids = next.clone();
@@ -2075,13 +2048,13 @@ impl MailApp {
     pub(super) fn service_entries(&self, id: &str) -> Vec<Entry> {
         vec![
             entry(
-                "Refresh Aliases",
+                t!("forwarding-refresh-aliases"),
                 "refresh",
                 Action::RefreshAliases(id.into()),
             ),
             Entry::Separator,
             danger(
-                "Remove Service…",
+                t!("forwarding-remove-service"),
                 "trash",
                 Action::RemoveForwarding(id.into()),
             ),
@@ -2096,7 +2069,7 @@ impl MailApp {
             .and_then(|f| f.deliver_to.clone());
         let mut entries = vec![
             checked(
-                "Any mailbox",
+                t!("forwarding-any-mailbox"),
                 current.is_none(),
                 Action::SetDeliverTo(id.into(), None),
             ),
@@ -2129,12 +2102,12 @@ impl MailApp {
             )
         };
         let mut entries = vec![
-            entry("Copy Address", "copy", Action::CopyText(a.email.clone())),
+            entry(t!("forwarding-copy-address"), "copy", Action::CopyText(a.email.clone())),
             entry(
                 if a.note.is_empty() {
-                    "Add Description…"
+                    t!("forwarding-add-description")
                 } else {
-                    "Edit Description…"
+                    t!("forwarding-edit-description")
                 },
                 "compose",
                 Action::EditAlias(id.into(), alias.into(), AliasField::Note),
@@ -2143,9 +2116,9 @@ impl MailApp {
         if f.service.has_display_name() {
             entries.push(entry(
                 if a.name.is_empty() {
-                    "Set Display Name…"
+                    t!("forwarding-set-display-name")
                 } else {
-                    "Edit Display Name…"
+                    t!("forwarding-edit-display-name")
                 },
                 "user",
                 Action::EditAlias(id.into(), alias.into(), AliasField::Name),
@@ -2153,7 +2126,7 @@ impl MailApp {
         }
         if f.service.can_pin() {
             entries.push(entry(
-                if a.pinned { "Unpin" } else { "Pin" },
+                if a.pinned { t!("forwarding-unpin") } else { t!("forwarding-pin") },
                 "pin",
                 Action::SetAliasPinned(id.into(), alias.into(), !a.pinned),
             ));
@@ -2169,7 +2142,7 @@ impl MailApp {
         }
         if let Some(on) = a.pgp {
             entries.push(checked(
-                "Encrypt with PGP",
+                t!("forwarding-encrypt-with-pgp"),
                 on,
                 Action::SetAliasPgp(id.into(), alias.into(), !on),
             ));
@@ -2178,9 +2151,9 @@ impl MailApp {
             let open = self.fwd_reverse.as_deref() == Some(format!("{id}:{alias}").as_str());
             entries.push(entry(
                 if open {
-                    "Hide Reverse Aliases"
+                    t!("forwarding-hide-reverse-aliases")
                 } else {
-                    "Show Reverse Aliases"
+                    t!("forwarding-show-reverse-aliases")
                 },
                 "reply",
                 Action::ToggleReverseAliases(id.into(), alias.into()),
@@ -2188,11 +2161,11 @@ impl MailApp {
         }
         entries.extend([
             Entry::Separator,
-            show("Show in Its Mailbox", AliasDisplay::Included),
-            show("Show as Its Own Account", AliasDisplay::Separate),
+            show(t!("forwarding-show-in-its-mailbox"), AliasDisplay::Included),
+            show(t!("forwarding-show-as-its-own-account"), AliasDisplay::Separate),
             Entry::Separator,
             danger(
-                "Delete Alias…",
+                t!("forwarding-delete-alias"),
                 "trash",
                 Action::DeleteAlias(id.into(), alias.into()),
             ),

@@ -25,15 +25,14 @@ pub trait RevocationFetcher {
 /// vouches for them. A host given as an address on this computer or its
 /// network is refused, as for any address a stranger's certificate chose.
 pub fn checked_url(url: &str) -> Result<url::Url> {
-    let parsed = url::Url::parse(url).with_context(|| format!("{url:?} isn't a valid address."))?;
+    let parsed = url::Url::parse(url).with_context(|| t!("manage-smime-revocation-isnt-a-valid-address", url = format!("{:?}", url)))?;
     ensure!(
         matches!(parsed.scheme(), "http" | "https"),
-        "Revocation is fetched over HTTP only, not {}.",
-        parsed.scheme()
+        t!("manage-smime-revocation-revocation-is-fetched-over-http-only", scheme = parsed.scheme())
     );
-    ensure!(parsed.host().is_some(), "{url:?} names no server.");
+    ensure!(parsed.host().is_some(), t!("manage-smime-revocation-names-no-server", url = format!("{:?}", url)));
     if crate::sync::public_net::names_local_address(&parsed) {
-        bail!("{url:?} is on a local network.");
+        bail!(t!("manage-smime-revocation-is-on-a-local-network", url = format!("{:?}", url)));
     }
     Ok(parsed)
 }
@@ -43,7 +42,7 @@ fn bounded(reader: impl std::io::Read, limit: u64) -> Result<Vec<u8>> {
     use std::io::Read as _;
     let mut bytes = Vec::new();
     reader.take(limit + 1).read_to_end(&mut bytes)?;
-    ensure!(bytes.len() as u64 <= limit, "The revocation server's answer is too large.");
+    ensure!(bytes.len() as u64 <= limit, t!("manage-smime-revocation-the-revocation-servers-answer-is-too"));
     Ok(bytes)
 }
 
@@ -74,9 +73,9 @@ impl HttpFetcher {
     }
     fn body(&self, url: &str, response: reqwest::blocking::Response) -> Result<Vec<u8>> {
         let status = response.status();
-        ensure!(status.is_success(), "{url} answered {status}.");
+        ensure!(status.is_success(), t!("manage-smime-revocation-answered", url = url, status = status));
         if response.content_length().is_some_and(|n| n > MAX_RESPONSE) {
-            bail!("The revocation server's answer is too large.");
+            bail!(t!("manage-smime-revocation-the-revocation-servers-answer-is-too"));
         }
         bounded(response, MAX_RESPONSE)
     }
@@ -85,7 +84,7 @@ impl HttpFetcher {
 impl RevocationFetcher for HttpFetcher {
     fn get(&self, url: &str) -> Result<Vec<u8>> {
         let at = checked_url(url)?;
-        let response = self.client.get(at).send().with_context(|| format!("Couldn't fetch {url}."))?;
+        let response = self.client.get(at).send().with_context(|| t!("manage-smime-revocation-couldnt-fetch", url = url))?;
         self.body(url, response)
     }
     fn post_ocsp(&self, url: &str, der: &[u8]) -> Result<Vec<u8>> {
@@ -97,7 +96,7 @@ impl RevocationFetcher for HttpFetcher {
             .header(reqwest::header::ACCEPT, "application/ocsp-response")
             .body(der.to_vec())
             .send()
-            .with_context(|| format!("Couldn't ask {url}."))?;
+            .with_context(|| t!("manage-smime-revocation-couldnt-ask", url = url))?;
         self.body(url, response)
     }
 }
@@ -180,7 +179,7 @@ impl CrlCache {
 fn parse_crl(bytes: &[u8]) -> Result<openssl::x509::X509Crl> {
     openssl::x509::X509Crl::from_der(bytes)
         .or_else(|_| openssl::x509::X509Crl::from_pem(bytes))
-        .context("The revocation server's answer isn't a revocation list.")
+        .with_context(|| t!("manage-smime-revocation-the-revocation-servers-answer-isnt-a"))
 }
 
 /// RFC 5280 §6.3: `cert`'s status by its issuer's CRL. A current one kept
@@ -198,7 +197,7 @@ pub fn crl_status(
 ) -> Status {
     let urls = if urls.is_empty() { crl_urls(cert) } else { urls.to_vec() };
     if urls.is_empty() {
-        return Status::Unknown("Its certificate names no revocation list.".into());
+        return Status::Unknown(t!("manage-smime-revocation-its-certificate-names-no-revocation-list").into());
     }
     let status = |crl: &openssl::x509::X509CrlRef| match crl.get_by_cert(&cert.to_owned()) {
         openssl::x509::CrlStatus::Revoked(_) => Status::Revoked,
@@ -210,16 +209,16 @@ pub fn crl_status(
         }
     }
     let Some(fetcher) = fetcher else {
-        return Status::Unknown("Its revocation list hasn't been fetched.".into());
+        return Status::Unknown(t!("manage-smime-revocation-its-revocation-list-hasnt-been-fetched").into());
     };
-    let mut why = String::from("No revocation list could be fetched.");
+    let mut why = String::from(t!("manage-smime-revocation-no-revocation-list-could-be-fetched"));
     for url in &urls {
         match fetcher.get(url).and_then(|bytes| parse_crl(&bytes)) {
             Ok(crl) if current_from(&crl, issuer, now) => {
                 let _ = cache.keep(url, &crl);
                 return status(&crl);
             }
-            Ok(_) => why = format!("{url} gave a list its issuer didn't sign, or an outdated one."),
+            Ok(_) => why = t!("manage-smime-revocation-gave-a-list-its-issuer-didnt", url = url),
             Err(e) => why = format!("{e:#}"),
         }
     }
@@ -261,20 +260,20 @@ pub fn ocsp_status(
         Ok(request.to_der()?)
     })();
     let Ok(request) = request else {
-        return unknown("the request couldn't be made");
+        return unknown(t!("manage-smime-revocation-the-request-couldnt-be-made"));
     };
     let answer = match fetcher.post_ocsp(url, &request) {
         Ok(answer) => answer,
         Err(e) => return Status::Unknown(format!("{e:#}")),
     };
     let Ok(response) = OcspResponse::from_der(&answer) else {
-        return unknown("the answer isn't an OCSP response");
+        return unknown(t!("manage-smime-revocation-the-answer-isnt-an-ocsp-response"));
     };
     if response.status() != OcspResponseStatus::SUCCESSFUL {
-        return unknown("the responder couldn't answer");
+        return unknown(t!("manage-smime-revocation-the-responder-couldnt-answer"));
     }
     let Ok(basic) = response.basic() else {
-        return unknown("the answer is incomplete");
+        return unknown(t!("manage-smime-revocation-the-answer-is-incomplete"));
     };
     // §4.2.2.2: signed by the issuer itself, or by a certificate it
     // issued for answering OCSP (id-kp-OCSPSigning).
@@ -287,21 +286,21 @@ pub fn ocsp_status(
         Ok(())
     })();
     if verified.is_err() {
-        return unknown("the answer isn't signed by the certificate's issuer");
+        return unknown(t!("manage-smime-revocation-the-answer-isnt-signed-by-the"));
     }
     let Ok(id) = id() else {
-        return unknown("the request couldn't be made");
+        return unknown(t!("manage-smime-revocation-the-request-couldnt-be-made"));
     };
     let Some(status) = basic.find_status(&id) else {
-        return unknown("the answer isn't about this certificate");
+        return unknown(t!("manage-smime-revocation-the-answer-isnt-about-this-certificate"));
     };
     if status.check_validity(OCSP_SLACK, Some(OCSP_MAX_AGE)).is_err() {
-        return unknown("the answer is out of date");
+        return unknown(t!("manage-smime-revocation-the-answer-is-out-of-date"));
     }
     match status.status {
         OcspCertStatus::GOOD => Status::Good,
         OcspCertStatus::REVOKED => Status::Revoked,
-        _ => unknown("the responder doesn't know this certificate"),
+        _ => unknown(t!("manage-smime-revocation-the-responder-doesnt-know-this-certificate")),
     }
 }
 

@@ -75,31 +75,31 @@ impl MailApp {
         let Some(l) = self.receipts.iter().find(|l| l.key() == key) else {
             return;
         };
-        let mut entries = vec![entry("Open Email", "mail-open", open_email(l))];
+        let mut entries = vec![entry(t!("receipts-open-email"), "mail-open", open_email(l))];
         if !l.receipt.lines.is_empty() {
             let shown = self.summary_expanded.contains(&format!("receipt:{key}"));
             entries.push(entry(
-                if shown { "Hide Details" } else { "Show Details" },
+                if shown { t!("receipts-hide-details") } else { t!("receipts-show-details") },
                 "list",
                 Action::ToggleReceipt(key.to_owned()),
             ));
         }
         if let Some(order) = &l.receipt.order {
             entries.push(entry(
-                "Copy Order Number",
+                t!("receipts-copy-order-number"),
                 "copy",
                 Action::CopyText(order.clone()),
             ));
         }
         if let Some(total) = &l.receipt.total {
-            entries.push(entry("Copy Amount", "copy", Action::CopyText(total.show())));
+            entries.push(entry(t!("receipts-copy-amount"), "copy", Action::CopyText(total.show())));
         }
         entries.push(Entry::Separator);
         let key = key.to_owned();
         entries.push(if l.hidden {
-            entry("Show Receipt", "eye", Action::HideReceipt(key, false))
+            entry(t!("receipts-show-receipt"), "eye", Action::HideReceipt(key, false))
         } else {
-            entry("Hide Receipt", "eye-off", Action::HideReceipt(key, true))
+            entry(t!("receipts-hide-receipt"), "eye-off", Action::HideReceipt(key, true))
         });
         self.open_menu_here(entries, w, cx);
     }
@@ -182,7 +182,7 @@ impl MailApp {
                 14.,
                 if open { c.accent } else { c.muted },
             ))
-            .tooltip(|w, cx| Tooltip::new("Search Receipts").build(w, cx))
+            .tooltip(|w, cx| Tooltip::new(t!("receipts-search-receipts")).build(w, cx))
             .on_click(
                 cx.listener(move |this, _, w, cx| {
                     this.handle(Action::SearchReceipts(!open), w, cx)
@@ -211,9 +211,9 @@ impl MailApp {
                 .text_size(px(12.))
                 .text_color(rgb(c.muted))
                 .child(if spent.is_empty() {
-                    format!("{count} in all")
+                    t!("receipts-in-all", count = count)
                 } else {
-                    format!("{} this month · {count} in all", show_totals(&spent))
+                    t!("receipts-this-month-in-all", spent = show_totals(&spent), count = count)
                 })
         })
     }
@@ -256,7 +256,7 @@ impl MailApp {
                             .flex_1()
                             .text_size(px(13.))
                             .font_weight(FontWeight::SEMIBOLD)
-                            .child("Receipts"),
+                            .child(t!("receipts-receipts")),
                     )
                     .children(self.receipts_count(count)),
             )
@@ -298,14 +298,14 @@ impl MailApp {
                                 .text_size(px(11.))
                                 .text_color(rgb(c.muted))
                                 .child(if count > shown {
-                                    format!("{shown} of {count}")
+                                    t!("receipts-of", shown = shown, count = count)
                                 } else {
                                     String::new()
                                 }),
                         )
                         .child(self.summary_link(
                             "summary-receipts-more",
-                            "View more…",
+                            t!("receipts-view-more"),
                             Action::SummaryReceipts(true),
                             cx,
                         )),
@@ -317,9 +317,9 @@ impl MailApp {
     /// What an empty Receipts section says.
     fn receipts_empty_text(&self) -> &'static str {
         if self.summary_loading && self.receipts.is_empty() {
-            "Looking through your mail for receipts…"
+            t!("receipts-looking-through-your-mail-for-receipts")
         } else {
-            "No receipts in this mail"
+            t!("receipts-no-receipts-in-this-mail")
         }
     }
 
@@ -330,7 +330,7 @@ impl MailApp {
         let account = all.then(|| self.account_name(&l.first().account)).flatten();
         let mut detail = Vec::new();
         if let Some(order) = &l.receipt.order {
-            detail.push(format!("Order {order}"));
+            detail.push(t!("receipts-order", order = order));
         }
         detail.push(date_day(l.date));
         let key = l.key();
@@ -374,7 +374,7 @@ impl MailApp {
                                     .child(l.merchant.clone()),
                             )
                             .when(l.receipt.kind == Kind::Refund, |d| {
-                                d.child(tag("Refund", c))
+                                d.child(tag(t!("summary-refund"), c))
                             })
                             .when_some(account, |d, name| d.child(tag(&name, c))),
                     )
@@ -434,7 +434,7 @@ impl MailApp {
                         div()
                             .text_size(px(14.))
                             .font_weight(FontWeight::SEMIBOLD)
-                            .child("Receipts"),
+                            .child(t!("receipts-receipts")),
                     )
                     .children(self.receipts_count(count))
                     .child(div().flex_1())
@@ -443,9 +443,9 @@ impl MailApp {
                         d.child(self.summary_link(
                             "summary-receipts-show-hidden",
                             &if show_hidden {
-                                format!("Leave Out {hidden} Hidden")
+                                t!("receipts-leave-out-hidden", hidden = hidden)
                             } else {
-                                format!("Show {hidden} Hidden")
+                                t!("receipts-show-hidden", hidden = hidden)
                             },
                             Action::ShowHiddenReceipts(!show_hidden),
                             cx,
@@ -486,7 +486,7 @@ impl MailApp {
                         .text_size(px(12.))
                         .text_color(rgb(c.muted))
                         .child(spinner(12., c.muted))
-                        .child("Searching emails…"),
+                        .child(t!("receipts-searching-emails")),
                 )
             })
             .children(self.summary_download_status(false, cx))
@@ -515,7 +515,7 @@ impl MailApp {
                         .child(icon_el("receipt", 28., c.border))
                         .child(
                             if searched && self.listed_receipts(show_hidden).next().is_some() {
-                                "No receipts match your search"
+                                t!("receipts-no-receipts-match-your-search")
                             } else {
                                 self.receipts_empty_text()
                             },
@@ -531,11 +531,7 @@ impl MailApp {
                 div()
                     .text_size(px(12.))
                     .text_color(rgb(c.muted))
-                    .child(format!(
-                        "Found in {} emails on this device. Amounts are what the \
-                         emails say; nothing is looked up online.",
-                        fmt_count(self.receipts_scanned),
-                    )),
+                    .child(t!("receipts-found-in-emails-on-this-device", shown = fmt_count(self.receipts_scanned), count = self.receipts_scanned)),
         )
         .into_any_element()
     }
@@ -654,7 +650,7 @@ impl MailApp {
         let name = chrono::Local
             .timestamp_opt(start, 0)
             .single()
-            .map(|d| d.format("%B %Y").to_string())
+            .map(|d| d.local(t!("dates-month-year")))
             .unwrap_or_default();
         div()
             .id(SharedString::from(format!("summary-receipts-month-{m}")))
@@ -704,11 +700,11 @@ impl MailApp {
         let account = all.then(|| self.account_name(&l.first().account)).flatten();
         let mut detail = Vec::new();
         if let Some(order) = &l.receipt.order {
-            detail.push(format!("Order {order}"));
+            detail.push(t!("receipts-order", order = order));
         }
         detail.push(date_full(l.date));
         if l.emails.len() > 1 {
-            detail.push(format!("{} emails", l.emails.len()));
+            detail.push(t!("receipts-emails", count = l.emails.len()));
         }
         let key = l.key();
         let open = open_email(l);
@@ -757,13 +753,13 @@ impl MailApp {
                                     .child(l.merchant.clone()),
                             )
                             .when(l.receipt.kind == Kind::Refund, |d| {
-                                d.child(tag("Refund", c))
+                                d.child(tag(t!("summary-refund"), c))
                             })
                             .when(l.receipt.source == receipts::Source::Markup, |d| {
-                                d.child(tag("From sender", c))
+                                d.child(tag(t!("summary-from-sender"), c))
                             })
                             .when_some(account, |d, name| d.child(tag(&name, c)))
-                            .when(l.hidden, |d| d.child(tag("Hidden", c)))
+                            .when(l.hidden, |d| d.child(tag(t!("summary-hidden"), c)))
                             .when(in_email, |d| {
                                 d.child(
                                     div()
@@ -773,7 +769,7 @@ impl MailApp {
                                         .debug_selector(move || {
                                             format!("summary-receipt-in-email-{i}")
                                         })
-                                        .child(tag("Matched in an email", c)),
+                                        .child(tag(t!("summary-matched-in-an-email"), c)),
                                 )
                             }),
                     )
@@ -797,7 +793,7 @@ impl MailApp {
             .when(has_lines, |d| {
                 d.child(self.summary_link(
                     &format!("summary-receipt-details-{i}"),
-                    if expanded { "Less" } else { "Details" },
+                    if expanded { t!("receipts-less") } else { t!("receipts-details") },
                     Action::ToggleReceipt(key.clone()),
                     cx,
                 ))
@@ -805,7 +801,7 @@ impl MailApp {
             // Phones have no right click: hiding is a link.
             .child(self.summary_link(
                 &format!("summary-receipt-hide-{i}"),
-                if l.hidden { "Show" } else { "Hide" },
+                if l.hidden { t!("receipts-show") } else { t!("receipts-hide") },
                 Action::HideReceipt(key, !l.hidden),
                 cx,
             ));
@@ -945,7 +941,7 @@ fn date_day(t: i64) -> String {
     chrono::Local
         .timestamp_opt(t, 0)
         .single()
-        .map(|d| d.format("%b %-d, %Y").to_string())
+        .map(|d| d.local(t!("dates-month-day-year")))
         .unwrap_or_default()
 }
 

@@ -97,14 +97,15 @@ pub fn cleartext(original: &Original, subject: &str, body: &str) -> Cleartext {
 /// Anything written below the quote (bottom-posting) is left out with it:
 /// it is past the point where the original's text starts.
 pub fn quote_start(body: &str) -> Option<usize> {
-    if let Some(at) = body.find("\n---------- Forwarded message ----------") {
-        return Some(at);
-    }
+    use crate::manage::composing::{introduces_quote, starts_forward};
     let mut offset = 0;
     let lines: Vec<&str> = body.split_inclusive('\n').collect();
+    if let Some(i) = lines.iter().skip(1).position(|l| starts_forward(l)) {
+        // From the line break before it.
+        return Some(lines[..=i].iter().map(|l| l.len()).sum::<usize>() - 1);
+    }
     for (i, line) in lines.iter().enumerate() {
-        let text = line.trim_end();
-        let introduces = text.starts_with("On ") && text.ends_with(" wrote:");
+        let introduces = introduces_quote(line);
         let quoted_next = lines
             .get(i + 1)
             .is_some_and(|next| next.starts_with('>'));

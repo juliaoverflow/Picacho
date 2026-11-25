@@ -80,21 +80,21 @@ impl MailApp {
         let shown = self.codes_shown.contains(&m.id);
         let toggle = self.link(
             "codes-toggle",
-            if shown { "Hide Code" } else { "Show Code" },
+            if shown { t!("local-ai-hide-code") } else { t!("local-ai-show-code") },
             Action::ShowCodes(m.id.clone(), !shown),
             cx,
         );
         // Copies without showing it.
-        let copy = self.link("codes-copy", "Copy Code", Action::CopyCode(m.id.clone()), cx);
+        let copy = self.link("codes-copy", t!("local-ai-copy-code"), Action::CopyCode(m.id.clone()), cx);
         Some(
             self.banner(
                 "codes-banner",
                 "lock",
                 BannerStyle::Filled,
                 if shown {
-                    "This message's sign-in code is shown."
+                    t!("local-ai-this-messages-sign-in-code-is")
                 } else {
-                    "This message's sign-in code is hidden."
+                    t!("local-ai-this-messages-sign-in-code-is-2")
                 },
                 [
                     toggle.into_any_element(),
@@ -139,7 +139,7 @@ impl MailApp {
         crate::android::copy_sensitive_to_system(&copied);
         #[cfg(not(target_os = "android"))]
         drop(copied);
-        self.notice("Code copied", false, cx);
+        self.notice(t!("local-ai-code-copied"), false, cx);
     }
     pub(super) fn show_codes(&mut self, id: String, show: bool, cx: &mut Context<Self>) {
         if show {
@@ -230,7 +230,7 @@ impl MailApp {
         self.reply_history = replies::History::default();
         self.save_reply_history();
         self.notice(
-            "Picacho forgot which replies you chose and turned away",
+            t!("local-ai-picacho-forgot-which-replies-you-chose"),
             false,
             cx,
         );
@@ -586,7 +586,7 @@ impl MailApp {
         }
         match model.remove(&self.backend.store) {
             Ok(()) => self.notice(
-                format!("Deleted the {}", model.label.to_lowercase()),
+                t!("local-ai-deleted-the", to_lowercase = model.label.to_lowercase()),
                 false,
                 cx,
             ),
@@ -675,7 +675,7 @@ impl MailApp {
                 .text_color(rgb(c.danger))
                 .child(div().flex_1().min_w_0().child(error))
                 .when(self.local_ai, |d| {
-                    d.child(self.link(&format!("{id}-retry"), "Try Again", retry, cx))
+                    d.child(self.link(&format!("{id}-retry"), t!("local-ai-try-again"), retry, cx))
                 })
                 .into_any_element(),
         )
@@ -689,21 +689,19 @@ impl MailApp {
             .flex()
             .flex_col()
             .gap_5()
-            .child(self.section("Local AI"))
+            .child(self.section(t!("local-ai-local-ai")))
             .child(div().text_size(px(12.)).text_color(rgb(c.muted)).child(
-                "Small models that run on this computer to understand your mail. \
-                     Nothing is downloaded until you turn on a feature that needs a model, \
-                     and your mail never leaves this computer.",
+                t!("local-ai-small-models-that-run-on-this"),
             ))
             .child(self.switch_setting(
-                "Local AI",
-                "Turning this off deletes every model it downloaded.",
+                t!("local-ai-local-ai"),
+                t!("local-ai-turning-this-off-deletes-every-model"),
                 "local-ai".into(),
                 self.local_ai,
                 Action::SetLocalAi(!self.local_ai),
                 cx,
             ))
-            .child(self.section("Features"))
+            .child(self.section(t!("local-ai-features")))
             .child(
                 div()
                     .flex()
@@ -711,16 +709,8 @@ impl MailApp {
                     .gap_2()
                     .when(!self.local_ai, |d| d.opacity(0.5))
                     .child(self.switch_setting(
-                        "Hide sign-in codes",
-                        &format!(
-                            "Find two-factor, verification and sign-in codes in received mail (in 37 \
-                             languages), and \
-                             show them as {b}{b}{b}{b}{b}{b} in subjects, message text and \
-                             notifications. Downloads the {} ({}).",
-                            model.label.to_lowercase(),
-                            mb(model.size),
-                            b = otp::BULLET,
-                        ),
+                        t!("local-ai-hide-sign-in-codes"),
+                        &t!("local-ai-find-two-factor-verification-and-sign", b = otp::BULLET, model = model.label.to_lowercase(), size = mb(model.size)),
                         "local-ai-otp".into(),
                         self.hide_codes,
                         // Needs Local AI on first.
@@ -734,14 +724,8 @@ impl MailApp {
                         cx,
                     ))
                     .child(self.switch_setting(
-                        "Understand typed dates",
-                        &format!(
-                            "Type when to snooze a message or send one later in your own words, in 37 \
-                             languages (“tmrw at 6”, “the monday in 3 weeks”, “übermorgen um 18 Uhr”, \
-                             “明天下午6点”), typos and all. Downloads the {} ({}).",
-                            local_ai::WHEN.label.to_lowercase(),
-                            mb(local_ai::WHEN.size),
-                        ),
+                        t!("local-ai-understand-typed-dates"),
+                        &t!("local-ai-type-when-to-snooze-a-message", model = local_ai::WHEN.label.to_lowercase(), size = mb(local_ai::WHEN.size)),
                         "local-ai-when".into(),
                         self.understand_dates,
                         Action::SetUnderstandDates(self.local_ai && !self.understand_dates),
@@ -754,16 +738,8 @@ impl MailApp {
                         cx,
                     ))
                     .child(self.switch_setting(
-                        "Find tracking numbers",
-                        &format!(
-                            "Confirm the tracking numbers found in mail by the words around \
-                             them, in many languages, so the reader and each account's \
-                             Summary find the ones given without a shipping word beside \
-                             them, and skip order and phone numbers that look like them. \
-                             Installs the {} ({}).",
-                            local_ai::PARCEL.label.to_lowercase(),
-                            mb(local_ai::PARCEL.size),
-                        ),
+                        t!("local-ai-find-tracking-numbers"),
+                        &t!("local-ai-confirm-the-tracking-numbers-found-in", model = local_ai::PARCEL.label.to_lowercase(), size = mb(local_ai::PARCEL.size)),
                         "local-ai-parcel".into(),
                         self.find_parcels,
                         Action::SetFindParcels(self.local_ai && !self.find_parcels),
@@ -776,17 +752,8 @@ impl MailApp {
                         cx,
                     ))
                     .child(self.switch_setting(
-                        "Suggest replies",
-                        &format!(
-                            "Offer a few short replies under received mail, chosen for what it \
-                             says and worded in its language (37 languages): “Let me check my \
-                             calendar.”, “Congratulations!”, “¡Tengo muchas ganas!”. Choosing one \
-                             starts a reply with it written in. Replies you choose are offered \
-                             more, and right-clicking one lets you stop it. \
-                             Installs the {} ({}).",
-                            local_ai::REPLIES.label.to_lowercase(),
-                            mb(local_ai::REPLIES.size),
-                        ),
+                        t!("local-ai-suggest-replies"),
+                        &t!("local-ai-offer-a-few-short-replies-under", model = local_ai::REPLIES.label.to_lowercase(), size = mb(local_ai::REPLIES.size)),
                         "local-ai-replies".into(),
                         self.suggest_replies,
                         Action::SetSuggestReplies(self.local_ai && !self.suggest_replies),
@@ -808,22 +775,20 @@ impl MailApp {
                                 .text_size(px(12.))
                                 .text_color(rgb(c.muted))
                                 .child(div().flex_1().min_w_0().child(if hidden == 0 {
-                                    "Picacho remembers which suggested replies you choose, on this computer.".to_owned()
+                                    t!("local-ai-picacho-remembers-which-suggested-replies-you").to_owned()
                                 } else {
-                                    format!(
-                                        "Picacho remembers which suggested replies you choose, and stopped {hidden} you turned away."
-                                    )
+                                    t!("local-ai-picacho-remembers-which-suggested-replies-you-2", hidden = hidden)
                                 }))
                                 .child(self.link(
                                     "local-ai-replies-forget",
-                                    "Forget",
+                                    t!("local-ai-forget"),
                                     Action::ForgetReplyHistory,
                                     cx,
                                 )),
                         )
                     }),
             )
-            .child(self.section("Models"))
+            .child(self.section(t!("local-ai-models")))
             .child(
                 div()
                     .id("local-ai-models")
@@ -842,15 +807,12 @@ impl MailApp {
             )
             .child(div().text_size(px(12.)).text_color(rgb(c.muted)).child({
                 let total = local_ai::installed_size(&self.backend.store);
-                let used = if total > 0 {
-                    format!("{} on this computer. ", mb(total))
+                let about = t!("local-ai-models-download-when-a-feature-that");
+                if total > 0 {
+                    crate::i18n::sentences(&t!("local-ai-on-this-computer", size = mb(total)), about)
                 } else {
-                    String::new()
-                };
-                format!(
-                    "{used}Models download when a feature that needs them is turned on. \
-                     They run on this computer; your mail isn't sent anywhere."
-                )
+                    about.to_owned()
+                }
             }))
             .into_any_element()
     }
@@ -904,14 +866,14 @@ impl MailApp {
         let detail = if downloading {
             let fraction = self.model_fraction(model);
             if fraction >= 1. {
-                "Installing…".to_owned()
+                t!("local-ai-installing").to_owned()
             } else {
-                format!("Downloading… {:.0}% of {}", fraction * 100., mb(model.size))
+                t!("local-ai-downloading-of", percent = format!("{:.0}", fraction * 100.), size = mb(model.size))
             }
         } else if installed {
-            format!("Installed · {}", mb(model.installed_size(store)))
+            t!("local-ai-installed", size = mb(model.installed_size(store)))
         } else {
-            format!("Not installed · {} download", mb(model.size))
+            t!("local-ai-not-installed-download", size = mb(model.size))
         };
         let id = model.id;
         div()
@@ -941,18 +903,14 @@ impl MailApp {
                         div()
                             .text_size(px(12.))
                             .text_color(rgb(c.muted))
-                            .child(format!(
-                                "{} · Used by {}",
-                                detail,
-                                model.features.join(", ")
-                            )),
+                            .child(t!("local-ai-used-by", detail = detail, features = model.features.join(", "))),
                     ),
             )
             .when(installed && !downloading, |d| {
                 d.child(
                     self.button(
                         format!("model-delete-{id}"),
-                        "@Delete model",
+                        t!("local-ai-delete-model"),
                         "trash",
                         Action::AskDeleteModel(id.into()),
                         false,
@@ -979,21 +937,13 @@ impl MailApp {
                 div()
                     .text_size(px(14.))
                     .font_weight(FontWeight::MEDIUM)
-                    .child(format!(
-                        "Delete the {} ({})?",
-                        model.label.to_lowercase(),
-                        mb(model.installed_size(&self.backend.store))
-                    )),
+                    .child(t!("local-ai-delete-the", model = model.label.to_lowercase(), size = mb(model.installed_size(&self.backend.store)))),
             )
             .child(
                 div()
                     .text_size(px(12.))
                     .text_color(rgb(c.muted))
-                    .child(if features.len() == 1 {
-                        "Deleting it turns off this feature:"
-                    } else {
-                        "Deleting it turns off these features:"
-                    }),
+                    .child(t!("local-ai-deleting-it-turns-off-these-features", count = features.len())),
             )
             .children(features.into_iter().map(|f| {
                 div()
@@ -1008,13 +958,13 @@ impl MailApp {
                 div()
                     .text_size(px(12.))
                     .text_color(rgb(c.muted))
-                    .child("Turning the feature on again downloads the model again."),
+                    .child(t!("local-ai-turning-the-feature-on-again-downloads")),
             );
         let footer = div()
             .child(div().flex_1())
             .child(self.button(
                 "delete-model-cancel",
-                "Cancel",
+                t!("local-ai-cancel"),
                 "",
                 Action::CloseModelSheet,
                 false,
@@ -1023,7 +973,7 @@ impl MailApp {
             .child(
                 self.button(
                     "delete-model-confirm",
-                    "Delete",
+                    t!("local-ai-delete"),
                     "",
                     Action::DeleteModel(model.id.into()),
                     true,
@@ -1034,7 +984,7 @@ impl MailApp {
         self.sheet_over_settings(
             super::settings::Sheet {
                 id: "delete-model-sheet",
-                title: "Delete Model",
+                title: t!("local-ai-delete-model-2"),
                 width: 400.,
                 close: Action::CloseModelSheet,
             },
@@ -1047,5 +997,5 @@ impl MailApp {
 
 /// Megabytes, as Settings shows sizes.
 fn mb(bytes: u64) -> String {
-    format!("{:.1} MB", bytes as f64 / 1_000_000.)
+    t!("local-ai-mb", mb = format!("{:.1}", bytes as f64 / 1_000_000.))
 }

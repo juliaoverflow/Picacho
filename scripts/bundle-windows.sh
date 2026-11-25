@@ -58,8 +58,11 @@ if [ ! -f "$ui/wixext5/WixToolset.UI.wixext.dll" ]; then
         || { rm -f "$ui/package.zip"; exit 1; }
     (cd "$ui" && unzip -oq package.zip)
 fi
+# English's installer (picacho.en-US.wxl has its words; the release build,
+# scripts/bundle-windows.ps1, makes one for each language).
 $PICACHO_WIX build -arch x64 \
     -ext "$(win "$ui/wixext5/WixToolset.UI.wixext.dll")" \
+    -culture en-US -loc "$(win packaging/windows/picacho.en-US.wxl)" \
     -d Version="${version%%[-+]*}" \
     -d ExeDir="$(win "$out")" \
     -d WebView2Loader=yes \

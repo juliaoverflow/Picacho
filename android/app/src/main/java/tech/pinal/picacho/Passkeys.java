@@ -22,7 +22,8 @@ import android.util.SparseArray;
  * whether to answer apps that do.
  *
  * <p>Answers Rust's request with "ok:" and the WebAuthn JSON, or one of
- * "cancelled", "none", "unsupported", "refused" or "error:" and why.
+ * "cancelled", "none", "unsupported", "refused", "closed" (Picacho isn't
+ * open) or "error:" and why. Rust words the messages.
  */
 final class Passkeys {
     private static final String TAG = "picacho";
@@ -48,7 +49,7 @@ final class Passkeys {
         }
         PicachoActivity activity = PicachoActivity.current();
         if (activity == null) {
-            Native.answer(id, "error:Open Picacho to use a passkey.");
+            Native.answer(id, "closed");
             return;
         }
         activity.runOnUiThread(() -> request(activity, id, requestJson, origin, clientDataHash));

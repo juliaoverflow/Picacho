@@ -69,7 +69,7 @@ pub(crate) fn parse(text: &str) -> Result<Policy> {
             "max_age" => max_age.is_some(),
             _ => false,
         };
-        ensure!(!repeated, "the policy gives {key} twice");
+        ensure!(!repeated, t!("sync-mta-sts-the-policy-gives-twice", key = key));
         match key {
             "version" => version = Some(value.to_owned()),
             "mode" => {
@@ -77,23 +77,23 @@ pub(crate) fn parse(text: &str) -> Result<Policy> {
                     "enforce" => Mode::Enforce,
                     "testing" => Mode::Testing,
                     "none" => Mode::None,
-                    other => bail!("unknown policy mode {other:?}"),
+                    other => bail!(t!("sync-mta-sts-unknown-policy-mode", mode = format!("{:?}", other))),
                 })
             }
             "mx" => mx.push(value.to_ascii_lowercase()),
-            "max_age" => max_age = Some(value.parse::<u64>().context("max_age isn't a number")?),
+            "max_age" => max_age = Some(value.parse::<u64>().with_context(|| t!("sync-mta-sts-max-age-isnt-a-number"))?),
             _ => {}
         }
     }
-    ensure!(version.as_deref() == Some("STSv1"), "not an STSv1 policy");
-    let mode = mode.context("the policy has no mode")?;
+    ensure!(version.as_deref() == Some("STSv1"), t!("sync-mta-sts-not-an-stsv1-policy"));
+    let mode = mode.with_context(|| t!("sync-mta-sts-the-policy-has-no-mode"))?;
     ensure!(
         mode == Mode::None || !mx.is_empty(),
-        "the policy names no mail servers"
+        t!("sync-mta-sts-the-policy-names-no-mail-servers")
     );
-    let max_age = max_age.context("the policy has no max_age")?;
+    let max_age = max_age.with_context(|| t!("sync-mta-sts-the-policy-has-no-max-age"))?;
     // At most a year (RFC 8461 §3.2: max_age is up to 31557600).
-    ensure!(max_age <= 31_557_600, "the policy's max_age is too large");
+    ensure!(max_age <= 31_557_600, t!("sync-mta-sts-the-policys-max-age-is-too"));
     Ok(Policy { mode, mx, max_age })
 }
 
@@ -126,7 +126,7 @@ fn fetch(domain: &str) -> Result<Policy> {
     // path, port or another host into the URL.
     ensure!(
         is_domain(domain),
-        "{domain:?} isn't a domain name that can publish a policy"
+        t!("sync-mta-sts-isnt-a-domain-name-that-can", domain = format!("{:?}", domain))
     );
     let client = reqwest::blocking::Client::builder()
         .min_tls_version(reqwest::tls::Version::TLS_1_2)
@@ -139,12 +139,11 @@ fn fetch(domain: &str) -> Result<Policy> {
     let response = client
         .get(&url)
         .send()
-        .with_context(|| format!("couldn't fetch {url}"))?;
+        .with_context(|| t!("sync-mta-sts-couldnt-fetch", url = url))?;
     // 200 only (RFC 8461 §3.3): other successes aren't a policy.
     ensure!(
         response.status() == reqwest::StatusCode::OK,
-        "{url} answered {}",
-        response.status()
+        t!("sync-mta-sts-answered", url = url, status = response.status())
     );
     let kind = response
         .headers()
@@ -154,13 +153,13 @@ fn fetch(domain: &str) -> Result<Policy> {
         .to_ascii_lowercase();
     // `text/plain`, perhaps with parameters, not `text/plain-something`.
     let media = kind.split(';').next().unwrap_or_default().trim();
-    ensure!(media == "text/plain", "{url} isn't plain text");
+    ensure!(media == "text/plain", t!("sync-mta-sts-isnt-plain-text", url = url));
     let mut text = String::new();
     response
         .take(POLICY_LIMIT + 1)
         .read_to_string(&mut text)
-        .with_context(|| format!("couldn't read {url}"))?;
-    ensure!(text.len() as u64 <= POLICY_LIMIT, "{url} is too large");
+        .with_context(|| t!("sync-mta-sts-couldnt-read", url = url))?;
+    ensure!(text.len() as u64 <= POLICY_LIMIT, t!("sync-mta-sts-is-too-large", url = url));
     parse(&text)
 }
 
@@ -232,7 +231,7 @@ pub(crate) fn protection(domain: &str) -> Protection {
     // Internationalized names are looked up in their ASCII (punycode) form.
     let domain = match url::Host::parse(&domain) {
         Ok(url::Host::Domain(ascii)) if is_domain(&ascii) => ascii,
-        _ => return Protection::Unknown(format!("{domain:?} isn't a domain name")),
+        _ => return Protection::Unknown(t!("sync-mta-sts-isnt-a-domain-name", domain = format!("{:?}", domain))),
     };
     let mut doubt = None;
     match policy(&domain) {

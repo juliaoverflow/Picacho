@@ -59,22 +59,23 @@ impl Rejected {
 }
 impl std::fmt::Display for Rejected {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The codes in brackets stay outside the words: they let the
+        // account pause as for a server limit (`imap::throttled`).
         let what = if self.is("IN-USE") {
-            "The POP3 mailbox is in use by another session"
+            t!("sync-pop-the-pop3-mailbox-is-in-use").to_owned()
         } else if self.is("LOGIN-DELAY") {
-            // Words in this one let the account pause as for a server limit.
-            "The POP3 server limits how often this account signs in [THROTTLED]"
+            format!("{} [THROTTLED]", t!("sync-pop-the-pop3-server-limits-how-often-this"))
         } else if self.is("SYS/TEMP") {
-            "The POP3 server has a temporary problem [UNAVAILABLE]"
+            format!("{} [UNAVAILABLE]", t!("sync-pop-the-pop3-server-has-a-temporary"))
         } else if self.is("SYS/PERM") {
-            "The POP3 server has a lasting problem"
+            t!("sync-pop-the-pop3-server-has-a-lasting").to_owned()
         } else if self.is("UTF8") {
-            "The POP3 server can't handle UTF-8 here"
+            t!("sync-pop-the-pop3-server-cant-handle-utf-8").to_owned()
         } else {
-            "POP3 server rejected the request"
+            t!("sync-pop-pop3-server-rejected-the-request").to_owned()
         };
         if self.text.is_empty() {
-            f.write_str(what)
+            f.write_str(&what)
         } else {
             write!(f, "{what}: {}", self.text)
         }
@@ -146,7 +147,7 @@ impl<T: Read + Write> PopSession<T> {
         self.reader.by_ref().take(8193).read_line(&mut line)?;
         ensure!(
             line.ends_with('\n') && line.len() <= 8192,
-            "Incomplete or oversized POP3 status"
+            t!("sync-pop-incomplete-or-oversized-pop3-status")
         );
         let status = line.trim_end_matches(['\r', '\n']);
         if status.starts_with("-ERR") {
@@ -154,7 +155,7 @@ impl<T: Read + Write> PopSession<T> {
         }
         ensure!(
             status == "+OK" || status.starts_with("+OK "),
-            "Invalid POP3 status"
+            t!("sync-pop-invalid-pop3-status")
         );
         Ok(line)
     }
@@ -173,7 +174,7 @@ impl<T: Read + Write> PopSession<T> {
     /// The headers of message `number`, without its body (TOP n 0, RFC 1939
     /// §7), where the server lists TOP; `None` where it doesn't.
     pub(crate) fn top(&mut self, number: u32, max: usize) -> Result<Option<Vec<u8>>> {
-        ensure!(number > 0, "Invalid POP3 message number");
+        ensure!(number > 0, t!("sync-pop-invalid-pop3-message-number"));
         if !self.caps.is_empty() && !self.has("TOP") {
             return Ok(None);
         }
@@ -190,7 +191,7 @@ impl<T: Read + Write> PopSession<T> {
     /// saving a round trip per message; else one at a time. A message the
     /// server refuses (deleted meanwhile, say) is an empty header block.
     pub(crate) fn top_many(&mut self, numbers: &[u32], max: usize) -> Result<Option<Vec<Vec<u8>>>> {
-        ensure!(numbers.iter().all(|n| *n > 0), "Invalid POP3 message number");
+        ensure!(numbers.iter().all(|n| *n > 0), t!("sync-pop-invalid-pop3-message-number"));
         if !self.has("PIPELINING") || !self.has("TOP") {
             let mut out = Vec::with_capacity(numbers.len());
             for n in numbers {
@@ -247,7 +248,7 @@ impl<T: Read + Write> PopSession<T> {
         Ok(out)
     }
     pub(crate) fn command(&mut self, command: &str) -> Result<String> {
-        ensure!(!command.contains(['\r', '\n']), "Invalid POP3 command");
+        ensure!(!command.contains(['\r', '\n']), t!("sync-pop-invalid-pop3-command"));
         write!(self.reader.get_mut(), "{command}\r\n")?;
         self.reader.get_mut().flush()?;
         self.status()
@@ -319,7 +320,7 @@ impl<T: Read + Write> PopSession<T> {
             self.reader.by_ref().take(8193).read_line(&mut line)?;
             ensure!(
                 line.ends_with('\n') && line.len() <= 8192,
-                "Incomplete or oversized POP3 status"
+                t!("sync-pop-incomplete-or-oversized-pop3-status")
             );
             let line = line.trim_end_matches(['\r', '\n']);
             if line == "+OK" || line.starts_with("+OK ") {
@@ -330,14 +331,14 @@ impl<T: Read + Write> PopSession<T> {
                 let error = anyhow::Error::new(Rejected::parse(line));
                 return Err(match reason {
                     Some(reason) => {
-                        error.context(format!("The server refused the token ({reason})"))
+                        error.context(t!("sync-pop-the-server-refused-the-token", reason = reason))
                     }
                     None => error,
                 });
             }
             let challenge = line
                 .strip_prefix('+')
-                .context("Invalid POP3 sign-in reply")?;
+                .with_context(|| t!("sync-pop-invalid-pop3-sign-in-reply"))?;
             if let Some(first) = self.pending_initial.take() {
                 write!(self.reader.get_mut(), "{first}\r\n")?;
                 self.reader.get_mut().flush()?;
@@ -366,8 +367,8 @@ impl<T: Read + Write> PopSession<T> {
                 .by_ref()
                 .take((max.saturating_sub(result.len()).saturating_add(3)) as u64)
                 .read_until(b'\n', &mut line)?;
-            ensure!(n > 0, "POP3 connection closed unexpectedly");
-            ensure!(line.ends_with(b"\n"), "Incomplete POP3 response line");
+            ensure!(n > 0, t!("sync-pop-pop3-connection-closed-unexpectedly"));
+            ensure!(line.ends_with(b"\n"), t!("sync-pop-incomplete-pop3-response-line"));
             if line == b".\r\n" || line == b".\n" {
                 break;
             }
@@ -376,7 +377,7 @@ impl<T: Read + Write> PopSession<T> {
             }
             ensure!(
                 result.len() + line.len() <= max,
-                "POP3 response exceeds the download limit"
+                t!("sync-pop-pop3-response-exceeds-the-download-limit")
             );
             result.extend(line);
         }
@@ -388,7 +389,7 @@ impl<T: Read + Write> PopSession<T> {
     /// Whether the server marked it; a refusal (-ERR, say the message was
     /// already marked) leaves the session usable.
     pub(crate) fn dele(&mut self, number: u32) -> Result<bool> {
-        ensure!(number > 0, "Invalid POP3 message number");
+        ensure!(number > 0, t!("sync-pop-invalid-pop3-message-number"));
         match self.command(&format!("DELE {number}")) {
             Ok(_) => Ok(true),
             Err(e) if e.is::<Rejected>() => Ok(false),
@@ -408,7 +409,7 @@ impl<T: Read + Write> PopSession<T> {
         let mut words = line.split_ascii_whitespace().skip(1);
         let count = words.next().and_then(|n| n.parse().ok());
         let size = words.next().and_then(|n| n.parse().ok());
-        count.zip(size).context("Invalid POP3 STAT reply")
+        count.zip(size).with_context(|| t!("sync-pop-invalid-pop3-stat-reply"))
     }
     /// Unmarks every message marked for deletion in this session (RSET,
     /// RFC 1939 §5), so QUIT removes nothing.
@@ -459,23 +460,23 @@ impl<T: Read + Write> PopSession<T> {
         let mut identities = HashSet::new();
         let mut result = Vec::new();
         for line in std::str::from_utf8(&bytes)
-            .context("Invalid POP3 UIDL encoding")?
+            .with_context(|| t!("sync-pop-invalid-pop3-uidl-encoding"))?
             .lines()
         {
             let mut parts = line.split_ascii_whitespace();
-            let number: u32 = parts.next().context("Invalid POP3 UIDL")?.parse()?;
-            let uid = parts.next().context("Invalid POP3 UIDL")?;
+            let number: u32 = parts.next().with_context(|| t!("sync-pop-invalid-pop3-uidl"))?.parse()?;
+            let uid = parts.next().with_context(|| t!("sync-pop-invalid-pop3-uidl"))?;
             ensure!(
                 number > 0 && parts.next().is_none(),
-                "Invalid POP3 UIDL entry"
+                t!("sync-pop-invalid-pop3-uidl-entry")
             );
             ensure!(
                 (1..=70).contains(&uid.len()) && uid.bytes().all(|b| (0x21..=0x7e).contains(&b)),
-                "Invalid POP3 UIDL identity"
+                t!("sync-pop-invalid-pop3-uidl-identity")
             );
             ensure!(
                 numbers.insert(number) && identities.insert(uid.to_owned()),
-                "Duplicate POP3 UIDL identity or message number"
+                t!("sync-pop-duplicate-pop3-uidl-identity-or-message")
             );
             result.push((number, uid.to_owned()));
         }
@@ -545,22 +546,20 @@ fn pop_connect(
     let caps = plain.capabilities()?;
     ensure!(
         caps.is_empty() || plain.has("STLS"),
-        "{} doesn't offer encryption (STLS) on port {}; Picacho won't sign in to it. Use port 995 with TLS from the start.",
-        a.incoming_host,
-        a.incoming_port
+        t!("sync-pop-doesnt-offer-encryption-stls-on-port", host = a.incoming_host, port = a.incoming_port)
     );
     plain.command("STLS").map_err(|e| {
-        e.context("The POP3 server refused to start encryption (STLS); credentials were not sent")
+        e.context(t!("sync-pop-the-pop3-server-refused-to-start"))
     })?;
     // A server must not send anything before the handshake; bytes already
     // read could be an attacker's injected commands' replies.
     ensure!(
         plain.reader.buffer().is_empty(),
-        "Unexpected data from the POP3 server before encryption started"
+        t!("sync-pop-unexpected-data-from-the-pop3-server")
     );
     let socket = plain.reader.into_inner();
     tls.connect(&a.incoming_host, socket)
-        .map_err(|e| anyhow::anyhow!("POP3 TLS handshake failed: {e}"))
+        .map_err(|e| anyhow::anyhow!(t!("sync-pop-pop3-tls-handshake-failed", error = e.to_string())))
 }
 /// The session after STLS has no greeting; this starts one already past it.
 impl<T: Read + Write> PopSession<T> {
@@ -620,10 +619,7 @@ pub(crate) fn pop_login(
         // never the token as a password.
         let mechanism = Mechanism::choose(&sasl::TOKEN_ORDER, offered.iter().copied())
             .with_context(|| {
-                format!(
-                    "{} doesn't take sign-in tokens (SASL OAUTHBEARER or XOAUTH2). Ask your organization whether its POP3 server supports single sign-on.",
-                    a.incoming_host
-                )
+                t!("sync-pop-doesnt-take-sign-in-tokens-sasl", host = a.incoming_host)
             })?;
         s.authenticate(&mut sasl::Exchange::new(
             mechanism,
@@ -640,10 +636,7 @@ pub(crate) fn pop_login(
         // Kerberos only: never a password, and never another mechanism.
         let mechanism = Mechanism::choose(&sasl::KERBEROS_ORDER, offered.iter().copied())
             .with_context(|| {
-                format!(
-                    "{} doesn't offer Kerberos sign-in (SASL GSSAPI). Turn off Kerberos for this account to use a password.",
-                    a.incoming_host
-                )
+                t!("sync-pop-doesnt-offer-kerberos-sign-in-sasl", host = a.incoming_host)
             })?;
         s.authenticate(&mut sasl::Exchange::new(
             mechanism,
@@ -681,8 +674,7 @@ pub(crate) fn pop_login(
         None => {
             ensure!(
                 user_pass || s.apop.is_some(),
-                "{} offers no sign-in method Picacho supports.",
-                a.incoming_host
+                t!("sync-pop-offers-no-sign-in-method-picacho", host = a.incoming_host)
             );
             // USER/PASS are ASCII unless UTF8 is turned on first (RFC
             // 6856 §2: allowed before signing in where listed as
@@ -690,8 +682,7 @@ pub(crate) fn pop_login(
             if !(a.login().is_ascii() && password.is_ascii()) {
                 ensure!(
                     s.utf8_on && s.caps.iter().any(|c| c == "UTF8 USER"),
-                    "{} can't take a sign-in name or password with non-ASCII characters (POP3 UTF8 USER).",
-                    a.incoming_host
+                    t!("sync-pop-cant-take-a-sign-in-name", host = a.incoming_host)
                 );
             }
             // APOP where the server lists no USER but greeted with a

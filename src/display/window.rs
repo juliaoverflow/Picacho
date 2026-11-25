@@ -185,7 +185,7 @@ pub(super) fn client_titlebar(
     let maximized = w.is_maximized();
     bar.when(available.minimize, |bar| {
         bar.child(
-            control("window-minimize", "window-minimize", "Minimize", c)
+            control("window-minimize", "window-minimize", t!("window-minimize"), c)
                 .on_click(|_, w, _| w.minimize_window()),
         )
     })
@@ -198,13 +198,13 @@ pub(super) fn client_titlebar(
                 } else {
                     "window-maximize"
                 },
-                if maximized { "Restore" } else { "Maximize" },
+                if maximized { t!("window-restore") } else { t!("window-maximize") },
                 c,
             )
             .on_click(|_, w, _| w.zoom_window()),
         )
     })
-    .child(control("window-close", "window-close", "Close", c).on_click(on_close))
+    .child(control("window-close", "window-close", t!("window-close"), c).on_click(on_close))
 }
 
 /// Keep a press on a title bar button from starting a window move.
@@ -290,7 +290,7 @@ pub(super) fn detached_titlebar(
         return bar
             .window_control_area(WindowControlArea::Drag)
             .child(
-                control("window-minimize", "window-minimize", "Minimize", c)
+                control("window-minimize", "window-minimize", t!("window-minimize"), c)
                     .window_control_area(WindowControlArea::Min),
             )
             .child(
@@ -301,13 +301,13 @@ pub(super) fn detached_titlebar(
                     } else {
                         "window-maximize"
                     },
-                    "Maximize",
+                    t!("window-maximize"),
                     c,
                 )
                 .window_control_area(WindowControlArea::Max),
             )
             .child(
-                control("window-close", "window-close", "Close", c)
+                control("window-close", "window-close", t!("window-close"), c)
                     .window_control_area(WindowControlArea::Close),
             );
     }

@@ -250,7 +250,7 @@ impl MailApp {
             .cursor_pointer()
             .active(|s| s.opacity(0.5))
             .child(icon_el("chevron-left", 28., c.accent))
-            .tooltip(|w, cx| Tooltip::new("Back").build(w, cx))
+            .tooltip(|w, cx| Tooltip::new(t!("mobile-chrome-back")).build(w, cx))
             .on_click(self.tap_listener(
                 Rc::new(
                     |this: &mut MailApp, w: &mut Window, cx: &mut Context<MailApp>| {
@@ -280,7 +280,7 @@ impl MailApp {
             .cursor_pointer()
             .active(|s| s.opacity(0.6))
             .child(icon_el("compose", 22., c.accent))
-            .tooltip(|w, cx| Tooltip::new("New message").build(w, cx))
+            .tooltip(|w, cx| Tooltip::new(t!("mobile-chrome-new-message")).build(w, cx))
             .on_click(self.tap_listener(act(Action::Compose), cx))
             .into_any_element()
     }
@@ -489,7 +489,7 @@ impl MailApp {
                 // so a thumb reaching for one doesn't land on the other.
                 .when(self.undo.is_some() && !self.error, |d| {
                     d.child(
-                        self.touch_text("toast-undo", "Undo", true, act(Action::Undo), cx)
+                        self.touch_text("toast-undo", t!("mobile-chrome-undo"), true, act(Action::Undo), cx)
                             .px_3(),
                     )
                     .child(div().w(px(16.)).flex_shrink_0())
@@ -504,7 +504,7 @@ impl MailApp {
                 .child(self.touch_icon(
                     "toast-dismiss",
                     "close",
-                    "Dismiss",
+                    t!("mobile-chrome-dismiss"),
                     act(Action::Dismiss),
                     cx,
                 ))

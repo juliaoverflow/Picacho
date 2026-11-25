@@ -9,6 +9,15 @@ PlasmoidItem {
     id: root
 
     property var snapshot: null
+
+    // The widget's words in the language Picacho shows (the snapshot's
+    // labels, which Picacho writes in it), else in English. %1 and %2
+    // stand for a and b.
+    function word(name, english, a, b) {
+        var labels = root.snapshot && root.snapshot.labels;
+        var text = (labels && labels[name]) || english;
+        return text.replace("%1", function () { return a; }).replace("%2", function () { return b; });
+    }
     property var events: []
     property bool calendarConnected: false
     property color accentColor: Kirigami.Theme.highlightColor
@@ -43,8 +52,8 @@ PlasmoidItem {
     function dayLabel(dateObj) {
         var today = new Date();
         var tomorrow = new Date(today.getFullYear(), today.getMonth(), today.getDate() + 1);
-        if (dateObj.toDateString() === today.toDateString()) return "Today";
-        if (dateObj.toDateString() === tomorrow.toDateString()) return "Tomorrow";
+        if (dateObj.toDateString() === today.toDateString()) return word("today", "Today");
+        if (dateObj.toDateString() === tomorrow.toDateString()) return word("tomorrow", "Tomorrow");
         return Qt.formatDate(dateObj, "ddd, MMM d");
     }
 
@@ -52,13 +61,13 @@ PlasmoidItem {
         if (ev.all_day) {
             var utc = new Date(ev.start * 1000);
             var local = new Date(utc.getUTCFullYear(), utc.getUTCMonth(), utc.getUTCDate());
-            return dayLabel(local) + " · All day";
+            return dayLabel(local) + " · " + word("all-day", "All day");
         }
         var start = new Date(ev.start * 1000);
-        var label = dayLabel(start) + " · " + Qt.formatTime(start, "HH:mm");
+        var label = dayLabel(start) + " · " + Qt.formatTime(start, Qt.locale().timeFormat(Locale.ShortFormat));
         if (ev.end && ev.end > ev.start) {
             var end = new Date(ev.end * 1000);
-            label += " – " + Qt.formatTime(end, "HH:mm");
+            label += " – " + Qt.formatTime(end, Qt.locale().timeFormat(Locale.ShortFormat));
         }
         return label;
     }
@@ -152,7 +161,7 @@ PlasmoidItem {
                             implicitHeight: 18
                         }
                         PlasmaComponents.Label {
-                            text: "Calendar"
+                            text: word("calendar", "Calendar")
                             font.bold: true
                             Layout.fillWidth: true
                         }
@@ -168,7 +177,7 @@ PlasmoidItem {
                     icon.name: "view-refresh"
                     display: PlasmaComponents.AbstractButton.IconOnly
                     onClicked: root.refreshSnapshot()
-                    PlasmaComponents.ToolTip.text: "Refresh"
+                    PlasmaComponents.ToolTip.text: word("refresh", "Refresh")
                     PlasmaComponents.ToolTip.visible: hovered
                 }
             }
@@ -221,7 +230,7 @@ PlasmoidItem {
                             spacing: 1
                             PlasmaComponents.Label {
                                 Layout.fillWidth: true
-                                text: modelData.title || "(No title)"
+                                text: modelData.title || word("no-title", "(No title)")
                                 font.bold: true
                                 elide: Text.ElideRight
                             }
@@ -248,7 +257,7 @@ PlasmoidItem {
                     anchors.centerIn: parent
                     visible: eventList.count === 0
                     opacity: 0.65
-                    text: root.calendarConnected ? "No upcoming events" : "Connect a calendar in Settings"
+                    text: root.calendarConnected ? word("no-upcoming-events", "No upcoming events") : word("connect-calendar", "Connect a calendar in Settings")
                 }
             }
         }

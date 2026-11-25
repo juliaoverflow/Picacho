@@ -46,10 +46,10 @@ impl Group {
     pub(super) const ALL: [Self; 4] = [Self::Messages, Self::Mailbox, Self::Writing, Self::App];
     pub(super) fn title(self) -> &'static str {
         match self {
-            Self::Messages => "Messages",
-            Self::Mailbox => "Mailbox",
-            Self::Writing => "Writing",
-            Self::App => "Window & App",
+            Self::Messages => t!("shortcuts-messages"),
+            Self::Mailbox => t!("shortcuts-mailbox"),
+            Self::Writing => t!("shortcuts-writing"),
+            Self::App => t!("shortcuts-window-app"),
         }
     }
 }
@@ -105,77 +105,77 @@ pub(super) fn bindable() -> Vec<Bindable> {
     let send = entry(
         Writing,
         "send",
-        "Send",
+        t!("shortcuts-send"),
         "secondary-enter",
         vec![(Box::new(SendMail), "Mail"), (Box::new(SendDraft), "Composer")],
     );
     vec![
-        b(Messages, "reply", "Reply", "secondary-shift-r", Reply),
-        b(Messages, "reply-all", "Reply All", "secondary-alt-r", ReplyAll),
-        b(Messages, "forward", "Forward", "secondary-shift-f", ForwardMail),
-        b(Messages, "archive", "Archive", "secondary-shift-a", Archive),
-        b(Messages, "delete", "Move to Trash", "secondary-backspace", DeleteMail),
-        b(Messages, "move-to-spam", "Move to Spam", "secondary-shift-j", MoveToSpam),
-        b(Messages, "toggle-read", "Mark as Read / Unread", "secondary-shift-u", ToggleRead),
-        b(Messages, "toggle-star", "Star / Unstar", "secondary-shift-s", ToggleStar),
-        b(Messages, "next-message", "Next Message", "alt-down", Next),
-        b(Messages, "previous-message", "Previous Message", "alt-up", Previous),
-        b(Messages, "open-in-window", "Open in New Window", "secondary-o", OpenInWindow),
-        b(Messages, "find-in-message", "Find in Message", "secondary-f", FindInMessage),
-        b(Messages, "print", "Print", "secondary-p", PrintMessage),
-        b(Mailbox, "refresh", "Refresh", "secondary-r", Refresh),
-        b(Mailbox, "search-mailbox", "Search Mailbox", "secondary-alt-f", Search),
-        b(Mailbox, "select-all", "Select All Messages", "secondary-a", SelectAllMail),
-        b(Mailbox, "group-by-conversation", "Group by Conversation", "secondary-shift-t", ToggleThreads),
-        b(Mailbox, "go-inbox", "Go to Inbox", "secondary-1", GoInbox),
-        b(Mailbox, "go-starred", "Go to Starred", "secondary-2", GoStarred),
-        b(Mailbox, "go-sent", "Go to Sent", "secondary-3", GoSent),
-        b(Mailbox, "go-drafts", "Go to Drafts", "secondary-4", GoDrafts),
-        b(Mailbox, "go-archive", "Go to Archive", "secondary-5", GoArchive),
-        b(Mailbox, "go-spam", "Go to Spam", "secondary-6", GoSpam),
-        b(Mailbox, "go-trash", "Go to Trash", "secondary-7", GoTrash),
-        b(Mailbox, "go-all-mail", "Go to All Mail", "secondary-8", GoAllMail),
-        b(Writing, "new-message", "New Message", "secondary-n", Compose),
+        b(Messages, "reply", t!("shortcuts-reply"), "secondary-shift-r", Reply),
+        b(Messages, "reply-all", t!("shortcuts-reply-all"), "secondary-alt-r", ReplyAll),
+        b(Messages, "forward", t!("shortcuts-forward"), "secondary-shift-f", ForwardMail),
+        b(Messages, "archive", t!("shortcuts-archive"), "secondary-shift-a", Archive),
+        b(Messages, "delete", t!("shortcuts-move-to-trash"), "secondary-backspace", DeleteMail),
+        b(Messages, "move-to-spam", t!("shortcuts-move-to-spam"), "secondary-shift-j", MoveToSpam),
+        b(Messages, "toggle-read", t!("shortcuts-mark-as-read-unread"), "secondary-shift-u", ToggleRead),
+        b(Messages, "toggle-star", t!("shortcuts-star-unstar"), "secondary-shift-s", ToggleStar),
+        b(Messages, "next-message", t!("shortcuts-next-message"), "alt-down", Next),
+        b(Messages, "previous-message", t!("shortcuts-previous-message"), "alt-up", Previous),
+        b(Messages, "open-in-window", t!("shortcuts-open-in-new-window"), "secondary-o", OpenInWindow),
+        b(Messages, "find-in-message", t!("shortcuts-find-in-message"), "secondary-f", FindInMessage),
+        b(Messages, "print", t!("shortcuts-print"), "secondary-p", PrintMessage),
+        b(Mailbox, "refresh", t!("shortcuts-refresh"), "secondary-r", Refresh),
+        b(Mailbox, "search-mailbox", t!("shortcuts-search-mailbox"), "secondary-alt-f", Search),
+        b(Mailbox, "select-all", t!("shortcuts-select-all-messages"), "secondary-a", SelectAllMail),
+        b(Mailbox, "group-by-conversation", t!("shortcuts-group-by-conversation"), "secondary-shift-t", ToggleThreads),
+        b(Mailbox, "go-inbox", t!("shortcuts-go-to-inbox"), "secondary-1", GoInbox),
+        b(Mailbox, "go-starred", t!("shortcuts-go-to-starred"), "secondary-2", GoStarred),
+        b(Mailbox, "go-sent", t!("shortcuts-go-to-sent"), "secondary-3", GoSent),
+        b(Mailbox, "go-drafts", t!("shortcuts-go-to-drafts"), "secondary-4", GoDrafts),
+        b(Mailbox, "go-archive", t!("shortcuts-go-to-archive"), "secondary-5", GoArchive),
+        b(Mailbox, "go-spam", t!("shortcuts-go-to-spam"), "secondary-6", GoSpam),
+        b(Mailbox, "go-trash", t!("shortcuts-go-to-trash"), "secondary-7", GoTrash),
+        b(Mailbox, "go-all-mail", t!("shortcuts-go-to-all-mail"), "secondary-8", GoAllMail),
+        b(Writing, "new-message", t!("shortcuts-new-message"), "secondary-n", Compose),
         send,
-        composing("save-draft", "Save Draft", "secondary-s", SaveDraft),
-        composing("bold", "Bold", "secondary-b", Bold),
-        composing("italic", "Italic", "secondary-i", Italic),
-        composing("strikethrough", "Strikethrough", "secondary-shift-x", Strike),
-        composing("code", "Code", "secondary-e", InlineCode),
-        composing("link", "Insert Link", "secondary-k", InsertLink),
-        composing("bulleted-list", "Bulleted List", "secondary-shift-8", Bullets),
-        composing("numbered-list", "Numbered List", "secondary-shift-7", Numbers),
-        composing("quote", "Quote", "secondary-shift-9", QuoteLines),
-        composing("heading", "Heading", "secondary-alt-1", Heading),
-        composing("preview-formatting", "Preview Formatting", "secondary-shift-p", TogglePreview),
-        b(Writing, "undo", "Undo", "secondary-z", gpui_component::input::Undo),
-        b(App, "settings", "Settings", "secondary-,", ShowAccounts),
+        composing("save-draft", t!("shortcuts-save-draft"), "secondary-s", SaveDraft),
+        composing("bold", t!("shortcuts-bold"), "secondary-b", Bold),
+        composing("italic", t!("shortcuts-italic"), "secondary-i", Italic),
+        composing("strikethrough", t!("shortcuts-strikethrough"), "secondary-shift-x", Strike),
+        composing("code", t!("shortcuts-code"), "secondary-e", InlineCode),
+        composing("link", t!("shortcuts-insert-link"), "secondary-k", InsertLink),
+        composing("bulleted-list", t!("shortcuts-bulleted-list"), "secondary-shift-8", Bullets),
+        composing("numbered-list", t!("shortcuts-numbered-list"), "secondary-shift-7", Numbers),
+        composing("quote", t!("shortcuts-quote"), "secondary-shift-9", QuoteLines),
+        composing("heading", t!("shortcuts-heading"), "secondary-alt-1", Heading),
+        composing("preview-formatting", t!("shortcuts-preview-formatting"), "secondary-shift-p", TogglePreview),
+        b(Writing, "undo", t!("shortcuts-undo"), "secondary-z", gpui_component::input::Undo),
+        b(App, "settings", t!("shortcuts-settings"), "secondary-,", ShowAccounts),
         b(
             App,
             "toggle-sidebar",
-            "Show / Hide Sidebar",
+            t!("shortcuts-show-hide-sidebar"),
             if cfg!(target_os = "macos") { "ctrl-cmd-s" } else { "ctrl-alt-s" },
             ToggleSidebar,
         ),
-        b(App, "toggle-dark-mode", "Light / Dark Appearance", "secondary-shift-l", ToggleTheme),
-        b(App, "zoom-in", "Zoom In", "secondary-=, secondary-+", ZoomIn),
-        b(App, "zoom-out", "Zoom Out", "secondary--", ZoomOut),
-        b(App, "actual-size", "Actual Size", "secondary-0", ActualSize),
-        b(App, "close", "Close / Cancel", "escape", Close),
-        b(App, "minimize", "Minimize", "secondary-m", Minimize),
-        b(App, "close-window", "Close Window", "secondary-w", CloseWindow),
-        b(App, "lock", "Lock Picacho", "secondary-alt-l", LockApp),
-        b(App, "quit", "Quit Picacho", "secondary-q", Quit),
+        b(App, "toggle-dark-mode", t!("shortcuts-light-dark-appearance"), "secondary-shift-l", ToggleTheme),
+        b(App, "zoom-in", t!("shortcuts-zoom-in"), "secondary-=, secondary-+", ZoomIn),
+        b(App, "zoom-out", t!("shortcuts-zoom-out"), "secondary--", ZoomOut),
+        b(App, "actual-size", t!("shortcuts-actual-size"), "secondary-0", ActualSize),
+        b(App, "close", t!("shortcuts-close-cancel"), "escape", Close),
+        b(App, "minimize", t!("shortcuts-minimize"), "secondary-m", Minimize),
+        b(App, "close-window", t!("shortcuts-close-window"), "secondary-w", CloseWindow),
+        b(App, "lock", t!("shortcuts-lock-picacho"), "secondary-alt-l", LockApp),
+        b(App, "quit", t!("shortcuts-quit-picacho"), "secondary-q", Quit),
     ]
 }
 
 /// What the mouse does that isn't a shortcut to change, shown with them.
 pub(super) fn gestures() -> [(&'static str, String); 2] {
-    let secondary = if cfg!(target_os = "macos") { "⌘" } else { "Ctrl+" };
-    let shift = if cfg!(target_os = "macos") { "⇧" } else { "Shift+" };
+    let secondary = if cfg!(target_os = "macos") { "⌘" } else { t!("shortcuts-ctrl") };
+    let shift = if cfg!(target_os = "macos") { "⇧" } else { t!("shortcuts-shift") };
     [
-        ("Select a Range of Messages", format!("{shift}Click")),
-        ("Add to or Take from the Selection", format!("{secondary}Click")),
+        (t!("shortcuts-select-a-range-of-messages"), format!("{shift}Click")),
+        (t!("shortcuts-add-to-or-take-from-the"), format!("{secondary}Click")),
     ]
 }
 
@@ -430,18 +430,18 @@ fn shown_one(k: &Keystroke) -> String {
     let mac = cfg!(target_os = "macos");
     let key = match k.key.as_str() {
         "enter" if mac => "↩".to_owned(),
-        "enter" => "Enter".to_owned(),
+        "enter" => t!("shortcuts-enter").to_owned(),
         "backspace" if mac => "⌫".to_owned(),
         "delete" if mac => "⌦".to_owned(),
         "tab" if mac => "⇥".to_owned(),
-        "escape" => "Esc".to_owned(),
+        "escape" => t!("shortcuts-esc").to_owned(),
         "up" => "↑".to_owned(),
         "down" => "↓".to_owned(),
         "left" => "←".to_owned(),
         "right" => "→".to_owned(),
-        "pageup" => "Page Up".to_owned(),
-        "pagedown" => "Page Down".to_owned(),
-        "space" => "Space".to_owned(),
+        "pageup" => t!("shortcuts-page-up").to_owned(),
+        "pagedown" => t!("shortcuts-page-down").to_owned(),
+        "space" => t!("shortcuts-space").to_owned(),
         key if key.chars().count() == 1 || key.starts_with('f') && key[1..].parse::<u8>().is_ok() => {
             key.to_uppercase()
         }
@@ -454,15 +454,15 @@ fn shown_one(k: &Keystroke) -> String {
     };
     if mac {
         let mut out = String::new();
-        for (on, sign) in [(m.function, "fn "), (m.control, "⌃"), (m.alt, "⌥"), (m.shift, "⇧"), (m.platform, "⌘")] {
+        for (on, sign) in [(m.function, t!("shortcuts-fn")), (m.control, "⌃"), (m.alt, "⌥"), (m.shift, "⇧"), (m.platform, "⌘")] {
             if on {
                 out.push_str(sign);
             }
         }
         out + &key
     } else {
-        let super_key = if cfg!(windows) { "Win" } else { "Super" };
-        [(m.control, "Ctrl"), (m.platform, super_key), (m.alt, "Alt"), (m.shift, "Shift"), (m.function, "Fn")]
+        let super_key = if cfg!(windows) { t!("shortcuts-win") } else { t!("shortcuts-super") };
+        [(m.control, t!("shortcuts-ctrl-2")), (m.platform, super_key), (m.alt, t!("shortcuts-alt")), (m.shift, t!("shortcuts-shift-2")), (m.function, t!("shortcuts-fn-2"))]
             .into_iter()
             .filter(|(on, _)| *on)
             .map(|(_, name)| name.to_owned())
@@ -510,13 +510,14 @@ pub(super) fn current(name: &str, cx: &App) -> Option<String> {
 /// A tooltip naming `name`'s shortcut as it is now ("Reply · ⇧⌘R"), or
 /// just the label when it has none.
 pub(super) fn tip(label: &str, name: &str, cx: &App) -> String {
-    tip_then(label, name, "", cx)
+    tip_then(label, name, |keys| keys.to_owned(), cx)
 }
 
-/// [`tip`], with words after the shortcut ("· ⌘A selects all").
-pub(super) fn tip_then(label: &str, name: &str, after: &str, cx: &App) -> String {
+/// [`tip`], saying what the shortcut does ("Select · ⌘A selects all"):
+/// `said` words the keys.
+pub(super) fn tip_then(label: &str, name: &str, said: impl FnOnce(&str) -> String, cx: &App) -> String {
     match current(name, cx) {
-        Some(keys) => format!("{label} · {keys}{after}"),
+        Some(keys) => format!("{label} · {}", said(&keys)),
         None => label.to_owned(),
     }
 }
@@ -550,10 +551,7 @@ fn bindings_for(custom: &HashMap<String, String>, cx: &App) -> (Vec<KeyBinding>,
             Some(keys) => match load(keys) {
                 Some(bindings) => out.extend(bindings),
                 None => {
-                    let msg = format!(
-                        "the shortcut “{keys}” for {} isn't understood; keeping {}",
-                        b.name, b.default
-                    );
+                    let msg = t!("shortcuts-the-shortcut-for-isnt-understood-keeping", keys = keys, name = b.name, default = b.default);
                     eprintln!("Picacho: {msg}");
                     warnings.push(msg);
                     out.extend(load(&b.default).unwrap_or_default());
@@ -718,14 +716,14 @@ impl MailApp {
                 match result {
                     Ok(()) => {
                         self.apply_shortcuts(cx);
-                        self.notice("Every shortcut is back to its default", false, cx);
+                        self.notice(t!("shortcuts-every-shortcut-is-back-to-its"), false, cx);
                     }
-                    Err(e) => self.notice(format!("Couldn't save the shortcuts: {e}"), true, cx),
+                    Err(e) => self.notice(t!("shortcuts-couldnt-save-the-shortcuts", e = e), true, cx),
                 }
             }
             KeyAction::OpenFile => match ensure_file() {
                 Ok(path) => cx.open_with_system(&path),
-                Err(e) => self.notice(format!("Couldn't write the shortcuts file: {e}"), true, cx),
+                Err(e) => self.notice(t!("shortcuts-couldnt-write-the-shortcuts-file", e = e), true, cx),
             },
         }
         cx.notify();
@@ -756,9 +754,9 @@ impl MailApp {
         let typed = k.key.chars().count() == 1 || matches!(k.key.as_str(), "space" | "enter" | "tab");
         if self.keys_ui.pressed.is_empty() && typed && !(m.control || m.alt || m.platform || m.function) {
             self.keys_ui.hint = Some(if cfg!(target_os = "macos") {
-                "Add ⌘, ⌃ or ⌥ to that key".into()
+                t!("shortcuts-add-or-to-that-key").into()
             } else {
-                "Add Ctrl or Alt to that key".into()
+                t!("shortcuts-add-ctrl-or-alt-to-that").into()
             });
             cx.notify();
             return;
@@ -808,7 +806,7 @@ impl MailApp {
                 let left: Vec<String> = theirs.into_iter().filter(|o| !same(o, &keys)).collect();
                 let left = if left.is_empty() { "none".to_owned() } else { left.join(", ") };
                 if let Err(e) = set_at(&file_path(), other.name, Some(&left)) {
-                    self.notice(format!("Couldn't save the shortcuts: {e}"), true, cx);
+                    self.notice(t!("shortcuts-couldnt-save-the-shortcuts", e = e), true, cx);
                     return;
                 }
                 taken.push(other.label);
@@ -817,7 +815,7 @@ impl MailApp {
         self.save_shortcut(name, Some(&keys), cx);
         if !taken.is_empty() {
             self.notice(
-                format!("{} no longer has {}", taken.join(", "), shown(&keys)),
+                t!("shortcuts-no-longer-has", actions = taken.join(", "), keys = shown(&keys)),
                 false,
                 cx,
             );
@@ -828,7 +826,7 @@ impl MailApp {
     fn save_shortcut(&mut self, name: &str, keys: Option<&str>, cx: &mut Context<Self>) {
         match set_at(&file_path(), name, keys) {
             Ok(()) => self.apply_shortcuts(cx),
-            Err(e) => self.notice(format!("Couldn't save the shortcuts: {e}"), true, cx),
+            Err(e) => self.notice(t!("shortcuts-couldnt-save-the-shortcuts", e = e), true, cx),
         }
     }
 
@@ -885,7 +883,7 @@ impl MailApp {
                 div()
                     .text_size(px(12.))
                     .text_color(rgb(c.muted))
-                    .child("Click a shortcut and press the keys you'd like for it. For a sequence, press the next key within a second. Keys another action had are taken from it."),
+                    .child(t!("shortcuts-click-a-shortcut-and-press-the")),
             );
         for group in Group::ALL {
             page = page.child(self.section(group.title()));
@@ -901,7 +899,7 @@ impl MailApp {
                     .id(SharedString::from(id.clone()))
                     .debug_selector(move || id)
                     .role(Role::Button)
-                    .aria_label(format!("Change the shortcut for {label}"))
+                    .aria_label(t!("shortcuts-change-the-shortcut-for", label = label))
                     .focusable()
                     .tab_stop(true)
                     .focus_visible(move |s| s.border_color(rgb(c.accent)))
@@ -921,7 +919,7 @@ impl MailApp {
                             let pressed = &self.keys_ui.pressed;
                             let note = match &self.keys_ui.hint {
                                 Some(hint) => hint.clone(),
-                                None if pressed.is_empty() => "Press keys… (Esc cancels)".into(),
+                                None if pressed.is_empty() => t!("shortcuts-press-keys-esc-cancels").into(),
                                 // A pause saves them; another key makes a sequence.
                                 None => "…".into(),
                             };
@@ -943,7 +941,7 @@ impl MailApp {
                                         .px_1()
                                         .text_size(px(12.))
                                         .text_color(rgb(c.muted))
-                                        .child("None"),
+                                        .child(t!("shortcuts-none")),
                                 )
                         } else {
                             d.border_color(rgb(c.surface))
@@ -973,7 +971,7 @@ impl MailApp {
                                     div()
                                         .text_size(px(11.))
                                         .text_color(rgb(c.warning))
-                                        .child(format!("Also used by {}", names.join(", "))),
+                                        .child(t!("shortcuts-also-used-by", actions = names.join(", "))),
                                 )
                             }),
                     )
@@ -983,7 +981,7 @@ impl MailApp {
                         d.child(icon_button(
                             format!("shortcut-reset-{name}"),
                             "undo",
-                            "Use the default shortcut",
+                            t!("shortcuts-use-the-default-shortcut"),
                             KeyAction::Reset(name),
                         ))
                     }))
@@ -991,7 +989,7 @@ impl MailApp {
                         d.child(icon_button(
                             format!("shortcut-remove-{name}"),
                             "close",
-                            "No shortcut",
+                            t!("shortcuts-no-shortcut"),
                             KeyAction::Remove(name),
                         ))
                     }));
@@ -1027,15 +1025,12 @@ impl MailApp {
             }
             page = page.child(rows);
         }
-        page.child(self.section("Shortcuts File"))
+        page.child(self.section(t!("shortcuts-shortcuts-file")))
             .child(
                 div()
                     .text_size(px(12.))
                     .text_color(rgb(c.muted))
-                    .child(format!(
-                        "Shortcuts are kept in {}, a line per action such as “reply = secondary-shift-r”. Edits to it apply as soon as it's saved.",
-                        file_path().display()
-                    )),
+                    .child(t!("shortcuts-shortcuts-are-kept-in-a-line", file = file_path().display())),
             )
             .child(
                 div()
@@ -1044,7 +1039,7 @@ impl MailApp {
                     .gap_2()
                     .child(self.button(
                         "open-shortcuts",
-                        "Edit as Text",
+                        t!("shortcuts-edit-as-text"),
                         "external",
                         Action::Keys(KeyAction::OpenFile),
                         false,
@@ -1053,7 +1048,7 @@ impl MailApp {
                     .when(changed, |d| {
                         d.child(self.button(
                             "reset-shortcuts",
-                            "Reset All Shortcuts",
+                            t!("shortcuts-reset-all-shortcuts"),
                             "undo",
                             Action::Keys(KeyAction::ResetAll),
                             false,

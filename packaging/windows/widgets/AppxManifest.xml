@@ -20,7 +20,7 @@
     ProcessorArchitecture="x64" />
 
   <Properties>
-    <DisplayName>Picacho Widgets</DisplayName>
+    <DisplayName>ms-resource:PackageName</DisplayName>
     <PublisherDisplayName>Pinal Technologies</PublisherDisplayName>
     <Logo>Assets\StoreLogo.png</Logo>
     <uap10:AllowExternalContent>true</uap10:AllowExternalContent>
@@ -30,6 +30,12 @@
     <TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.19041.0" MaxVersionTested="10.0.26100.0" />
   </Dependencies>
 
+  <!-- The languages of Strings/<language>/Resources.resw (built into
+       resources.pri), which the ms-resource: names below come from. -->
+  <Resources>
+    <Resource Language="en-us" />
+  </Resources>
+
   <Capabilities>
     <rescap:Capability Name="runFullTrust" />
   </Capabilities>
@@ -37,8 +43,8 @@
   <Applications>
     <Application Id="PicachoWidgets" Executable="PicachoWidgets.exe" EntryPoint="Windows.FullTrustApplication">
       <uap:VisualElements
-        DisplayName="Picacho Widgets"
-        Description="Inbox, unread count, and calendar agenda widgets for Picacho"
+        DisplayName="ms-resource:PackageName"
+        Description="ms-resource:PackageDescription"
         BackgroundColor="transparent"
         Square150x150Logo="Assets\Square150x150Logo.png"
         Square44x44Logo="Assets\Square44x44Logo.png"
@@ -55,7 +61,7 @@
 
         <uap3:Extension Category="windows.appExtension">
           <uap3:AppExtension Name="com.microsoft.windows.widgets"
-                             DisplayName="Picacho"
+                             DisplayName="ms-resource:ProviderName"
                              Id="PicachoWidgets"
                              PublicFolder="Public">
             <uap3:Properties>
@@ -67,7 +73,7 @@
                   <CreateInstance ClassId="7F3E2D4A-8C19-4B5E-9A1D-2E6F4C8B3A50" />
                 </Activation>
                 <Definitions>
-                  <Definition Id="Picacho_Inbox" DisplayName="Picacho Inbox" Description="Recent inbox messages, unread count, and quick compose">
+                  <Definition Id="Picacho_Inbox" DisplayName="ms-resource:InboxName" Description="ms-resource:InboxDescription">
                     <Capabilities>
                       <Capability><Size Name="small" /></Capability>
                       <Capability><Size Name="medium" /></Capability>
@@ -80,7 +86,7 @@
                       <LightMode />
                     </ThemeResources>
                   </Definition>
-                  <Definition Id="Picacho_Unread" DisplayName="Picacho Unread Mail" Description="Unread count, latest unread message, and quick compose">
+                  <Definition Id="Picacho_Unread" DisplayName="ms-resource:UnreadName" Description="ms-resource:UnreadDescription">
                     <Capabilities>
                       <Capability><Size Name="small" /></Capability>
                       <Capability><Size Name="medium" /></Capability>
@@ -92,7 +98,7 @@
                       <LightMode />
                     </ThemeResources>
                   </Definition>
-                  <Definition Id="Picacho_Calendar" DisplayName="Picacho Calendar" Description="Upcoming calendar events">
+                  <Definition Id="Picacho_Calendar" DisplayName="ms-resource:CalendarName" Description="ms-resource:CalendarDescription">
                     <Capabilities>
                       <Capability><Size Name="small" /></Capability>
                       <Capability><Size Name="medium" /></Capability>
@@ -105,7 +111,7 @@
                       <LightMode />
                     </ThemeResources>
                   </Definition>
-                  <Definition Id="Picacho_Packages" DisplayName="Picacho Packages" Description="Your recent tracked packages and delivery progress">
+                  <Definition Id="Picacho_Packages" DisplayName="ms-resource:PackagesName" Description="ms-resource:PackagesDescription">
                     <Capabilities>
                       <Capability><Size Name="small" /></Capability>
                       <Capability><Size Name="medium" /></Capability>
@@ -118,7 +124,7 @@
                       <LightMode />
                     </ThemeResources>
                   </Definition>
-                  <Definition Id="Picacho_Receipts" DisplayName="Picacho Receipts" Description="Your recent receipts and refunds">
+                  <Definition Id="Picacho_Receipts" DisplayName="ms-resource:ReceiptsName" Description="ms-resource:ReceiptsDescription">
                     <Capabilities>
                       <Capability><Size Name="small" /></Capability>
                       <Capability><Size Name="medium" /></Capability>

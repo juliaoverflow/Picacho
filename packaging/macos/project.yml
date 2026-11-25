@@ -19,6 +19,9 @@ targets:
     sources:
       - path: ../ios/Widgets/WidgetSnapshot.swift
       - path: ../ios/Widgets/PicachoWidgets.swift
+      - path: ../ios/Shared/PicachoLanguage.swift
+      # The widgets' text, by language.
+      - path: ../ios/Widgets/Localizable.xcstrings
     entitlements:
       path: PicachoWidgets.entitlements
       properties:

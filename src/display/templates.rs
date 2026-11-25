@@ -23,9 +23,9 @@ impl TemplatesUi {
     pub(super) fn new(window: &mut Window, cx: &mut App) -> Self {
         Self {
             signature_for: None,
-            name: input("Name, as Thanks for applying", false, window, cx),
-            subject: input("Subject (optional)", false, window, cx),
-            body: textarea("What the template writes, as Hi {first_name},", window, cx),
+            name: input(t!("templates-name-as-thanks-for-applying"), false, window, cx),
+            subject: input(t!("templates-subject-optional"), false, window, cx),
+            body: textarea(t!("templates-what-the-template-writes-as-hi"), window, cx),
         }
     }
 }
@@ -55,7 +55,7 @@ impl MailApp {
             None => options.templates.push(t),
         }
         self.save_compose_options(options, cx);
-        self.notice(format!("Saved the template “{name}”"), false, cx);
+        self.notice(t!("templates-saved-the-template", name = name), false, cx);
     }
 
     pub(super) fn template_action(
@@ -85,7 +85,7 @@ impl MailApp {
                 let subject = Self::value(&self.templates.subject, cx).trim().to_owned();
                 let body = self.templates.body.read(cx).value().to_string();
                 if name.is_empty() || body.trim().is_empty() {
-                    self.notice("A template needs a name and some text", true, cx);
+                    self.notice(t!("templates-a-template-needs-a-name-and"), true, cx);
                     return;
                 }
                 self.save_template(Template { name, subject, body }, cx);
@@ -111,7 +111,7 @@ impl MailApp {
         }
         let act = |id: Option<String>| Action::Templates(TemplateAction::SignatureFor(id));
         let mut options = vec![(
-            "Every mailbox".to_owned(),
+            t!("templates-every-mailbox").to_owned(),
             act(None),
             self.templates.signature_for.is_none(),
         )];
@@ -141,23 +141,20 @@ impl MailApp {
     /// The templates section of Settings → Composing.
     pub(super) fn templates_settings(&self, cx: &Context<Self>) -> Div {
         let c = self.colors();
-        let mut section = div().flex().flex_col().gap_3().child(self.section("Templates")).child(
+        let mut section = div().flex().flex_col().gap_3().child(self.section(t!("templates-templates"))).child(
             div()
                 .text_size(px(12.))
                 .text_color(rgb(c.muted))
-                .child("Messages you send often. Insert one from the composer's Templates button, which also saves the message you're writing as a template."),
+                .child(t!("templates-messages-you-send-often-insert-one")),
         ).child(
             div()
                 .text_size(px(12.))
                 .text_color(rgb(c.muted))
-                .child(format!(
-                    "Placeholders fill in as a template is inserted: {}.",
-                    crate::manage::composing::PLACEHOLDERS
+                .child(t!("templates-placeholders-fill-in-as-a-template", placeholders = crate::manage::composing::PLACEHOLDERS
                         .iter()
                         .map(|(p, what)| format!("{p} {what}"))
                         .collect::<Vec<_>>()
-                        .join(", ")
-                )),
+                        .join(", "))),
         );
         for (i, t) in self.compose_options.templates.iter().enumerate() {
             section = section.child(
@@ -186,7 +183,7 @@ impl MailApp {
                     )
                     .child(self.button(
                         format!("remove-template-{i}"),
-                        "@Remove template",
+                        t!("templates-remove-template"),
                         "trash",
                         Action::Templates(TemplateAction::Remove(i)),
                         false,
@@ -204,7 +201,7 @@ impl MailApp {
             )
             .child(div().flex().justify_end().child(self.button(
                 "add-template",
-                "Add Template",
+                t!("templates-add-template"),
                 "plus",
                 Action::Templates(TemplateAction::Add),
                 true,

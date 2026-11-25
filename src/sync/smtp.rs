@@ -29,9 +29,9 @@ fn sender<'a>(
         "" => None,
         _ if !d.send_as.trim().is_empty() => None,
         id => Some(a.identity(id).with_context(|| {
-            format!(
-                "The address this message is from was removed from {} (Settings → Sending). Choose another in From.",
-                a.email
+            t!(
+                "sync-smtp-the-address-this-message-is-from",
+                email = a.email
             )
         })?),
     };
@@ -45,7 +45,7 @@ fn sender<'a>(
             i.email
                 .trim()
                 .parse()
-                .context("The address in From isn't valid.")?,
+                .with_context(|| t!("sync-smtp-the-address-in-from-isnt-valid"))?,
         ),
         None => Mailbox::new(Some(a.name.clone()), a.email.parse()?),
     };
@@ -109,11 +109,17 @@ pub(crate) fn build_to(
             builder = builder.raw_header(raw_header(FORMAT_HEADER, "markdown".into()));
         }
     } else {
-        ensure!(count > 0 || only_to.is_some(), "Add at least one recipient.");
+        ensure!(
+            count > 0 || only_to.is_some(),
+            t!("sync-smtp-add-at-least-one-recipient")
+        );
         if let Some(to) = only_to {
             builder = builder.envelope(lettre::address::Envelope::new(
                 Some(from.email.clone()),
-                vec![to.parse().with_context(|| format!("“{to}” isn't a valid address."))?],
+                vec![
+                    to.parse()
+                        .with_context(|| t!("sync-smtp-isnt-a-valid-address", to = to))?,
+                ],
             )?);
         }
     }
@@ -131,7 +137,9 @@ pub(crate) fn build_to(
     } else {
         ""
     };
-    for (name, address) in recipients(reply_to).context("Enter a valid Reply-To address.")? {
+    for (name, address) in
+        recipients(reply_to).with_context(|| t!("sync-smtp-enter-a-valid-reply-to-address"))?
+    {
         builder = builder.reply_to(Mailbox::new(name, address.parse()?));
     }
     if a.read_receipts && !draft {
@@ -218,12 +226,16 @@ pub(crate) fn build_to(
         .expect("a valid content type");
         let mut related = MultiPart::builder().header(kind).singlepart(html());
         for image in &inline.images {
-            let meta = std::fs::metadata(&image.path)
-                .with_context(|| format!("The picture {} can't be read.", image.path.display()))?;
+            let meta = std::fs::metadata(&image.path).with_context(|| {
+                t!(
+                    "sync-smtp-the-picture-cant-be-read",
+                    path = image.path.display()
+                )
+            })?;
             total += meta.len() as usize;
             ensure!(
                 total < 4 * DEFAULT_LIMIT,
-                "Attachments are too large to send by email. Share them by link instead."
+                t!("sync-smtp-attachments-are-too-large-to-send")
             );
             let bytes = std::fs::read(&image.path)?;
             let name = image.name.clone();
@@ -239,15 +251,23 @@ pub(crate) fn build_to(
         MultiPart::alternative().singlepart(plain())
     };
     let mut multipart = MultiPart::mixed().multipart(text);
-    for path in d.attachments.iter().filter(|p| !inline.images.iter().any(|i| &i.path == *p)) {
-        let meta = std::fs::metadata(path)
-            .with_context(|| format!("The attachment {} can't be read.", path.display()))?;
+    for path in d
+        .attachments
+        .iter()
+        .filter(|p| !inline.images.iter().any(|i| &i.path == *p))
+    {
+        let meta = std::fs::metadata(path).with_context(|| {
+            t!(
+                "sync-smtp-the-attachment-cant-be-read",
+                path = path.display()
+            )
+        })?;
         total += meta.len() as usize;
         // The server's own limit is checked once connected; this only
         // keeps absurd files out of memory.
         ensure!(
             total < 4 * DEFAULT_LIMIT,
-            "Attachments are too large to send by email. Share them by link instead."
+            t!("sync-smtp-attachments-are-too-large-to-send")
         );
         let bytes = std::fs::read(path)?;
         let name = path
@@ -413,7 +433,7 @@ pub(crate) struct ServerLimits {
 pub(crate) struct NoServerHold;
 impl std::fmt::Display for NoServerHold {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("The outgoing server can't hold this message until it's due.")
+        f.write_str(t!("sync-smtp-the-outgoing-server-cant-hold-this"))
     }
 }
 impl std::error::Error for NoServerHold {}
@@ -431,11 +451,10 @@ pub(crate) struct EncryptedBccUnsupported {
 }
 impl std::fmt::Display for EncryptedBccUnsupported {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "Encrypted mail with Bcc can't be sent through {} without showing who got a Bcc. Send to them separately, or turn off Encrypt.",
-            self.service
-        )
+        f.write_str(&t!(
+            "sync-smtp-encrypted-mail-with-bcc-cant-be",
+            service = self.service
+        ))
     }
 }
 impl std::error::Error for EncryptedBccUnsupported {}
@@ -575,7 +594,10 @@ pub(crate) struct Delivered {
     pub(crate) receipts_unsupported: bool,
 }
 fn megabytes(bytes: usize) -> String {
-    format!("{:.1} MB", bytes as f64 / 1_048_576.0)
+    t!(
+        "sync-smtp-mb",
+        megabytes = format!("{:.1}", bytes as f64 / 1_048_576.0)
+    )
 }
 
 /// An outgoing server and who signs in to it: the account's own, or one
@@ -710,27 +732,27 @@ pub(crate) fn meaning(class: u8, subject: u16, detail: u16) -> Option<&'static s
         return None;
     }
     Some(match (subject, detail) {
-        (1, 1) => "That mailbox doesn't exist",
-        (1, 2) => "That domain doesn't exist or takes no mail",
-        (1, 3) => "That address isn't valid",
-        (1, 6) => "That person has moved and no longer gets mail there",
-        (1, 7) | (1, 8) => "The server won't send from this address",
-        (1, 10) => "That domain takes no mail (null MX)",
-        (2, 1) => "That mailbox isn't taking mail now",
-        (2, 2) => "That mailbox is full",
-        (2, 3) | (3, 4) => "The message is too large",
-        (3, 1) => "The server's storage is full",
-        (4, 1) | (4, 2) | (4, 7) => "The recipient's server couldn't be reached",
-        (4, 4) => "The recipient's domain couldn't be routed to",
-        (5, 3) => "Too many recipients for one message",
-        (6, _) => "The server can't take this message's format",
-        (7, 0) | (7, 1) => "The server refused this by its policy",
-        (7, 8) | (7, 9) => "The sign-in wasn't accepted",
-        (7, 13) => "This account is disabled",
-        (7, 23) => "SPF says this server may not send for this address",
-        (7, 25) | (7, 26) | (7, 27) => "The message failed the receiving server's sender checks",
-        (7, 30) => "The server can't keep the message encrypted all the way",
-        (_, _) if class == 4 => "The server can't take this now; it may later",
+        (1, 1) => t!("sync-smtp-that-mailbox-doesnt-exist"),
+        (1, 2) => t!("sync-smtp-that-domain-doesnt-exist-or-takes"),
+        (1, 3) => t!("sync-smtp-that-address-isnt-valid"),
+        (1, 6) => t!("sync-smtp-that-person-has-moved-and-no"),
+        (1, 7) | (1, 8) => t!("sync-smtp-the-server-wont-send-from-this"),
+        (1, 10) => t!("sync-smtp-that-domain-takes-no-mail-null"),
+        (2, 1) => t!("sync-smtp-that-mailbox-isnt-taking-mail-now"),
+        (2, 2) => t!("sync-smtp-that-mailbox-is-full"),
+        (2, 3) | (3, 4) => t!("sync-smtp-the-message-is-too-large"),
+        (3, 1) => t!("sync-smtp-the-servers-storage-is-full"),
+        (4, 1) | (4, 2) | (4, 7) => t!("sync-smtp-the-recipients-server-couldnt-be-reached"),
+        (4, 4) => t!("sync-smtp-the-recipients-domain-couldnt-be-routed"),
+        (5, 3) => t!("sync-smtp-too-many-recipients-for-one-message"),
+        (6, _) => t!("sync-smtp-the-server-cant-take-this-messages"),
+        (7, 0) | (7, 1) => t!("sync-smtp-the-server-refused-this-by-its"),
+        (7, 8) | (7, 9) => t!("sync-smtp-the-sign-in-wasnt-accepted"),
+        (7, 13) => t!("sync-smtp-this-account-is-disabled"),
+        (7, 23) => t!("sync-smtp-spf-says-this-server-may-not"),
+        (7, 25) | (7, 26) | (7, 27) => t!("sync-smtp-the-message-failed-the-receiving-servers"),
+        (7, 30) => t!("sync-smtp-the-server-cant-keep-the-message"),
+        (_, _) if class == 4 => t!("sync-smtp-the-server-cant-take-this-now"),
         _ => return None,
     })
 }
@@ -800,25 +822,31 @@ impl<S: Read + Write + Patience> Session<S> {
                 Err(e) if crate::sync::stream::closed_without_goodbye(&e) => 0,
                 other => other?,
             };
-            ensure!(read > 0, "The outgoing server closed the connection.");
+            ensure!(
+                read > 0,
+                t!("sync-smtp-the-outgoing-server-closed-the-connection")
+            );
             ensure!(
                 line.ends_with('\n') && line.len() <= 4096 && lines.len() < 512,
-                "The outgoing server sent an invalid reply."
+                t!("sync-smtp-the-outgoing-server-sent-an-invalid")
             );
             let line = line.trim_end_matches(['\r', '\n']);
             let code: u16 = line
                 .get(..3)
                 .and_then(|c| c.parse().ok())
-                .context("The outgoing server sent an invalid reply.")?;
+                .with_context(|| t!("sync-smtp-the-outgoing-server-sent-an-invalid"))?;
             let rest = line.get(3..).unwrap_or("");
             // Every line of a reply carries the same code (RFC 5321 §4.2.1).
             if let Some(first) = first_code {
-                ensure!(first == code, "The outgoing server sent an invalid reply.");
+                ensure!(
+                    first == code,
+                    t!("sync-smtp-the-outgoing-server-sent-an-invalid")
+                );
             }
             first_code = Some(code);
             ensure!(
                 rest.is_empty() || rest.starts_with(['-', ' ']),
-                "The outgoing server sent an invalid reply."
+                t!("sync-smtp-the-outgoing-server-sent-an-invalid")
             );
             lines.push(rest.get(1..).unwrap_or("").to_owned());
             if !rest.starts_with('-') {
@@ -832,7 +860,10 @@ impl<S: Read + Write + Patience> Session<S> {
     }
     /// Writes a command without waiting for its reply.
     fn send(&mut self, line: &str) -> Result<()> {
-        ensure!(!line.contains(['\r', '\n']), "Invalid SMTP command");
+        ensure!(
+            !line.contains(['\r', '\n']),
+            t!("sync-smtp-invalid-smtp-command")
+        );
         let stream = self.reader.get_mut();
         stream.write_all(line.as_bytes())?;
         stream.write_all(b"\r\n")?;
@@ -869,9 +900,9 @@ impl<S: Read + Write + Patience> Session<S> {
                 self.enhanced = false;
                 return Ok(ServerLimits::default());
             }
-            return Err(Refused(format!(
-                "The outgoing server refused EHLO: {}",
-                reply.explained()
+            return Err(Refused(t!(
+                "sync-smtp-the-outgoing-server-refused-ehlo",
+                explained = reply.explained()
             ))
             .into());
         }
@@ -894,18 +925,19 @@ impl<S: Read + Write + Patience> Session<S> {
             &sasl::PASSWORD_ORDER
         };
         let bound = !self.reader.get_ref().binding().is_empty();
-        let mechanism = sasl::Mechanism::choose_bound(order, limits.auth.iter().map(String::as_str), bound)
-            .with_context(|| {
-                format!(
-                    "{} offers no sign-in method Picacho supports{}.",
-                    endpoint.host,
+        let mechanism =
+            sasl::Mechanism::choose_bound(order, limits.auth.iter().map(String::as_str), bound)
+                .with_context(|| {
                     if limits.auth.is_empty() {
-                        String::new()
+                        t!("sync-smtp-offers-no-sign-in-method-picacho", host = endpoint.host)
                     } else {
-                        format!(" (it offers {})", limits.auth.join(", "))
+                        t!(
+                            "sync-smtp-offers-no-sign-in-method-it-offers",
+                            host = endpoint.host,
+                            methods = limits.auth.join(", ")
+                        )
                     }
-                )
-            })?;
+                })?;
         let mut exchange = sasl::Exchange::new(
             mechanism,
             sasl::Credentials {
@@ -976,10 +1008,11 @@ impl<S: Read + Write + Patience> Session<S> {
                         Some(reason) => format!("{} ({reason})", reply.explained()),
                         None => reply.explained(),
                     };
-                    return Err(Refused(format!(
-                        "{} refused the sign-in with {}: {why}",
-                        endpoint.host,
-                        mechanism.name(),
+                    return Err(Refused(t!(
+                        "sync-smtp-refused-the-sign-in-with",
+                        host = endpoint.host,
+                        name = mechanism.name(),
+                        why = why
                     ))
                     .into());
                 }
@@ -990,9 +1023,9 @@ impl<S: Read + Write + Patience> Session<S> {
     fn data(&mut self, bytes: &[u8]) -> Result<Reply> {
         let reply = self.command("DATA")?;
         if reply.code != 354 {
-            return Err(Refused(format!(
-                "The server refused the message: {}",
-                reply.explained()
+            return Err(Refused(t!(
+                "sync-smtp-the-server-refused-the-message",
+                explained = reply.explained()
             ))
             .into());
         }
@@ -1004,9 +1037,9 @@ impl<S: Read + Write + Patience> Session<S> {
         // RFC 5321 §4.1.1.4: only a 2xx after the final dot accepts it.
         let reply = self.final_reply()?;
         if !reply.positive() {
-            return Err(Refused(format!(
-                "The server refused the message: {}",
-                reply.explained()
+            return Err(Refused(t!(
+                "sync-smtp-the-server-refused-the-message",
+                explained = reply.explained()
             ))
             .into());
         }
@@ -1046,9 +1079,9 @@ impl<S: Read + Write + Patience> Session<S> {
                     };
                     pending -= 1;
                     if !r.positive() {
-                        return Err(Refused(format!(
-                            "The server refused the message: {}",
-                            r.explained()
+                        return Err(Refused(t!(
+                            "sync-smtp-the-server-refused-the-message",
+                            explained = r.explained()
                         ))
                         .into());
                     }
@@ -1056,7 +1089,7 @@ impl<S: Read + Write + Patience> Session<S> {
                 }
             }
         }
-        reply.context("No reply to the message")
+        reply.with_context(|| t!("sync-smtp-no-reply-to-the-message"))
     }
     /// The message named by an IMAP URL, which the server fetches (BURL,
     /// RFC 4468), as the whole of the message.
@@ -1067,9 +1100,9 @@ impl<S: Read + Write + Patience> Session<S> {
         if !reply.positive() {
             // RFC 4468 §3: a refused BURL ends the transaction with nothing
             // delivered, so the message can still be sent another way.
-            return Err(BurlRefused(Refused(format!(
-                "The server couldn't fetch the message to send: {}",
-                reply.explained()
+            return Err(BurlRefused(Refused(t!(
+                "sync-smtp-the-server-couldnt-fetch-the-message",
+                explained = reply.explained()
             )))
             .into());
         }
@@ -1098,16 +1131,22 @@ fn open(
 ) -> Result<(Session<native_tls::TlsStream<Wire>>, ServerLimits)> {
     let socket = crate::sync::transport::tcp(&endpoint.host, endpoint.port)?;
     let mut session = if endpoint.implicit_tls {
-        let stream = tls
-            .connect(&endpoint.host, socket)
-            .map_err(|e| anyhow::anyhow!("TLS with {} failed: {e}", endpoint.host))?;
+        let stream = tls.connect(&endpoint.host, socket).map_err(|e| {
+            anyhow::anyhow!(t!(
+                "sync-smtp-tls-with-failed",
+                host = endpoint.host,
+                error = e.to_string()
+            ))
+        })?;
         let mut session = Session::new(stream);
         let greeting = session.reply()?;
         ensure!(
             greeting.code == 220,
-            "{} refused the connection: {}",
-            endpoint.host,
-            greeting.explained()
+            t!(
+                "sync-smtp-refused-the-connection",
+                host = endpoint.host,
+                explained = greeting.explained()
+            )
         );
         session
     } else {
@@ -1115,34 +1154,48 @@ fn open(
         let greeting = plain.reply()?;
         ensure!(
             greeting.code == 220,
-            "{} refused the connection: {}",
-            endpoint.host,
-            greeting.explained()
+            t!(
+                "sync-smtp-refused-the-connection",
+                host = endpoint.host,
+                explained = greeting.explained()
+            )
         );
         let limits = plain.ehlo()?;
         // Never send credentials or mail unencrypted.
         ensure!(
             limits.starttls,
-            "{} doesn't offer STARTTLS on port {}; Picacho only sends over encrypted connections. If this server uses TLS from the start, turn on \"TLS from the start\" for it.",
-            endpoint.host,
-            endpoint.port
+            t!(
+                "sync-smtp-doesnt-offer-starttls-on-port-picacho",
+                host = endpoint.host,
+                port = endpoint.port
+            )
         );
         let reply = plain.command("STARTTLS")?;
         ensure!(
             reply.code == 220,
-            "{} refused STARTTLS: {}",
-            endpoint.host,
-            reply.explained()
+            t!(
+                "sync-smtp-refused-starttls",
+                host = endpoint.host,
+                explained = reply.explained()
+            )
         );
         // Anything sent before the handshake could be an attacker's.
         ensure!(
             plain.reader.buffer().is_empty(),
-            "Unexpected data from {} before encryption started; nothing was sent.",
-            endpoint.host
+            t!(
+                "sync-smtp-unexpected-data-from-before-encryption-started",
+                host = endpoint.host
+            )
         );
         let stream = tls
             .connect(&endpoint.host, plain.reader.into_inner())
-            .map_err(|e| anyhow::anyhow!("TLS with {} failed: {e}", endpoint.host))?;
+            .map_err(|e| {
+                anyhow::anyhow!(t!(
+                    "sync-smtp-tls-with-failed",
+                    host = endpoint.host,
+                    error = e.to_string()
+                ))
+            })?;
         Session::new(stream)
     };
     let limits = session.ehlo()?;
@@ -1227,13 +1280,13 @@ fn deliver_bcc_apart(
         let alone = deliver_bytes(a, &visible, &message, bytes, endpoint, secret, tls, hold_until, None);
         let alone = match delivered {
             Some(_) => alone.with_context(|| {
-                format!("The message went to its other recipients, but not to {address}.")
+                t!("sync-smtp-the-message-went-to-its-other", address = address)
             })?,
             None => alone?,
         };
         delivered.get_or_insert(alone);
     }
-    delivered.context("Add at least one recipient.")
+    delivered.with_context(|| t!("sync-smtp-add-at-least-one-recipient"))
 }
 
 /// A new Message-ID at `address`'s domain (RFC 5322 §3.6.4): random
@@ -1315,8 +1368,7 @@ pub(crate) fn deliver_bytes(
     hold_until: Option<i64>,
     burl: Option<Burl<'_>>,
 ) -> Result<Delivered> {
-    let failed =
-        "SMTP delivery failed. Your draft has been kept; check the server and account settings.";
+    let failed = t!("sync-smtp-smtp-delivery-failed-your-draft-has");
     let (mut session, limits) = open(endpoint, secret, tls).context(failed)?;
     let limit = limits.size.unwrap_or(DEFAULT_LIMIT);
     // As the server will count it (RFC 1870 §4): with DATA, every line
@@ -1327,19 +1379,21 @@ pub(crate) fn deliver_bytes(
         data_size(&bytes)
     };
     if size > limit {
-        bail!(
-            "This message is {} with its attachments; {} accepts up to {}. Remove an attachment or share it by link.",
-            megabytes(size),
-            endpoint.host,
-            megabytes(limit)
-        );
+        bail!(t!(
+            "sync-smtp-this-message-is-with-its-attachments",
+            size = megabytes(size),
+            host = endpoint.host,
+            limit = megabytes(limit)
+        ));
     }
     if a.require_tls {
         ensure!(
             limits.require_tls,
-            "{} can't promise this message stays encrypted all the way (it doesn't offer REQUIRETLS), so it wasn't sent. Turn off Require encryption in transit (Settings → {} → Sending) to send it anyway.",
-            endpoint.host,
-            a.email
+            t!(
+                "sync-smtp-cant-promise-this-message-stays-encrypted",
+                host = endpoint.host,
+                email = a.email
+            )
         );
     }
     // Held for later: for how long, from the server's own clock.
@@ -1377,8 +1431,10 @@ pub(crate) fn deliver_bytes(
     if non_ascii {
         ensure!(
             limits.utf8,
-            "{} can't send to or from addresses with accents or non-Latin letters (no SMTPUTF8).",
-            endpoint.host
+            t!(
+                "sync-smtp-cant-send-to-or-from-addresses",
+                host = endpoint.host
+            )
         );
         mail.push_str(" SMTPUTF8");
     }
@@ -1465,14 +1521,16 @@ pub(crate) fn deliver_bytes(
             let _ = session.command("QUIT");
             session = open(endpoint, secret, tls)
                 .map(|(s, _)| s)
-                .context("The message went to some recipients only.")?;
+                .with_context(|| t!("sync-smtp-the-message-went-to-some-recipients"))?;
         } else if sent > 0 {
             let reset = session.command("RSET")?;
             ensure!(
                 reset.positive(),
-                "{} refused to start another message: {}",
-                endpoint.host,
-                reset.explained()
+                t!(
+                    "sync-smtp-refused-to-start-another-message",
+                    host = endpoint.host,
+                    explained = reset.explained()
+                )
             );
         }
         let these = take_batch(&mut pending, batch, limits.rcpt_domain_max);
@@ -1480,14 +1538,15 @@ pub(crate) fn deliver_bytes(
         let sender = &replies[0];
         if !sender.positive() {
             let _ = session.command("QUIT");
-            let error = Err(Refused(format!(
-                "The server refused to send from {from}: {}",
-                sender.explained()
+            let error = Err(Refused(t!(
+                "sync-smtp-the-server-refused-to-send-from-2",
+                from = from,
+                explained = sender.explained()
             )));
             return if sent == 0 {
                 error.context(failed)
             } else {
-                error.context("The message went to some recipients only.")
+                error.with_context(|| t!("sync-smtp-the-message-went-to-some-recipients"))
             };
         }
         let mut later = Vec::new();
@@ -1502,16 +1561,18 @@ pub(crate) fn deliver_bytes(
             let _ = session.command("QUIT");
             let error = Err(Refused(reply.explained()));
             return if sent == 0 {
-                error.with_context(|| format!("The server refused the recipient {to}."))
+                error.with_context(|| t!("sync-smtp-the-server-refused-the-recipient", to = to))
             } else {
-                error.with_context(|| {
-                    format!("The message went to some recipients, but the server refused {to}.")
-                })
+                error
+                    .with_context(|| t!("sync-smtp-the-message-went-to-some-recipients-2", to = to))
             };
         }
         if later.len() == these.len() {
             let _ = session.command("QUIT");
-            bail!("{} took none of this message's recipients (too many).", endpoint.host);
+            bail!(t!(
+                "sync-smtp-took-none-of-this-messages-recipients",
+                host = endpoint.host
+            ));
         }
         // Those refused for their number go first next time.
         later.append(&mut pending);
@@ -1539,7 +1600,7 @@ pub(crate) fn deliver_bytes(
                     Ok(BurlRefused(refused)) => anyhow::Error::new(refused),
                     Err(e) => e,
                 })
-                .context("The message went to some recipients only.")?;
+                .with_context(|| t!("sync-smtp-the-message-went-to-some-recipients"))?;
         }
         sent += 1;
     }
@@ -1668,20 +1729,22 @@ pub(crate) fn deliver_raw(
     secret: &str,
     tls: &native_tls::TlsConnector,
 ) -> Result<()> {
-    ensure!(!to.is_empty(), "Add at least one recipient.");
+    ensure!(!to.is_empty(), t!("sync-smtp-add-at-least-one-recipient"));
     let named = (!from.is_empty()).then_some(from);
     for address in named.into_iter().chain(to.iter().map(String::as_str)) {
         ensure!(
             !address.contains(['<', '>', '\r', '\n', ' ']) && address.contains('@'),
-            "“{address}” isn't a valid address."
+            t!("sync-smtp-isnt-a-valid-address-2", address = address)
         );
     }
     let (mut session, limits) = open(endpoint, secret, tls)?;
     if a.require_tls {
         ensure!(
             limits.require_tls,
-            "{} can't promise this message stays encrypted all the way (no REQUIRETLS), so it wasn't sent.",
-            endpoint.host
+            t!(
+                "sync-smtp-cant-promise-this-message-stays-encrypted-2",
+                host = endpoint.host
+            )
         );
     }
     let limit = limits.size.unwrap_or(DEFAULT_LIMIT);
@@ -1693,10 +1756,12 @@ pub(crate) fn deliver_raw(
     };
     ensure!(
         size <= limit,
-        "This message is {}; {} accepts up to {}.",
-        megabytes(size),
-        endpoint.host,
-        megabytes(limit)
+        t!(
+            "sync-smtp-this-message-is-accepts-up-to",
+            size = megabytes(size),
+            host = endpoint.host,
+            limit = megabytes(limit)
+        )
     );
     // `from` empty: the null reverse-path, for reports such as read
     // receipts, which must never be answered (RFC 8098 §3).
@@ -1710,7 +1775,13 @@ pub(crate) fn deliver_raw(
     let head_end = memchr::memmem::find(bytes, b"\r\n\r\n").unwrap_or(bytes.len());
     let utf8_report = has_global_part(bytes);
     if !from.is_ascii() || to.iter().any(|t| !t.is_ascii()) || utf8_report {
-        ensure!(limits.utf8, "{} can't send to this address (no SMTPUTF8).", endpoint.host);
+        ensure!(
+            limits.utf8,
+            t!(
+                "sync-smtp-cant-send-to-this-address-no",
+                host = endpoint.host
+            )
+        );
         mail.push_str(" SMTPUTF8");
     } else if !bytes[..head_end].is_ascii() && limits.utf8 {
         mail.push_str(" SMTPUTF8");
@@ -1719,8 +1790,10 @@ pub(crate) fn deliver_raw(
     if !bytes.is_ascii() {
         ensure!(
             limits.eight_bit,
-            "{} can't take this message's 8-bit content (no 8BITMIME).",
-            endpoint.host
+            t!(
+                "sync-smtp-cant-take-this-messages-8-bit",
+                host = endpoint.host
+            )
         );
         mail.push_str(" BODY=8BITMIME");
     }
@@ -1730,21 +1803,30 @@ pub(crate) fn deliver_raw(
     let rcpt = |t: &lettre::Address| format!("RCPT TO:<{t}>");
     let addresses: Vec<lettre::Address> = to
         .iter()
-        .map(|t| t.parse().with_context(|| format!("“{t}” isn't a valid address.")))
+        .map(|t| {
+            t.parse()
+                .with_context(|| t!("sync-smtp-isnt-a-valid-address-3", address = t))
+        })
         .collect::<Result<_>>()?;
     let refs: Vec<&lettre::Address> = addresses.iter().collect();
     let replies = transaction(&mut session, &mail, &refs, &rcpt, limits.pipelining)?;
     let shown = if from.is_empty() { "<>" } else { from };
     ensure!(
         replies[0].positive(),
-        "The server refused to send from {shown}: {}",
-        replies[0].explained()
+        t!(
+            "sync-smtp-the-server-refused-to-send-from",
+            address = shown,
+            explained = replies[0].explained()
+        )
     );
     for (address, reply) in to.iter().zip(&replies[1..]) {
         ensure!(
             reply.positive(),
-            "The server refused the recipient {address}: {}",
-            reply.explained()
+            t!(
+                "sync-smtp-the-server-refused-the-recipient-2",
+                address = address,
+                explained = reply.explained()
+            )
         );
     }
     if limits.chunking {
@@ -1847,7 +1929,24 @@ pub(crate) fn receipt(
     let domain = a.email.rsplit('@').next().unwrap_or("localhost");
     let now = chrono::Local::now();
     let name = crate::sync::mime::display_name(&a.name);
-    let subject = encoded(&format!("Read: {}", m.subject));
+    // In the language of mail Picacho writes (Settings).
+    let (subject, shown) = crate::i18n::in_outgoing(|| {
+        let shown = t!(
+            "outgoing-your-message-to-was-displayed-on",
+            address = a.email,
+            date = crate::i18n::dates::format(&now, t!("dates-receipt")),
+        );
+        let shown = format!(
+            "{shown}\r\n{}\r\n\r\n{}\r\n",
+            t!(
+                "outgoing-receipt-subject",
+                subject = m.subject.replace(['\r', '\n'], " ")
+            ),
+            t!("outgoing-this-only-says-the-message-was"),
+        );
+        (t!("outgoing-read", subject = m.subject), shown)
+    });
+    let subject = encoded(&subject);
     // The sender's Message-ID is theirs to write (and decoded, so CR/LF can
     // hide in an encoded word): kept to one line so it can't add headers.
     let original: String = m
@@ -1881,12 +1980,7 @@ pub(crate) fn receipt(
     out.push_str(&format!(
         "--{boundary}\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: 8bit\r\n\r\n"
     ));
-    out.push_str(&format!(
-        "Your message to {} was displayed on {}.\r\nSubject: {}\r\n\r\nThis only says the message was shown; it doesn't guarantee that it was read or understood.\r\n",
-        a.email,
-        now.format("%a, %b %-d %Y at %-H:%M"),
-        m.subject.replace(['\r', '\n'], " ")
-    ));
+    out.push_str(&shown);
     // RFC 6533 §6: a report naming an address or message id that isn't
     // ASCII is message/global-disposition-notification, its addresses of
     // type utf-8 (which reads UTF-8 as is, as message/global does).
@@ -1981,7 +2075,7 @@ pub(crate) fn recipients(list: &str) -> Result<Vec<(Option<String>, String)>> {
         return Ok(vec![]);
     }
     let parsed = mailparse::addrparse(list)
-        .context("Enter valid recipient email addresses, separated by commas")?;
+        .with_context(|| t!("sync-smtp-enter-valid-recipient-email-addresses-separated"))?;
     let mut out = vec![];
     for address in parsed.iter() {
         match address {

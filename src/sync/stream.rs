@@ -43,7 +43,7 @@ impl Deflate {
         self.remaining = self.remaining.checked_sub(made).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
-                "Mail server response exceeds the 32 MB session-command limit",
+                t!("sync-stream-mail-server-response-exceeds-the-32"),
             )
         })?;
         Ok(())
@@ -419,7 +419,7 @@ impl ImapStream {
             if line.len() > 64 * 1024 || self.read(&mut byte)? == 0 {
                 return Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
-                    "The server closed the connection during a command.",
+                    t!("sync-stream-the-server-closed-the-connection-during"),
                 ));
             }
             line.push(byte[0]);
@@ -452,7 +452,7 @@ impl ImapStream {
                                 if self.read(&mut byte)? == 0 {
                                     return Err(io::Error::new(
                                         io::ErrorKind::UnexpectedEof,
-                                        "The server closed the connection during a command.",
+                                        t!("sync-stream-the-server-closed-the-connection-during"),
                                     ));
                                 }
                                 held.push(byte[0]);
@@ -511,7 +511,7 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
 fn invalid(e: impl std::fmt::Display) -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidData,
-        format!("Compressed IMAP stream: {e}"),
+        t!("sync-stream-compressed-imap-stream", error = e.to_string()),
     )
 }
 /// OpenSSL 3 reports a connection closed without TLS's goodbye as an error;
@@ -601,7 +601,7 @@ impl ImapStream {
                 out.truncate(made);
                 d.output = out;
                 if status == Status::StreamEnd && made == 0 {
-                    return Err(invalid("the server ended compression"));
+                    return Err(invalid(t!("sync-stream-the-server-ended-compression")));
                 }
                 // An end of the stream with its last bytes: those are
                 // handed out first; the end is reported on the next read.

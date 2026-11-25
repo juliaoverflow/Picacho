@@ -118,12 +118,12 @@
   "actions": [
     {
       "type": "Action.OpenUrl",
-      "title": "Compose",
+      "title": "${composeText}",
       "url": "${composeUrl}"
     },
     {
       "type": "Action.Execute",
-      "title": "Refresh",
+      "title": "${refreshText}",
       "verb": "refresh"
     }
   ]

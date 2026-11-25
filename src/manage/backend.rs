@@ -220,9 +220,9 @@ fn allowed(result: imap::error::Result<()>, what: impl FnOnce() -> String) -> Re
     match result {
         Ok(()) => Ok(()),
         Err(imap::error::Error::No(why) | imap::error::Error::Bad(why)) => {
-            bail!("The server didn't allow this account to {}: {why}", what())
+            bail!(t!("manage-backend-the-server-didnt-allow-this-account", what = what(), why = why))
         }
-        Err(e) => Err(e).with_context(|| format!("Couldn't {}", what())),
+        Err(e) => Err(e).with_context(|| t!("manage-backend-couldnt", what = what())),
     }
 }
 /// Subscribes to a new folder so other mail apps, which often list only
@@ -472,7 +472,7 @@ impl Backend {
         // Proton signs in in steps, which `proton_begin` starts.
         ensure!(
             account.provider != Provider::Proton,
-            "Sign in to Proton with its own steps."
+            t!("manage-backend-sign-in-to-proton-with-its")
         );
         if account.service == crate::manage::model::Service::Pinal {
             let (secret, who) = crate::sync::oauth::pinal(&account.email, cancel.clone(), &|| {
@@ -480,7 +480,7 @@ impl Backend {
             })?;
             ensure!(
                 account.email.is_empty() || account.email.eq_ignore_ascii_case(&who.email),
-                "Choose the same email address to reconnect this mailbox."
+                t!("manage-backend-choose-the-same-email-address-to")
             );
             let issued = crate::sync::oauth::pinal_account(&who.email, &who.name);
             // Reconnecting keeps the account's place, settings and names.
@@ -507,7 +507,7 @@ impl Backend {
             // Kerberos uses the system's ticket; there is no password.
             ensure!(
                 account.kerberos || !password.is_empty(),
-                "Enter your password or app password."
+                t!("manage-backend-enter-your-password-or-app-password")
             );
             let secret = Secret {
                 password,
@@ -547,7 +547,7 @@ impl Backend {
             .lock()
             .unwrap()
             .take()
-            .context("This sign-in can no longer be retried. Sign in again.")?;
+            .with_context(|| t!("manage-backend-this-sign-in-can-no-longer"))?;
         match stage {
             Stage::Redeem(grant) => self.redeem(account, grant, &taken, &cancel),
             Stage::Verify(secret) => self.verify(account, secret, &taken, &cancel, true),
@@ -593,7 +593,7 @@ impl Backend {
                 }
                 ensure!(
                     who.email.contains('@'),
-                    "The server didn't say which address signed in. Enter your email address and try again."
+                    t!("manage-backend-the-server-didnt-say-which-address")
                 );
             } else {
                 who.email = account.email.clone();
@@ -601,7 +601,7 @@ impl Backend {
         }
         ensure!(
             account.email.is_empty() || account.email.eq_ignore_ascii_case(&who.email),
-            "Choose the same email address to reconnect this mailbox."
+            t!("manage-backend-choose-the-same-email-address-to")
         );
         if account.email.is_empty() {
             account.email = who.email;
@@ -629,8 +629,7 @@ impl Backend {
         account.validate()?;
         ensure!(
             !taken.iter().any(|e| e.eq_ignore_ascii_case(&account.email)),
-            "{} is already added.",
-            account.email
+            t!("manage-backend-is-already-added", email = account.email)
         );
         self.step(cancel, SignInStep::Mailbox);
         let lock = self.account_lock(&account.id);
@@ -646,7 +645,7 @@ impl Backend {
             }
             return Err(e);
         }
-        ensure!(!cancel.load(Ordering::Relaxed), "Sign-in cancelled.");
+        ensure!(!cancel.load(Ordering::Relaxed), t!("manage-backend-sign-in-cancelled"));
         // A replaced sign-in must not keep using the old session.
         self.disconnect(&account.id);
         self.save_credentials(&account.id, &secret)?;
@@ -675,14 +674,7 @@ impl Backend {
                 // Microsoft issued a token, but its IMAP server refused the
                 // mailbox: IMAP is off in Outlook's settings (new accounts),
                 // or the sign-in address is not the mailbox address.
-                return Err(e.context(format!(
-                    "Microsoft signed you in, but Outlook's mail server refused {}. \
-                     Outlook.com turns IMAP off for new accounts: at outlook.live.com, open \
-                     Settings → Mail → Forwarding and IMAP, turn on IMAP, save, then choose Retry. If you sign in to \
-                     Microsoft with a different address than your Outlook address, make the \
-                     Outlook address your primary alias.",
-                    account.email
-                )));
+                return Err(e.context(t!("manage-backend-microsoft-signed-you-in-but-outlooks", email = account.email)));
             }
             other => other?,
         };
@@ -703,7 +695,7 @@ impl Backend {
                     .accounts()?
                     .into_iter()
                     .find(|o| o.id == a.credentials_of)
-                    .context("The account this one was shared with is gone. Remove this one.")?,
+                    .with_context(|| t!("manage-backend-the-account-this-one-was-shared"))?,
             )
         };
         let who = owner.as_ref().unwrap_or(a);
@@ -786,15 +778,13 @@ impl Backend {
             .accounts()?
             .into_iter()
             .find(|a| a.id == account)
-            .context("The account was removed.")?;
+            .with_context(|| t!("manage-backend-the-account-was-removed"))?;
         ensure!(
             !a.email.eq_ignore_ascii_case(identity.email.trim())
                 && !a.identities.iter().any(|i| {
                     i.id != identity.id && i.email.eq_ignore_ascii_case(identity.email.trim())
                 }),
-            "{} already sends as {}.",
-            a.email,
-            identity.email.trim()
+            t!("manage-backend-already-sends-as", email = a.email, address = identity.email.trim())
         );
         if let Some(endpoint) = crate::sync::smtp::Endpoint::of_identity(&identity) {
             let secret = match password.filter(|p| !p.is_empty()) {
@@ -804,10 +794,10 @@ impl Backend {
                 },
                 None => self
                     .identity_secret(&identity)
-                    .context("Enter the password for its outgoing server.")?,
+                    .with_context(|| t!("manage-backend-enter-the-password-for-its-outgoing"))?,
             };
             crate::sync::smtp::check_server(&endpoint, &secret.password, &self.tls_connector()?)
-                .with_context(|| format!("Couldn't sign in to {}", endpoint.host))?;
+                .with_context(|| t!("manage-backend-couldnt-sign-in-to", host = endpoint.host))?;
             #[cfg(test)]
             let saved = self.test_secret.is_some();
             #[cfg(not(test))]
@@ -840,7 +830,7 @@ impl Backend {
             .accounts()?
             .into_iter()
             .find(|a| a.id == account)
-            .context("The account was removed.")?;
+            .with_context(|| t!("manage-backend-the-account-was-removed"))?;
         if let Some(i) = a.identity(id).cloned() {
             self.forget_identity_secret(&i);
         }
@@ -876,9 +866,7 @@ impl Backend {
             .collect();
         ensure!(
             sharing.is_empty(),
-            "Remove {} first: {} with this account's sign-in.",
-            sharing.join(", "),
-            if sharing.len() == 1 { "it was shared" } else { "they were shared" }
+            t!("manage-backend-remove-first-with-this-accounts-sign", accounts = sharing.join(", "), count = sharing.len())
         );
         let lock = self.account_lock(id);
         let _operation = lock.lock().unwrap();
@@ -967,7 +955,7 @@ impl Backend {
             ensure!(
                 self.saved_credentials(&next.id)
                     .is_ok_and(|s| !s.password.is_empty()),
-                "This account has no saved password. Sign in again with the password to stop using Kerberos."
+                t!("manage-backend-this-account-has-no-saved-password")
             );
         }
         // The connections signed in the old way are replaced.
@@ -989,8 +977,8 @@ impl Backend {
                 .into_iter()
                 .find(|o| o.id == account.credentials_of)
                 .map(|o| o.label().to_owned())
-                .unwrap_or_else(|| "the account it was shared with".into());
-            bail!("This account signs in as {owner}: sign in again there.");
+                .unwrap_or_else(|| t!("manage-backend-the-account-it-was-shared-with").into());
+            bail!(t!("manage-backend-this-account-signs-in-as-sign", owner = owner));
         }
         let mut next = account.clone();
         if next.oauth && next.client_secret.is_empty() {
@@ -1031,7 +1019,7 @@ impl Backend {
         let mut s = self.credentials(a)?;
         ensure!(
             !s.mail_bundle.is_empty(),
-            "This account's mail is not encrypted."
+            t!("manage-backend-this-accounts-mail-is-not-encrypted")
         );
         let bundle: crate::manage::crypto::KeyBundle = serde_json::from_str(&s.mail_bundle)?;
         let secret = secret.trim_end_matches(['\r', '\n']);
@@ -1403,8 +1391,7 @@ impl Backend {
             // Accounts added before encryption existed have no key bundle.
             ensure!(
                 a.service != Service::Pinal || !self.credentials(a)?.mail_bundle.is_empty(),
-                "This message is encrypted. Remove this Pinal account and add it again so \
-                 Picacho receives your encryption keys."
+                t!("manage-backend-this-message-is-encrypted-remove-this")
             );
             return Err(crate::manage::crypto::Locked.into());
         };
@@ -1797,7 +1784,7 @@ impl Backend {
             // them. A batch with no headers at all would never finish.
             ensure!(
                 next.is_empty() || !added.is_empty(),
-                "The server omitted requested headers; cached mail has been kept. Refresh to retry."
+                t!("manage-backend-the-server-omitted-requested-headers-cached")
             );
             self.store.save_messages(&added)?;
             Ok(Catalog {
@@ -1833,7 +1820,7 @@ impl Backend {
             let selected = c.selected(&layout.remote)?;
             ensure!(
                 selected.validity == layout.validity,
-                "The server reset this mailbox's message identities. Refresh this mailbox."
+                t!("manage-backend-the-server-reset-this-mailboxs-message")
             );
             let added = self.list_uids(
                 c,
@@ -2156,7 +2143,7 @@ impl Backend {
                 };
                 ensure!(
                     !result.iter().any(|m: &Mail| m.uid == row.uid),
-                    "Duplicate IMAP flags response"
+                    t!("manage-backend-duplicate-imap-flags-response")
                 );
                 let mut m = old.clone();
                 m.unread = !row.seen();
@@ -2182,7 +2169,7 @@ impl Backend {
                 newest
                     .iter()
                     .all(|uid| !current.contains(uid) || fetched.contains(uid)),
-                "The server omitted requested headers; cached mail has been kept. Refresh to retry."
+                t!("manage-backend-the-server-omitted-requested-headers-cached")
             );
             all_ids.retain(|id| {
                 id.rsplit(':')
@@ -2295,7 +2282,7 @@ impl Backend {
             };
             ensure!(
                 !result.iter().any(|m| m.uid == row.uid),
-                "Duplicate IMAP header response"
+                t!("manage-backend-duplicate-imap-header-response")
             );
             bytes += header.len();
             let id = format!("{}:{remote}:{validity}:{}", a.id, row.uid);
@@ -2343,7 +2330,7 @@ impl Backend {
         let uidl = m
             .id
             .strip_prefix(&format!("{}:pop:", a.id))
-            .context("This message isn't from this POP3 account.")?;
+            .with_context(|| t!("manage-backend-this-message-isnt-from-this-pop3"))?;
         let secret = self.credentials(a)?;
         let mut pop = self.pop_login(a, pop_secret(a, &secret))?;
         let ids = pop.identities(256 * 1024)?;
@@ -2351,7 +2338,7 @@ impl Backend {
         let (number, _) = ids
             .iter()
             .find(|(_, u)| u == uidl)
-            .context("This message is no longer on the POP3 server.")?;
+            .with_context(|| t!("manage-backend-this-message-is-no-longer-on"))?;
         pop.command(&format!("RETR {number}"))?;
         let raw = pop.multiline(MAX_MESSAGE)?;
         let _ = pop.command("QUIT");
@@ -2773,7 +2760,7 @@ impl Backend {
                             .collect();
                         handles
                             .into_iter()
-                            .map(|h| h.join().unwrap_or_else(|_| Err(anyhow::anyhow!("A download failed."))))
+                            .map(|h| h.join().unwrap_or_else(|_| Err(anyhow::anyhow!(t!("manage-backend-a-download-failed")))))
                             .collect()
                     });
                     got.extend(part.iter().map(|(m, _)| *m).zip(downloaded));
@@ -2818,7 +2805,7 @@ impl Backend {
         self.read(a, m)?;
         self.store
             .raw(&m.id)?
-            .context("The original message is not available offline.")
+            .with_context(|| t!("manage-backend-the-original-message-is-not-available"))
     }
     /// What a delivery report (DSN, RFC 3464) says of each recipient:
     /// `None` until `m`'s source is downloaded, then `Some(None)` where it
@@ -2920,11 +2907,11 @@ impl Backend {
                         .iter()
                         .filter(|f| f.uid == Some(m.uid))
                         .find_map(|f| f.body())
-                        .context("Message no longer exists on the server")?
+                        .with_context(|| t!("manage-backend-message-no-longer-exists-on-the"))?
                         .to_vec();
                     ensure!(
                         raw.len() <= large::MAX_DOWNLOAD,
-                        "Message exceeds the download limit."
+                        t!("manage-backend-message-exceeds-the-download-limit")
                     );
                     Ok(raw)
                 })?,
@@ -3047,7 +3034,7 @@ impl Backend {
     ) -> Result<FolderChange> {
         ensure!(
             Self::can_manage_folders(a),
-            "This account's folders aren't kept on the server."
+            t!("manage-backend-this-accounts-folders-arent-kept-on")
         );
         let lock = self.account_lock(&a.id);
         let _operation = lock.lock().unwrap();
@@ -3064,13 +3051,13 @@ impl Backend {
             let namespace = c.namespace()?;
             let name = new_folder_name(&names, a.provider, parent, leaf, namespace.as_deref())?;
             if let Some(parent) = parent {
-                c.require_rights(parent, "k", "make folders")?;
+                c.require_rights(parent, "k", t!("manage-backend-make-folders"))?;
             }
             let label = decode_name(&name);
             let wire = c.mailbox(&name)?;
             allowed(
                 c.session.run_command_and_check_ok(format!("CREATE {wire}")),
-                || format!("create “{label}”"),
+                || t!("manage-backend-create", label = label),
             )?;
             subscribe(c, &name)?;
             Ok(FolderChange {
@@ -3093,7 +3080,7 @@ impl Backend {
     ) -> Result<FolderChange> {
         ensure!(
             Self::can_manage_folders(a),
-            "This account's folders aren't kept on the server."
+            t!("manage-backend-this-accounts-folders-arent-kept-on")
         );
         let lock = self.account_lock(&a.id);
         let _operation = lock.lock().unwrap();
@@ -3108,7 +3095,7 @@ impl Backend {
             let namespace = c.namespace()?;
             let next = renamed_folder_name(&names, a.provider, name, leaf, namespace.as_deref())?;
             if next != name {
-                c.require_rights(name, "x", "rename the folder")?;
+                c.require_rights(name, "x", t!("manage-backend-rename-the-folder"))?;
             }
             if next == name {
                 return Ok(FolderChange {
@@ -3131,7 +3118,7 @@ impl Backend {
             allowed(
                 c.session
                     .run_command_and_check_ok(format!("RENAME {from} {to}")),
-                || format!("rename “{label}”"),
+                || t!("manage-backend-rename", label = label),
             )?;
             for (old, new) in &moved {
                 subscribe(c, new)?;
@@ -3164,7 +3151,7 @@ impl Backend {
     pub fn delete_remote_folder(&self, a: &Account, name: &str) -> Result<Vec<RemoteFolder>> {
         ensure!(
             Self::can_manage_folders(a),
-            "This account's folders aren't kept on the server."
+            t!("manage-backend-this-accounts-folders-arent-kept-on")
         );
         let lock = self.account_lock(&a.id);
         let _operation = lock.lock().unwrap();
@@ -3177,11 +3164,11 @@ impl Backend {
         let folders = self.with_imap(a, |c| {
             let names = c.names(true)?.to_vec();
             deletable(&names, a.provider, name)?;
-            c.require_rights(name, "x", "delete the folder")?;
+            c.require_rights(name, "x", t!("manage-backend-delete-the-folder"))?;
             c.leave(name)?;
             let label = decode_name(name);
             let wire = c.wire(name);
-            allowed(c.session.delete(&wire), || format!("delete “{label}”"))?;
+            allowed(c.session.delete(&wire), || t!("manage-backend-delete", label = label))?;
             // Its subscription goes too (RFC 3501 §6.3.4 leaves it): a
             // folder of that name made later isn't subscribed unasked.
             let _ = c.session.unsubscribe(&wire);
@@ -3199,14 +3186,14 @@ impl Backend {
         let _operation = lock.lock().unwrap();
         ensure!(
             mails.iter().all(|m| m.account == a.id),
-            "Message belongs to another account"
+            t!("manage-backend-message-belongs-to-another-account")
         );
         ensure!(
             a.provider != Provider::Gmail
                 || mails
                     .iter()
                     .all(|m| matches!(m.folder, Folder::Trash | Folder::Junk)),
-            "Gmail deletes mail for good only from Trash and Spam. Move it to Trash first."
+            t!("manage-backend-gmail-deletes-mail-for-good-only")
         );
         if mails.is_empty() {
             return Ok(());
@@ -3246,7 +3233,7 @@ impl Backend {
             }
             for (first, uids) in groups {
                 let selected = c.select_for(first)?;
-                c.require_rights(&first.remote_folder, "te", "delete messages")?;
+                c.require_rights(&first.remote_folder, "te", t!("manage-backend-delete-messages"))?;
                 for chunk in uids.chunks(200) {
                     c.erase(chunk)?;
                     if let Some(mut state) = self.store.mailbox_state(&a.id, &first.remote_folder)?
@@ -3283,7 +3270,7 @@ impl Backend {
     pub fn empty_mailbox(&self, a: &Account, folder: Folder) -> Result<usize> {
         ensure!(
             matches!(folder, Folder::Trash | Folder::Junk),
-            "Only Trash and Spam can be emptied."
+            t!("manage-backend-only-trash-and-spam-can-be")
         );
         if a.provider == Provider::Pop3 {
             // Deleted by id: their text needn't be read.
@@ -3303,7 +3290,7 @@ impl Backend {
         let count = self.with_imap(a, |c| {
             let remote = resolve_in(c.names(false)?, a.provider, folder)?;
             c.select(&remote)?;
-            c.require_rights(&remote, "te", "delete messages")?;
+            c.require_rights(&remote, "te", t!("manage-backend-delete-messages"))?;
             let uids: Vec<u32> = c.uid_search("ALL")?.into_iter().collect();
             for chunk in uids.chunks(500) {
                 c.erase(chunk)?;
@@ -3399,7 +3386,7 @@ impl Backend {
             }
         }
         pop.quit()
-            .context("The POP3 server didn't confirm deleting downloaded mail; it is checked again next time.")
+            .with_context(|| t!("manage-backend-the-pop3-server-didnt-confirm-deleting"))
     }
     /// UIDLs of POP3 mail deleted here for good, which stays on the server
     /// unless `pop_delete_with_local` deletes it at the next check.
@@ -3466,7 +3453,7 @@ impl Backend {
         let _operation = lock.lock().unwrap();
         let mut current = Vec::new();
         for m in mails {
-            ensure!(m.account == a.id, "Message belongs to another account");
+            ensure!(m.account == a.id, t!("manage-backend-message-belongs-to-another-account"));
             let next = self.store.message(&m.id)?.unwrap_or_else(|| m.clone());
             if !change.moved_already(&next) {
                 current.push(next);
@@ -3477,7 +3464,7 @@ impl Backend {
         }
         ensure!(
             !matches!(change, Change::MoveTo(_)) || Self::can_manage_folders(a),
-            "This account's folders aren't kept on the server."
+            t!("manage-backend-this-accounts-folders-arent-kept-on")
         );
         if a.provider == Provider::Proton {
             // Changes made while offline go first, in order.
@@ -3541,15 +3528,14 @@ impl Backend {
                 let names = c.names(true)?;
                 ensure!(
                     custom_folders(names).iter().any(|f| &f.name == name),
-                    "The folder “{}” is no longer on the server.",
-                    decode_name(name)
+                    t!("manage-backend-the-folder-is-no-longer-on", folder = decode_name(name))
                 );
                 Some(name.clone())
             }
             _ => None,
         };
         if let Some(target) = &target {
-            c.require_rights(target, "i", "put messages")?;
+            c.require_rights(target, "i", t!("manage-backend-put-messages"))?;
         }
         let gmail = c.extensions()?.gmail;
         let label = match &change {
@@ -3569,28 +3555,27 @@ impl Backend {
         for (first, uids) in groups {
             let selected = c.select_for(first)?;
             c.require_writable(match &change {
-                Change::Move(_) | Change::MoveTo(_) => "move messages out",
-                Change::Label(..) => "change labels",
-                _ => "change messages",
+                Change::Move(_) | Change::MoveTo(_) => t!("manage-backend-move-messages-out"),
+                Change::Label(..) => t!("manage-backend-change-labels"),
+                _ => t!("manage-backend-change-messages"),
             })?;
             if target.is_some() {
-                c.require_rights(&first.remote_folder, "te", "remove messages")?;
+                c.require_rights(&first.remote_folder, "te", t!("manage-backend-remove-messages"))?;
             }
             if matches!(change, Change::Label(_, true)) && !gmail {
                 // Servers say in SELECT whether new keywords stick.
                 ensure!(
                     selected.keywords,
-                    "This server doesn't allow new labels in “{}”.",
-                    decode_name(&first.remote_folder)
+                    t!("manage-backend-this-server-doesnt-allow-new-labels", folder = decode_name(&first.remote_folder))
                 );
             }
             if label.is_some() {
-                c.require_rights(&first.remote_folder, "w", "change labels")?;
+                c.require_rights(&first.remote_folder, "w", t!("manage-backend-change-labels"))?;
             }
             // RFC 4314 §2.1: \Seen needs `s`, \Flagged and others `w`.
             match &change {
-                Change::Read(_) => c.require_rights(&first.remote_folder, "s", "mark messages read")?,
-                Change::Star(_) => c.require_rights(&first.remote_folder, "w", "star messages")?,
+                Change::Read(_) => c.require_rights(&first.remote_folder, "s", t!("manage-backend-mark-messages-read"))?,
+                Change::Star(_) => c.require_rights(&first.remote_folder, "w", t!("manage-backend-star-messages"))?,
                 _ => {}
             }
             // Moving mail into or out of Spam tells the server's spam
@@ -3796,7 +3781,7 @@ impl Backend {
             self.with_imap(a, |c| {
                 let remote = remote_name(c.names(false)?, a, mailbox)?;
                 c.selected(&remote)?;
-                c.require_writable("mark messages read")?;
+                c.require_writable(t!("manage-backend-mark-messages-read"))?;
                 let unseen: Vec<u32> = c.uid_search("UNSEEN")?.into_iter().collect();
                 if !unseen.is_empty() {
                     c.session
@@ -3872,9 +3857,7 @@ impl Backend {
         self.with_imap(a, |c| {
             let mut stored = shared;
             for group in groups {
-                c.select_for(group[0]).context(
-                    "Could not download messages from their mailbox. Refresh that mailbox first.",
-                )?;
+                c.select_for(group[0]).with_context(|| t!("manage-backend-could-not-download-messages-from-their"))?;
                 let uids: Vec<u32> = group.iter().map(|m| m.uid).collect();
                 for chunk in uids.chunks(10) {
                     // Someone is opening a message: let them have the
@@ -3956,7 +3939,7 @@ impl Backend {
             return Ok(plan);
         }
         let latest = messages.first().map_or(sub.unsubscribe.as_str(), |m| m.list_unsubscribe.as_str());
-        Plan::new(None, latest).context("This sender offers no way to unsubscribe.")
+        Plan::new(None, latest).with_context(|| t!("manage-backend-this-sender-offers-no-way-to"))
     }
     /// Carries out a plan from `unsubscribe_plan`: one click, or a message
     /// sent from `a`, or the page to open.
@@ -4076,8 +4059,7 @@ impl Backend {
             let accounts = self.store.accounts()?;
             ensure!(
                 !crate::manage::forwarding::requires_alias(&forwarding, &accounts, &a.id),
-                "{} sends only as its aliases (Settings → Forwarding). Choose an alias in From.",
-                a.email
+                t!("manage-backend-sends-only-as-its-aliases-settings", email = a.email)
             );
         }
         crate::manage::forwarding::verify_alias(&self.store, d)?;
@@ -4172,7 +4154,7 @@ impl Backend {
             let from = envelope
                 .from()
                 .map(|f| f.to_string())
-                .context("The message has no sender.")?;
+                .with_context(|| t!("manage-backend-the-message-has-no-sender"))?;
             let to: Vec<String> = envelope.to().iter().map(|t| t.to_string()).collect();
             let receipts = if a.provider == Provider::Jmap {
                 // Encryption all the way and delivery reports, as SMTP
@@ -4225,26 +4207,13 @@ impl Backend {
         let sent_raw = delivered.raw;
         let mut notes = Vec::new();
         if !unchecked.is_empty() {
-            notes.push(format!(
-                "It was encrypted to {} found automatically for {}. Compare {} fingerprint with {} in Settings → Encryption.",
-                if unchecked.len() == 1 { "a key" } else { "keys" },
-                unchecked.join(", "),
-                if unchecked.len() == 1 { "its" } else { "each" },
-                if unchecked.len() == 1 { "its owner" } else { "their owners" },
-            ));
+            notes.push(t!("manage-backend-it-was-encrypted-to-keys-found", count = unchecked.len(), addresses = unchecked.join(", ")));
         }
         if !unprotected.is_empty() {
-            notes.push(format!(
-                "It may bounce at {}: encryption all the way was required, and {} no MTA-STS policy or DANE records for servers to insist on it by.",
-                unprotected.join(", "),
-                if unprotected.len() == 1 { "that domain publishes" } else { "those domains publish" }
-            ));
+            notes.push(t!("manage-backend-it-may-bounce-at", count = unprotected.len(), domains = unprotected.join(", ")));
         }
         if delivered.receipts_unsupported {
-            notes.push(format!(
-                "{} can't request delivery receipts, so none were asked for.",
-                a.smtp_host
-            ));
+            notes.push(t!("manage-backend-cant-request-delivery-receipts", host = a.smtp_host));
         }
         // Gmail and Outlook save what goes through their own servers
         // themselves. Custom IMAP servers do not, nor does anyone save what
@@ -4272,13 +4241,11 @@ impl Backend {
                 Ok(()) => {}
                 // It will never fit: nothing to try again.
                 Err(e) if e.is::<TooLargeForSent>() => {
-                    notes.push(format!("A copy wasn't saved in Sent: {e:#}"));
+                    notes.push(t!("manage-backend-a-copy-wasnt-saved-in-sent", error = format!("{:#}", e)));
                 }
                 Err(e) => match self.queue_sent_copy(&a.id, &raw) {
-                    Ok(()) => notes.push(format!(
-                        "A copy couldn't be saved in Sent yet ({e:#}); Picacho will try again with the next mail check."
-                    )),
-                    Err(_) => notes.push(format!("A copy wasn't saved in Sent: {e:#}")),
+                    Ok(()) => notes.push(t!("manage-backend-a-copy-couldnt-be-saved-in", error = format!("{:#}", e))),
+                    Err(_) => notes.push(t!("manage-backend-a-copy-wasnt-saved-in-sent", error = format!("{:#}", e))),
                 },
             }
         }
@@ -4416,7 +4383,7 @@ impl Backend {
                 None => c.append_heard(&wire, &raw, &flags)?,
             };
             let (validity, uid) = crate::sync::transport::append_uid(&heard)
-                .context("The server didn't say where it filed the message.")?;
+                .with_context(|| t!("manage-backend-the-server-didnt-say-where-it"))?;
             let url = c.submit_url(&a.incoming_host, a.incoming_port, a.login(), &wire, validity, uid);
             Ok((sent, validity, uid, url))
         });
@@ -4920,7 +4887,7 @@ impl Backend {
                 let copies = draft_copies(&mut c.session, esearch, &d.id, floor)?;
                 let Some(uid) = given.or_else(|| copies.iter().copied().filter(|u| *u > floor).max())
                 else {
-                    bail!("The server didn't keep the uploaded draft.");
+                    bail!(t!("manage-backend-the-server-didnt-keep-the-uploaded"));
                 };
                 floor = floor.max(uid);
                 // Earlier copies of this draft, by its id or where it was.
@@ -4962,8 +4929,8 @@ impl Backend {
             && crate::manage::crypto::encrypted_part(raw).is_none()
         {
             let (plain, verdict, _) = crate::manage::smime::open(raw, &self.certificates())
-                .context("A draft on the server is encrypted to a certificate this device doesn't have.")?;
-            ensure!(verdict.decrypted, "A draft on the server couldn't be decrypted.");
+                .with_context(|| t!("manage-backend-a-draft-on-the-server-is"))?;
+            ensure!(verdict.decrypted, t!("manage-backend-a-draft-on-the-server-couldnt"));
             let mut d = self.draft_from(a, id, &plain)?;
             d.encrypt = true;
             d.smime = true;
@@ -4973,8 +4940,8 @@ impl Backend {
         if sealed {
             let ring = self.keyring();
             let (plain, verdict) = crate::manage::openpgp::open(raw, &ring)
-                .context("A draft on the server is encrypted to a key this device doesn't have.")?;
-            ensure!(verdict.decrypted, "A draft on the server couldn't be decrypted.");
+                .with_context(|| t!("manage-backend-a-draft-on-the-server-is-2"))?;
+            ensure!(verdict.decrypted, t!("manage-backend-a-draft-on-the-server-couldnt"));
             let mut d = self.draft_from(a, id, &plain)?;
             d.encrypt = true;
             d.encrypt_subject = mailparse::parse_headers(raw).is_ok_and(|(h, _)| {
@@ -5047,7 +5014,7 @@ impl Backend {
                 self.fetch_attachment(c, m, &attachment)
             });
         }
-        let raw = self.store.raw(&m.id)?.context("Open this message first")?;
+        let raw = self.store.raw(&m.id)?.with_context(|| t!("manage-backend-open-this-message-first"))?;
         // Decrypting may read the account's keys: briefly, under its lock.
         let (_, raw) = {
             let lock = self.account_lock(&a.id);
@@ -5059,7 +5026,7 @@ impl Backend {
         collect_leaves(&parsed, &mut leaves);
         leaves
             .get(part)
-            .context("Attachment not found")?
+            .with_context(|| t!("manage-backend-attachment-not-found"))?
             .get_body_raw()
             .map_err(Into::into)
     }
@@ -5124,11 +5091,7 @@ const BURL_FROM: u64 = 1024 * 1024;
 struct TooLargeForSent(u64);
 impl std::fmt::Display for TooLargeForSent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "it's larger than the server keeps ({} KB)",
-            self.0 / 1024
-        )
+        f.write_str(&t!("manage-backend-its-larger-than-the-server-keeps", kb = self.0 / 1024))
     }
 }
 impl std::error::Error for TooLargeForSent {}
@@ -5240,7 +5203,7 @@ fn remote_name(names: &[Name], a: &Account, mailbox: &Mailbox) -> Result<String>
         Mailbox::Remote(name) => {
             ensure!(
                 names.iter().any(|n| &n.name == name),
-                "The folder “{name}” no longer exists on the server."
+                t!("manage-backend-the-folder-no-longer-exists-on", name = name)
             );
             name.clone()
         }

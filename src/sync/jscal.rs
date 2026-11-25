@@ -113,7 +113,7 @@ fn query_all(s: &Session, method: &str, account: &str, filter: Value) -> Result<
 }
 /// An event's version on the server now (`event_version`), by id.
 pub fn version_of(s: &Session, id: &str) -> Result<String> {
-    let account = s.calendars_account().context("This JMAP server has no calendars.")?;
+    let account = s.calendars_account().with_context(|| t!("sync-jscal-this-jmap-server-has-no-calendars"))?;
     let (list, _) = get_all(s, "CalendarEvent/get", account, &[id.to_owned()])?;
     Ok(list.first().map(event_version).unwrap_or_default())
 }
@@ -156,7 +156,7 @@ pub struct JmapCalendar {
 
 /// The calendars of the sign-in's calendar account.
 pub fn calendars(s: &Session) -> Result<Vec<JmapCalendar>> {
-    let account = s.calendars_account().context("This JMAP server has no calendars.")?;
+    let account = s.calendars_account().with_context(|| t!("sync-jscal-this-jmap-server-has-no-calendars"))?;
     let v = s.call_one(
         "Calendar/get",
         json!({ "accountId": account, "ids": null }),
@@ -196,7 +196,7 @@ pub fn collection_changes(s: &Session, kind: &str, since: &str) -> Result<Option
         "Principal" | "ShareNotification" => s.principals_account(),
         _ => bail!("Not a kind with /changes here: {kind}"),
     }
-    .context("This JMAP server doesn't keep those.")?
+    .with_context(|| t!("sync-jscal-this-jmap-server-doesnt-keep-those"))?
     .to_owned();
     changes(s, &format!("{kind}/changes"), &account, since)
 }
@@ -213,7 +213,7 @@ pub fn query_changes(s: &Session, kind: &str, filter: Value, since: &str) -> Res
         "ContactCard" => s.contacts_account(),
         _ => bail!("Not a kind with /queryChanges here: {kind}"),
     }
-    .context("This JMAP server doesn't keep those.")?
+    .with_context(|| t!("sync-jscal-this-jmap-server-doesnt-keep-those"))?
     .to_owned();
     let v = match s.call_one(
         &format!("{kind}/queryChanges"),
@@ -251,7 +251,7 @@ pub fn copy_from(s: &Session, kind: &str, from_account: &str, ids: &[String], in
         "ContactCard" => (s.contacts_account(), "addressBookIds"),
         _ => bail!("Not a kind with /copy here: {kind}"),
     };
-    let account = account.context("This JMAP server doesn't keep those.")?.to_owned();
+    let account = account.with_context(|| t!("sync-jscal-this-jmap-server-doesnt-keep-those"))?.to_owned();
     let mut out = std::collections::HashMap::new();
     for chunk in ids.chunks(s.max_set()) {
         let create: Map<String, Value> = chunk
@@ -264,7 +264,7 @@ pub fn copy_from(s: &Session, kind: &str, from_account: &str, ids: &[String], in
         }
         let v = s.call_one(&format!("{kind}/copy"), args)?;
         if let Some((id, e)) = v["notCreated"].as_object().and_then(|m| m.iter().next()) {
-            bail!("The server didn't copy {id}: {}", e["type"].as_str().unwrap_or("refused"));
+            bail!(t!("sync-jscal-the-server-didnt-copy", id = id, error = e["type"].as_str().unwrap_or(t!("sync-jscal-refused"))));
         }
         out.extend(
             v["created"]
@@ -283,7 +283,7 @@ pub fn copy_from(s: &Session, kind: &str, from_account: &str, ids: &[String], in
 // server.
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn parse_events(s: &Session, blobs: &[String]) -> Result<std::collections::HashMap<String, Vec<ical::Event>>> {
-    let account = s.calendars_account().context("This JMAP server has no calendars.")?.to_owned();
+    let account = s.calendars_account().with_context(|| t!("sync-jscal-this-jmap-server-has-no-calendars"))?.to_owned();
     let v = s.call_one("CalendarEvent/parse", json!({ "accountId": account, "blobIds": blobs }))?;
     Ok(v["parsed"]
         .as_object()
@@ -332,16 +332,16 @@ pub fn share_with(s: &Session, kind: &str, id: &str, with: &Map<String, Value>) 
     let account = match kind {
         "Calendar" => s.calendars_account(),
         "AddressBook" => s.contacts_account(),
-        _ => bail!("Only calendars and address books are shared this way."),
+        _ => bail!(t!("sync-jscal-only-calendars-and-address-books-are")),
     }
-    .context("This JMAP server doesn't keep those.")?
+    .with_context(|| t!("sync-jscal-this-jmap-server-doesnt-keep-those"))?
     .to_owned();
     let v = s.call_one(
         &format!("{kind}/set"),
         json!({ "accountId": account, "update": { id: { "shareWith": with } } }),
     )?;
     if let Some(e) = v["notUpdated"].get(id) {
-        bail!("The server didn't share it: {}", e["description"].as_str().or(e["type"].as_str()).unwrap_or("refused"));
+        bail!(t!("sync-jscal-the-server-didnt-share-it", error = e["description"].as_str().or(e["type"].as_str()).unwrap_or(t!("sync-jscal-refused"))));
     }
     Ok(())
 }
@@ -361,7 +361,7 @@ pub struct Principal {
 // Backend-only until the UI calls it: the directory of people.
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn principals(s: &Session, ids: Option<&[String]>) -> Result<Vec<Principal>> {
-    let account = s.principals_account().context("This JMAP server has no directory of people.")?.to_owned();
+    let account = s.principals_account().with_context(|| t!("sync-jscal-this-jmap-server-has-no-directory"))?.to_owned();
     let v = s.call_one("Principal/get", json!({ "accountId": account, "ids": ids }))?;
     Ok(v["list"]
         .as_array()
@@ -383,10 +383,10 @@ pub fn principals(s: &Session, ids: Option<&[String]>) -> Result<Vec<Principal>>
 // Backend-only until the UI calls it: editing one's own directory entry.
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn update_principal(s: &Session, id: &str, patch: &Map<String, Value>) -> Result<()> {
-    let account = s.principals_account().context("This JMAP server has no directory of people.")?.to_owned();
+    let account = s.principals_account().with_context(|| t!("sync-jscal-this-jmap-server-has-no-directory"))?.to_owned();
     let v = s.call_one("Principal/set", json!({ "accountId": account, "update": { id: patch } }))?;
     if let Some(e) = v["notUpdated"].get(id) {
-        bail!("The server didn't change it: {}", e["description"].as_str().or(e["type"].as_str()).unwrap_or("refused"));
+        bail!(t!("sync-jscal-the-server-didnt-change-it", error = e["description"].as_str().or(e["type"].as_str()).unwrap_or(t!("sync-jscal-refused"))));
     }
     Ok(())
 }
@@ -931,7 +931,7 @@ pub fn events_in(
     from: i64,
     to: i64,
 ) -> Result<(Vec<JmapEvent>, String)> {
-    let account = s.calendars_account().context("This JMAP server has no calendars.")?;
+    let account = s.calendars_account().with_context(|| t!("sync-jscal-this-jmap-server-has-no-calendars"))?;
     let mut out = Vec::new();
     let mut state = String::new();
     for calendar in calendars {
@@ -981,7 +981,7 @@ pub fn event_changes(
     calendars: &[String],
     since: &str,
 ) -> Result<Option<EventChanges>> {
-    let account = s.calendars_account().context("This JMAP server has no calendars.")?;
+    let account = s.calendars_account().with_context(|| t!("sync-jscal-this-jmap-server-has-no-calendars"))?;
     let Some(changed) = changes(s, "CalendarEvent/changes", account, since)? else {
         return Ok(None);
     };
@@ -1047,7 +1047,7 @@ pub fn save_event_scheduled(
     in_state: Option<&str>,
     scheduling: Scheduling,
 ) -> Result<String> {
-    let account = s.calendars_account().context("This JMAP server has no calendars.")?;
+    let account = s.calendars_account().with_context(|| t!("sync-jscal-this-jmap-server-has-no-calendars"))?;
     let mut props = to_jscalendar(event, overrides);
     if scheduling != Scheduling::ByPicacho
         && let Some(Value::Object(people)) = props.get_mut("participants")
@@ -1090,16 +1090,16 @@ pub fn save_event_scheduled(
     };
     if let Some(id) = id {
         if let Some(e) = v["notUpdated"].get(id) {
-            bail!("The server didn't change the event: {}", e["description"].as_str().or(e["type"].as_str()).unwrap_or("refused"));
+            bail!(t!("sync-jscal-the-server-didnt-change-the-event", error = e["description"].as_str().or(e["type"].as_str()).unwrap_or(t!("sync-jscal-refused"))));
         }
         return Ok(id.to_owned());
     }
     if let Some(e) = v["notCreated"].get("e") {
-        bail!("The server didn't add the event: {}", e["description"].as_str().or(e["type"].as_str()).unwrap_or("refused"));
+        bail!(t!("sync-jscal-the-server-didnt-add-the-event", error = e["description"].as_str().or(e["type"].as_str()).unwrap_or(t!("sync-jscal-refused"))));
     }
     Ok(v["created"]["e"]["id"]
         .as_str()
-        .context("The server didn't say which event it added.")?
+        .with_context(|| t!("sync-jscal-the-server-didnt-say-which-event"))?
         .to_owned())
 }
 
@@ -1274,7 +1274,7 @@ fn merge_entries(props: &mut Map<String, Value>, current: &Value, key: &str, our
 /// `Scheduling::ByServer` has the server tell the participants it is
 /// cancelled.
 pub fn delete_event_scheduled(s: &Session, id: &str, scheduling: Scheduling) -> Result<()> {
-    let account = s.calendars_account().context("This JMAP server has no calendars.")?;
+    let account = s.calendars_account().with_context(|| t!("sync-jscal-this-jmap-server-has-no-calendars"))?;
     let v = s.call_one(
         "CalendarEvent/set",
         json!({ "accountId": account, "destroy": [id], "sendSchedulingMessages": scheduling.sends() }),
@@ -1282,23 +1282,23 @@ pub fn delete_event_scheduled(s: &Session, id: &str, scheduling: Scheduling) -> 
     if let Some(e) = v["notDestroyed"].get(id)
         && e["type"] != "notFound"
     {
-        bail!("The server didn't remove the event.");
+        bail!(t!("sync-jscal-the-server-didnt-remove-the-event"));
     }
     Ok(())
 }
 
 /// Makes a calendar named `name`, returning its id.
 pub fn create_calendar(s: &Session, name: &str, color: &str) -> Result<String> {
-    let account = s.calendars_account().context("This JMAP server has no calendars.")?;
+    let account = s.calendars_account().with_context(|| t!("sync-jscal-this-jmap-server-has-no-calendars"))?;
     let mut props = json!({ "name": name });
     if !color.is_empty() {
         props["color"] = json!(color);
     }
     let v = s.call_one("Calendar/set", json!({ "accountId": account, "create": { "c": props } }))?;
     if let Some(e) = v["notCreated"].get("c") {
-        bail!("The server didn't make the calendar: {}", e["type"].as_str().unwrap_or("refused"));
+        bail!(t!("sync-jscal-the-server-didnt-make-the-calendar", error = e["type"].as_str().unwrap_or(t!("sync-jscal-refused"))));
     }
-    Ok(v["created"]["c"]["id"].as_str().context("No calendar id.")?.to_owned())
+    Ok(v["created"]["c"]["id"].as_str().with_context(|| t!("sync-jscal-no-calendar-id"))?.to_owned())
 }
 
 // Contacts.
@@ -1313,7 +1313,7 @@ pub struct JmapBook {
 
 /// The address books of the sign-in's contacts account.
 pub fn address_books(s: &Session) -> Result<Vec<JmapBook>> {
-    let account = s.contacts_account().context("This JMAP server has no contacts.")?;
+    let account = s.contacts_account().with_context(|| t!("sync-jscal-this-jmap-server-has-no-contacts"))?;
     let v = s.call_one("AddressBook/get", json!({ "accountId": account, "ids": null }))?;
     Ok(v["list"]
         .as_array()
@@ -1692,7 +1692,7 @@ pub fn to_jscontact(card: &Card, before: Option<&Value>) -> Map<String, Value> {
 /// as blobs are reused from `known` (the cards as last read) where the
 /// blob is the same.
 pub fn cards_in(s: &Session, known: &[Card]) -> Result<(Vec<Card>, String, String)> {
-    let account = s.contacts_account().context("This JMAP server has no contacts.")?;
+    let account = s.contacts_account().with_context(|| t!("sync-jscal-this-jmap-server-has-no-contacts"))?;
     let books = address_books(s)?;
     // Every id by query, then the cards in pieces; a server without
     // ContactCard/query is asked for them all at once, as before.
@@ -1785,7 +1785,7 @@ fn jmap_card(c: &Value) -> Card {
 /// new state. `None` when the server can't say. Photos are as `cards_in`
 /// reads them.
 pub fn card_changes(s: &Session, since: &str, known: &[Card]) -> Result<Option<CardChanges>> {
-    let account = s.contacts_account().context("This JMAP server has no contacts.")?;
+    let account = s.contacts_account().with_context(|| t!("sync-jscal-this-jmap-server-has-no-contacts"))?;
     let Some(changed) = changes(s, "ContactCard/changes", account, since)? else {
         return Ok(None);
     };
@@ -1802,7 +1802,7 @@ pub fn card_changes(s: &Session, since: &str, known: &[Card]) -> Result<Option<C
 
 /// Creates or changes a card; returns it as saved.
 pub fn save_card(s: &Session, card: &Card, book: &str) -> Result<Card> {
-    let account = s.contacts_account().context("This JMAP server has no contacts.")?;
+    let account = s.contacts_account().with_context(|| t!("sync-jscal-this-jmap-server-has-no-contacts"))?;
     let before: Option<Value> = serde_json::from_str(&card.vcard).ok().filter(|v: &Value| v.is_object());
     let mut props = to_jscontact(card, before.as_ref());
     let existing = card.href.strip_prefix("jmap:").filter(|i| !i.is_empty());
@@ -1823,21 +1823,21 @@ pub fn save_card(s: &Session, card: &Card, book: &str) -> Result<Card> {
                 set_if_unchanged(s, "ContactCard", account, id, &card.etag, &state, args, card_version, CHANGED)?
             };
             if let Some(e) = v["notUpdated"].get(id) {
-                bail!("The server didn't change the contact: {}", e["type"].as_str().unwrap_or("refused"));
+                bail!(t!("sync-jscal-the-server-didnt-change-the-contact", error = e["type"].as_str().unwrap_or(t!("sync-jscal-refused"))));
             }
         }
         None => {
             let book = book.strip_prefix("jmap:").filter(|b| !b.is_empty());
-            let book = book.context("No address book on the server can take new contacts.")?;
+            let book = book.with_context(|| t!("sync-jscal-no-address-book-on-the-server"))?;
             props.insert("addressBookIds".into(), json!({ book: true }));
             let v = s.call_one(
                 "ContactCard/set",
                 json!({ "accountId": account, "create": { "c": props } }),
             )?;
             if let Some(e) = v["notCreated"].get("c") {
-                bail!("The server didn't add the contact: {}", e["type"].as_str().unwrap_or("refused"));
+                bail!(t!("sync-jscal-the-server-didnt-add-the-contact", error = e["type"].as_str().unwrap_or(t!("sync-jscal-refused"))));
             }
-            let id = v["created"]["c"]["id"].as_str().context("No contact id.")?;
+            let id = v["created"]["c"]["id"].as_str().with_context(|| t!("sync-jscal-no-contact-id"))?;
             saved.href = format!("jmap:{id}");
         }
     }
@@ -1853,8 +1853,8 @@ pub fn save_card(s: &Session, card: &Card, book: &str) -> Result<Card> {
 
 /// Removes a card.
 pub fn delete_card(s: &Session, card: &Card) -> Result<()> {
-    let account = s.contacts_account().context("This JMAP server has no contacts.")?;
-    let id = card.href.strip_prefix("jmap:").context("This contact isn't on the JMAP server.")?;
+    let account = s.contacts_account().with_context(|| t!("sync-jscal-this-jmap-server-has-no-contacts"))?;
+    let id = card.href.strip_prefix("jmap:").with_context(|| t!("sync-jscal-this-contact-isnt-on-the-jmap"))?;
     let v = s.call_one(
         "ContactCard/set",
         json!({ "accountId": account, "destroy": [id] }),
@@ -1862,22 +1862,22 @@ pub fn delete_card(s: &Session, card: &Card) -> Result<()> {
     if let Some(e) = v["notDestroyed"].get(id)
         && e["type"] != "notFound"
     {
-        bail!("The server didn't remove the contact.");
+        bail!(t!("sync-jscal-the-server-didnt-remove-the-contact"));
     }
     Ok(())
 }
 
 /// Makes an address book named `name`, returning its id.
 pub fn create_address_book(s: &Session, name: &str) -> Result<String> {
-    let account = s.contacts_account().context("This JMAP server has no contacts.")?;
+    let account = s.contacts_account().with_context(|| t!("sync-jscal-this-jmap-server-has-no-contacts"))?;
     let v = s.call_one(
         "AddressBook/set",
         json!({ "accountId": account, "create": { "b": { "name": name } } }),
     )?;
     if let Some(e) = v["notCreated"].get("b") {
-        bail!("The server didn't make the address book: {}", e["type"].as_str().unwrap_or("refused"));
+        bail!(t!("sync-jscal-the-server-didnt-make-the-address", error = e["type"].as_str().unwrap_or(t!("sync-jscal-refused"))));
     }
-    Ok(v["created"]["b"]["id"].as_str().context("No address book id.")?.to_owned())
+    Ok(v["created"]["b"]["id"].as_str().with_context(|| t!("sync-jscal-no-address-book-id"))?.to_owned())
 }
 
 /// When `attendees` are busy over `from..to`, from the server's directory
@@ -1893,12 +1893,12 @@ pub fn free_busy(
 ) -> Result<Vec<ical::FreeBusy>> {
     ensure!(
         s.has(crate::sync::jmap::PRINCIPALS),
-        "Your calendar server can't say when others are free."
+        t!("sync-jscal-your-calendar-server-cant-say-when")
     );
     let account = s
         .principals_account()
         .or_else(|| s.calendars_account())
-        .context("Your calendar server can't say when others are free.")?
+        .with_context(|| t!("sync-jscal-your-calendar-server-cant-say-when"))?
         .to_owned();
     let mut out = Vec::new();
     for email in attendees {
@@ -1989,25 +1989,25 @@ pub fn notices(s: &Session) -> Result<Vec<Notice>> {
                 .as_str()
                 .or(n["changedBy"]["email"].as_str())
                 .filter(|w| !w.is_empty())
-                .unwrap_or("Someone");
+                .unwrap_or(t!("sync-jscal-someone"));
             let text = if kind == "ShareNotification" {
-                let name = n["name"].as_str().unwrap_or("a calendar");
+                let name = n["name"].as_str().unwrap_or(t!("sync-jscal-a-calendar"));
                 if n["newRights"].is_null() {
-                    format!("{who} stopped sharing {name} with you.")
+                    t!("sync-jscal-stopped-sharing-with-you", who = who, name = name)
                 } else if n["oldRights"].is_null() {
-                    format!("{who} shared {name} with you.")
+                    t!("sync-jscal-shared-with-you", who = who, name = name)
                 } else {
-                    format!("{who} changed what you may do with {name}.")
+                    t!("sync-jscal-changed-what-you-may-do-with", who = who, name = name)
                 }
             } else {
                 let title = n["event"]["title"]
                     .as_str()
                     .or(n["eventPatch"]["title"].as_str())
-                    .unwrap_or("an event");
+                    .unwrap_or(t!("sync-jscal-an-event"));
                 match n["type"].as_str() {
-                    Some("created") => format!("{who} added {title}."),
-                    Some("destroyed") => format!("{who} removed {title}."),
-                    _ => format!("{who} changed {title}."),
+                    Some("created") => t!("sync-jscal-added", who = who, title = title),
+                    Some("destroyed") => t!("sync-jscal-removed", who = who, title = title),
+                    _ => t!("sync-jscal-changed", who = who, title = title),
                 }
             };
             out.push(Notice {
@@ -2041,7 +2041,7 @@ pub fn dismiss_notices(s: &Session, notices: &[Notice]) -> Result<()> {
 
 /// Renames a calendar (and changes its colour; empty: as it is).
 pub fn update_calendar(s: &Session, id: &str, name: &str, color: &str) -> Result<()> {
-    let account = s.calendars_account().context("This JMAP server has no calendars.")?;
+    let account = s.calendars_account().with_context(|| t!("sync-jscal-this-jmap-server-has-no-calendars"))?;
     let mut patch = json!({ "name": name });
     if !color.is_empty() {
         patch["color"] = json!(color);
@@ -2051,13 +2051,13 @@ pub fn update_calendar(s: &Session, id: &str, name: &str, color: &str) -> Result
         json!({ "accountId": account, "update": { id: patch } }),
     )?;
     if let Some(e) = v["notUpdated"].get(id) {
-        bail!("The server didn't rename the calendar: {}", e["type"].as_str().unwrap_or("refused"));
+        bail!(t!("sync-jscal-the-server-didnt-rename-the-calendar", error = e["type"].as_str().unwrap_or(t!("sync-jscal-refused"))));
     }
     Ok(())
 }
 /// Deletes a calendar with its events (`onDestroyRemoveEvents`).
 pub fn delete_calendar(s: &Session, id: &str) -> Result<()> {
-    let account = s.calendars_account().context("This JMAP server has no calendars.")?;
+    let account = s.calendars_account().with_context(|| t!("sync-jscal-this-jmap-server-has-no-calendars"))?;
     let v = s.call_one(
         "Calendar/set",
         json!({ "accountId": account, "destroy": [id], "onDestroyRemoveEvents": true }),
@@ -2065,25 +2065,25 @@ pub fn delete_calendar(s: &Session, id: &str) -> Result<()> {
     if let Some(e) = v["notDestroyed"].get(id)
         && e["type"] != "notFound"
     {
-        bail!("The server didn't delete the calendar: {}", e["type"].as_str().unwrap_or("refused"));
+        bail!(t!("sync-jscal-the-server-didnt-delete-the-calendar", error = e["type"].as_str().unwrap_or(t!("sync-jscal-refused"))));
     }
     Ok(())
 }
 /// Renames an address book.
 pub fn rename_address_book(s: &Session, id: &str, name: &str) -> Result<()> {
-    let account = s.contacts_account().context("This JMAP server has no contacts.")?;
+    let account = s.contacts_account().with_context(|| t!("sync-jscal-this-jmap-server-has-no-contacts"))?;
     let v = s.call_one(
         "AddressBook/set",
         json!({ "accountId": account, "update": { id: { "name": name } } }),
     )?;
     if let Some(e) = v["notUpdated"].get(id) {
-        bail!("The server didn't rename the address book: {}", e["type"].as_str().unwrap_or("refused"));
+        bail!(t!("sync-jscal-the-server-didnt-rename-the-address", error = e["type"].as_str().unwrap_or(t!("sync-jscal-refused"))));
     }
     Ok(())
 }
 /// Deletes an address book with its cards (`onDestroyRemoveContents`).
 pub fn delete_address_book(s: &Session, id: &str) -> Result<()> {
-    let account = s.contacts_account().context("This JMAP server has no contacts.")?;
+    let account = s.contacts_account().with_context(|| t!("sync-jscal-this-jmap-server-has-no-contacts"))?;
     let v = s.call_one(
         "AddressBook/set",
         json!({ "accountId": account, "destroy": [id], "onDestroyRemoveContents": true }),
@@ -2091,7 +2091,7 @@ pub fn delete_address_book(s: &Session, id: &str) -> Result<()> {
     if let Some(e) = v["notDestroyed"].get(id)
         && e["type"] != "notFound"
     {
-        bail!("The server didn't delete the address book: {}", e["type"].as_str().unwrap_or("refused"));
+        bail!(t!("sync-jscal-the-server-didnt-delete-the-address", error = e["type"].as_str().unwrap_or(t!("sync-jscal-refused"))));
     }
     Ok(())
 }
@@ -2100,14 +2100,14 @@ pub fn delete_address_book(s: &Session, id: &str) -> Result<()> {
 pub fn ensure_calendars(s: &Session) -> Result<()> {
     ensure!(
         s.calendars_account().is_some(),
-        "This JMAP server doesn't offer calendars."
+        t!("sync-jscal-this-jmap-server-doesnt-offer-calendars")
     );
     Ok(())
 }
 pub fn ensure_contacts(s: &Session) -> Result<()> {
     ensure!(
         s.contacts_account().is_some(),
-        "This JMAP server doesn't offer contacts."
+        t!("sync-jscal-this-jmap-server-doesnt-offer-contacts")
     );
     Ok(())
 }

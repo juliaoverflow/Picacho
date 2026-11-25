@@ -20,14 +20,13 @@ pub fn download(url: &str, max: u64, received: &AtomicU64) -> Result<Vec<u8>> {
     let response = client
         .get(url)
         .send()
-        .context("Couldn't reach the model download")?;
+        .with_context(|| t!("sync-models-couldnt-reach-the-model-download"))?;
     ensure!(
         response.status().is_success(),
-        "The model download answered {}",
-        response.status()
+        t!("sync-models-the-model-download-answered", status = response.status())
     );
     if let Some(length) = response.content_length() {
-        ensure!(length <= max, "The model download is larger than expected");
+        ensure!(length <= max, t!("sync-models-the-model-download-is-larger-than"));
     }
     let mut bytes = Vec::new();
     let mut body = response.take(max + 1);
@@ -36,7 +35,7 @@ pub fn download(url: &str, max: u64, received: &AtomicU64) -> Result<Vec<u8>> {
     loop {
         let n = body
             .read(&mut chunk)
-            .context("The model download was interrupted")?;
+            .with_context(|| t!("sync-models-the-model-download-was-interrupted"))?;
         if n == 0 {
             break;
         }
@@ -45,7 +44,7 @@ pub fn download(url: &str, max: u64, received: &AtomicU64) -> Result<Vec<u8>> {
     }
     ensure!(
         bytes.len() as u64 <= max,
-        "The model download is larger than expected"
+        t!("sync-models-the-model-download-is-larger-than")
     );
     Ok(bytes)
 }

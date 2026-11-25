@@ -77,14 +77,14 @@ pub(super) fn label_for(folders: &[proton::Folder], mailbox: &Mailbox) -> Result
             Folder::Junk => label_id::SPAM,
             Folder::Trash => label_id::TRASH,
             Folder::All => label_id::ALL_MAIL,
-            Folder::Other => bail!("Choose one of the account's folders."),
+            Folder::Other => bail!(t!("manage-proton-choose-one-of-the-accounts-folders")),
         }
         .to_owned(),
         Mailbox::Remote(name) => folders
             .iter()
             .find(|f| f.exclusive && &f.path == name)
             .map(|f| f.id.clone())
-            .with_context(|| format!("The folder “{name}” no longer exists at Proton."))?,
+            .with_context(|| t!("manage-proton-the-folder-no-longer-exists-at", name = name))?,
     })
 }
 
@@ -152,14 +152,14 @@ impl Backend {
     ) -> Result<ProtonNext> {
         self.proton_abandon();
         ensure!(proton::available(), "{}", proton::UNAVAILABLE);
-        ensure!(!password.is_empty(), "Enter your Proton password.");
+        ensure!(!password.is_empty(), t!("manage-proton-enter-your-proton-password"));
         account.validate()?;
         self.step(&cancel, SignInStep::Mailbox);
         let login = proton::Login::begin(account.login(), &password, &cancel, &|| {
             self.step(&cancel, SignInStep::Verifying)
         })?;
         self.step(&cancel, SignInStep::Mailbox);
-        ensure!(!cancel.load(Ordering::Relaxed), "Sign-in cancelled.");
+        ensure!(!cancel.load(Ordering::Relaxed), t!("manage-proton-sign-in-cancelled"));
         self.proton_advance(
             ProtonLogin {
                 account: account.clone(),
@@ -233,7 +233,7 @@ impl Backend {
             .lock()
             .unwrap()
             .take()
-            .context("This sign-in has ended. Start again with your password.")
+            .with_context(|| t!("manage-proton-this-sign-in-has-ended-start"))
     }
     /// Keeps the sign-in for its next step, or finishes it.
     fn proton_advance(&self, mut p: ProtonLogin, cancel: &AtomicBool) -> Result<ProtonNext> {
@@ -266,7 +266,7 @@ impl Backend {
         } = p;
         if cancel.load(Ordering::Relaxed) {
             proton::sign_out(&signed.saved);
-            bail!("Sign-in cancelled.");
+            bail!(t!("manage-proton-sign-in-cancelled"));
         }
         let existing = self
             .store
@@ -285,8 +285,7 @@ impl Backend {
             if existing.is_some() || signed.addresses.is_empty() {
                 proton::sign_out(&signed.saved);
                 bail!(
-                    "That Proton account doesn't have {}. Sign in to the account it belongs to.",
-                    account.email
+                    t!("manage-proton-that-proton-account-doesnt-have-sign", email = account.email)
                 );
             }
             account.email = signed.addresses[0].clone();
@@ -302,8 +301,7 @@ impl Backend {
             account.validate()?;
             ensure!(
                 !taken.iter().any(|e| e.eq_ignore_ascii_case(&account.email)),
-                "{} is already added.",
-                account.email
+                t!("manage-proton-is-already-added", email = account.email)
             );
             let lock = self.account_lock(&account.id);
             let _operation = lock.lock().unwrap();
@@ -650,11 +648,11 @@ impl Backend {
 
     /// Downloads and decrypts one message as MIME, and caches it.
     pub(super) fn download_proton(&self, a: &Account, m: &Mail) -> Result<Vec<u8>> {
-        let id = proton_id(a, m).context("This message isn't from Proton.")?;
+        let id = proton_id(a, m).with_context(|| t!("manage-proton-this-message-isnt-from-proton"))?;
         let raw = self.with_proton(a, |s| s.literal(id))?;
         ensure!(
             raw.len() <= large::MAX_DOWNLOAD,
-            "Message exceeds the download limit."
+            t!("manage-proton-message-exceeds-the-download-limit")
         );
         self.note_traffic(a, raw.len());
         self.store.save_raw(&m.id, &raw)?;
@@ -665,7 +663,7 @@ impl Backend {
     /// each attachment downloads when it is saved (`proton_attachment`),
     /// as for one through IMAP.
     pub(super) fn read_proton_parts(&self, a: &Account, m: &Mail) -> Result<Mail> {
-        let id = proton_id(a, m).context("This message isn't from Proton.")?;
+        let id = proton_id(a, m).with_context(|| t!("manage-proton-this-message-isnt-from-proton"))?;
         let (text, attachments) = self.with_proton(a, |s| s.text_only(id))?;
         let mut next = parse_message(&text, a, &m.id, m.folder, &m.remote_folder, m.uid)?;
         next.set_attachments(
@@ -698,7 +696,7 @@ impl Backend {
         m: &Mail,
         section: &str,
     ) -> Result<Vec<u8>> {
-        let id = proton_id(a, m).context("This message isn't from Proton.")?;
+        let id = proton_id(a, m).with_context(|| t!("manage-proton-this-message-isnt-from-proton"))?;
         self.with_proton(a, |s| s.attachment(id, section))
     }
 
@@ -772,7 +770,7 @@ impl Backend {
                     Folder::Archive => label_id::ARCHIVE,
                     Folder::Junk => label_id::SPAM,
                     Folder::Trash => label_id::TRASH,
-                    other => bail!("Proton doesn't move mail to {}.", other.label()),
+                    other => bail!(t!("manage-proton-proton-doesnt-move-mail-to", label = other.label())),
                 };
                 s.label_messages(target, &ids, true)
             }
@@ -986,7 +984,7 @@ impl Backend {
                 let raw = s.literal(id)?;
                 ensure!(
                     raw.len() <= MAX_MESSAGE,
-                    "A draft at Proton is too large to open here."
+                    t!("manage-proton-a-draft-at-proton-is-too")
                 );
                 let mut d = self.draft_from(a, &uuid::Uuid::new_v4().to_string(), &raw)?;
                 d.remote = Some(proton_remote(id));
@@ -1051,7 +1049,7 @@ impl Backend {
         to: &[String],
         raw: &[u8],
     ) -> Result<()> {
-        ensure!(!to.is_empty(), "Add at least one recipient.");
+        ensure!(!to.is_empty(), t!("manage-proton-add-at-least-one-recipient"));
         self.with_proton(a, |s| s.send(from, to, raw))
     }
 

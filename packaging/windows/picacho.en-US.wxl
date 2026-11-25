@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  The Windows installer's words (picacho.wxs), in English. To translate,
+  copy this file to picacho.<culture>.wxl (for example picacho.de-DE.wxl),
+  set Culture and the Language string (the culture's Windows LCID: 1031
+  for German), and translate the other values. scripts/bundle-windows.ps1
+  builds an installer for each file.
+-->
+<WixLocalization Culture="en-US" xmlns="http://wixtoolset.org/schemas/v4/wxl">
+  <String Id="Language" Value="1033" />
+  <!-- The installer file's description, in its properties -->
+  <String Id="SummaryDescription" Value="Picacho email" />
+  <String Id="NewerInstalled" Value="A newer version of Picacho is already installed." />
+  <!-- A check box on the installer's last page -->
+  <String Id="OpenPicacho" Value="Open Picacho" />
+  <!-- File types, in Windows' "Open with" -->
+  <String Id="EmailMessage" Value="Email Message" />
+  <String Id="OutlookEmailMessage" Value="Outlook Email Message" />
+  <!-- Picacho, in Windows' default apps settings -->
+  <String Id="ApplicationDescription" Value="Fast, native email for every inbox you have" />
+  <!-- The Start menu shortcut's tooltip -->
+  <String Id="ShortcutDescription" Value="Email" />
+</WixLocalization>

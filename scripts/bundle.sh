@@ -33,6 +33,11 @@ cp packaging/Info.plist "$bundle/Contents/Info.plist"
 if [ -f assets/AppIcon.icns ]; then
     cp assets/AppIcon.icns "$bundle/Contents/Resources/AppIcon.icns"
 fi
+# Info.plist's words by language (the Bluetooth prompt, the .eml file type).
+for lproj in packaging/macos/*.lproj; do
+    rm -rf "$bundle/Contents/Resources/$(basename "$lproj")"
+    cp -R "$lproj" "$bundle/Contents/Resources/"
+done
 # Ad-hoc signatures change identity on rebuild and can invalidate Keychain ACLs.
 # A stable Apple Development/Developer ID identity preserves access across builds.
 identity="${PICACHO_CODESIGN_IDENTITY:--}"

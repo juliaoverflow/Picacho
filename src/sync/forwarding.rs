@@ -39,14 +39,14 @@ pub fn server_url(service: ForwardingService, server: &str) -> Result<String> {
     } else {
         server
     };
-    let url = url::Url::parse(server).context("Enter the server's address, like https://…")?;
+    let url = url::Url::parse(server).with_context(|| t!("sync-forwarding-enter-the-servers-address-like-https"))?;
     let local = matches!(
         url.host_str(),
         Some("localhost" | "127.0.0.1" | "[::1]" | "::1")
     );
     ensure!(
         url.scheme() == "https" || (url.scheme() == "http" && local),
-        "The server must use https://."
+        t!("sync-forwarding-the-server-must-use-https")
     );
     Ok(server.to_owned())
 }
@@ -54,10 +54,10 @@ pub fn server_url(service: ForwardingService, server: &str) -> Result<String> {
 impl Client {
     pub fn new(service: ForwardingService, server: &str, key: &str) -> Result<Self> {
         let key = key.trim();
-        ensure!(!key.is_empty(), "Enter an API key.");
+        ensure!(!key.is_empty(), t!("sync-forwarding-enter-an-api-key"));
         ensure!(
             !key.contains(['\r', '\n']),
-            "The API key has a line break in it."
+            t!("sync-forwarding-the-api-key-has-a-line")
         );
         Ok(Self {
             service,
@@ -91,31 +91,28 @@ impl Client {
     fn send(&self, request: reqwest::blocking::RequestBuilder) -> Result<Value> {
         let response = request
             .send()
-            .with_context(|| format!("Could not reach {}", self.service.label()))?;
+            .with_context(|| t!("sync-forwarding-could-not-reach", label = self.service.label()))?;
         let status = response.status();
         // Alias lists are kilobytes; a service answering without end isn't
         // held in memory whole.
         let text = crate::sync::public_net::bounded_text(response, 32 * 1024 * 1024).unwrap_or_default();
         if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
             bail!(
-                "{} did not accept the API key. Check it and try again.",
-                self.service.label()
+                t!("sync-forwarding-did-not-accept-the-api-key", label = self.service.label())
             );
         }
         if !status.is_success() {
             bail!(
-                "{} answered {status}{}",
-                self.service.label(),
-                error_message(&text)
+                t!("sync-forwarding-answered", label = self.service.label(), status = status, detail = error_message(&text)
                     .map(|m| format!(": {m}"))
-                    .unwrap_or_default()
+                    .unwrap_or_default())
             );
         }
         if text.trim().is_empty() {
             return Ok(Value::Null);
         }
         serde_json::from_str(&text)
-            .with_context(|| format!("{} sent a reply Picacho can't read", self.service.label()))
+            .with_context(|| t!("sync-forwarding-sent-a-reply-picacho-cant-read", label = self.service.label()))
     }
 
     /// Checks the key and says whose it is.
@@ -138,7 +135,7 @@ impl Client {
             }
             ForwardingService::FirefoxRelay => {
                 let v = self.send(self.request(Method::GET, "/api/v1/profiles/"))?;
-                ensure!(v.is_array(), "Firefox Relay sent an unexpected reply");
+                ensure!(v.is_array(), t!("sync-forwarding-firefox-relay-sent-an-unexpected-reply"));
                 Profile::default()
             }
         })
@@ -231,10 +228,10 @@ impl Client {
                 let options = self.send(self.request(Method::GET, "/api/v5/alias/options"))?;
                 ensure!(
                     options["can_create"].as_bool() != Some(false),
-                    "SimpleLogin won't make more aliases on this plan."
+                    t!("sync-forwarding-simplelogin-wont-make-more-aliases-on")
                 );
                 let signed = simplelogin_signed_suffix(&options, new.domain.as_deref())
-                    .context("SimpleLogin no longer offers that domain. Choose another.")?;
+                    .with_context(|| t!("sync-forwarding-simplelogin-no-longer-offers-that-domain"))?;
                 let prefix = if new.prefix.is_empty() {
                     random_prefix(new.format.unwrap_or(AliasFormat::RandomWords))
                 } else {
@@ -242,7 +239,7 @@ impl Client {
                 };
                 let mailboxes = self.send(self.request(Method::GET, "/api/v2/mailboxes"))?;
                 let mailbox = simplelogin_mailbox(&mailboxes, new.mailbox.as_deref())
-                    .context("SimpleLogin has no mailbox to forward the alias to")?;
+                    .with_context(|| t!("sync-forwarding-simplelogin-has-no-mailbox-to-forward"))?;
                 let v = self.send(
                     self.request(Method::POST, "/api/v3/alias/custom/new")
                         .json(&json!({
@@ -288,7 +285,7 @@ impl Client {
                 parse_relay_alias(&v)
             }
         };
-        alias.context("The new alias was made, but its address was missing from the reply")
+        alias.with_context(|| t!("sync-forwarding-the-new-alias-was-made-but"))
     }
 
     /// Whether the alias still exists at the service; it can be deleted
@@ -304,7 +301,7 @@ impl Client {
         let response = self
             .request(Method::GET, &path)
             .send()
-            .with_context(|| format!("Could not reach {}", self.service.label()))?;
+            .with_context(|| t!("sync-forwarding-could-not-reach", label = self.service.label()))?;
         let status = response.status();
         // SimpleLogin answers Forbidden for an alias that isn't the key's,
         // which a deleted one no longer is.
@@ -315,8 +312,7 @@ impl Client {
         }
         ensure!(
             status.is_success(),
-            "{} answered {status}",
-            self.service.label()
+            t!("sync-forwarding-answered-2", label = self.service.label(), status = status)
         );
         let v: Value = serde_json::from_str(
             &crate::sync::public_net::bounded_text(response, 32 * 1024 * 1024).unwrap_or_default(),
@@ -356,7 +352,7 @@ impl Client {
                         .send(self.request(Method::POST, &format!("/api/aliases/{id}/toggle")))?;
                     ensure!(
                         v["enabled"].as_bool() == Some(enabled),
-                        "SimpleLogin did not change the alias"
+                        t!("sync-forwarding-simplelogin-did-not-change-the-alias")
                     );
                 }
             }
@@ -393,7 +389,7 @@ impl Client {
         const MAX_PAGES: usize = 100;
         ensure!(
             self.service == ForwardingService::SimpleLogin,
-            "Only SimpleLogin has reverse aliases"
+            t!("sync-forwarding-only-simplelogin-has-reverse-aliases")
         );
         let mut out: Vec<ReverseAlias> = Vec::new();
         let mut seen = std::collections::HashSet::new();
@@ -407,7 +403,7 @@ impl Client {
                     .into_iter()
                     .map(|page| {
                         page.join()
-                            .unwrap_or_else(|_| bail!("Listing the reverse aliases failed"))
+                            .unwrap_or_else(|_| bail!(t!("sync-forwarding-listing-the-reverse-aliases-failed")))
                     })
                     .collect()
             });
@@ -441,7 +437,7 @@ impl Client {
         const MAX_PAGES: usize = 250;
         ensure!(
             self.service == ForwardingService::SimpleLogin,
-            "Only SimpleLogin lists an alias's activity"
+            t!("sync-forwarding-only-simplelogin-lists-an-aliass-activity")
         );
         let mut out = Vec::new();
         let mut first = 0;
@@ -454,7 +450,7 @@ impl Client {
                     .into_iter()
                     .map(|page| {
                         page.join()
-                            .unwrap_or_else(|_| bail!("Reading the alias's activity failed"))
+                            .unwrap_or_else(|_| bail!(t!("sync-forwarding-reading-the-aliass-activity-failed")))
                     })
                     .collect()
             });
@@ -482,7 +478,7 @@ impl Client {
     pub fn toggle_contact(&self, contact: &ReverseAlias) -> Result<bool> {
         ensure!(
             self.service == ForwardingService::SimpleLogin && !contact.id.is_empty(),
-            "Only SimpleLogin contacts can be blocked"
+            t!("sync-forwarding-only-simplelogin-contacts-can-be-blocked")
         );
         let v = self.send(self.request(
             reqwest::Method::POST,
@@ -490,13 +486,13 @@ impl Client {
         ))?;
         v["block_forward"]
             .as_bool()
-            .context("SimpleLogin did not say whether the contact is blocked")
+            .with_context(|| t!("sync-forwarding-simplelogin-did-not-say-whether-the"))
     }
     /// SimpleLogin: deletes a contact and its reverse alias.
     pub fn delete_contact(&self, contact: &ReverseAlias) -> Result<()> {
         ensure!(
             self.service == ForwardingService::SimpleLogin && !contact.id.is_empty(),
-            "Only SimpleLogin contacts can be deleted"
+            t!("sync-forwarding-only-simplelogin-contacts-can-be-deleted")
         );
         self.send(self.request(
             reqwest::Method::DELETE,
@@ -509,7 +505,7 @@ impl Client {
     pub fn add_contact(&self, alias: &Alias, address: &str) -> Result<ReverseAlias> {
         ensure!(
             self.service == ForwardingService::SimpleLogin,
-            "Only SimpleLogin has reverse aliases"
+            t!("sync-forwarding-only-simplelogin-has-reverse-aliases")
         );
         let v = self.send(
             self.request(
@@ -518,7 +514,7 @@ impl Client {
             )
             .json(&json!({ "contact": address.trim() })),
         )?;
-        parse_contact(&v).context("SimpleLogin did not give an address for the contact")
+        parse_contact(&v).with_context(|| t!("sync-forwarding-simplelogin-did-not-give-an-address"))
     }
 
     /// The service's mailboxes (SimpleLogin) or recipients (addy.io) that
@@ -550,7 +546,7 @@ impl Client {
                 format!("/api/v1/aliases/{}", alias.id),
                 json!({ "from_name": value }),
             ),
-            ForwardingService::FirefoxRelay => bail!("Firefox Relay aliases have no display name"),
+            ForwardingService::FirefoxRelay => bail!(t!("sync-forwarding-firefox-relay-aliases-have-no-display")),
         };
         self.send(self.request(Method::PATCH, &path).json(&body))?;
         Ok(())
@@ -571,14 +567,14 @@ impl Client {
             ForwardingService::Addy => {
                 self.send(self.request(Method::DELETE, &format!("/api/v1/pinned-aliases/{id}")))?
             }
-            ForwardingService::FirefoxRelay => bail!("Firefox Relay aliases can't be pinned"),
+            ForwardingService::FirefoxRelay => bail!(t!("sync-forwarding-firefox-relay-aliases-cant-be-pinned")),
         };
         Ok(())
     }
     /// Chooses the mailboxes (or recipients) the alias forwards to.
     pub fn set_mailboxes(&self, alias: &Alias, ids: &[String]) -> Result<()> {
         use reqwest::Method;
-        ensure!(!ids.is_empty(), "An alias needs somewhere to forward to.");
+        ensure!(!ids.is_empty(), t!("sync-forwarding-an-alias-needs-somewhere-to-forward"));
         match self.service {
             ForwardingService::SimpleLogin => {
                 // SimpleLogin's ids are numbers.
@@ -597,7 +593,7 @@ impl Client {
                         .json(&json!({ "alias_id": alias.id, "recipient_ids": ids })),
                 )?;
             }
-            ForwardingService::FirefoxRelay => bail!("Firefox Relay forwards to your account's address"),
+            ForwardingService::FirefoxRelay => bail!(t!("sync-forwarding-firefox-relay-forwards-to-your-accounts")),
         }
         Ok(())
     }
@@ -606,7 +602,7 @@ impl Client {
     pub fn set_pgp(&self, alias: &Alias, enabled: bool) -> Result<()> {
         ensure!(
             self.service == ForwardingService::SimpleLogin,
-            "Only SimpleLogin encrypts forwarded mail per alias"
+            t!("sync-forwarding-only-simplelogin-encrypts-forwarded-mail-per")
         );
         self.send(
             self.request(reqwest::Method::PATCH, &format!("/api/aliases/{}", alias.id))
@@ -621,7 +617,7 @@ impl Client {
         use reqwest::Method;
         ensure!(
             self.service == ForwardingService::SimpleLogin,
-            "Only SimpleLogin has reverse aliases"
+            t!("sync-forwarding-only-simplelogin-has-reverse-aliases")
         );
         let v = self.send(
             self.request(Method::POST, &format!("/api/aliases/{}/contacts", alias.id))
@@ -630,7 +626,7 @@ impl Client {
         let address = str_of(&v["reverse_alias_address"]);
         ensure!(
             !address.is_empty(),
-            "SimpleLogin did not give an address for writing to {contact}"
+            t!("sync-forwarding-simplelogin-did-not-give-an-address-2", contact = contact)
         );
         Ok(address)
     }

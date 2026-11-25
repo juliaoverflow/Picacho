@@ -183,10 +183,10 @@ impl PasscodeHash {
 /// Why `passcode` can't be a passcode, if it can't.
 pub fn check_passcode(passcode: &str) -> Result<()> {
     if passcode.chars().count() < MIN_PASSCODE {
-        bail!("A passcode needs at least {MIN_PASSCODE} characters.");
+        bail!(t!("manage-applock-a-passcode-needs-at-least-characters", min_passcode = MIN_PASSCODE));
     }
     if passcode.trim() != passcode {
-        bail!("A passcode can't begin or end with a space.");
+        bail!(t!("manage-applock-a-passcode-cant-begin-or-end"));
     }
     Ok(())
 }

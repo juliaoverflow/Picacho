@@ -53,7 +53,7 @@ fn revocation_signature(key: &SignedSecretKey, reason: RevocationReason, text: &
     }
     config
         .sign_key(primary, &Password::empty(), primary.public_key())
-        .context("The revocation couldn't be made.")
+        .with_context(|| t!("manage-openpgp-keys-the-revocation-couldnt-be-made"))
 }
 
 /// A revocation certificate for `key`: its public key with a Key
@@ -98,7 +98,7 @@ fn resigned_subpackets(
     created: Timestamp,
     lasts: Option<Duration>,
 ) -> Result<SignatureConfig> {
-    let mut config = old.config().context("A self-signature on the key can't be read.")?.clone();
+    let mut config = old.config().with_context(|| t!("manage-openpgp-keys-a-self-signature-on-the-key"))?.clone();
     config.hashed_subpackets.retain(|p| {
         !matches!(p.data, SubpacketData::SignatureCreationTime(_) | SubpacketData::KeyExpirationTime(_))
     });
@@ -122,7 +122,7 @@ fn resigned_subpackets(
 fn validity(lasts: std::time::Duration) -> Result<Duration> {
     let secs = u32::try_from(lasts.as_secs()).ok().filter(|s| *s > 0);
     secs.map(Duration::from_secs)
-        .context("Choose a time between a second and 136 years after the key was made.")
+        .with_context(|| t!("manage-openpgp-keys-choose-a-time-between-a-second"))
 }
 
 /// `key` re-signed to expire `lasts` after it was made (RFC 9580
@@ -175,7 +175,7 @@ fn resign(key: &SignedSecretKey, lasts: Option<Duration>, how: Supersede) -> Res
         let config = resigned_subpackets(direct, created, lasts)?;
         let signature = config
             .sign_key(primary, &Password::empty(), public)
-            .context("The key couldn't be re-signed.")?;
+            .with_context(|| t!("manage-openpgp-keys-the-key-couldnt-be-re-signed"))?;
         add(&mut out.details.direct_signatures, signature);
         resigned += 1;
     }
@@ -187,11 +187,11 @@ fn resign(key: &SignedSecretKey, lasts: Option<Duration>, how: Supersede) -> Res
         let config = resigned_subpackets(newest, created, lasts)?;
         let signature = config
             .sign_certification(primary, public, &Password::empty(), user.id.tag(), &user.id)
-            .context("The key couldn't be re-signed.")?;
+            .with_context(|| t!("manage-openpgp-keys-the-key-couldnt-be-re-signed"))?;
         add(&mut user.signatures, signature);
         resigned += 1;
     }
-    ensure!(resigned > 0, "This key has no self-signature to set its expiry on.");
+    ensure!(resigned > 0, t!("manage-openpgp-keys-this-key-has-no-self-signature"));
     for sub in &mut out.secret_subkeys {
         let Some(binding) = newest(&sub.signatures) else { continue };
         if binding.typ() != Some(SignatureType::SubkeyBinding) {
@@ -207,7 +207,7 @@ fn resign(key: &SignedSecretKey, lasts: Option<Duration>, how: Supersede) -> Res
         let config = resigned_subpackets(binding, created, sub_lasts)?;
         let signature = config
             .sign_subkey_binding(primary, public, &Password::empty(), sub.key.public_key())
-            .context("The key couldn't be re-signed.")?;
+            .with_context(|| t!("manage-openpgp-keys-the-key-couldnt-be-re-signed"))?;
         add(&mut sub.signatures, signature);
     }
     Ok(out)
@@ -246,7 +246,7 @@ impl Keyring {
                 let (k, _) = SignedSecretKey::from_string(k).ok()?;
                 (fingerprint(&SignedPublicKey::from(k.clone())) == fp).then_some((at, k))
             })
-            .context("That isn't one of your keys.")?;
+            .with_context(|| t!("manage-openpgp-keys-that-isnt-one-of-your-keys"))?;
         let lasts = from_now.map(|d| {
             let age = Timestamp::now().as_secs().saturating_sub(key.primary_key.created_at().as_secs());
             d + std::time::Duration::from_secs(age.into())
@@ -262,7 +262,7 @@ impl Keyring {
             .secret_keys()
             .into_iter()
             .find(|k| fingerprint(&SignedPublicKey::from(k.clone())) == fp)
-            .context("That isn't one of your keys.")?;
+            .with_context(|| t!("manage-openpgp-keys-that-isnt-one-of-your-keys"))?;
         revocation_certificate(&key, reason, text)
     }
     /// Where `public` (its signatures already verified) is one of your own

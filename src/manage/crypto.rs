@@ -67,7 +67,7 @@ pub struct KeyBundle {
 pub struct Locked;
 impl std::fmt::Display for Locked {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("This mail is encrypted. Enter your Pinal password to read it on this device.")
+        f.write_str(t!("manage-crypto-this-mail-is-encrypted-enter-your"))
     }
 }
 impl std::error::Error for Locked {}
@@ -78,8 +78,7 @@ pub struct WrongSecret;
 impl std::fmt::Display for WrongSecret {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(
-            "That does not unlock your mail. If you changed your Pinal password recently, \
-             use your previous password or your recovery key.",
+            t!("manage-crypto-that-does-not-unlock-your-mail"),
         )
     }
 }
@@ -100,7 +99,7 @@ pub fn argon2(password: &str, salt: &[u8], kdf: &KdfParams) -> Result<Zeroizing<
             && (FLOOR.0..=CEILING.0).contains(&kdf.memory_kib)
             && (FLOOR.1..=CEILING.1).contains(&kdf.iterations)
             && (FLOOR.2..=CEILING.2).contains(&kdf.parallelism),
-        "These key settings are not allowed."
+        t!("manage-crypto-these-key-settings-are-not-allowed")
     );
     let params = argon2::Params::new(kdf.memory_kib, kdf.iterations, kdf.parallelism, Some(32))
         .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -162,9 +161,9 @@ pub fn unlock_with_password(bundle: &KeyBundle, password: &str) -> Result<Zeroiz
     let kdf = slot
         .kdf
         .as_ref()
-        .context("The password slot has no key settings.")?;
+        .with_context(|| t!("manage-crypto-the-password-slot-has-no-key"))?;
     let salt = B64.decode(&kdf.salt).map_err(|_| WrongSecret)?;
-    ensure!(salt.len() == 16, "Bad salt.");
+    ensure!(salt.len() == 16, t!("manage-crypto-bad-salt"));
     let stretched = argon2(password, &salt, kdf)?;
     let kek = hkdf(stretched.as_ref(), "pinal-mail/v1/password-kek");
     let aad = context(&["pinal-mail/v1/slot", &bundle.user_id, &slot.id, "password"]);
@@ -186,7 +185,7 @@ pub fn parse_recovery_key(text: &str) -> Result<Zeroizing<[u8; 32]>> {
         .collect();
     ensure!(
         clean.len() == 56,
-        "Check the recovery key. It has 56 letters and numbers."
+        t!("manage-crypto-check-the-recovery-key-it-has")
     );
     let mut bytes = Zeroizing::new(Vec::with_capacity(35));
     let (mut bits, mut value) = (0u32, 0u32);
@@ -194,7 +193,7 @@ pub fn parse_recovery_key(text: &str) -> Result<Zeroizing<[u8; 32]>> {
         let digit = ALPHABET
             .iter()
             .position(|a| *a == c)
-            .context("Check the recovery key. It has 56 letters and numbers.")?;
+            .with_context(|| t!("manage-crypto-check-the-recovery-key-it-has"))?;
         value = (value << 5) | digit as u32;
         bits += 5;
         if bits >= 8 {
@@ -211,7 +210,7 @@ pub fn parse_recovery_key(text: &str) -> Result<Zeroizing<[u8; 32]>> {
         .finalize();
     ensure!(
         sum[..3] == bytes[32..35],
-        "Check the recovery key. It has 56 letters and numbers."
+        t!("manage-crypto-check-the-recovery-key-it-has")
     );
     Ok(key)
 }
@@ -248,9 +247,9 @@ pub fn open_keys(bundle: &KeyBundle, mk: &[u8; 32]) -> Result<Vec<SignedSecretKe
         ]);
         let binary = open(&k, &record.nonce, &record.sealed_private_key, &aad)?;
         let key = SignedSecretKey::from_bytes(Cursor::new(binary.as_slice()))
-            .context("A mail key could not be read.")?;
+            .with_context(|| t!("manage-crypto-a-mail-key-could-not-be"))?;
         let (listed, _) = SignedPublicKey::from_string(&record.public_key)
-            .context("A mail key's public half could not be read.")?;
+            .with_context(|| t!("manage-crypto-a-mail-keys-public-half-could"))?;
         let hex = |f: pgp::types::Fingerprint| hex(f.as_bytes());
         let subkeys = |k: &[String]| {
             let mut v = k.to_vec();
@@ -271,7 +270,7 @@ pub fn open_keys(bundle: &KeyBundle, mk: &[u8; 32]) -> Result<Vec<SignedSecretKe
             hex(key.fingerprint()) == record.fingerprint
                 && hex(listed.fingerprint()) == record.fingerprint
                 && subkeys(&secret_subs) == subkeys(&public_subs),
-            "A mail key does not match its public key."
+            t!("manage-crypto-a-mail-key-does-not-match")
         );
         keys.push(key);
     }
@@ -523,7 +522,7 @@ pub fn open_message(raw: &[u8], keys: &[SignedSecretKey]) -> Result<(Protection,
     };
     ensure!(
         raw.len() <= MAX_MESSAGE,
-        "This message is too large to open."
+        t!("manage-crypto-this-message-is-too-large-to")
     );
     let decrypt = || -> Result<Vec<u8>> {
         let (message, _) = Message::from_string(&armored)?;

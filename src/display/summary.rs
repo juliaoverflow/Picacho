@@ -219,7 +219,7 @@ impl MailApp {
                     Err(e) => {
                         this.summary_downloads = None;
                         this.summary_error =
-                            Some(format!("Couldn't download shipping and receipt emails: {e:#}"));
+                            Some(t!("summary-couldnt-download-shipping-and-receipt-emails", e = format!("{:#}", e)));
                     }
                 }
                 cx.notify();
@@ -231,7 +231,7 @@ impl MailApp {
     pub(super) fn stop_summary_downloads(&mut self, cx: &mut Context<Self>) {
         self.summary_cancel.store(true, Ordering::Relaxed);
         self.summary_downloads = None;
-        self.summary_error = Some("Downloading shipping and receipt emails was stopped.".into());
+        self.summary_error = Some(t!("summary-downloading-shipping-and-receipt-emails-was").into());
         cx.notify();
     }
 
@@ -318,7 +318,7 @@ impl MailApp {
         };
         let key = key.to_owned();
         let mut entries = vec![checked(
-            "Automatic (from emails)",
+            t!("summary-automatic-from-emails"),
             t.manual.is_none(),
             Action::SetParcelStatus(key.clone(), None),
         )];
@@ -332,20 +332,20 @@ impl MailApp {
         }
         entries.push(Entry::Separator);
         entries.push(entry(
-            "Rename Package…",
+            t!("summary-rename-package"),
             "select",
             Action::EditParcel(key.clone(), ParcelField::Name),
         ));
         entries.push(entry(
-            "Edit Sender…",
+            t!("summary-edit-sender"),
             "user",
             Action::EditParcel(key.clone(), ParcelField::Sender),
         ));
         entries.push(Entry::Separator);
         entries.push(if t.hidden {
-            entry("Show Package", "eye", Action::HideParcel(key, false))
+            entry(t!("summary-show-package"), "eye", Action::HideParcel(key, false))
         } else {
-            entry("Hide Package", "eye-off", Action::HideParcel(key, true))
+            entry(t!("summary-hide-package"), "eye-off", Action::HideParcel(key, true))
         });
         entries
     }
@@ -374,9 +374,9 @@ impl MailApp {
         let (text, placeholder) = match field {
             ParcelField::Name => (
                 t.name.clone().unwrap_or_default(),
-                "Name, such as \"Graphics card\"".to_owned(),
+                t!("summary-name-such-as-graphics-card").to_owned(),
             ),
-            ParcelField::Sender => (t.from().to_owned(), "Sender".to_owned()),
+            ParcelField::Sender => (t.from().to_owned(), t!("summary-sender").to_owned()),
         };
         self.summary_packages = true;
         self.summary_receipts = false;
@@ -670,7 +670,7 @@ impl MailApp {
                     } else {
                         FontWeight::MEDIUM
                     })
-                    .child("Summary"),
+                    .child(t!("summary-summary")),
             )
             .on_click(cx.listener(move |this, _, w, cx| this.handle(action.clone(), w, cx)))
     }
@@ -680,7 +680,7 @@ impl MailApp {
         let active = self.summary_open && self.account.as_deref() == Some(id);
         self.rail_button(
             format!("rail-{id}-summary"),
-            "Summary".into(),
+            t!("summary-summary").into(),
             icon_el("summary", 17., if active { c.accent } else { c.muted }).into_any_element(),
             active,
             Action::OpenSummary(id.to_owned()),
@@ -706,7 +706,7 @@ impl MailApp {
         let c = self.colors();
         let all = self.account.as_deref() == Some(fwd::ALL_MAIL);
         let title = if all {
-            "All Accounts".to_owned()
+            t!("summary-all-accounts").to_owned()
         } else {
             self.account
                 .as_deref()
@@ -758,7 +758,7 @@ impl MailApp {
                                 .text_color(rgb(c.accent))
                                 .hover(|s| s.opacity(0.75))
                                 .child(icon_el("arrow-left", 13., c.accent))
-                                .child("Summary")
+                                .child(t!("summary-summary"))
                                 .on_click(cx.listener(|this, _, w, cx| {
                                     let back = if this.summary_receipts {
                                         Action::SummaryReceipts(false)
@@ -780,11 +780,11 @@ impl MailApp {
                                     .text_size(px(17.))
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .child(if self.summary_receipts {
-                                        "Receipts"
+                                        t!("summary-receipts")
                                     } else if page {
-                                        "Packages"
+                                        t!("summary-packages")
                                     } else {
-                                        "Summary"
+                                        t!("summary-summary")
                                     }),
                             )
                             .when(!title.is_empty(), |d| {
@@ -870,7 +870,7 @@ impl MailApp {
                             .flex_1()
                             .text_size(px(13.))
                             .font_weight(FontWeight::SEMIBOLD)
-                            .child("Packages"),
+                            .child(t!("summary-packages")),
                     )
                     .children(self.packages_count(packages)),
             )
@@ -892,9 +892,9 @@ impl MailApp {
                         .child(icon_el("package", 18., c.border))
                         .child(
                             if self.summary_loading || self.summary_downloads.is_some() {
-                                "Looking through your mail for packages…"
+                                t!("summary-looking-through-your-mail-for-packages")
                             } else {
-                                "No packages in this mail"
+                                t!("summary-no-packages-in-this-mail")
                             },
                         ),
                 )
@@ -917,14 +917,14 @@ impl MailApp {
                         .items_center()
                         .child(div().flex_1().text_size(px(11.)).text_color(rgb(c.muted)).child(
                             if packages > shown {
-                                format!("{shown} of {packages}")
+                                t!("summary-of", shown = shown, packages = packages)
                             } else {
                                 String::new()
                             },
                         ))
                         .child(self.summary_link(
                             "summary-view-more",
-                            "View more…",
+                            t!("summary-view-more"),
                             Action::SummaryPackages(true),
                             cx,
                         )),
@@ -945,9 +945,9 @@ impl MailApp {
                 .text_size(px(12.))
                 .text_color(rgb(c.muted))
                 .child(if active > 0 {
-                    format!("{active} on the way · {packages} in all")
+                    t!("summary-on-the-way-in-all", active = active, packages = packages)
                 } else {
-                    format!("{packages} in all")
+                    t!("summary-in-all", packages = packages)
                 })
         })
     }
@@ -970,11 +970,11 @@ impl MailApp {
             detail.push(from);
         }
         if quiet(t) {
-            detail.push(format!("No news since {}", date_full(t.updated)));
+            detail.push(t!("summary-no-news-since", date = date_full(t.updated)));
         } else if !delivered
             && let Some(arrival) = p.expected_arrival.as_deref().and_then(arrival_date)
         {
-            detail.push(format!("Expected {arrival}"));
+            detail.push(t!("summary-expected", arrival = arrival));
         } else {
             detail.push(date_full(t.updated));
         }
@@ -1078,7 +1078,7 @@ impl MailApp {
                         div()
                             .text_size(px(14.))
                             .font_weight(FontWeight::SEMIBOLD)
-                            .child("Packages"),
+                            .child(t!("summary-packages")),
                     )
                     .children(self.packages_count(packages))
                     .child(div().flex_1())
@@ -1087,9 +1087,9 @@ impl MailApp {
                         d.child(self.summary_link(
                             "summary-show-hidden",
                             &if show_hidden {
-                                format!("Leave Out {hidden} Hidden")
+                                t!("summary-leave-out-hidden", hidden = hidden)
                             } else {
-                                format!("Show {hidden} Hidden")
+                                t!("summary-show-hidden", hidden = hidden)
                             },
                             Action::ShowHiddenParcels(!show_hidden),
                             cx,
@@ -1130,7 +1130,7 @@ impl MailApp {
                         .text_size(px(12.))
                         .text_color(rgb(c.muted))
                         .child(spinner(12., c.muted))
-                        .child("Searching emails…"),
+                        .child(t!("summary-searching-emails")),
                 )
             })
             .children(self.summary_download_status(false, cx))
@@ -1143,17 +1143,10 @@ impl MailApp {
         div()
                     .text_size(px(12.))
                     .text_color(rgb(c.muted))
-                    .child(format!(
-                        "Found in {} emails on this device{}. Nothing is looked up \
-                         online; Track opens the carrier's page.",
-                        fmt_count(self.summary_scanned),
-                        if self.find_parcels && self.parcel_model.is_some() {
-                            ", with tracking numbers confirmed by the local \
-                             tracking number model"
-                        } else {
-                            " (turn on Find tracking numbers in Settings → \
-                             Local AI to find more)"
-                        }
+                    .child(t!(
+                        "summary-found-in-emails-on-this-device",
+                        shown = fmt_count(self.summary_scanned),
+                        model = if self.find_parcels && self.parcel_model.is_some() { "on" } else { "off" }
                     ))
             .into_any_element()
     }
@@ -1176,7 +1169,7 @@ impl MailApp {
             .when(open, |d| d.bg(rgb(c.soft)))
             .hover(move |s| s.bg(rgb(c.border)))
             .child(icon_el("search", 14., if open { c.accent } else { c.muted }))
-            .tooltip(|w, cx| Tooltip::new("Search Packages").build(w, cx))
+            .tooltip(|w, cx| Tooltip::new(t!("summary-search-packages")).build(w, cx))
             .on_click(cx.listener(move |this, _, w, cx| {
                 this.handle(Action::SearchParcels(!open), w, cx)
             }))
@@ -1210,17 +1203,14 @@ impl MailApp {
                             .flex_1()
                             .min_w_0()
                             .child(if compact {
-                                format!("Downloading emails: {done} of {total}")
+                                t!("summary-downloading-emails-of", done = done, total = total)
                             } else {
-                                format!(
-                                    "Downloading shipping and receipt emails to read their \
-                                     tracking numbers and totals: {done} of {total}"
-                                )
+                                t!("summary-downloading-shipping-and-receipt-emails-to", done = done, total = total)
                             }),
                     )
                     .child(self.summary_link(
                         "summary-downloads-stop",
-                        "Stop",
+                        t!("summary-stop"),
                         Action::StopSummaryDownloads,
                         cx,
                     ))
@@ -1289,11 +1279,11 @@ impl MailApp {
                 .child(icon_el("package", 28., c.border))
                 .child(
                     if searched {
-                        "No packages match your search"
+                        t!("summary-no-packages-match-your-search")
                     } else if self.summary_loading || self.summary_downloads.is_some() {
-                        "Looking through your mail for packages…"
+                        t!("summary-looking-through-your-mail-for-packages")
                     } else {
-                        "No packages in this mail"
+                        t!("summary-no-packages-in-this-mail")
                     },
                 )
                 .into_any_element()
@@ -1496,12 +1486,12 @@ impl MailApp {
         if !t.done()
             && let Some(arrival) = p.expected_arrival.as_deref().and_then(arrival_date)
         {
-            detail.push(format!("Expected {arrival}"));
+            detail.push(t!("summary-expected", arrival = arrival));
         }
         if quiet(t) {
-            detail.push(format!("No news since {}", date_full(t.updated)));
+            detail.push(t!("summary-no-news-since", date = date_full(t.updated)));
         } else {
-            detail.push(format!("Updated {}", date_full(t.updated)));
+            detail.push(t!("summary-updated", date = date_full(t.updated)));
         }
         let latest = t.latest();
         let mut from = if t.from().is_empty() {
@@ -1512,7 +1502,7 @@ impl MailApp {
         let editing_name = self.editing(&key, ParcelField::Name);
         let editing_sender = self.editing(&key, ParcelField::Sender);
         if t.history.len() > 1 {
-            from.push_str(&format!(" · {} emails", t.history.len()));
+            from = format!("{from} · {}", t!("summary-emails", count = t.history.len()));
         }
         let account = all.then(|| self.account_name(&latest.account)).flatten();
         let delivered = t.done();
@@ -1586,16 +1576,16 @@ impl MailApp {
                                     .child(p.title()),
                             )
                             .when(matches!(p.source, Source::Markup), |d| {
-                                d.child(tag("From sender", c))
+                                d.child(tag(t!("summary-from-sender"), c))
                             })
                             .when_some(account, |d, name| d.child(tag(&name, c)))
-                            .when(t.hidden, |d| d.child(tag("Hidden", c)))
+                            .when(t.hidden, |d| d.child(tag(t!("summary-hidden"), c)))
                             .when(in_email, |d| {
                                 d.child(
                                     div()
                                         .id(SharedString::from(format!("summary-in-email-{i}")))
                                         .debug_selector(move || format!("summary-in-email-{i}"))
-                                        .child(tag("Matched in an email", c)),
+                                        .child(tag(t!("summary-matched-in-an-email"), c)),
                                 )
                             }),
                     )
@@ -1656,7 +1646,7 @@ impl MailApp {
             actions.push(
                 self.summary_link(
                     &format!("summary-track-{i}"),
-                    "Track",
+                    t!("summary-track"),
                     // An email can name this address: opened as its links are
                     // (warned about on phones, as an unfamiliar site).
                     Action::OpenEmailLink(url.clone()),
@@ -1669,7 +1659,7 @@ impl MailApp {
             actions.push(
                 self.summary_link(
                     &format!("summary-copy-{i}"),
-                    "Copy Number",
+                    t!("summary-copy-number"),
                     Action::CopyText(p.tracking_number.clone()),
                     cx,
                 )
@@ -1679,7 +1669,7 @@ impl MailApp {
         actions.push(
             self.summary_link(
                 &format!("summary-status-{i}"),
-                "Set Status",
+                t!("summary-set-status"),
                 Action::ParcelMenu(p.key()),
                 cx,
             )
@@ -1692,10 +1682,10 @@ impl MailApp {
         if let Some(order) = &p.order
             && !p.tracking_number.is_empty()
         {
-            facts.push(format!("Order {order}"));
+            facts.push(t!("summary-order", order = order));
         }
         if let Some(arrival) = p.expected_arrival.as_deref().and_then(arrival_date) {
-            facts.push(format!("Expected {arrival}"));
+            facts.push(t!("summary-expected", arrival = arrival));
         }
         div()
             .id(SharedString::from(format!("summary-history-{i}")))
@@ -1727,7 +1717,7 @@ impl MailApp {
                 div()
                     .text_size(px(12.))
                     .font_weight(FontWeight::SEMIBOLD)
-                    .child("History"),
+                    .child(t!("summary-history")),
             )
             .child(
                 div().flex().flex_col().children(
@@ -1752,7 +1742,7 @@ impl MailApp {
     ) -> AnyElement {
         let c = self.colors();
         let s = &e.sighting;
-        let what = e.status.map_or("Update", |s| s.label());
+        let what = e.status.map_or(t!("summary-update"), |s| s.label());
         let mut who = if s.sender.is_empty() {
             String::new()
         } else {
@@ -1816,7 +1806,7 @@ impl MailApp {
                             .child(div().flex_1())
                             .child(self.summary_link(
                                 &format!("summary-open-{i}-{j}"),
-                                "Open Email",
+                                t!("summary-open-email"),
                                 open,
                                 cx,
                             )),
@@ -1888,7 +1878,7 @@ impl MailApp {
                 let mut text = if p.tracking_number.is_empty() {
                     p.title()
                 } else {
-                    format!("Tracking number {}", p.tracking_number)
+                    t!("summary-tracking-number", tracking_number = p.tracking_number)
                 };
                 if let Some(carrier) = &p.carrier {
                     text.push_str(&format!(" · {carrier}"));
@@ -1901,7 +1891,7 @@ impl MailApp {
                     actions.push(
                         self.link(
                             &format!("parcel-track-{i}"),
-                            "Track Package",
+                            t!("summary-track-package"),
                             Action::OpenEmailLink(url.clone()),
                             cx,
                         )
@@ -1915,7 +1905,7 @@ impl MailApp {
                     actions.push(
                         self.link(
                             &format!("parcel-copy-{i}"),
-                            "Copy Number",
+                            t!("summary-copy-number"),
                             Action::CopyText(p.tracking_number.clone()),
                             cx,
                         )
@@ -1933,7 +1923,7 @@ impl MailApp {
 /// status set by hand.
 fn status_text(t: &Tracked) -> String {
     if t.manual.is_some() {
-        format!("{} (set by you)", t.status_label())
+        t!("summary-set-by-you", status_label = t.status_label())
     } else {
         t.status_label().to_owned()
     }
@@ -2013,7 +2003,7 @@ pub(super) fn tag(text: &str, c: Colors) -> Div {
 fn arrival_date(raw: &str) -> Option<String> {
     let date = raw.get(..10)?;
     let date = chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").ok()?;
-    Some(date.format("%b %-d, %Y").to_string())
+    Some(date.local(t!("dates-month-day-year")))
 }
 
 /// An item of a Summary page's list (see `MailApp::summary_list`).

@@ -67,7 +67,7 @@ static LIST_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomic
 pub(super) struct Superseded;
 impl std::fmt::Display for Superseded {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("Another list was asked for meanwhile.")
+        f.write_str(t!("views-another-list-was-asked-for-meanwhile"))
     }
 }
 impl std::error::Error for Superseded {}
@@ -559,8 +559,8 @@ impl MailApp {
     pub(super) fn view_title(&self, id: &str) -> Option<(String, String, &'static str)> {
         if id == ALL_MAIL {
             return Some((
-                "All Accounts".into(),
-                "Mail from every account".into(),
+                t!("views-all-accounts").into(),
+                t!("views-mail-from-every-account").into(),
                 "inboxes",
             ));
         }
@@ -569,11 +569,13 @@ impl MailApp {
             .deliver_to
             .as_ref()
             .and_then(|d| self.accounts.iter().find(|a| &a.id == d))
-            .map(|a| format!(" · forwards to {}", a.email))
-            .unwrap_or_default();
+            .map(|a| a.email.clone());
         Some((
             alias.email.clone(),
-            format!("{} alias{into}", f.service.label()),
+            match into {
+                Some(email) => t!("views-alias-forwards-to", label = f.service.label(), email = email),
+                None => t!("views-alias", label = f.service.label()),
+            },
             "alias",
         ))
     }
@@ -587,39 +589,39 @@ impl MailApp {
     pub(super) fn view_entries(&self, id: &str) -> Vec<Entry> {
         let id = id.to_owned();
         let mut entries = vec![
-            entry("Refresh", "refresh", Action::RefreshAccount(id.clone())),
+            entry(t!("views-refresh"), "refresh", Action::RefreshAccount(id.clone())),
             entry(
-                "Mark Inbox as Read",
+                t!("views-mark-inbox-as-read"),
                 "mail-open",
                 Action::MarkAllRead(id.clone(), Folder::Inbox.into()),
             ),
             Entry::Separator,
             entry(
                 if self.collapsed.contains(&id) {
-                    "Expand"
+                    t!("views-expand")
                 } else {
-                    "Collapse"
+                    t!("views-collapse")
                 },
                 "chevron-down",
                 Action::ToggleAccount(id.clone()),
             ),
         ];
         if id == ALL_MAIL {
-            entries.push(entry("Hide All Accounts", "eye-off", Action::SetAllMail(false)));
+            entries.push(entry(t!("views-hide-all-accounts"), "eye-off", Action::SetAllMail(false)));
         } else if let Some((f, alias)) = fwd::find_alias(&self.forwarding, &id) {
             entries.push(entry(
-                "Copy Address",
+                t!("views-copy-address"),
                 "copy",
                 Action::CopyText(alias.email.clone()),
             ));
             entries.push(entry(
-                "Forwarding Settings…",
+                t!("views-forwarding-settings"),
                 "settings",
                 Action::SettingsPage(Page::Forwarding),
             ));
             entries.push(Entry::Separator);
             entries.push(entry(
-                "Show in Mailbox",
+                t!("views-show-in-mailbox"),
                 "inbox",
                 Action::SetAliasDisplay(f.id.clone(), alias.id.clone(), AliasDisplay::Included),
             ));
@@ -865,7 +867,7 @@ impl MailApp {
                 let button = self.rail_button(
                     format!("rail-{id}-{}", folder.key()),
                     if count > 0 {
-                        format!("{} · {} unread", folder.label(), fmt_count(count))
+                        t!("views-unread", label = folder.label(), shown = fmt_count(count), count = count)
                     } else {
                         folder.label().into()
                     },
@@ -1013,11 +1015,7 @@ impl MailApp {
                     Ok(account) => {
                         let count = account.aliases.len();
                         this.notice(
-                            format!(
-                                "Connected {} · {count} alias{}",
-                                account.service.label(),
-                                if count == 1 { "" } else { "es" }
-                            ),
+                            t!("views-connected-alias", label = account.service.label(), count = count),
                             false,
                             cx,
                         );
@@ -1121,7 +1119,7 @@ impl MailApp {
         let typed = !Self::value(&self.fwd_prefix, cx).trim().is_empty();
         if typed && prefix.is_empty() {
             self.notice(
-                "Use letters, numbers, dots, dashes or underscores in the prefix.",
+                t!("views-use-letters-numbers-dots-dashes-or"),
                 true,
                 cx,
             );
@@ -1151,7 +1149,7 @@ impl MailApp {
                 match result {
                     Ok(alias) => {
                         cx.write_to_clipboard(ClipboardItem::new_string(alias.email.clone()));
-                        this.notice(format!("Created {} · copied", alias.email), false, cx);
+                        this.notice(t!("views-created-copied", email = alias.email), false, cx);
                         if let Some(f) = this.forwarding.iter_mut().find(|f| f.id == id) {
                             f.aliases.insert(0, alias);
                         }
@@ -1320,7 +1318,7 @@ impl MailApp {
             && !options.prefix_suggestion.is_empty()
         {
             entries.push(entry(
-                format!("Suggested: {}", options.prefix_suggestion),
+                t!("views-suggested", prefix_suggestion = options.prefix_suggestion),
                 "star",
                 Action::SetAliasPrefix(options.prefix_suggestion.clone()),
             ));
@@ -1425,7 +1423,7 @@ impl MailApp {
                             f.aliases.retain(|a| a.id != alias_id);
                         }
                         this.views_changed(cx);
-                        this.notice("Alias deleted", false, cx);
+                        this.notice(t!("views-alias-deleted"), false, cx);
                     }
                     Err(e) => this.notice(format!("{e:#}"), true, cx),
                 }

@@ -9,10 +9,19 @@ PlasmoidItem {
     id: root
 
     property var snapshot: null
+
+    // The widget's words in the language Picacho shows (the snapshot's
+    // labels, which Picacho writes in it), else in English. %1 and %2
+    // stand for a and b.
+    function word(name, english, a, b) {
+        var labels = root.snapshot && root.snapshot.labels;
+        var text = (labels && labels[name]) || english;
+        return text.replace("%1", function () { return a; }).replace("%2", function () { return b; });
+    }
     property var packages: []
     // How many the Summary lists (for "View all"), most of them in the snapshot.
     property int totalCount: 0
-    property string headerTitle: "Packages"
+    property string headerTitle: word("packages", "Packages")
     property bool showAccountLabel: false
     property color accentColor: Kirigami.Theme.highlightColor
     property var execSource: null
@@ -60,7 +69,7 @@ PlasmoidItem {
         var parts = [];
         if (pkg.status) parts.push(pkg.status);
         if (pkg.carrier) parts.push(pkg.carrier);
-        if (pkg.expected) parts.push("Expected " + pkg.expected);
+        if (pkg.expected) parts.push(word("expected", "Expected %1", pkg.expected));
         else {
             var d = formatShortDate(pkg.updated);
             if (d) parts.push(d);
@@ -75,12 +84,12 @@ PlasmoidItem {
         var accs = snapshot.accounts || [];
         root.accentColor = rgb24ToColor(isDarkTheme() ? (snapshot.accent_dark || 0x86cfaa) : (snapshot.accent_light || 0x246846));
 
-        var title = "Packages";
+        var title = word("packages", "Packages");
         if (accId) {
             for (var i = 0; i < accs.length; i++) {
                 if (accs[i].id === accId) {
                     var label = accs[i].name || accs[i].email || "";
-                    if (label) title = "Packages · " + label;
+                    if (label) title = word("packages-of", "Packages · %1", label);
                     break;
                 }
             }
@@ -202,10 +211,10 @@ PlasmoidItem {
 
                 PlasmaComponents.ToolButton {
                     visible: root.totalCount > 0
-                    text: "View all " + root.totalCount
+                    text: word("view-all:" + root.totalCount, "View all %1", root.totalCount)
                     flat: true
                     onClicked: Qt.openUrlExternally(root.packagesUri())
-                    PlasmaComponents.ToolTip.text: "Open them in Picacho's Summary"
+                    PlasmaComponents.ToolTip.text: word("open-in-summary", "Open them in Picacho's Summary")
                     PlasmaComponents.ToolTip.visible: hovered
                 }
 
@@ -213,7 +222,7 @@ PlasmoidItem {
                     icon.name: "view-refresh"
                     display: PlasmaComponents.AbstractButton.IconOnly
                     onClicked: root.refreshSnapshot()
-                    PlasmaComponents.ToolTip.text: "Refresh"
+                    PlasmaComponents.ToolTip.text: word("refresh", "Refresh")
                     PlasmaComponents.ToolTip.visible: hovered
                 }
             }
@@ -284,7 +293,7 @@ PlasmoidItem {
                             spacing: 6
                             PlasmaComponents.Label {
                                 Layout.fillWidth: true
-                                text: modelData.title || "Package"
+                                text: modelData.title || word("package", "Package")
                                 font.bold: true
                                 elide: Text.ElideRight
                             }
@@ -328,7 +337,7 @@ PlasmoidItem {
                     anchors.centerIn: parent
                     visible: root.packages.length === 0
                     opacity: 0.65
-                    text: "No recent packages"
+                    text: word("no-recent-packages", "No recent packages")
                 }
             }
         }

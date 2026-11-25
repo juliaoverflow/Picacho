@@ -88,21 +88,29 @@ if (-not (Test-Path $uiExt)) {
 }
 
 New-Item -ItemType Directory -Force dist | Out-Null
-$msi = "dist\Picacho-$version-x64.msi"
-# MSVC links WebView2's loader statically: no DLL beside the app.
-$wixArgs = @(
-    $wix.FullName, "build", "-arch", "x64",
-    "-ext", $uiExt,
-    "-define", "Version=$msiVersion",
-    "-define", "ExeDir=$exeDir",
-    "-define", "WebView2Loader=no",
-    "-out", $msi,
-    "packaging\windows\picacho.wxs"
-)
-Write-Host "dotnet $($wixArgs -join ' ')"
 # WiX 5 targets .NET 6; roll forward to whichever newer runtime is here.
 $env:DOTNET_ROLL_FORWARD = "Major"
-& dotnet @wixArgs
-if ($LASTEXITCODE -ne 0) { throw "wix build failed (exit $LASTEXITCODE): see WiX's errors above" }
-Sign $msi
-Write-Host "Built $msi"
+# An installer in each language of packaging\windows\picacho.<culture>.wxl:
+# English's is Picacho-<version>-x64.msi, the others' end in their culture.
+foreach ($loc in Get-ChildItem packaging\windows\picacho.*.wxl) {
+    $culture = $loc.Name -replace '^picacho\.(.+)\.wxl$', '$1'
+    $suffix = if ($culture -eq "en-US") { "" } else { "-$culture" }
+    $msi = "dist\Picacho-$version-x64$suffix.msi"
+    # MSVC links WebView2's loader statically: no DLL beside the app.
+    $wixArgs = @(
+        $wix.FullName, "build", "-arch", "x64",
+        "-ext", $uiExt,
+        "-culture", $culture,
+        "-loc", $loc.FullName,
+        "-define", "Version=$msiVersion",
+        "-define", "ExeDir=$exeDir",
+        "-define", "WebView2Loader=no",
+        "-out", $msi,
+        "packaging\windows\picacho.wxs"
+    )
+    Write-Host "dotnet $($wixArgs -join ' ')"
+    & dotnet @wixArgs
+    if ($LASTEXITCODE -ne 0) { throw "wix build failed (exit $LASTEXITCODE): see WiX's errors above" }
+    Sign $msi
+    Write-Host "Built $msi"
+}

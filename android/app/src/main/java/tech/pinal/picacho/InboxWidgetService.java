@@ -72,8 +72,10 @@ public final class InboxWidgetService extends RemoteViewsService {
                 row.setViewVisibility(R.id.widget_item_dot, View.INVISIBLE);
             }
 
-            CharSequence senderText = m.sender.isEmpty() ? "(Unknown sender)" : m.sender;
-            CharSequence subjectText = m.subject.isEmpty() ? "(No subject)" : m.subject;
+            CharSequence senderText = m.sender.isEmpty()
+                    ? Lang.of(context).getString(R.string.widget_unknown_sender) : m.sender;
+            CharSequence subjectText = m.subject.isEmpty()
+                    ? Lang.of(context).getString(R.string.widget_no_subject) : m.subject;
             if (m.unread) {
                 senderText = bold(senderText);
                 subjectText = bold(subjectText);

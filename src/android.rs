@@ -168,6 +168,8 @@ impl Process {
         }
         let backend = display::new_backend(Arc::new(Store::open(path)?));
         self.backend = Some(backend.clone());
+        // Notifications and widgets in the language Picacho shows.
+        set_language("", false);
         // Notification buttons pressed while the activity's window isn't up
         // act here; taps and Reply open the activity themselves (Notifier).
         display::notify::set_background(display::notify::Background {
@@ -450,7 +452,7 @@ fn write_system_clipboard(text: &str) -> bool {
 /// off the UI thread.
 pub fn save_as(bytes: &[u8], name: &str, mime: &str) -> anyhow::Result<bool> {
     if JAVA.get().is_none() {
-        anyhow::bail!("Saving isn't available yet");
+        anyhow::bail!(t!("android-saving-isnt-available-yet"));
     }
     // Written whole to the cache first; Java copies it where it was asked.
     let dir = std::env::temp_dir().join("picacho-save");
@@ -498,7 +500,7 @@ pub fn save_as(bytes: &[u8], name: &str, mime: &str) -> anyhow::Result<bool> {
     match outcome {
         Some(0) => Ok(true),
         Some(1) => Ok(false),
-        _ => anyhow::bail!("Couldn't save the file"),
+        _ => anyhow::bail!(t!("android-couldnt-save-the-file")),
     }
 }
 
@@ -829,6 +831,8 @@ struct Java {
     widgets: Global<JClass<'static>>,
     /// The app lock's fingerprint or face prompt (`AppLock`).
     app_lock: Global<JClass<'static>>,
+    /// Picacho's language, for the text Android shows (`Lang`).
+    lang: Global<JClass<'static>>,
     /// The app's package name (`tech.pinal.picacho`, or the beta's).
     package: String,
 }
@@ -922,6 +926,7 @@ pub extern "system" fn Java_tech_pinal_picacho_Native_attach<'caller>(
         let save_file = env.find_class(jni_str!("tech/pinal/picacho/SaveFile"))?;
         let widgets = env.find_class(jni_str!("tech/pinal/picacho/WidgetStore"))?;
         let app_lock = env.find_class(jni_str!("tech/pinal/picacho/AppLock"))?;
+        let lang = env.find_class(jni_str!("tech/pinal/picacho/Lang"))?;
         let package = env
             .call_method(
                 &context,
@@ -946,6 +951,7 @@ pub extern "system" fn Java_tech_pinal_picacho_Native_attach<'caller>(
             save_file: env.new_global_ref(&save_file)?,
             widgets: env.new_global_ref(&widgets)?,
             app_lock: env.new_global_ref(&app_lock)?,
+            lang: env.new_global_ref(&lang)?,
             package,
         };
         let _ = JAVA.set(java);
@@ -1095,7 +1101,10 @@ pub fn open_sign_in(url: &str) -> anyhow::Result<()> {
         )?
         .z()
     });
-    anyhow::ensure!(opened == Some(true), "Could not open the browser");
+    anyhow::ensure!(
+        opened == Some(true),
+        t!("android-could-not-open-the-browser")
+    );
     Ok(())
 }
 
@@ -1145,7 +1154,7 @@ pub fn verify(url: &str, cancel: &AtomicBool) -> anyhow::Result<Option<(String, 
     });
     anyhow::ensure!(
         started == Some(true),
-        "Proton wants to check that it's you, but its check couldn't be shown."
+        t!("android-proton-wants-to-check-that-its")
     );
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30 * 60);
     let outcome = loop {
@@ -1158,7 +1167,7 @@ pub fn verify(url: &str, cancel: &AtomicBool) -> anyhow::Result<Option<(String, 
                 }
             }
             Waited::Answer(None) | Waited::TimedOut => break Ok(None),
-            Waited::Cancelled => break Err(anyhow::anyhow!("Sign-in cancelled.")),
+            Waited::Cancelled => break Err(anyhow::anyhow!(t!("android-sign-in-cancelled"))),
         }
     };
     with_java("VerifyActivity.close", |env, java| {
@@ -1195,9 +1204,9 @@ pub fn authenticate_biometrics(reason: &str) -> crate::display::biometric::Answe
     let request = Request::new();
     let id = request.id();
     let asked = call_java("AppLock.authenticate", |env, java| {
-        let title = env.new_string("Unlock Picacho")?;
+        let title = env.new_string(t!("android-unlock-picacho"))?;
         let reason = env.new_string(reason)?;
-        let cancel = env.new_string("Use Passcode")?;
+        let cancel = env.new_string(t!("android-use-passcode"))?;
         env.call_static_method(
             &java.app_lock,
             jni_str!("authenticate"),
@@ -1212,18 +1221,47 @@ pub fn authenticate_biometrics(reason: &str) -> crate::display::biometric::Answe
         .map(drop)
     });
     if asked.is_none() {
-        return Err(Failure::Failed("The fingerprint or face prompt couldn't be shown.".into()));
+        return Err(Failure::Failed(
+            t!("android-the-fingerprint-or-face-prompt-couldnt").into(),
+        ));
     }
     let never = AtomicBool::new(false);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10 * 60);
     match request.next(&never, deadline) {
         Waited::Answer(Some(answer)) if answer == "ok" => Ok(()),
+        Waited::Answer(Some(answer)) if answer == "unsupported" => Err(Failure::Failed(
+            t!("android-this-phones-android-is-too-old").into(),
+        )),
         Waited::Answer(Some(answer)) => match answer.strip_prefix("error:") {
             Some(why) => Err(Failure::Failed(why.to_owned())),
             None => Err(Failure::Cancelled),
         },
         Waited::Answer(None) | Waited::TimedOut | Waited::Cancelled => Err(Failure::Cancelled),
     }
+}
+
+/// Tells the Java side the language Picacho shows (`Lang.set`), for the
+/// text Android shows for it: notifications, widgets, the widget settings.
+/// With `apply`, `chosen` (empty: the phone's) was just chosen in Settings,
+/// and Android 13 and later learn it too (its app info, the widget picker).
+pub fn set_language(chosen: &str, apply: bool) {
+    let code = crate::i18n::language();
+    with_java("Lang.set", |env, java| {
+        let code = env.new_string(code)?;
+        let chosen = env.new_string(chosen)?;
+        env.call_static_method(
+            &java.lang,
+            jni_str!("set"),
+            jni_sig!("(Landroid/content/Context;Ljava/lang/String;Ljava/lang/String;Z)V"),
+            &[
+                JValue::Object(java.context.as_obj()),
+                JValue::Object(&code),
+                JValue::Object(&chosen),
+                JValue::Bool(apply),
+            ],
+        )
+        .map(drop)
+    });
 }
 
 /// Keeps Picacho's picture out of Recents (Android 13 and later), while

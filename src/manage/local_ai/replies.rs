@@ -472,9 +472,7 @@ impl Suggester {
     pub fn new(tagger: NativeTagger) -> Result<Self> {
         ensure!(
             tagger.classes() == CLASSES.len(),
-            "The reply model has {} outputs, but {} replies are expected",
-            tagger.classes(),
-            CLASSES.len()
+            t!("manage-local-ai-replies-the-reply-model-has-outputs-but", classes = tagger.classes(), count = CLASSES.len())
         );
         Ok(Self { tagger })
     }

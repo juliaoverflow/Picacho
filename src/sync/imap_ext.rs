@@ -64,7 +64,7 @@ pub(crate) fn enable(session: &mut ImapSession, ext: &Extensions) -> Result<Enab
             // UTF-8 (RFC 6855 §7).
             ensure!(
                 !ext.utf8_only,
-                "The server only accepts UTF-8 sessions and refused to enable one."
+                t!("sync-imap-ext-the-server-only-accepts-utf-8")
             );
             return Ok(base);
         }
@@ -83,7 +83,7 @@ pub(crate) fn enable(session: &mut ImapSession, ext: &Extensions) -> Result<Enab
     enabled.utf8 |= enabled.rev2;
     ensure!(
         !ext.utf8_only || enabled.utf8,
-        "The server only accepts UTF-8 sessions and didn't enable one."
+        t!("sync-imap-ext-the-server-only-accepts-utf-8-2")
     );
     Ok(enabled)
 }
@@ -139,14 +139,14 @@ fn parse_set_into(set: &str, out: &mut Vec<u32>, elsewhere: usize) -> Result<()>
             None => (part, part),
         };
         let (a, b): (u32, u32) = (
-            a.trim().parse().context("Invalid IMAP sequence set")?,
-            b.trim().parse().context("Invalid IMAP sequence set")?,
+            a.trim().parse().with_context(|| t!("sync-imap-ext-invalid-imap-sequence-set"))?,
+            b.trim().parse().with_context(|| t!("sync-imap-ext-invalid-imap-sequence-set"))?,
         );
         let (lo, hi) = (a.min(b), a.max(b));
-        ensure!(lo > 0, "Invalid IMAP UID 0");
+        ensure!(lo > 0, t!("sync-imap-ext-invalid-imap-uid-0"));
         ensure!(
             (out.len() + elsewhere) as u64 + u64::from(hi - lo) < MOST_UIDS as u64,
-            "The server's search result is too large"
+            t!("sync-imap-ext-the-servers-search-result-is-too")
         );
         out.extend(lo..=hi);
     }
@@ -187,7 +187,7 @@ pub(crate) fn multisearch(
     criteria: &str,
     utf8: bool,
 ) -> Result<Vec<Found>> {
-    ensure!(literals_only(criteria), "Invalid IMAP search");
+    ensure!(literals_only(criteria), t!("sync-imap-ext-invalid-imap-search"));
     if names.is_empty() {
         return Ok(Vec::new());
     }
@@ -309,7 +309,7 @@ pub(crate) fn search_uids(
     selected: &Selected,
     criteria: &str,
 ) -> Result<Vec<u32>> {
-    ensure!(literals_only(criteria), "Invalid IMAP search");
+    ensure!(literals_only(criteria), t!("sync-imap-ext-invalid-imap-search"));
     let mut uids = if ext.esearch {
         let data = run_with_literals(session, literals, &format!("UID SEARCH RETURN (ALL) {criteria}"))?;
         esearch_uids(&data)?
@@ -345,7 +345,7 @@ pub(crate) fn search_uids(
     };
     ensure!(
         uids.iter().all(|uid| *uid > 0),
-        "Invalid IMAP UID in search response"
+        t!("sync-imap-ext-invalid-imap-uid-in-search-response")
     );
     uids.sort_unstable();
     uids.dedup();
@@ -437,7 +437,7 @@ pub(crate) fn run_with_literals(
         }
         Some(_) => session.run_command_and_read_response(command),
         None if parts.len() > 1 => Err(imap::error::Error::Bad(
-            "This connection can't send text with accents to the server's search.".into(),
+            t!("sync-imap-ext-this-connection-cant-send-text-with").into(),
         )),
         None => session.run_command_and_read_response(command),
     }
@@ -519,7 +519,7 @@ pub(crate) fn sorted_search(
                 None => line,
             };
             for word in line.split_ascii_whitespace() {
-                out.push(word.parse::<u32>().context("Invalid IMAP SORT response")?);
+                out.push(word.parse::<u32>().with_context(|| t!("sync-imap-ext-invalid-imap-sort-response"))?);
             }
         }
         return Ok(out);
@@ -624,7 +624,7 @@ fn parse_threads(line: &str) -> Result<Vec<Vec<u32>>> {
     let mut number = String::new();
     let flush = |number: &mut String, current: &mut Vec<u32>| -> Result<()> {
         if !number.is_empty() {
-            current.push(number.parse().context("Invalid IMAP THREAD response")?);
+            current.push(number.parse().with_context(|| t!("sync-imap-ext-invalid-imap-thread-response"))?);
             number.clear();
         }
         Ok(())
@@ -637,7 +637,7 @@ fn parse_threads(line: &str) -> Result<Vec<Vec<u32>>> {
             }
             ')' => {
                 flush(&mut number, &mut current)?;
-                ensure!(depth > 0, "Invalid IMAP THREAD response");
+                ensure!(depth > 0, t!("sync-imap-ext-invalid-imap-thread-response"));
                 depth -= 1;
                 if depth == 0 && !current.is_empty() {
                     out.push(std::mem::take(&mut current));
@@ -645,10 +645,10 @@ fn parse_threads(line: &str) -> Result<Vec<Vec<u32>>> {
             }
             ' ' => flush(&mut number, &mut current)?,
             d if d.is_ascii_digit() => number.push(d),
-            _ => bail!("Invalid IMAP THREAD response"),
+            _ => bail!(t!("sync-imap-ext-invalid-imap-thread-response")),
         }
     }
-    ensure!(depth == 0, "Invalid IMAP THREAD response");
+    ensure!(depth == 0, t!("sync-imap-ext-invalid-imap-thread-response"));
     Ok(out)
 }
 
@@ -732,7 +732,7 @@ pub(crate) fn get_metadata(
         entries
             .iter()
             .all(|e| e.starts_with('/') && !e.contains([' ', '\r', '\n', '"'])),
-        "Invalid METADATA entry"
+        t!("sync-imap-ext-invalid-metadata-entry")
     );
     // Values past 64 KB aren't sent (MAXSIZE, RFC 5464 §4.2.1): the
     // server says how long the longest was, rather than a huge reply.
@@ -769,7 +769,7 @@ pub(crate) fn set_metadata(
 ) -> Result<bool> {
     ensure!(
         entry.starts_with('/') && !entry.contains([' ', '\r', '\n', '"']),
-        "Invalid METADATA entry"
+        t!("sync-imap-ext-invalid-metadata-entry")
     );
     let value = match value {
         Some(v) => quote(v)?,
@@ -878,7 +878,7 @@ pub(crate) fn structure(session: &mut ImapSession, uid: u32) -> Result<Vec<Leaf>
         .iter()
         .filter(|f| f.uid == Some(uid))
         .find_map(|f| f.bodystructure())
-        .context("The server didn't describe this message's parts.")?;
+        .with_context(|| t!("sync-imap-ext-the-server-didnt-describe-this-messages"))?;
     let mut out = Vec::new();
     leaves(bs, "", &mut out);
     Ok(out)
@@ -1077,12 +1077,11 @@ pub(crate) fn fetch_part(
         leaf.section
             .bytes()
             .all(|b| b.is_ascii_digit() || b == b'.'),
-        "Invalid IMAP section"
+        t!("sync-imap-ext-invalid-imap-section")
     );
     ensure!(
         leaf.size <= limit,
-        "This part is larger than Picacho downloads ({} MB).",
-        limit / (1024 * 1024)
+        t!("sync-imap-ext-this-part-is-larger-than-picacho", megabytes = limit / (1024 * 1024))
     );
     if ext.binary {
         let data = session.run_command_and_read_response(format!(
@@ -1118,7 +1117,7 @@ pub(crate) fn fetch_part(
         .into_iter()
         .find(|r| r.uid == uid)
         .and_then(|r| r.header)
-        .context("The message no longer exists on the server")?;
+        .with_context(|| t!("sync-imap-ext-the-message-no-longer-exists-on"))?;
     decode_part(&raw, &leaf.encoding)
 }
 /// A part's body in its transfer encoding, decoded.
@@ -1127,7 +1126,7 @@ pub(crate) fn decode_part(raw: &[u8], encoding: &str) -> Result<Vec<u8>> {
     // only a name (a line break would add headers of the server's own).
     ensure!(
         encoding.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'),
-        "The server named an invalid transfer encoding."
+        t!("sync-imap-ext-the-server-named-an-invalid-transfer")
     );
     let mut wrapped = format!(
         "Content-Type: application/octet-stream\r\nContent-Transfer-Encoding: {encoding}\r\n\r\n"
@@ -1153,7 +1152,7 @@ pub(crate) fn fetch_range(
     rows.into_iter()
         .find(|r| r.uid == uid)
         .and_then(|r| r.header)
-        .context("The message no longer exists on the server")
+        .with_context(|| t!("sync-imap-ext-the-message-no-longer-exists-on"))
 }
 
 #[cfg(test)]

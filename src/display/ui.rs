@@ -11,6 +11,7 @@ mod recovery;
 mod links;
 #[path = "proton_login.rs"]
 mod proton_login;
+use crate::i18n::dates::Local as _;
 use crate::manage::backend::{KeyMethod, KeyPrompt};
 use proton_login::ProtonStage;
 #[path = "catalog.rs"]
@@ -350,13 +351,13 @@ impl Accent {
     }
     fn label(self) -> &'static str {
         match self {
-            Self::Green => "Green",
-            Self::Teal => "Teal",
-            Self::Blue => "Blue",
-            Self::Purple => "Purple",
-            Self::Pink => "Pink",
-            Self::Orange => "Orange",
-            Self::Graphite => "Graphite",
+            Self::Green => t!("ui-green"),
+            Self::Teal => t!("ui-teal"),
+            Self::Blue => t!("ui-blue"),
+            Self::Purple => t!("ui-purple"),
+            Self::Pink => t!("ui-pink"),
+            Self::Orange => t!("ui-orange"),
+            Self::Graphite => t!("ui-graphite"),
         }
     }
     fn from_key(key: &str) -> Self {
@@ -447,12 +448,20 @@ fn address_entries(name: Option<&str>, email: &str, from: Option<&str>) -> Vec<E
     let name = name.map(str::trim).filter(|n| !n.is_empty());
     let mut entries = Vec::new();
     if let Some(name) = name {
-        entries.push(entry("Copy Name", "copy", Action::CopyText(name.to_owned())));
+        entries.push(entry(
+            t!("ui-copy-name"),
+            "copy",
+            Action::CopyText(name.to_owned()),
+        ));
     }
-    entries.push(entry("Copy Address", "copy", Action::CopyText(email.to_owned())));
+    entries.push(entry(
+        t!("ui-copy-address"),
+        "copy",
+        Action::CopyText(email.to_owned()),
+    ));
     if name.is_some() {
         entries.push(entry(
-            "Copy Name and Address",
+            t!("ui-copy-name-and-address"),
             "copy",
             Action::CopyText(name_and_address(name, email)),
         ));
@@ -460,12 +469,12 @@ fn address_entries(name: Option<&str>, email: &str, from: Option<&str>) -> Vec<E
     if let Some(from) = from {
         entries.push(Entry::Separator);
         entries.push(entry(
-            "Send Email…",
+            t!("ui-send-email"),
             "compose",
             Action::ComposeTo(name_and_address(name, email)),
         ));
         entries.push(entry(
-            "Show Mail From This Address",
+            t!("ui-show-mail-from-this-address"),
             "search",
             Action::SearchFor(search_term("from", from)),
         ));
@@ -550,9 +559,9 @@ impl SourceView {
     pub(super) const ALL: [Self; 3] = [Self::Headers, Self::Html, Self::Original];
     pub(super) fn label(self) -> &'static str {
         match self {
-            Self::Headers => "Headers",
+            Self::Headers => t!("ui-headers"),
             Self::Html => "HTML",
-            Self::Original => "Raw",
+            Self::Original => t!("ui-raw"),
         }
     }
 }
@@ -566,10 +575,10 @@ enum Filter {
 impl Filter {
     fn label(self) -> &'static str {
         match self {
-            Self::All => "All Messages",
-            Self::Unread => "Unread",
-            Self::Starred => "Starred",
-            Self::Attachments => "Has Attachments",
+            Self::All => t!("ui-all-messages"),
+            Self::Unread => t!("ui-unread"),
+            Self::Starred => t!("ui-starred"),
+            Self::Attachments => t!("ui-has-attachments"),
         }
     }
 }
@@ -938,6 +947,10 @@ enum Action {
     SetCleanLinks(bool),
     /// Keep running in the background once the windows close.
     SetBackground(bool),
+    /// Shows the interface in this language (a code; empty: the system's).
+    SetLanguage(String),
+    /// Writes mail in this language (a code; empty: the interface's).
+    SetOutgoingLanguage(String),
     /// Show the tray icon while a window is open too.
     SetTrayIcon(bool),
     /// Turns Local AI on, or off (deleting its models).
@@ -1991,11 +2004,60 @@ fn input(
     window: &mut Window,
     cx: &mut App,
 ) -> Entity<InputState> {
-    cx.new(|cx| {
+    reworded(cx.new(|cx| {
         InputState::new(window, cx)
             .placeholder(placeholder.to_owned())
             .masked(masked)
-    })
+    }))
+}
+
+/// Words a text field's placeholder again in the language now shown,
+/// saying whether the field still exists.
+type Reword = Box<dyn Fn(&mut Window, &mut App) -> bool>;
+
+thread_local! {
+    /// Each text field's `Reword` (`reword_placeholders`).
+    static PLACEHOLDERS: std::cell::RefCell<Vec<Reword>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// `field`, with its placeholder worded again when the language changes.
+fn reworded(field: Entity<InputState>) -> Entity<InputState> {
+    let weak = field.downgrade();
+    PLACEHOLDERS.with_borrow_mut(|all| {
+        all.push(Box::new(move |window, cx| {
+            weak.update(cx, |s, cx| {
+                if let Some(text) = crate::i18n::reword(s.presentation().placeholder()) {
+                    s.set_placeholder(text, window, cx);
+                }
+            })
+            .is_ok()
+        }))
+    });
+    field
+}
+
+/// `reworded`, for a multi-line field.
+fn reworded_area(field: Entity<TextareaState>) -> Entity<TextareaState> {
+    let weak = field.downgrade();
+    PLACEHOLDERS.with_borrow_mut(|all| {
+        all.push(Box::new(move |window, cx| {
+            weak.update(cx, |s, cx| {
+                if let Some(text) = crate::i18n::reword(s.presentation().placeholder()) {
+                    s.set_placeholder(text, window, cx);
+                }
+            })
+            .is_ok()
+        }))
+    });
+    field
+}
+
+/// Words every text field's placeholder in the language now shown, and
+/// forgets the fields that are gone.
+fn reword_placeholders(window: &mut Window, cx: &mut App) {
+    let all = PLACEHOLDERS.take();
+    let kept: Vec<_> = all.into_iter().filter(|reword| reword(window, cx)).collect();
+    PLACEHOLDERS.with_borrow_mut(|all| all.extend(kept));
 }
 /// Sets a field's text from code and reports it as a change, as a person's
 /// edit would be. gpui-base's `set_value` stays silent; Picacho's handlers
@@ -2073,24 +2135,24 @@ impl MailApp {
         let background = crate::manage::background::enabled(&store);
         let tray_icon = crate::manage::background::tray_while_open(&store);
         drop(store);
-        let search = cx.new(|cx| {
+        let search = reworded(cx.new(|cx| {
             InputState::new(window, cx)
-                .placeholder("Search, or from: reply-to: is:unread")
+                .placeholder(t!("ui-search-or-from-reply-to-is"))
                 .input_action(TextInputAction::Search)
-        });
+        }));
         let placeholders = [
             "you@example.com",
-            "Password",
+            t!("ui-password"),
             "imap.example.com",
             "993",
             "smtp.example.com",
             "587",
-            "Same as the email address",
+            t!("ui-same-as-the-email-address"),
             "123456",
-            "Mailbox password",
+            t!("ui-mailbox-password"),
             "PIN",
             "https://login.example.com/realms/mail",
-            "Registered by Picacho when allowed",
+            t!("ui-registered-by-picacho-when-allowed"),
         ];
         let form: Vec<_> = placeholders
             .iter()
@@ -2160,7 +2222,7 @@ impl MailApp {
             });
         }
         let cal = calendar_views::CalViews::new(window, cx);
-        let rename_input = input("Folder name", false, window, cx);
+        let rename_input = input(t!("ui-folder-name"), false, window, cx);
         subscriptions.push(
             cx.subscribe_in(&rename_input, window, |this, _, event, w, cx| {
                 if matches!(event, InputEvent::PressEnter { .. } | InputEvent::Blur) {
@@ -2168,7 +2230,7 @@ impl MailApp {
                 }
             }),
         );
-        let parcel_input = input("Name", false, window, cx);
+        let parcel_input = input(t!("ui-name"), false, window, cx);
         subscriptions.push(
             cx.subscribe_in(&parcel_input, window, |this, _, event, w, cx| {
                 if matches!(event, InputEvent::PressEnter { .. } | InputEvent::Blur) {
@@ -2176,19 +2238,19 @@ impl MailApp {
                 }
             }),
         );
-        let parcel_search = input("Search packages", false, window, cx);
+        let parcel_search = input(t!("ui-search-packages"), false, window, cx);
         subscriptions.push(cx.subscribe(&parcel_search, |_, _, event, cx| {
             if matches!(event, InputEvent::Change) {
                 cx.notify();
             }
         }));
-        let receipt_search = input("Search receipts", false, window, cx);
+        let receipt_search = input(t!("ui-search-receipts"), false, window, cx);
         subscriptions.push(cx.subscribe(&receipt_search, |_, _, event, cx| {
             if matches!(event, InputEvent::Change) {
                 cx.notify();
             }
         }));
-        let label_input = input("Label name", false, window, cx);
+        let label_input = input(t!("ui-label-name"), false, window, cx);
         subscriptions.push(
             cx.subscribe_in(&label_input, window, |this, _, event, w, cx| {
                 if matches!(event, InputEvent::PressEnter { .. }) {
@@ -2196,7 +2258,7 @@ impl MailApp {
                 }
             }),
         );
-        let unlock_input = input("Pinal password or recovery key", true, window, cx);
+        let unlock_input = input(t!("ui-pinal-password-or-recovery-key"), true, window, cx);
         subscriptions.push(
             cx.subscribe_in(&unlock_input, window, |this, _, event, w, cx| {
                 if matches!(event, InputEvent::PressEnter { .. }) {
@@ -2205,55 +2267,59 @@ impl MailApp {
             }),
         );
         let encrypted = HashSet::new();
-        let fwd_key = input("API key", true, window, cx);
+        let fwd_key = input(t!("ui-api-key"), true, window, cx);
         let calendar_url = input("https://caldav.example.com", false, window, cx);
-        let calendar_user = input("User name", false, window, cx);
-        let calendar_password = input("Password or app password", true, window, cx);
+        let calendar_user = input(t!("ui-user-name"), false, window, cx);
+        let calendar_password = input(t!("ui-password-or-app-password"), true, window, cx);
         subscriptions.push(cx.subscribe_in(&calendar_password, window, |this, _, event, w, cx| {
             if matches!(event, InputEvent::PressEnter { .. }) {
                 this.handle(Action::ConnectCalendar, w, cx);
             }
         }));
-        let event_title = input("Title", false, window, cx);
+        let event_title = input(t!("ui-title"), false, window, cx);
         let event_start = input("2026-11-24 10:00", false, window, cx);
         let event_end = input("2026-11-24 11:00", false, window, cx);
-        let event_location = input("Where (optional)", false, window, cx);
-        let event_notes = input("Notes (optional)", false, window, cx);
-        let event_zone = input("Europe/Berlin", false, window, cx);
+        let event_location = input(t!("ui-where-optional"), false, window, cx);
+        let event_notes = input(t!("ui-notes-optional"), false, window, cx);
+        let event_zone = input(t!("ui-europe-berlin"), false, window, cx);
         subscriptions.push(cx.subscribe(&event_zone, |_, _, event, cx| {
             if matches!(event, InputEvent::Change) {
                 cx.notify();
             }
         }));
-        let event_guests = input("ana@example.com, bo@example.com (optional)", false, window, cx);
-        let key_check_input = input("Their fingerprint", false, window, cx);
+        let event_guests = input(t!("ui-ana-example-com-bo-example-com"), false, window, cx);
+        let key_check_input = input(t!("ui-their-fingerprint"), false, window, cx);
         let key_lookup = input("name@example.com", false, window, cx);
-        let key_passphrase = input("Passphrase (only for a protected secret key)", true, window, cx);
-        let contact_name = input("Name", false, window, cx);
+        let key_passphrase = input(
+            t!("ui-passphrase-only-for-a-protected-secret"),
+            true,
+            window,
+            cx,
+        );
+        let contact_name = input(t!("ui-name"), false, window, cx);
         let contact_emails = input("name@example.com", false, window, cx);
-        let contact_phones = input("Phone numbers (optional)", false, window, cx);
-        let contact_org = input("Organization (optional)", false, window, cx);
-        let contact_note = input("Note (optional)", false, window, cx);
-        let contact_filter = input("Find a contact", false, window, cx);
+        let contact_phones = input(t!("ui-phone-numbers-optional"), false, window, cx);
+        let contact_org = input(t!("ui-organization-optional"), false, window, cx);
+        let contact_note = input(t!("ui-note-optional"), false, window, cx);
+        let contact_filter = input(t!("ui-find-a-contact"), false, window, cx);
         subscriptions.push(cx.subscribe(&contact_filter, |_, _, event, cx| {
             if matches!(event, InputEvent::Change) {
                 cx.notify();
             }
         }));
         let contacts_url = input("https://carddav.example.com", false, window, cx);
-        let contacts_user = input("User name", false, window, cx);
-        let contacts_password = input("Password or app password", true, window, cx);
-        subscriptions.push(cx.subscribe_in(&contacts_password, window, |this, _, event, w, cx| {
-            if matches!(event, InputEvent::PressEnter { .. }) {
-                this.handle(Action::ConnectContacts, w, cx);
-            }
-        }));
-        let fwd_server = input("Server (optional, for self-hosted)", false,
-            window,
-            cx,
+        let contacts_user = input(t!("ui-user-name"), false, window, cx);
+        let contacts_password = input(t!("ui-password-or-app-password"), true, window, cx);
+        subscriptions.push(
+            cx.subscribe_in(&contacts_password, window, |this, _, event, w, cx| {
+                if matches!(event, InputEvent::PressEnter { .. }) {
+                    this.handle(Action::ConnectContacts, w, cx);
+                }
+            }),
         );
-        let fwd_note = input("Description (optional)", false, window, cx);
-        let fwd_prefix = input("Random prefix", false, window, cx);
+        let fwd_server = input(t!("ui-server-optional-for-self-hosted"), false, window, cx);
+        let fwd_note = input(t!("ui-description-optional"), false, window, cx);
+        let fwd_prefix = input(t!("ui-random-prefix"), false, window, cx);
         subscriptions.push(cx.subscribe_in(&fwd_prefix, window, |this, _, event, w, cx| {
             match event {
                 InputEvent::PressEnter { .. } => {
@@ -2265,7 +2331,7 @@ impl MailApp {
                 _ => {}
             }
         }));
-        let fwd_description = input("Description", false, window, cx);
+        let fwd_description = input(t!("ui-description"), false, window, cx);
         subscriptions.push(
             cx.subscribe_in(&fwd_description, window, |this, _, event, w, cx| {
                 if matches!(event, InputEvent::PressEnter { .. }) {
@@ -2273,7 +2339,7 @@ impl MailApp {
                 }
             }),
         );
-        let fwd_contact_search = input("Find a contact", false, window, cx);
+        let fwd_contact_search = input(t!("ui-find-a-contact"), false, window, cx);
         subscriptions.push(cx.subscribe(&fwd_contact_search, |this, input, event, cx| {
             if matches!(event, InputEvent::Change) {
                 let query = input.read(cx).value().to_string();
@@ -2282,7 +2348,7 @@ impl MailApp {
                 cx.notify();
             }
         }));
-        let fwd_contact_new = input("Write to a new address", false, window, cx);
+        let fwd_contact_new = input(t!("ui-write-to-a-new-address"), false, window, cx);
         subscriptions.push(
             cx.subscribe_in(&fwd_contact_new, window, |this, _, event, w, cx| {
                 if matches!(event, InputEvent::PressEnter { .. })
@@ -2293,7 +2359,7 @@ impl MailApp {
                 }
             }),
         );
-        let fwd_search = input("Find an alias", false, window, cx);
+        let fwd_search = input(t!("ui-find-an-alias"), false, window, cx);
         subscriptions.push(cx.subscribe(&fwd_search, |this, _, event, cx| {
             if matches!(event, InputEvent::Change) {
                 this.fwd_pages.clear();
@@ -2403,11 +2469,11 @@ impl MailApp {
             .preference(crate::manage::composing::PREFERENCE)
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default();
-        let signature_input = cx.new(|cx| {
+        let signature_input = reworded_area(cx.new(|cx| {
             TextareaState::new(window, cx)
-                .placeholder("Your name, title, phone…")
+                .placeholder(t!("ui-your-name-title-phone"))
                 .default_value(compose_options.signature.clone())
-        });
+        }));
         subscriptions.push(cx.subscribe(&signature_input, |this, input, e, cx| {
             if matches!(e, InputEvent::Change) {
                 let signature = input.read(cx).value().to_string();
@@ -2424,7 +2490,7 @@ impl MailApp {
                 .detach();
             }
         }));
-        let nickname_input = input("Nickname", false, window, cx);
+        let nickname_input = input(t!("ui-nickname"), false, window, cx);
         subscriptions.push(cx.subscribe(&nickname_input, |this, input, e, cx| {
             match e {
                 InputEvent::Change => {
@@ -2437,7 +2503,7 @@ impl MailApp {
                 _ => {}
             }
         }));
-        let login_input = input("Same as the email address", false, window, cx);
+        let login_input = input(t!("ui-same-as-the-email-address"), false, window, cx);
         subscriptions.push(cx.subscribe(&login_input, |this, input, e, cx| {
             // Applied once typed (a pause, Enter or leaving the field), not
             // on every key: each change signs the account out, and its
@@ -2472,30 +2538,37 @@ impl MailApp {
                 _ => {}
             }
         }));
-        let reply_to_input = input("Replies come to the sending address", false, window, cx);
-        subscriptions.push(cx.subscribe(&reply_to_input, |this, input, e, cx| {
-            match e {
-                InputEvent::Change => {
-                    if let Some(id) = this.nickname_for.clone() {
-                        let value = input.read(cx).value().trim().to_owned();
-                        if let Some(a) = this.accounts.iter_mut().find(|a| a.id == id && a.reply_to != value) {
-                            a.reply_to = value;
-                            this.save_account_soon(&id, cx);
-                        }
+        let reply_to_input = input(
+            t!("ui-replies-come-to-the-sending-address"),
+            false,
+            window,
+            cx,
+        );
+        subscriptions.push(cx.subscribe(&reply_to_input, |this, input, e, cx| match e {
+            InputEvent::Change => {
+                if let Some(id) = this.nickname_for.clone() {
+                    let value = input.read(cx).value().trim().to_owned();
+                    if let Some(a) = this
+                        .accounts
+                        .iter_mut()
+                        .find(|a| a.id == id && a.reply_to != value)
+                    {
+                        a.reply_to = value;
+                        this.save_account_soon(&id, cx);
                     }
                 }
-                InputEvent::PressEnter { .. } | InputEvent::Blur => this.save_unsaved_account(cx),
-                _ => {}
             }
+            InputEvent::PressEnter { .. } | InputEvent::Blur => this.save_unsaved_account(cx),
+            _ => {}
         }));
         let identity_inputs = [
             input("name@example.com", false, window, cx),
-            input("Your name, as recipients see it", false, window, cx),
-            input("Replies come to this address", false, window, cx),
+            input(t!("ui-your-name-as-recipients-see-it"), false, window, cx),
+            input(t!("ui-replies-come-to-this-address"), false, window, cx),
             input("smtp.example.com", false, window, cx),
             input("587", false, window, cx),
-            input("Same as the address", false, window, cx),
-            input("Password or app password", true, window, cx),
+            input(t!("ui-same-as-the-address"), false, window, cx),
+            input(t!("ui-password-or-app-password"), true, window, cx),
         ];
         let html_view = cx.new(HtmlView::new);
         // The person's text zoom for emails, as last set.
@@ -2928,13 +3001,18 @@ impl MailApp {
             contact_phones,
             contact_org,
             contact_note,
-            contact_addresses: input("Street, city (one a line; optional)", false, window, cx),
-            contact_birthday: input("1990-01-31, or --01-31 without a year (optional)", false, window, cx),
-            contact_title: input("Job title (optional)", false, window, cx),
-            contact_nicknames: input("Nicknames, separated by commas (optional)", false, window, cx),
-            contact_links: input("Web pages and chat (https://…, xmpp:…; optional)", false, window, cx),
-            contact_anniversary: input("2010-06-12, or --06-12 without a year (optional)", false, window, cx),
-            contact_members: input("For a group: its people, by address (optional)", false, window, cx),
+            contact_addresses: input(t!("ui-street-city-one-a-line-optional"), false, window, cx),
+            contact_birthday: input(t!("ui-1990-01-31-or-01-31"), false, window, cx),
+            contact_title: input(t!("ui-job-title-optional"), false, window, cx),
+            contact_nicknames: input(
+                t!("ui-nicknames-separated-by-commas-optional"),
+                false,
+                window,
+                cx,
+            ),
+            contact_links: input(t!("ui-web-pages-and-chat-https-xmpp"), false, window, cx),
+            contact_anniversary: input(t!("ui-2010-06-12-or-06-12"), false, window, cx),
+            contact_members: input(t!("ui-for-a-group-its-people-by"), false, window, cx),
             contact_filter,
             key_passphrase,
             key_error: None,
@@ -2963,11 +3041,11 @@ impl MailApp {
             event_location,
             event_notes,
             event_guests,
-            collection_name: input("Name", false, window, cx),
+            collection_name: input(t!("ui-name"), false, window, cx),
             task_editing: None,
-            task_title: input("Task", false, window, cx),
-            task_due: input("2026-11-24 17:00, a date, or empty", false, window, cx),
-            task_notes: input("Notes", false, window, cx),
+            task_title: input(t!("ui-task"), false, window, cx),
+            task_due: input(t!("ui-2026-11-24-17-00-a"), false, window, cx),
+            task_notes: input(t!("ui-notes"), false, window, cx),
             event_alarm: None,
             free_busy: None,
             held: None,
@@ -3112,11 +3190,42 @@ impl MailApp {
     /// Quits Picacho (not just the window), unless a message is being sent.
     fn quit_app(&mut self, cx: &mut Context<Self>) {
         if self.sending {
-            self.notice("Wait for the current message to finish sending.", true, cx);
+            self.notice(t!("ui-wait-for-the-current-message-to"), true, cx);
         } else {
             self.persist_draft(cx);
             cx.quit();
         }
+    }
+    /// Shows the interface in `code` (empty: the system's language), in
+    /// every window, from now on.
+    fn set_language(&mut self, code: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.backend
+            .store
+            .set_preference_soon(crate::i18n::PREFERENCE, &code);
+        crate::i18n::set_preference(Some(&code));
+        // The phone's own text for Picacho (notifications, widgets) follows,
+        // and the widgets' text from the snapshot.
+        #[cfg(target_os = "android")]
+        crate::android::set_language(&code, true);
+        crate::manage::widgets::publish_soon(self.backend.store.clone());
+        // What was worded once: the app's menus, the tray's.
+        cx.set_menus(menus());
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        super::tray::relabel();
+        // iOS's notification buttons, and the text fields' placeholders.
+        #[cfg(target_os = "ios")]
+        crate::ios::register_categories();
+        reword_placeholders(window, cx);
+        cx.refresh_windows();
+    }
+    /// Writes mail (quotes, invitations, read receipts) in `code` (empty:
+    /// the interface's language), from now on.
+    fn set_outgoing_language(&mut self, code: String, cx: &mut Context<Self>) {
+        self.backend
+            .store
+            .set_preference_soon(crate::i18n::OUTGOING_PREFERENCE, &code);
+        crate::i18n::set_outgoing(Some(&code));
+        cx.notify();
     }
     fn set_background(&mut self, on: bool, cx: &mut Context<Self>) {
         use crate::manage::background::PREFERENCE;
@@ -3223,7 +3332,7 @@ impl MailApp {
     }
     fn mailbox_label(&self) -> String {
         if self.local_results.is_some() {
-            return "Results on This Computer".into();
+            return t!("ui-results-on-this-computer").into();
         }
         if self.folder != Folder::Other {
             return self.folder.label().into();
@@ -3736,57 +3845,65 @@ impl MailApp {
             .iter()
             .any(|a| a.id == id && !a.nickname.is_empty());
         vec![
-            entry("Refresh", "refresh", Action::RefreshAccount(id.clone())),
             entry(
-                "Mark Inbox as Read",
+                t!("ui-refresh"),
+                "refresh",
+                Action::RefreshAccount(id.clone()),
+            ),
+            entry(
+                t!("ui-mark-inbox-as-read"),
                 "mail-open",
                 Action::MarkAllRead(id.clone(), Folder::Inbox.into()),
             ),
             Entry::Separator,
             entry(
                 if self.collapsed.contains(&id) {
-                    "Expand"
+                    t!("ui-expand")
                 } else {
-                    "Collapse"
+                    t!("ui-collapse")
                 },
                 "chevron-down",
                 Action::ToggleAccount(id.clone()),
             ),
             entry(
-                "Account Settings…",
+                t!("ui-account-settings"),
                 "settings",
                 Action::AccountSettings(id.clone()),
             ),
             entry(
                 if has_nickname {
-                    "Edit Nickname…"
+                    t!("ui-edit-nickname")
                 } else {
-                    "Add Nickname…"
+                    t!("ui-add-nickname")
                 },
                 "compose",
                 Action::EditNickname(id.clone(), inline),
             ),
-            entry("Change Picture…", "user", Action::AvatarMenu(id.clone())),
+            entry(
+                t!("ui-change-picture"),
+                "user",
+                Action::AvatarMenu(id.clone()),
+            ),
             Entry::Separator,
-            danger("Remove Account…", "trash", Action::ConfirmRemove(id)),
+            danger(t!("ui-remove-account"), "trash", Action::ConfirmRemove(id)),
         ]
     }
     fn mailbox_entries(&self, id: &str, mailbox: Mailbox) -> Vec<Entry> {
         let mut entries = vec![
             entry(
-                "Open",
+                t!("ui-open"),
                 "inbox",
                 Action::OpenMailbox(id.into(), mailbox.clone()),
             ),
             entry(
-                "Refresh",
+                t!("ui-refresh"),
                 "refresh",
                 Action::OpenMailbox(id.into(), mailbox.clone()),
             ),
         ];
         if !matches!(mailbox, Mailbox::Standard(Folder::Drafts | Folder::Starred)) {
             entries.push(entry(
-                "Mark All as Read",
+                t!("ui-mark-all-as-read"),
                 "mail-open",
                 Action::MarkAllRead(id.into(), mailbox.clone()),
             ));
@@ -3794,13 +3911,13 @@ impl MailApp {
         if self.accounts.iter().any(|a| a.id == id) {
             entries.push(Entry::Separator);
             entries.push(entry(
-                "Export as Mbox…",
+                t!("ui-export-as-mbox"),
                 "download",
                 Action::ExportMailbox(id.into(), mailbox.clone()),
             ));
             if !mailbox.folder().is_virtual() && mailbox.folder() != Folder::Drafts {
                 entries.push(entry(
-                    "Import Messages…",
+                    t!("ui-import-messages"),
                     "upload",
                     Action::ImportMail(id.into(), mailbox.clone()),
                 ));
@@ -3812,9 +3929,9 @@ impl MailApp {
             entries.push(Entry::Separator);
             entries.push(danger(
                 if folder == Folder::Trash {
-                    "Empty Trash…"
+                    t!("ui-empty-trash")
                 } else {
-                    "Empty Spam…"
+                    t!("ui-empty-spam")
                 },
                 "trash",
                 Action::EmptyMailbox(id.into(), folder),
@@ -3824,7 +3941,7 @@ impl MailApp {
         if mailbox == Mailbox::Standard(Folder::Inbox) && self.manages_folders(id) {
             entries.push(Entry::Separator);
             entries.push(entry(
-                "New Folder",
+                t!("ui-new-folder"),
                 "folder-closed",
                 Action::NewRemoteFolder(id.into(), None),
             ));
@@ -3834,21 +3951,21 @@ impl MailApp {
         {
             entries.push(Entry::Separator);
             entries.push(entry(
-                "Rename…",
+                t!("ui-rename"),
                 "compose",
                 Action::RenameRemoteFolder(id.into(), name.clone()),
             ));
             if self.folder_nestable(id, &name) {
                 entries.push(Entry::Separator);
                 entries.push(entry(
-                    "New Folder Inside",
+                    t!("ui-new-folder-inside"),
                     "folder-closed",
                     Action::NewRemoteFolder(id.into(), Some(name.clone())),
                 ));
             }
             entries.push(Entry::Separator);
             entries.push(danger(
-                "Delete Folder…",
+                t!("ui-delete-folder"),
                 "trash",
                 Action::DeleteRemoteFolder(id.into(), name),
             ));
@@ -3911,18 +4028,16 @@ impl MailApp {
                 div()
                     .text_size(px(14.))
                     .font_weight(FontWeight::MEDIUM)
-                    .child(format!("Delete “{label}”?")),
+                    .child(t!("ui-delete", label = label)),
             )
             .child(
                 div()
                     .text_size(px(12.))
                     .text_color(rgb(c.muted))
                     .child(if gmail {
-                        format!("The label is removed from {email}. Its messages stay in All Mail.")
+                        t!("ui-the-label-is-removed-from-its", email = email)
                     } else {
-                        format!(
-                            "The folder and the messages in it are deleted from {email}'s server. This can't be undone."
-                        )
+                        t!("ui-the-folder-and-the-messages-in", email = email)
                     }),
             )
             .into_any_element()
@@ -3951,7 +4066,7 @@ impl MailApp {
                 match result {
                     Ok(folders) => {
                         this.folders.insert(id.clone(), folders);
-                        this.notice(format!("Deleted “{label}”"), false, cx);
+                        this.notice(t!("ui-deleted", label = label), false, cx);
                         // Its view is gone; show the account's inbox.
                         if this.account.as_ref() == Some(&id)
                             && this.mailbox() == Mailbox::Remote(name.clone())
@@ -3960,7 +4075,11 @@ impl MailApp {
                         }
                         this.refresh_counts(cx);
                     }
-                    Err(e) => this.notice(format!("Couldn't delete “{label}”: {e:#}"), true, cx),
+                    Err(e) => this.notice(
+                        t!("ui-couldnt-delete", label = label, e = format!("{:#}", e)),
+                        true,
+                        cx,
+                    ),
                 }
                 cx.notify();
             },
@@ -4017,7 +4136,13 @@ impl MailApp {
             })
         };
         (1..)
-            .map(|n| if n == 1 { "New Folder".to_owned() } else { format!("New Folder {n}") })
+            .map(|n| {
+                if n == 1 {
+                    t!("ui-new-folder").to_owned()
+                } else {
+                    t!("ui-new-folder-2", n = n)
+                }
+            })
             .find(|name| !taken(name))
             .unwrap_or_default()
     }
@@ -4059,7 +4184,7 @@ impl MailApp {
         self.tree_ui.renaming = Some(Self::folder_edit_key(&id, &edit));
         self.folder_edit = Some((id, edit));
         self.rename_input.update(cx, |s, cx| {
-            s.set_placeholder("Folder name", w, cx);
+            s.set_placeholder(t!("ui-folder-name"), w, cx);
             s.set_text(value, w, cx);
             s.focus(w, cx);
         });
@@ -4131,10 +4256,14 @@ impl MailApp {
                     }
                     Err(e) => {
                         let what = match &edit {
-                            FolderEdit::New(_) => "create the folder",
-                            FolderEdit::Rename(_) => "rename the folder",
+                            FolderEdit::New(_) => t!("ui-create-the-folder"),
+                            FolderEdit::Rename(_) => t!("ui-rename-the-folder"),
                         };
-                        this.notice(format!("Couldn't {what}: {e:#}"), true, cx);
+                        this.notice(
+                            t!("ui-couldnt", what = what, e = format!("{:#}", e)),
+                            true,
+                            cx,
+                        );
                     }
                 }
                 cx.notify();
@@ -4145,8 +4274,12 @@ impl MailApp {
     fn mail_entries(&self, id: &str) -> Vec<Entry> {
         if self.folder == Folder::Drafts {
             return vec![
-                entry("Open Draft", "compose", Action::Select(id.into())),
-                danger("Delete Draft", "trash", Action::DeleteDraft(id.into())),
+                entry(t!("ui-open-draft"), "compose", Action::Select(id.into())),
+                danger(
+                    t!("ui-delete-draft"),
+                    "trash",
+                    Action::DeleteDraft(id.into()),
+                ),
             ];
         }
         if self.selection.len() > 1 && self.selection.contains(id) {
@@ -4154,59 +4287,59 @@ impl MailApp {
             let all_starred = self.selection_all(|m| m.starred);
             return vec![
                 entry(
-                    format!("Mark {n} as Read"),
+                    t!("ui-mark-as-read", n = n),
                     "mail-open",
                     Action::ApplySelection(Change::Read(true)),
                 ),
                 entry(
-                    format!("Mark {n} as Unread"),
+                    t!("ui-mark-as-unread", n = n),
                     "mail",
                     Action::ApplySelection(Change::Read(false)),
                 ),
                 if all_starred {
                     entry(
-                        format!("Unstar {n}"),
+                        t!("ui-unstar", n = n),
                         "star",
                         Action::ApplySelection(Change::Star(false)),
                     )
                 } else {
                     entry(
-                        format!("Star {n}"),
+                        t!("ui-star", n = n),
                         "star",
                         Action::ApplySelection(Change::Star(true)),
                     )
                 },
                 Entry::Separator,
                 entry(
-                    format!("Move {n} to Inbox"),
+                    t!("ui-move-to-inbox", n = n),
                     "inbox",
                     Action::ApplySelection(Change::Move(Folder::Inbox)),
                 ),
                 entry(
-                    format!("Archive {n}"),
+                    t!("ui-archive", n = n),
                     "archive",
                     Action::ApplySelection(Change::Move(Folder::Archive)),
                 ),
                 entry(
-                    format!("Move {n} to Spam"),
+                    t!("ui-move-to-spam", n = n),
                     "spam",
                     Action::ApplySelection(Change::Move(Folder::Junk)),
                 ),
                 danger(
-                    format!("Move {n} to Trash"),
+                    t!("ui-move-to-trash", n = n),
                     "trash",
                     Action::ApplySelection(Change::Move(Folder::Trash)),
                 ),
-                entry(format!("Snooze {n}…"), "snooze", Action::SnoozeMenu(vec![])),
+                entry(t!("ui-snooze", n = n), "snooze", Action::SnoozeMenu(vec![])),
             ]
             .into_iter()
-            .chain(self.move_folder_entry(format!("Move {n} to Folder…"), MoveTarget::Selection))
-            .chain(self.label_entry(format!("Label {n}…"), MoveTarget::Selection))
+            .chain(self.move_folder_entry(t!("ui-move-to-folder", n = n), MoveTarget::Selection))
+            .chain(self.label_entry(t!("ui-label", n = n), MoveTarget::Selection))
             .chain(
                 self.selection_all(|m| matches!(m.folder, Folder::Trash | Folder::Junk))
                     .then(|| {
                         danger(
-                            format!("Delete {n} Permanently…"),
+                            t!("ui-delete-permanently", n = n),
                             "trash",
                             Action::DeleteForever(self.selection.iter().cloned().collect()),
                         )
@@ -4214,8 +4347,8 @@ impl MailApp {
             )
             .chain([
                 Entry::Separator,
-                entry("Select All", "select", Action::SelectAll),
-                entry("Clear Selection", "close", Action::StopSelecting),
+                entry(t!("ui-select-all"), "select", Action::SelectAll),
+                entry(t!("ui-clear-selection"), "close", Action::StopSelecting),
             ])
             .collect();
         }
@@ -4225,42 +4358,50 @@ impl MailApp {
         let ids = vec![m.id.clone()];
         let mut entries = vec![
             entry(
-                "Open in New Window",
+                t!("ui-open-in-new-window"),
                 "popout",
                 Action::OpenWindow(m.id.clone()),
             ),
             Entry::Separator,
-            entry("Reply", "reply", Action::ReplyTo(m.id.clone(), 1)),
-            entry("Reply All", "reply-all", Action::ReplyTo(m.id.clone(), 2)),
-            entry("Forward", "forward", Action::ReplyTo(m.id.clone(), 3)),
+            entry(t!("ui-reply"), "reply", Action::ReplyTo(m.id.clone(), 1)),
             entry(
-                "Forward as Attachment",
+                t!("ui-reply-all"),
+                "reply-all",
+                Action::ReplyTo(m.id.clone(), 2),
+            ),
+            entry(
+                t!("ui-forward"),
+                "forward",
+                Action::ReplyTo(m.id.clone(), 3),
+            ),
+            entry(
+                t!("ui-forward-as-attachment"),
                 "paperclip",
                 Action::ReplyTo(m.id.clone(), 4),
             ),
             Entry::Separator,
             if m.unread {
                 entry(
-                    "Mark as Read",
+                    t!("ui-mark-as-read-2"),
                     "mail-open",
                     Action::Apply(ids.clone(), Change::Read(true)),
                 )
             } else {
                 entry(
-                    "Mark as Unread",
+                    t!("ui-mark-as-unread-2"),
                     "mail",
                     Action::Apply(ids.clone(), Change::Read(false)),
                 )
             },
             if m.starred {
                 entry(
-                    "Unstar",
+                    t!("ui-unstar-2"),
                     "star",
                     Action::Apply(ids.clone(), Change::Star(false)),
                 )
             } else {
                 entry(
-                    "Star",
+                    t!("ui-star-2"),
                     "star",
                     Action::Apply(ids.clone(), Change::Star(true)),
                 )
@@ -4268,9 +4409,9 @@ impl MailApp {
             Entry::Separator,
         ];
         for (folder, label, icon) in [
-            (Folder::Inbox, "Move to Inbox", "inbox"),
-            (Folder::Archive, "Archive", "archive"),
-            (Folder::Junk, "Move to Spam", "spam"),
+            (Folder::Inbox, t!("ui-move-to-inbox-2"), "inbox"),
+            (Folder::Archive, t!("ui-archive-2"), "archive"),
+            (Folder::Junk, t!("ui-move-to-spam-2"), "spam"),
         ] {
             if m.folder != folder {
                 entries.push(entry(
@@ -4282,7 +4423,7 @@ impl MailApp {
         }
         if m.folder != Folder::Trash {
             entries.push(danger(
-                "Move to Trash",
+                t!("ui-move-to-trash-2"),
                 "trash",
                 Action::Apply(ids.clone(), Change::Move(Folder::Trash)),
             ));
@@ -4290,40 +4431,44 @@ impl MailApp {
         if self.account_of(m).is_some_and(|a| a.provider != Provider::Pop3) {
             match self.snoozed_until(m) {
                 Some(_) => entries.push(entry(
-                    "Unsnooze",
+                    t!("ui-unsnooze"),
                     "inbox",
                     Action::Unsnooze(m.account.clone(), m.message_id.clone()),
                 )),
-                None if !matches!(m.folder, Folder::Drafts | Folder::Sent) => {
-                    entries.push(entry("Snooze…", "snooze", Action::SnoozeMenu(ids.clone())))
-                }
+                None if !matches!(m.folder, Folder::Drafts | Folder::Sent) => entries.push(entry(
+                    t!("ui-snooze-2"),
+                    "snooze",
+                    Action::SnoozeMenu(ids.clone()),
+                )),
                 None => {}
             }
         }
-        entries.extend(self.move_folder_entry("Move to Folder…", MoveTarget::Mail(ids.clone())));
-        entries.extend(self.label_entry("Labels…", MoveTarget::Mail(ids.clone())));
+        entries.extend(
+            self.move_folder_entry(t!("ui-move-to-folder-2"), MoveTarget::Mail(ids.clone())),
+        );
+        entries.extend(self.label_entry(t!("ui-labels"), MoveTarget::Mail(ids.clone())));
         if matches!(m.folder, Folder::Trash | Folder::Junk) {
             entries.push(danger(
-                "Delete Permanently…",
+                t!("ui-delete-permanently-2"),
                 "trash",
                 Action::DeleteForever(ids),
             ));
         }
         entries.push(Entry::Separator);
         entries.push(entry(
-            "Select",
+            t!("ui-select"),
             "select",
             Action::StartSelecting(m.id.clone()),
         ));
         if !m.from.is_empty() {
             entries.push(entry(
-                "Select All From Sender",
+                t!("ui-select-all-from-sender"),
                 "select",
                 Action::SelectFromSender(m.id.clone()),
             ));
             entries.push(Entry::Separator);
             entries.push(entry(
-                "Show Mail From Sender",
+                t!("ui-show-mail-from-sender"),
                 "search",
                 Action::SearchFor(search_term("from", &m.from)),
             ));
@@ -4340,7 +4485,7 @@ impl MailApp {
                 entries.push(Entry::Separator);
             }
             entries.push(entry(
-                "Show Mail With This Reply-To",
+                t!("ui-show-mail-with-this-reply-to"),
                 "search",
                 Action::SearchFor(search_term("reply-to", &email)),
             ));
@@ -4360,12 +4505,12 @@ impl MailApp {
         .collect();
         entries.push(Entry::Separator);
         entries.push(checked(
-            "Newest First",
+            t!("ui-newest-first"),
             !self.oldest_first,
             Action::OldestFirst(false),
         ));
         entries.push(checked(
-            "Oldest First",
+            t!("ui-oldest-first"),
             self.oldest_first,
             Action::OldestFirst(true),
         ));
@@ -4424,9 +4569,9 @@ impl MailApp {
                 .spawn(async move {
                     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job(backend)))
                         .unwrap_or_else(|_| {
-                            Err(anyhow::anyhow!(
-                                "Something went wrong while doing this. Please try again."
-                            ))
+                            Err(anyhow::anyhow!(t!(
+                                "ui-something-went-wrong-while-doing-this"
+                            )))
                         })
                 })
                 .await;
@@ -4466,9 +4611,9 @@ impl MailApp {
         let result = views::on_list_thread_for(self.load_generation, move || job(backend));
         cx.spawn(async move |this, cx| {
             let result = result.await.unwrap_or_else(|_| {
-                Err(anyhow::anyhow!(
-                    "Something went wrong while doing this. Please try again."
-                ))
+                Err(anyhow::anyhow!(t!(
+                    "ui-something-went-wrong-while-doing-this"
+                )))
             });
             let _ = this.update(cx, |this, cx| {
                 this.busy = this.busy.saturating_sub(1);
@@ -4895,42 +5040,48 @@ impl MailApp {
                             .iter()
                             .map(|d| {
                                 let mut m = Mail {
-                                id: d.id.clone(),
-                                account: d.account.clone(),
-                                folder: Folder::Drafts,
-                                remote_folder: String::new(),
-                                uid: 0,
-                                from: d.to.clone(),
-                                sender: if d.to.is_empty() {
-                                    "New message".into()
-                                } else {
-                                    d.to.clone()
-                                },
-                                to: d.to.clone(),
-                                subject: if d.subject.is_empty() {
-                                    "(No subject)".into()
-                                } else {
-                                    d.subject.clone()
-                                },
-                                // Scheduled ones say when they go, or why
-                                // they didn't.
-                                snippet: match d.send_at {
-                                    Some(at) => {
-                                        let when = crate::manage::composing::describe_later(
-                                            at,
-                                            chrono::Local::now(),
-                                        );
-                                        if d.send_error.is_empty() {
-                                            format!("Scheduled to send {when} · {}", d.body)
-                                        } else {
-                                            format!(
-                                                "Not sent {when}: {} · {}",
-                                                d.send_error, d.body
-                                            )
+                                    id: d.id.clone(),
+                                    account: d.account.clone(),
+                                    folder: Folder::Drafts,
+                                    remote_folder: String::new(),
+                                    uid: 0,
+                                    from: d.to.clone(),
+                                    sender: if d.to.is_empty() {
+                                        t!("ui-new-message").into()
+                                    } else {
+                                        d.to.clone()
+                                    },
+                                    to: d.to.clone(),
+                                    subject: if d.subject.is_empty() {
+                                        t!("ui-no-subject").into()
+                                    } else {
+                                        d.subject.clone()
+                                    },
+                                    // Scheduled ones say when they go, or why
+                                    // they didn't.
+                                    snippet: match d.send_at {
+                                        Some(at) => {
+                                            let when = crate::manage::composing::describe_later(
+                                                at,
+                                                chrono::Local::now(),
+                                            );
+                                            if d.send_error.is_empty() {
+                                                t!(
+                                                    "ui-scheduled-to-send",
+                                                    when = when,
+                                                    body = d.body
+                                                )
+                                            } else {
+                                                t!(
+                                                    "ui-not-sent",
+                                                    when = when,
+                                                    send_error = d.send_error,
+                                                    body = d.body
+                                                )
+                                            }
                                         }
-                                    }
-                                    None => d.body.clone(),
-                                },
+                                        None => d.body.clone(),
+                                    },
                                 date: d.send_at.unwrap_or_else(|| chrono::Utc::now().timestamp()),
                                 unread: false,
                                 starred: false,
@@ -5301,11 +5452,7 @@ impl MailApp {
                                     .map(|before| Moved { before, change: change.clone() })
                                     .collect();
                                 this.notice_undo(
-                                    if count == 1 {
-                                        format!("Moved to {to}")
-                                    } else {
-                                        format!("Moved {count} messages to {to}")
-                                    },
+                                    t!("ui-moved-messages-to", count = count, to = to),
                                     Undo::Moves(account_id.clone(), moved),
                                     cx,
                                 );
@@ -5365,15 +5512,13 @@ impl MailApp {
                         this.account_result(&account_id, IssueSource::Change, &result);
                         match result {
                             Ok(_) => this.notice(
-                                if count == 1 {
-                                    "Moved back".to_string()
-                                } else {
-                                    format!("Moved {count} messages back")
-                                },
+                                t!("ui-moved-messages-back", count = count),
                                 false,
                                 cx,
                             ),
-                            Err(e) => this.notice(format!("Couldn't undo: {e:#}"), true, cx),
+                            Err(e) => {
+                                this.notice(t!("ui-couldnt-undo", e = format!("{:#}", e)), true, cx)
+                            }
                         }
                         this.reload_cached(cx);
                         this.refresh_counts(cx);
@@ -5508,7 +5653,11 @@ impl MailApp {
         if !entries.is_empty() {
             entries.push(Entry::Separator);
         }
-        entries.push(entry("New Label…", "plus", Action::NewLabel(target.clone())));
+        entries.push(entry(
+            t!("ui-new-label"),
+            "plus",
+            Action::NewLabel(target.clone()),
+        ));
         entries
     }
     /// Applies a change to a menu's target.
@@ -5560,16 +5709,16 @@ impl MailApp {
                             this.refresh_counts(cx);
                             match result {
                                 Ok(()) => this.notice(
-                                    if count == 1 {
-                                        "Deleted permanently".to_owned()
-                                    } else {
-                                        format!("Deleted {count} messages permanently")
-                                    },
+                                    t!("ui-deleted-messages-permanently", count = count),
                                     false,
                                     cx,
                                 ),
                                 Err(e) => {
-                                    this.notice(format!("Couldn't delete: {e:#}"), true, cx);
+                                    this.notice(
+                                        t!("ui-couldnt-delete-2", e = format!("{:#}", e)),
+                                        true,
+                                        cx,
+                                    );
                                     this.reload_cached(cx);
                                 }
                             }
@@ -5595,17 +5744,25 @@ impl MailApp {
                         this.refresh_counts(cx);
                         match result {
                             Ok(n) => this.notice(
-                                format!(
-                                    "Emptied {} ({} message{})",
-                                    folder.label(),
-                                    fmt_count(n),
-                                    if n == 1 { "" } else { "s" }
+                                t!(
+                                    "ui-emptied-message",
+                                    label = folder.label(),
+                                    count = n,
+                                    shown = fmt_count(n)
                                 ),
                                 false,
                                 cx,
                             ),
                             Err(e) => {
-                                this.notice(format!("Couldn't empty {}: {e:#}", folder.label()), true, cx);
+                                this.notice(
+                                    t!(
+                                        "ui-couldnt-empty",
+                                        label = folder.label(),
+                                        e = format!("{:#}", e)
+                                    ),
+                                    true,
+                                    cx,
+                                );
                                 this.reload_cached(cx);
                             }
                         }
@@ -5628,22 +5785,18 @@ impl MailApp {
                     .filter(|m| chosen.contains(&m.id))
                     .any(|m| self.account_of(m).is_some_and(|a| a.provider == Provider::Pop3));
                 (
-                    if ids.len() == 1 {
-                        "Delete this message permanently?".to_owned()
-                    } else {
-                        format!("Delete {} messages permanently?", fmt_count(ids.len()))
-                    },
+                    t!(
+                        "ui-delete-messages-permanently",
+                        count = ids.len(),
+                        shown = fmt_count(ids.len())
+                    ),
                     pop,
                 )
             }
             Erase::Mailbox(id, folder) => {
                 let a = self.accounts.iter().find(|a| &a.id == id);
                 (
-                    format!(
-                        "Empty {} in {}?",
-                        folder.label(),
-                        a.map(|a| a.email.as_str()).unwrap_or_default()
-                    ),
+                    t!("ui-empty-in", label = folder.label(), account = a.map(|a| a.email.as_str()).unwrap_or_default()),
                     a.is_some_and(|a| a.provider == Provider::Pop3),
                 )
             }
@@ -5660,11 +5813,16 @@ impl MailApp {
                     .font_weight(FontWeight::MEDIUM)
                     .child(question),
             )
-            .child(div().text_size(px(12.)).text_color(rgb(c.muted)).child(if pop {
-                "They're deleted from this computer. The server's copies are kept (Picacho never deletes POP mail there) but won't download again."
-            } else {
-                "They're deleted from the server and this computer. This can't be undone."
-            }))
+            .child(
+                div()
+                    .text_size(px(12.))
+                    .text_color(rgb(c.muted))
+                    .child(if pop {
+                        t!("ui-theyre-deleted-from-this-computer-the")
+                    } else {
+                        t!("ui-theyre-deleted-from-the-server-and")
+                    }),
+            )
             .into_any_element()
     }
     /// The dialog naming a new label.
@@ -5681,11 +5839,7 @@ impl MailApp {
                 div()
                     .text_size(px(12.))
                     .text_color(rgb(c.muted))
-                    .child(if n == 1 {
-                        "A label for this message, kept on the server.".to_owned()
-                    } else {
-                        format!("A label for these {} messages, kept on the server.", fmt_count(n))
-                    }),
+                    .child(t!("ui-a-label-for-these-messages-kept", count = n, shown = fmt_count(n))),
             )
             .child(
                 div()
@@ -5777,13 +5931,17 @@ impl MailApp {
                 return;
             };
             let _ = this.update(cx, |this, cx| {
-                this.notice("Exporting…", false, cx);
+                this.notice(t!("ui-exporting"), false, cx);
                 let stop = Arc::new(AtomicBool::new(false));
                 this.task(
                     cx,
                     move |b| b.export_mailbox(&a, &mailbox, &path, &stop),
                     |this, result, cx| match result {
-                        Ok(moved) => this.notice(moved.notice("Exported"), false, cx),
+                        Ok(moved) => this.notice(
+                            moved.notice(crate::manage::backend::archive::Done::Exported),
+                            false,
+                            cx,
+                        ),
                         Err(e) => this.notice(format!("{e:#}"), true, cx),
                     },
                 );
@@ -5800,14 +5958,14 @@ impl MailApp {
             files: true,
             directories: false,
             multiple: true,
-            prompt: Some("Import".into()),
+            prompt: Some(t!("ui-import").into()),
         });
         cx.spawn(async move |this, cx| {
             let Ok(Ok(Some(paths))) = picker.await else {
                 return;
             };
             let _ = this.update(cx, |this, cx| {
-                this.notice("Importing…", false, cx);
+                this.notice(t!("ui-importing"), false, cx);
                 let stop = Arc::new(AtomicBool::new(false));
                 let shown = mailbox.clone();
                 this.task(
@@ -5815,7 +5973,11 @@ impl MailApp {
                     move |b| b.import_messages(&a, &mailbox, &paths, &stop),
                     move |this, result, cx| match result {
                         Ok(moved) => {
-                            this.notice(moved.notice("Imported"), false, cx);
+                            this.notice(
+                                moved.notice(crate::manage::backend::archive::Done::Imported),
+                                false,
+                                cx,
+                            );
                             if this.account.as_ref() == Some(&id) && this.mailbox() == shown {
                                 this.refresh(cx);
                             }
@@ -6004,7 +6166,7 @@ impl MailApp {
         }
         let email = Self::value(&self.form[EMAIL], cx).trim().to_owned();
         if email.parse::<lettre::Address>().is_err() {
-            self.notice("Enter a valid email address.", true, cx);
+            self.notice(t!("ui-enter-a-valid-email-address"), true, cx);
             return;
         }
         if self
@@ -6012,7 +6174,7 @@ impl MailApp {
             .iter()
             .any(|old| old.email.eq_ignore_ascii_case(&email))
         {
-            self.notice("This account is already added.", true, cx);
+            self.notice(t!("ui-this-account-is-already-added"), true, cx);
             return;
         }
         self.status.clear();
@@ -6216,9 +6378,9 @@ impl MailApp {
             }
             if password.is_empty() && !a.oauth && !a.kerberos && a.sso.is_none() {
                 self.notice(
-                    format!(
-                        "Enter your {}.",
-                        self.service.password_label().to_lowercase()
+                    t!(
+                        "ui-enter-your",
+                        to_lowercase = self.service.password_label().to_lowercase()
                     ),
                     true,
                     cx,
@@ -6231,7 +6393,7 @@ impl MailApp {
             .iter()
             .any(|e| !a.email.is_empty() && e.eq_ignore_ascii_case(&a.email))
         {
-            self.notice("This account is already added.", true, cx);
+            self.notice(t!("ui-this-account-is-already-added"), true, cx);
             return;
         }
         self.sign_in_step = SignInStep::Browser;
@@ -6321,7 +6483,7 @@ impl MailApp {
             self.step = Step::Done;
             self.anim += 1;
         } else {
-            self.notice(format!("Added {}", saved.email), false, cx);
+            self.notice(t!("ui-added", email = saved.email), false, cx);
         }
         self.modal = None;
         self.folder = Folder::Inbox;
@@ -6365,7 +6527,7 @@ impl MailApp {
         let Some(account) = self.account_of(&m) else {
             self.details = Some(MessageInfo {
                 id: m.id.clone(),
-                result: Some(Err("This message's account is not available.".into())),
+                result: Some(Err(t!("ui-this-messages-account-is-not-available").into())),
             });
             return;
         };
@@ -6495,7 +6657,7 @@ impl MailApp {
             cx.spawn(async move |this, cx| {
                 let result = saved.await;
                 let _ = this.update(cx, |this, cx| match result {
-                    Ok(true) => this.notice("Raw message saved", false, cx),
+                    Ok(true) => this.notice(t!("ui-raw-message-saved"), false, cx),
                     Ok(false) => {}
                     Err(e) => this.notice(format!("{e:#}"), true, cx),
                 });
@@ -6511,7 +6673,7 @@ impl MailApp {
             if let Ok(Ok(Some(path))) = picker.await {
                 let result = std::fs::write(&path, &original.raw);
                 let _ = this.update(cx, |this, cx| match result {
-                    Ok(()) => this.notice("Raw message saved", false, cx),
+                    Ok(()) => this.notice(t!("ui-raw-message-saved"), false, cx),
                     Err(e) => this.notice(format!("{e:#}"), true, cx),
                 });
             }
@@ -6522,7 +6684,7 @@ impl MailApp {
     fn html_menu(&mut self, menu: &HtmlContextMenu, cx: &mut Context<Self>) {
         let mut entries = Vec::new();
         if let Some(text) = &menu.selection {
-            entries.push(entry("Copy", "copy", Action::CopyText(text.clone())));
+            entries.push(entry(t!("ui-copy"), "copy", Action::CopyText(text.clone())));
         }
         if let Some(link) = &menu.link {
             if !entries.is_empty() {
@@ -6531,18 +6693,18 @@ impl MailApp {
             let mailto = link.starts_with("mailto:");
             entries.push(entry(
                 if mailto {
-                    "Open Email Link"
+                    t!("ui-open-email-link")
                 } else {
-                    "Open Link in Browser"
+                    t!("ui-open-link-in-browser")
                 },
                 "external-link",
                 Action::OpenEmailLink(link.clone()),
             ));
             entries.push(entry(
                 if mailto {
-                    "Copy Email Address"
+                    t!("ui-copy-email-address")
                 } else {
-                    "Copy Link Address"
+                    t!("ui-copy-link-address")
                 },
                 "copy",
                 Action::CopyText(
@@ -6557,12 +6719,12 @@ impl MailApp {
                 entries.push(Entry::Separator);
             }
             entries.push(entry(
-                "Open Image in Browser",
+                t!("ui-open-image-in-browser"),
                 "external-link",
                 Action::OpenEmailLink(image.clone()),
             ));
             entries.push(entry(
-                "Copy Image Address",
+                t!("ui-copy-image-address"),
                 "copy",
                 Action::CopyText(image.clone()),
             ));
@@ -6571,29 +6733,57 @@ impl MailApp {
             entries.push(Entry::Separator);
         }
         if let Some(body) = self.selected_mail().and_then(|m| m.body) {
-            entries.push(entry("Copy Message Text", "copy", Action::CopyText(body)));
+            entries.push(entry(
+                t!("ui-copy-message-text"),
+                "copy",
+                Action::CopyText(body),
+            ));
         }
-        entries.push(entry("Show Raw", "code", Action::ShowOriginal));
-        entries.push(entry("Find in Message…", "search", Action::Tools(tools::ToolAction::FindOpen)));
+        entries.push(entry(t!("ui-show-raw"), "code", Action::ShowOriginal));
+        entries.push(entry(
+            t!("ui-find-in-message"),
+            "search",
+            Action::Tools(tools::ToolAction::FindOpen),
+        ));
         if let Some(id) = self.selected.clone() {
-            entries.push(entry("Print…", "print", Action::Tools(tools::ToolAction::Print(id.clone()))));
-            entries.push(entry("Save as PDF…", "download", Action::Tools(tools::ToolAction::SavePdf(id))));
+            entries.push(entry(
+                t!("ui-print"),
+                "print",
+                Action::Tools(tools::ToolAction::Print(id.clone())),
+            ));
+            entries.push(entry(
+                t!("ui-save-as-pdf"),
+                "download",
+                Action::Tools(tools::ToolAction::SavePdf(id)),
+            ));
         }
         // The text zoom, for touch screens that have no ⌘+ and ⌘−.
         entries.push(Entry::Separator);
         let zoom = self.text_zoom();
         if zoom < ZOOM_STEPS[ZOOM_STEPS.len() - 1] {
-            entries.push(entry("Larger Text", "zoom-in", Action::TextZoom(1)));
+            entries.push(entry(t!("ui-larger-text"), "zoom-in", Action::TextZoom(1)));
         }
         if zoom > ZOOM_STEPS[0] {
-            entries.push(entry("Smaller Text", "zoom-out", Action::TextZoom(-1)));
+            entries.push(entry(
+                t!("ui-smaller-text"),
+                "zoom-out",
+                Action::TextZoom(-1),
+            ));
         }
         if (zoom - 1.).abs() > 0.01 {
-            entries.push(entry("Actual Size", "a-large-small", Action::TextZoom(0)));
+            entries.push(entry(
+                t!("ui-actual-size"),
+                "a-large-small",
+                Action::TextZoom(0),
+            ));
         }
         // Accounts shared through the same JMAP sign-in copy on the server.
         for (id, label) in self.jmap_copy_targets() {
-            entries.push(entry(format!("Copy to {label}"), "copy", Action::CopyToJmapAccount(id)));
+            entries.push(entry(
+                t!("ui-copy-to", label = label),
+                "copy",
+                Action::CopyToJmapAccount(id),
+            ));
         }
         self.open_menu(menu.position, entries, cx);
     }
@@ -6635,7 +6825,7 @@ impl MailApp {
                             Ok(())
                         },
                         |this, result, cx| match result {
-                            Ok(()) => this.notice("Attachment saved", false, cx),
+                            Ok(()) => this.notice(t!("ui-attachment-saved"), false, cx),
                             Err(e) => this.notice(format!("{e:#}"), true, cx),
                         },
                     )
@@ -7095,9 +7285,9 @@ impl MailApp {
                             }
                             this.notice(
                                 if on {
-                                    "Signed in with Kerberos"
+                                    t!("ui-signed-in-with-kerberos")
                                 } else {
-                                    "Signing in with your password again"
+                                    t!("ui-signing-in-with-your-password-again")
                                 },
                                 false,
                                 cx,
@@ -7267,7 +7457,7 @@ impl MailApp {
                 let secret = Self::value(&self.unlock_input, cx);
                 if secret.is_empty() {
                     self.unlock_errors
-                        .insert(a.id, "Enter your password or recovery key.".into());
+                        .insert(a.id, t!("ui-enter-your-password-or-recovery-key").into());
                     self.unlock_input.update(cx, |s, cx| s.focus(w, cx));
                 } else {
                     Self::set(&self.unlock_input, "", w, cx);
@@ -7287,7 +7477,7 @@ impl MailApp {
                                     this.locked.remove(&m.account);
                                     this.unlock_errors.remove(&m.account);
                                     this.notice(
-                                        "Encrypted mail unlocked on this computer",
+                                        t!("ui-encrypted-mail-unlocked-on-this-computer"),
                                         false,
                                         cx,
                                     );
@@ -7319,7 +7509,9 @@ impl MailApp {
                     cx,
                     move |b| b.lock_mail(&a),
                     |this, result, cx| match result {
-                        Ok(()) => this.notice("This computer forgot your mail key", false, cx),
+                        Ok(()) => {
+                            this.notice(t!("ui-this-computer-forgot-your-mail-key"), false, cx)
+                        }
                         Err(e) => this.notice(format!("{e:#}"), true, cx),
                     },
                 );
@@ -7435,7 +7627,7 @@ impl MailApp {
             Action::SmartReply(intent) => self.smart_reply(intent, w, cx),
             Action::SmartReplyMenu(intent) => {
                 let entries = vec![entry(
-                    "Don't Suggest This",
+                    t!("ui-dont-suggest-this"),
                     "ban",
                     Action::DismissSmartReply(intent),
                 )];
@@ -7452,6 +7644,8 @@ impl MailApp {
                 self.model_confirm = None;
             }
             Action::SetBackground(on) => self.set_background(on, cx),
+            Action::SetLanguage(code) => self.set_language(code, w, cx),
+            Action::SetOutgoingLanguage(code) => self.set_outgoing_language(code, cx),
             Action::SetTrayIcon(on) => self.set_tray_icon(on, cx),
             Action::SetMotion(m) => {
                 self.motion = m;
@@ -7595,21 +7789,21 @@ impl MailApp {
                     };
                     cx.write_to_clipboard(ClipboardItem::new_string(text.to_string()));
                     let what = match view {
-                        SourceView::Headers => "Headers",
+                        SourceView::Headers => t!("ui-headers"),
                         SourceView::Html => "HTML",
-                        SourceView::Original => "Raw message",
+                        SourceView::Original => t!("ui-raw-message"),
                     };
                     // Android's clipboard, now: GPUI's is only the app's own.
                     #[cfg(target_os = "android")]
                     if !crate::android::copy_to_system(&text) {
                         self.notice(
-                            format!("{what} is too large for Android's clipboard. Download it instead."),
+                            t!("ui-is-too-large-for-androids-clipboard", what = what),
                             true,
                             cx,
                         );
                         return;
                     }
-                    self.notice(format!("{what} copied"), false, cx);
+                    self.notice(t!("ui-copied", what = what), false, cx);
                 }
             }
             Action::SaveOriginal => self.save_original(cx),
@@ -7618,7 +7812,7 @@ impl MailApp {
                 self.menu = None;
                 if matches!(self.modal, Some(Modal::LinkWarning(_))) {
                     self.modal = None;
-                    self.notice("Link copied", false, cx);
+                    self.notice(t!("ui-link-copied"), false, cx);
                 }
             }
             Action::OpenEmailLink(url) => self.open_email_link(url, cx),
@@ -7639,7 +7833,7 @@ impl MailApp {
                 };
                 match super::html::openable_url(&url) {
                     Some(url) => self.open_external(url.as_str(), cx),
-                    None => self.notice("Picacho only opens web and email links.", true, cx),
+                    None => self.notice(t!("ui-picacho-only-opens-web-and-email"), true, cx),
                 }
             }
             Action::Reveal(fraction) => {
@@ -7728,7 +7922,7 @@ impl MailApp {
             }
             Action::Remove(id) => {
                 if self.busy > 0 || self.downloading.contains(&id) {
-                    self.notice("Wait for the current mail operation to finish before removing this account.",true,cx);
+                    self.notice(t!("ui-wait-for-the-current-mail-operation"), true, cx);
                     return;
                 }
                 self.retrying.insert(id.clone());
@@ -8025,7 +8219,7 @@ impl MailApp {
                         this.sync_tree();
                         this.load_avatar(added.clone(), cx);
                         this.watch_inboxes();
-                        this.notice(format!("Added {}", added.label()), false, cx);
+                        this.notice(t!("ui-added-2", label = added.label()), false, cx);
                         this.refresh_counts(cx);
                     }
                     Err(e) => this.notice(format!("{e:#}"), true, cx),
@@ -8109,7 +8303,7 @@ impl MailApp {
             let port = match value(4).parse::<u16>() {
                 Ok(p) if p > 0 => p,
                 _ => {
-                    self.identity_failed("Enter a port between 1 and 65535.".into(), cx);
+                    self.identity_failed(t!("ui-enter-a-port-between-1-and").into(), cx);
                     return;
                 }
             };
@@ -8138,7 +8332,7 @@ impl MailApp {
         }
         let password = Self::value(&self.identity_inputs[6], cx).to_string();
         if edit.own_server && password.is_empty() && !edit.had_password {
-            self.identity_failed("Enter the password for its outgoing server.".into(), cx);
+            self.identity_failed(t!("ui-enter-the-password-for-its-outgoing").into(), cx);
             return;
         }
         if let Some(e) = &mut self.identity_edit {
@@ -8154,7 +8348,7 @@ impl MailApp {
                 Ok(a) => {
                     this.identity_edit = None;
                     this.account_saved(a, cx);
-                    this.notice("Address saved", false, cx);
+                    this.notice(t!("ui-address-saved"), false, cx);
                 }
                 Err(e) => this.identity_failed(format!("{e:#}"), cx),
             },
@@ -8448,7 +8642,7 @@ impl MailApp {
             .child(div().flex_1())
             .child(small(self.button(
                 "theme",
-                "@Switch appearance",
+                t!("ui-switch-appearance"),
                 if self.dark { "sun" } else { "moon" },
                 Action::Theme,
                 false,
@@ -8456,7 +8650,7 @@ impl MailApp {
             )))
             .child(small(self.button(
                 "about",
-                "@About Picacho",
+                t!("ui-about-picacho"),
                 "info",
                 Action::About,
                 false,
@@ -8485,7 +8679,7 @@ impl MailApp {
     ) -> impl Fn(&ClickEvent, &mut Window, &mut App) + 'static {
         cx.listener(|this, _: &ClickEvent, w, cx| {
             if this.sending {
-                this.notice("Wait for the current message to finish sending.", true, cx);
+                this.notice(t!("ui-wait-for-the-current-message-to"), true, cx);
             } else {
                 this.persist_draft(cx);
                 w.remove_window();
@@ -8561,8 +8755,8 @@ impl MailApp {
         };
         let spoken_nav = match count {
             0 => label_text.clone(),
-            1 => format!("{label_text}, 1 unread"),
-            n => format!("{label_text}, {n} unread"),
+            1 => t!("ui-1-unread", label_text = label_text),
+            n => t!("ui-unread-2", label_text = label_text, n = n),
         };
         div()
             .id(SharedString::from(selector.clone()))
@@ -8683,8 +8877,10 @@ impl MailApp {
                         .justify_center()
                         .child(icon_el("plus", 12., c.muted)),
                 )
-                .child("Add…")
-                .tooltip(|w, cx| Tooltip::new("Add an account, folder or separator").build(w, cx))
+                .child(t!("ui-add"))
+                .tooltip(|w, cx| {
+                    Tooltip::new(t!("ui-add-an-account-folder-or-separator")).build(w, cx)
+                })
                 .on_click(cx.listener(|this, _, w, cx| this.handle(Action::AddMenu, w, cx))),
         );
         list = list.child(self.app_view_links(false, cx));
@@ -8705,11 +8901,18 @@ impl MailApp {
                     .items_center()
                     .gap_2()
                     .child(
-                        self.button("compose", "Compose", "compose", Action::Compose, true, cx)
-                            .flex_1()
-                            .min_w_0()
-                            .h(px(38.))
-                            .rounded(px(10.)),
+                        self.button(
+                            "compose",
+                            t!("ui-compose"),
+                            "compose",
+                            Action::Compose,
+                            true,
+                            cx,
+                        )
+                        .flex_1()
+                        .min_w_0()
+                        .h(px(38.))
+                        .rounded(px(10.)),
                     )
                     .child(
                         self.sidebar_toggle(false, cx)
@@ -8764,7 +8967,7 @@ impl MailApp {
             .child(
                 self.button(
                     "compose",
-                    &shortcuts::tip("@New message", "new-message", cx),
+                    &shortcuts::tip(t!("ui-new-message-2"), "new-message", cx),
                     "compose",
                     Action::Compose,
                     true,
@@ -8789,7 +8992,7 @@ impl MailApp {
             rail.child(
                 self.rail_button(
                     "rail-add-account".into(),
-                    "Add an account, folder or separator".into(),
+                    t!("ui-add-an-account-folder-or-separator").into(),
                     icon_el("plus", 16., c.muted).into_any_element(),
                     false,
                     Action::AddMenu,
@@ -8812,14 +9015,9 @@ impl MailApp {
         let progress = done as f32 / d.total as f32;
         if collapsed {
             let tooltip = if d.missing == 0 {
-                format!("All {} messages downloaded", fmt_count(d.total))
+                t!("ui-all-messages-downloaded", shown = fmt_count(d.total), count = d.total)
             } else {
-                format!(
-                    "{} of {} downloaded · {} left",
-                    fmt_count(done),
-                    fmt_count(d.total),
-                    fmt_count(d.missing)
-                )
+                t!("ui-of-downloaded-left", done = fmt_count(done), total = fmt_count(d.total), left = fmt_count(d.missing))
             };
             let inner = if d.missing == 0 {
                 icon_el("check", 12., c.accent).into_any_element()
@@ -8880,7 +9078,7 @@ impl MailApp {
                     .items_center()
                     .gap_2()
                     .child(icon_el("check", 12., c.accent))
-                    .child(format!("{} messages downloaded", fmt_count(d.total))),
+                    .child(t!("ui-messages-downloaded", shown = fmt_count(d.total), count = d.total)),
             );
             return panel.into_any_element();
         }
@@ -8895,11 +9093,11 @@ impl MailApp {
                             .font_weight(FontWeight::MEDIUM)
                             .text_color(rgb(c.text))
                             .child(if d.active {
-                                "Downloading"
+                                t!("ui-downloading")
                             } else if d.paused {
-                                "Download paused"
+                                t!("ui-download-paused")
                             } else {
-                                "Waiting to download"
+                                t!("ui-waiting-to-download")
                             }),
                     )
                     .child(format!("{} / {}", fmt_count(done), fmt_count(d.total))),
@@ -8924,10 +9122,15 @@ impl MailApp {
                     .child(
                         div()
                             .flex_1()
-                            .child(format!("{} not downloaded", fmt_count(d.missing))),
+                            .child(t!("ui-not-downloaded", shown = fmt_count(d.missing), count = d.missing)),
                     )
                     .when(d.paused, |row| {
-                        row.child(self.link("download-resume", "Resume", Action::Download, cx))
+                        row.child(self.link(
+                            "download-resume",
+                            t!("ui-resume"),
+                            Action::Download,
+                            cx,
+                        ))
                     }),
             );
         panel.into_any_element()
@@ -8946,7 +9149,7 @@ impl MailApp {
             .flex_col()
             .id("message-list")
             .role(Role::List)
-            .aria_label("Messages")
+            .aria_label(t!("ui-messages"))
             .debug_selector(|| "message-list".into())
             .flex_1()
             .min_w(px(if single { 0. } else { LIST_MIN }))
@@ -8993,13 +9196,9 @@ impl MailApp {
                         .text_color(rgb(c.muted))
                         .child(spinner(12., c.muted))
                         .child(if progress.total == 0 {
-                            "Listing mail…".to_owned()
+                            t!("ui-listing-mail").to_owned()
                         } else {
-                            format!(
-                                "Listing mail · {} of {}",
-                                fmt_count(progress.cataloged),
-                                fmt_count(progress.total)
-                            )
+                            t!("ui-listing-mail-of", listed = fmt_count(progress.cataloged), total = fmt_count(progress.total))
                         }),
                 )
             })
@@ -9076,57 +9275,49 @@ impl MailApp {
         let names = |list: &[&Account]| match list {
             [] => String::new(),
             [one] => one.label().to_owned(),
-            [first, second] => format!("{} and {}", first.label(), second.label()),
-            [first, rest @ ..] => format!("{} and {} more", first.label(), rest.len()),
+            [first, second] => t!("ui-and", label = first.label(), label2 = second.label()),
+            [first, rest @ ..] => t!("ui-and-more", label = first.label(), count = rest.len()),
         };
         let unreachable = if loading { vec![] } else { self.unreachable_accounts() };
         let (icon, title, detail): (Option<&str>, String, Option<String>) = if searching {
             if loading {
                 (
                     Some("search"),
-                    "No results yet".into(),
-                    Some("Still fetching mail; more may match.".into()),
+                    t!("ui-no-results-yet").into(),
+                    Some(t!("ui-still-fetching-mail-more-may-match").into()),
                 )
             } else {
-                (Some("search"), "No results".into(), None)
+                (Some("search"), t!("ui-no-results").into(), None)
             }
         } else if loading {
             let detail = if self.cache_loading && fetching.is_empty() {
-                "Reading mail saved on this computer…".to_owned()
+                t!("ui-reading-mail-saved-on-this-computer").to_owned()
             } else if let Some(p) = self.catalog_progress().filter(|p| p.total > 0) {
-                format!(
-                    "Listed {} of {} messages",
-                    fmt_count(p.cataloged),
-                    fmt_count(p.total)
-                )
+                t!("ui-listed-of-messages", listed = fmt_count(p.cataloged), total = fmt_count(p.total), count = p.total)
             } else if shown > 1 && !fetching.is_empty() {
-                format!(
-                    "Checking {} of {} accounts: {}",
-                    fetching.len(),
-                    shown,
-                    names(&fetching)
-                )
+                t!("ui-checking-of-accounts", count = fetching.len(), shown = shown, accounts = names(&fetching))
             } else if !fetching.is_empty() {
-                format!("Checking {} for mail", names(&fetching))
+                t!("ui-checking-for-mail", accounts = names(&fetching))
             } else {
-                "Checking the server for mail".to_owned()
+                t!("ui-checking-the-server-for-mail").to_owned()
             };
-            (None, "Fetching mail…".into(), Some(detail))
+            (None, t!("ui-fetching-mail").into(), Some(detail))
         } else if !unreachable.is_empty() && self.filter_by == Filter::All {
             (
                 Some("warning"),
-                "Couldn't fetch mail".into(),
-                Some(format!(
-                    "{} couldn't be reached. Refresh to try again.",
-                    names(&unreachable)
-                )),
+                t!("ui-couldnt-fetch-mail").into(),
+                Some(t!("ui-couldnt-be-reached-refresh-to-try", accounts = names(&unreachable))),
             )
         } else if self.filter_by != Filter::All {
-            (Some("filter"), "No matching mail".into(), None)
+            (Some("filter"), t!("ui-no-matching-mail").into(), None)
         } else if self.folder == Folder::Drafts {
-            (Some("compose"), "No drafts".into(), None)
+            (Some("compose"), t!("ui-no-drafts").into(), None)
         } else {
-            (Some(folder_icon(self.folder)), "No mail here".into(), None)
+            (
+                Some(folder_icon(self.folder)),
+                t!("ui-no-mail-here").into(),
+                None,
+            )
         };
         let failed = icon == Some("warning");
         div()
@@ -9170,9 +9361,16 @@ impl MailApp {
             })
             .when(failed, |d| {
                 d.child(
-                    self.button("empty-list-retry", "Refresh", "refresh", Action::Refresh, false, cx)
-                        .h(px(30.))
-                        .mt_1(),
+                    self.button(
+                        "empty-list-retry",
+                        t!("ui-refresh"),
+                        "refresh",
+                        Action::Refresh,
+                        false,
+                        cx,
+                    )
+                    .h(px(30.))
+                    .mt_1(),
                 )
             })
             .into_any_element()
@@ -9237,7 +9435,7 @@ impl MailApp {
                                 .font_weight(FontWeight::SEMIBOLD)
                                 .child(fmt_count(unread))
                                 .tooltip(move |w, cx| {
-                                    Tooltip::new(format!("{} unread", fmt_count(unread)))
+                                    Tooltip::new(t!("ui-unread-3", shown = fmt_count(unread), count = unread))
                                         .build(w, cx)
                                 }),
                         )
@@ -9261,7 +9459,7 @@ impl MailApp {
                                 .cursor_pointer()
                                 .child(self.filter_by.label())
                                 .child(icon_el("close", 10., c.muted))
-                                .tooltip(|w, cx| Tooltip::new("Clear filter").build(w, cx))
+                                .tooltip(|w, cx| Tooltip::new(t!("ui-clear-filter")).build(w, cx))
                                 .on_click(cx.listener(|this, _, w, cx| {
                                     this.handle(Action::SetFilter(Filter::All), w, cx)
                                 })),
@@ -9288,9 +9486,14 @@ impl MailApp {
                             small(self.button(
                                 "select-toggle",
                                 &if self.selecting {
-                                    shortcuts::tip("@Done selecting", "close", cx)
+                                    shortcuts::tip(t!("ui-done-selecting"), "close", cx)
                                 } else {
-                                    shortcuts::tip_then("@Select messages", "select-all", " selects all", cx)
+                                    shortcuts::tip_then(
+                                        t!("ui-select-messages"),
+                                        "select-all",
+                                        |keys| t!("ui-key-selects-all", keys = keys),
+                                        cx,
+                                    )
                                 },
                                 "select",
                                 Action::ToggleSelectMode,
@@ -9303,7 +9506,7 @@ impl MailApp {
                     .child(
                         small(self.button(
                             "filter",
-                            "@Filter and sort",
+                            t!("ui-filter-and-sort"),
                             "filter",
                             Action::FilterMenu,
                             false,
@@ -9357,7 +9560,7 @@ impl MailApp {
                                         .hover(move |s| s.bg(rgb(c.border)))
                                         .child(icon_el("close", 12., c.muted))
                                         .tooltip(|w, cx| {
-                                            Tooltip::new("Close search · Esc").build(w, cx)
+                                            Tooltip::new(t!("ui-close-search-esc")).build(w, cx)
                                         })
                                         .on_click(cx.listener(|this, _, w, cx| {
                                             this.handle(Action::CloseSearch, w, cx)
@@ -9484,14 +9687,13 @@ impl MailApp {
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(rgb(c.accent))
                     .child(if n == 0 {
-                        "Pick messages".to_owned()
+                        t!("ui-pick-messages").to_owned()
                     } else {
-                        format!("{} selected", fmt_count(n))
+                        t!("ui-selected", shown = fmt_count(n), count = n)
                     })
                     .when(n == 0, |d| {
                         d.tooltip(|w, cx| {
-                            Tooltip::new("Click messages to select them; Shift-click selects a range")
-                                .build(w, cx)
+                            Tooltip::new(t!("ui-click-messages-to-select-them-shift")).build(w, cx)
                         })
                     }),
             )
@@ -9504,7 +9706,11 @@ impl MailApp {
                     .text_color(rgb(c.accent))
                     .cursor_pointer()
                     .hover(|s| s.opacity(0.7))
-                    .child(if all { "Deselect All" } else { "Select All" })
+                    .child(if all {
+                        t!("ui-deselect-all")
+                    } else {
+                        t!("ui-select-all")
+                    })
                     .on_click(cx.listener(|this, _, w, cx| this.handle(Action::SelectAll, w, cx))),
             )
             .child(div().flex_1())
@@ -9512,14 +9718,14 @@ impl MailApp {
                 d.child(if any_unread {
                     tool(
                         "bulk-read",
-                        "@Mark as read",
+                        t!("ui-mark-as-read-3"),
                         "mail-open",
                         Change::Read(true),
                     )
                 } else {
                     tool(
                         "bulk-unread",
-                        "@Mark as unread",
+                        t!("ui-mark-as-unread-3"),
                         "mail",
                         Change::Read(false),
                     )
@@ -9541,20 +9747,20 @@ impl MailApp {
                 )
                 .child(tool(
                     "bulk-spam",
-                    "@Move to spam",
+                    t!("ui-move-to-spam-3"),
                     "spam",
                     Change::Move(Folder::Junk),
                 ))
                 .child(tool(
                     "bulk-trash",
-                    "@Move to trash",
+                    t!("ui-move-to-trash-3"),
                     "trash",
                     Change::Move(Folder::Trash),
                 ))
                 .child(
                     self.button(
                         "bulk-snooze",
-                        "@Snooze until…",
+                        t!("ui-snooze-until"),
                         "snooze",
                         Action::SnoozeMenu(vec![]),
                         false,
@@ -9569,7 +9775,7 @@ impl MailApp {
             .child(
                 self.button(
                     "select-done",
-                    "@Clear selection · Esc",
+                    t!("ui-clear-selection-esc"),
                     "close",
                     Action::StopSelecting,
                     false,
@@ -9613,7 +9819,7 @@ impl MailApp {
             .debug_selector(|| format!("lead-{id}"))
             .when(!drafts, |d| {
                 d.role(Role::CheckBox)
-                    .aria_label("Select")
+                    .aria_label(t!("ui-select"))
                     .aria_toggled(if checked { Toggled::True } else { Toggled::False })
             })
             .group(lead_group.clone())
@@ -9639,7 +9845,12 @@ impl MailApp {
                 )
                 .cursor_pointer()
                 .tooltip(move |w, cx| {
-                    Tooltip::new(if checked { "Deselect" } else { "Select" }).build(w, cx)
+                    Tooltip::new(if checked {
+                        t!("ui-deselect")
+                    } else {
+                        t!("ui-select")
+                    })
+                    .build(w, cx)
                 })
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .on_click(cx.listener(move |this, e: &ClickEvent, w, cx| {
@@ -9669,10 +9880,10 @@ impl MailApp {
         let spoken_row = {
             let mut parts = Vec::new();
             if m.unread {
-                parts.push("Unread".to_owned());
+                parts.push(t!("ui-unread").to_owned());
             }
             if star {
-                parts.push("Starred".to_owned());
+                parts.push(t!("ui-starred").to_owned());
             }
             parts.push(sender.clone());
             // Codes hidden as the row shows them: spoken, they reached any
@@ -9680,7 +9891,7 @@ impl MailApp {
             parts.push(self.hide_codes(m, &m.subject).into_owned());
             parts.push(date_short(m.date).to_string());
             if m.has_attachments {
-                parts.push("Has attachments".to_owned());
+                parts.push(t!("ui-has-attachments-2").to_owned());
             }
             if !m.snippet.is_empty() {
                 parts.push(self.hide_codes(m, &m.snippet).chars().take(140).collect());
@@ -9809,7 +10020,7 @@ impl MailApp {
                                     div()
                                         .id(SharedString::from(format!("star-{}", m.id)))
                                         .role(Role::CheckBox)
-                                        .aria_label("Star")
+                                        .aria_label(t!("ui-star-2"))
                                         .aria_toggled(if star { Toggled::True } else { Toggled::False })
                                         .size(px(20.))
                                         .flex_shrink_0()
@@ -9828,8 +10039,12 @@ impl MailApp {
                                             icon_el("star", 14., c.muted)
                                         })
                                         .tooltip(move |w, cx| {
-                                            Tooltip::new(if star { "Unstar" } else { "Star" })
-                                                .build(w, cx)
+                                            Tooltip::new(if star {
+                                                t!("ui-unstar-2")
+                                            } else {
+                                                t!("ui-star-2")
+                                            })
+                                            .build(w, cx)
                                         })
                                         .on_mouse_down(MouseButton::Left, |_, _, cx| {
                                             cx.stop_propagation()
@@ -9861,7 +10076,7 @@ impl MailApp {
                     vec![id.clone()]
                 };
                 let label = if ids.len() > 1 {
-                    format!("{} messages", ids.len())
+                    t!("ui-messages-2", count = ids.len())
                 } else {
                     self.hide_codes(m, &m.subject).into_owned()
                 };
@@ -10067,14 +10282,14 @@ impl MailApp {
                                     .text_color(rgb(c.on_accent))
                                     .text_size(px(10.))
                                     .font_weight(FontWeight::SEMIBOLD)
-                                    .child("Recommended"),
+                                    .child(t!("ui-recommended")),
                             ),
                     )
                     .child(
                         div()
                             .text_size(px(12.))
                             .text_color(rgb(c.muted))
-                            .child("Private email designed for Picacho. Sign in once, with no passwords to copy."),
+                            .child(t!("ui-private-email-designed-for-picacho-sign")),
                     ),
             )
             .child(icon_el("chevron-right", 16., c.accent))
@@ -10129,7 +10344,7 @@ impl MailApp {
             )
             .child(div().pt_1().flex().justify_center().child(self.link(
                 "service-Other",
-                "Use another provider",
+                t!("ui-use-another-provider"),
                 Action::ChooseService(Service::Other),
                 cx,
             )))
@@ -10143,7 +10358,7 @@ impl MailApp {
                 .flex()
                 .flex_col()
                 .gap_4()
-                .child(self.field("Email address", EMAIL))
+                .child(self.field(t!("ui-email-address"), EMAIL))
                 .into_any_element();
         }
         // Proton's steps after the password replace the form.
@@ -10170,10 +10385,10 @@ impl MailApp {
                     .text_size(px(13.))
                     .child(avatar(&initials(&email), 24., 0, c))
                     .child(div().flex_1().min_w_0().truncate().child(email))
-                    .child(self.link("setup-change", "Change", Action::SetupBack, cx)),
+                    .child(self.link("setup-change", t!("ui-change"), Action::SetupBack, cx)),
             );
         } else {
-            content = content.child(self.field("Email address", EMAIL));
+            content = content.child(self.field(t!("ui-email-address"), EMAIL));
         }
         if self.manual {
             content = content
@@ -10209,64 +10424,73 @@ impl MailApp {
                         .gap_3()
                         .child(self.field(
                             if self.provider == Provider::Jmap {
-                                "JMAP server"
+                                t!("ui-jmap-server")
                             } else {
-                                "Incoming server"
+                                t!("ui-incoming-server")
                             },
                             IMAP_HOST,
                         ))
-                        .child(div().w(px(80.)).child(self.field("Port", IMAP_PORT))),
+                        .child(div().w(px(80.)).child(self.field(t!("ui-port"), IMAP_PORT))),
                 )
-                .when(matches!(self.provider, Provider::Imap | Provider::Pop3), |d| {
-                    d.child(self.switch_setting(
-                        "Incoming: STARTTLS",
-                        "On for servers that start plain and upgrade to encryption (usually port 143 for IMAP, 110 for POP3). Picacho never signs in without encryption.",
-                        "setup-incoming-starttls".into(),
-                        self.incoming_starttls,
-                        Action::ToggleIncomingStarttls,
-                        cx,
-                    ))
-                })
+                .when(
+                    matches!(self.provider, Provider::Imap | Provider::Pop3),
+                    |d| {
+                        d.child(self.switch_setting(
+                            t!("ui-incoming-starttls"),
+                            t!("ui-on-for-servers-that-start-plain"),
+                            "setup-incoming-starttls".into(),
+                            self.incoming_starttls,
+                            Action::ToggleIncomingStarttls,
+                            cx,
+                        ))
+                    },
+                )
                 // JMAP sends through the same server.
                 .when(self.provider != Provider::Jmap, |d| {
                     d.child(
                         div()
                             .flex()
                             .gap_3()
-                            .child(self.field("SMTP server", SMTP_HOST))
-                            .child(div().w(px(80.)).child(self.field("Port", SMTP_PORT))),
+                            .child(self.field(t!("ui-smtp-server"), SMTP_HOST))
+                            .child(div().w(px(80.)).child(self.field(t!("ui-port"), SMTP_PORT))),
                     )
                     .child(self.switch_setting(
-                        "TLS from the start",
-                        "On for servers that encrypt from the first byte (usually port 465); off for STARTTLS (usually 587).",
+                        t!("ui-tls-from-the-start"),
+                        t!("ui-on-for-servers-that-encrypt-from"),
                         "setup-smtp-tls".into(),
                         self.setup_smtp_tls(cx),
                         Action::ToggleSmtpTls,
                         cx,
                     ))
                 })
-                .child(self.field("Sign-in name, if not the email address", LOGIN))
-                .when(matches!(self.provider, Provider::Imap | Provider::Pop3), |d| {
-                    d.child(self.switch_setting(
-                        "Sign in with your organization",
-                        "Single sign-on in the browser (OpenID Connect or OAuth 2.0), for organizations using Okta, Microsoft Entra ID, Keycloak, Authentik, ADFS and the like, also where they sign people in with SAML. The mail servers take its tokens instead of a password.",
-                        "setup-sso".into(),
-                        self.setup_sso,
-                        Action::ToggleSetupSso,
-                        cx,
-                    ))
-                    .when(self.setup_sso, |d| {
-                        d.child(self.field("Sign-in service (issuer URL)", SSO_ISSUER))
-                            .child(self.field("Client ID, if your administrator gave you one", SSO_CLIENT))
-                    })
-                })
+                .child(self.field(t!("ui-sign-in-name-if-not-the"), LOGIN))
+                .when(
+                    matches!(self.provider, Provider::Imap | Provider::Pop3),
+                    |d| {
+                        d.child(self.switch_setting(
+                            t!("ui-sign-in-with-your-organization"),
+                            t!("ui-single-sign-on-in-the-browser"),
+                            "setup-sso".into(),
+                            self.setup_sso,
+                            Action::ToggleSetupSso,
+                            cx,
+                        ))
+                        .when(self.setup_sso, |d| {
+                            d.child(self.field(t!("ui-sign-in-service-issuer-url"), SSO_ISSUER))
+                                .child(self.field(
+                                    t!("ui-client-id-if-your-administrator-gave"),
+                                    SSO_CLIENT,
+                                ))
+                        })
+                    },
+                )
                 .when(
                     matches!(self.provider, Provider::Imap | Provider::Pop3)
                         && !cfg!(any(target_os = "android", target_os = "ios")),
                     |d| {
                         d.child(self.switch_setting(
-                            "Sign in with Kerberos",
-                            "For organizations whose mail servers use Kerberos: Picacho uses the ticket this computer already has (kinit, or your domain sign-in) and no password.",
+                            t!("ui-sign-in-with-kerberos"),
+                            t!("ui-for-organizations-whose-mail-servers-use"),
                             "setup-kerberos".into(),
                             self.setup_kerberos,
                             Action::ToggleSetupKerberos,
@@ -10275,16 +10499,13 @@ impl MailApp {
                     },
                 )
                 .when(self.provider == Provider::Jmap, |d| {
-                    d.child(notice_box(
-                        "Some JMAP services, such as Fastmail, want an API token with mail access as the password.",
-                        c,
-                    ))
-                    .child(div().flex().child(self.link(
-                        "jmap-browser",
-                        "Sign in with the browser instead",
-                        Action::JmapBrowser,
-                        cx,
-                    )))
+                    d.child(notice_box(t!("ui-some-jmap-services-such-as-fastmail"), c))
+                        .child(div().flex().child(self.link(
+                            "jmap-browser",
+                            t!("ui-sign-in-with-the-browser-instead"),
+                            Action::JmapBrowser,
+                            cx,
+                        )))
                 });
         }
         if let Some(why) = self.service.browser_unavailable() {
@@ -10297,7 +10518,7 @@ impl MailApp {
             // Found from the domain: say so, with the service it uses.
             let issuer = Self::value(&self.form[SSO_ISSUER], cx);
             content = content.child(notice_box(
-                format!("Your organization signs you in to mail in the browser, with {issuer}. Choose Connect to continue there."),
+                t!("ui-your-organization-signs-you-in-to", issuer = issuer),
                 c,
             ));
         }
@@ -10318,9 +10539,9 @@ impl MailApp {
                             self.link(
                                 "password-help",
                                 if self.service == Service::Proton {
-                                    "Open your Proton account"
+                                    t!("ui-open-your-proton-account")
                                 } else {
-                                    "Make one now"
+                                    t!("ui-make-one-now")
                                 },
                                 Action::OpenLink(url),
                                 cx,
@@ -10341,7 +10562,7 @@ impl MailApp {
         if !self.manual && self.service != Service::Proton {
             content = content.child(div().flex().justify_end().child(self.link(
                 "setup-manual",
-                "Server settings",
+                t!("ui-server-settings"),
                 Action::Manual,
                 cx,
             )));
@@ -10369,7 +10590,7 @@ impl MailApp {
                     .text_size(px(13.))
                     .text_color(rgb(c.muted))
                     .text_center()
-                    .child("Fast, native email for every inbox you have."),
+                    .child(t!("ui-fast-native-email-for-every-inbox")),
             )
     }
     /// The copyright, licence and version line at the foot of About.
@@ -10379,7 +10600,10 @@ impl MailApp {
             .text_size(px(11.))
             .text_color(rgb(c.muted))
             .text_center()
-            .child(format!("© Pinal Technologies 2026 · MIT Licensed · {}", version_label()))
+            .child(t!(
+                "ui-pinal-technologies-2026-mit-licensed",
+                version_label = version_label()
+            ))
     }
     /// A hyperlink with an icon, opening `url` in the browser.
     fn about_link(&self, id: &str, label: &str, icon: &str, url: &'static str, cx: &Context<Self>) -> Stateful<Div> {
@@ -10409,22 +10633,19 @@ impl MailApp {
             .pt_2()
             .child(self.about_heading())
             .child(
-                div()
-                    .mt_6()
+                div().mt_6().w_full().child(
+                    self.button(
+                        "about-shortcuts",
+                        t!("ui-keyboard-shortcuts"),
+                        "keyboard",
+                        Action::Help,
+                        false,
+                        cx,
+                    )
                     .w_full()
-                    .child(
-                        self.button(
-                            "about-shortcuts",
-                            "Keyboard Shortcuts",
-                            "keyboard",
-                            Action::Help,
-                            false,
-                            cx,
-                        )
-                        .w_full()
-                        .border_1()
-                        .border_color(rgb(c.border)),
-                    ),
+                    .border_1()
+                    .border_color(rgb(c.border)),
+                ),
             )
             .child(
                 div()
@@ -10433,8 +10654,20 @@ impl MailApp {
                     .items_center()
                     .justify_center()
                     .gap_5()
-                    .child(self.about_link("about-source", "Source Code", "github", REPO_URL, cx))
-                    .child(self.about_link("about-website", "Website", "globe", WEBSITE_URL, cx)),
+                    .child(self.about_link(
+                        "about-source",
+                        t!("ui-source-code"),
+                        "github",
+                        REPO_URL,
+                        cx,
+                    ))
+                    .child(self.about_link(
+                        "about-website",
+                        t!("ui-website"),
+                        "globe",
+                        WEBSITE_URL,
+                        cx,
+                    )),
             )
             .child(div().mt_5().mb_4().w_full().h(px(1.)).bg(rgb(c.border)))
             .child(self.about_footer())
@@ -10449,25 +10682,25 @@ impl MailApp {
         let label = self.service.label();
         let (title, subtitle): (String, String) = match self.step {
             Step::Welcome => (
-                "Welcome to Picacho".into(),
-                "Fast, native email for every inbox you have.".into(),
+                t!("ui-welcome-to-picacho").into(),
+                t!("ui-fast-native-email-for-every-inbox").into(),
             ),
             Step::Provider => (
-                "Add your email".into(),
-                "Choose where your mail lives.".into(),
+                t!("ui-add-your-email").into(),
+                t!("ui-choose-where-your-mail-lives").into(),
             ),
             Step::Email => (
-                "Another provider".into(),
-                "Enter your address and we'll find its settings.".into(),
+                t!("ui-another-provider").into(),
+                t!("ui-enter-your-address-and-well-find").into(),
             ),
             Step::Credentials if browser => (
-                format!("Sign in to {label}"),
+                t!("ui-sign-in-to", label = label),
                 if self.connecting && self.sign_in_step != SignInStep::Browser {
-                    "Picacho has your sign-in and is setting up the account.".into()
+                    t!("ui-picacho-has-your-sign-in-and").into()
                 } else if self.connecting {
-                    "Continue in the browser window that just opened.".into()
+                    t!("ui-continue-in-the-browser-window-that").into()
                 } else {
-                    "Sign in with your browser. Picacho never sees your password.".into()
+                    t!("ui-sign-in-with-your-browser-picacho").into()
                 },
             ),
             // Proton's steps after the password name themselves.
@@ -10479,21 +10712,24 @@ impl MailApp {
             }
             Step::Credentials => (
                 if self.service == Service::Other {
-                    "Sign in".into()
+                    t!("ui-sign-in").into()
                 } else {
-                    format!("Sign in to {label}")
+                    t!("ui-sign-in-to", label = label)
                 },
                 if self.manual {
-                    "We couldn't find your settings. Enter them below.".into()
+                    t!("ui-we-couldnt-find-your-settings-enter").into()
                 } else if self.service.browser_unavailable().is_some() {
-                    "Connect with an app password from your account's security settings.".into()
+                    t!("ui-connect-with-an-app-password-from").into()
                 } else if let Some(what) = self.service.token_instead().filter(|_| self.setup_token) {
-                    format!("Connect with an {what} instead of the browser. It's kept in your system's keychain.")
+                    t!("ui-connect-with-an-instead-of-the", what = what)
                 } else {
                     String::new()
                 },
             ),
-            Step::Done => ("You're all set".into(), "Your mail is syncing.".into()),
+            Step::Done => (
+                t!("ui-youre-all-set").into(),
+                t!("ui-your-mail-is-syncing").into(),
+            ),
         };
         let hero = match self.step {
             Step::Welcome => img("brand/picacho.svg")
@@ -10602,12 +10838,26 @@ impl MailApp {
         }
         let primary = match self.step {
             Step::Welcome => Some(
-                self.button("onboard-start", "Get Started", "", Action::Start, true, cx)
-                    .into_any_element(),
+                self.button(
+                    "onboard-start",
+                    t!("ui-get-started"),
+                    "",
+                    Action::Start,
+                    true,
+                    cx,
+                )
+                .into_any_element(),
             ),
             Step::Done => Some(
-                self.button("onboard-finish", "Open Inbox", "", Action::Finish, true, cx)
-                    .into_any_element(),
+                self.button(
+                    "onboard-finish",
+                    t!("ui-open-inbox"),
+                    "",
+                    Action::Finish,
+                    true,
+                    cx,
+                )
+                .into_any_element(),
             ),
             Step::Provider => None,
             Step::Credentials if browser && self.connecting => None,
@@ -10618,9 +10868,16 @@ impl MailApp {
                 None
             }
             Step::Credentials if self.sign_in_retry => Some(
-                self.button("setup-retry", "Try Again", "", Action::RetrySignIn, true, cx)
-                    .min_w(px(120.))
-                    .into_any_element(),
+                self.button(
+                    "setup-retry",
+                    t!("ui-try-again"),
+                    "",
+                    Action::RetrySignIn,
+                    true,
+                    cx,
+                )
+                .min_w(px(120.))
+                .into_any_element(),
             ),
             _ => Some(self.setup_submit(cx)),
         };
@@ -10633,14 +10890,14 @@ impl MailApp {
             .gap_3()
             .children(primary.map(|p| div().w_full().max_w(px(400.)).flex().flex_col().child(p)));
         let back = match self.step {
-            Step::Provider if !in_modal => Some("Back"),
+            Step::Provider if !in_modal => Some(t!("ui-back")),
             Step::Email | Step::Credentials => Some(if self.connecting {
-                "Cancel"
+                t!("ui-cancel")
             } else if self.proton_stage.is_some() {
                 // Back to the password (SetupBack leaves Proton's step).
-                "Back"
+                t!("ui-back")
             } else {
-                "Choose another provider"
+                t!("ui-choose-another-provider")
             }),
             _ => None,
         };
@@ -10649,9 +10906,9 @@ impl MailApp {
             actions = actions.child(self.link(
                 "setup-start-over",
                 if browser {
-                    "Open Browser Again"
+                    t!("ui-open-browser-again")
                 } else {
-                    "Connect Again"
+                    t!("ui-connect-again")
                 },
                 Action::SubmitAccount,
                 cx,
@@ -10664,11 +10921,16 @@ impl MailApp {
             && let Some(what) = self.service.token_instead()
         {
             actions = actions.child(if self.setup_token {
-                self.link("setup-use-browser", "Sign in with the browser instead", Action::UseToken(false), cx)
+                self.link(
+                    "setup-use-browser",
+                    t!("ui-sign-in-with-the-browser-instead"),
+                    Action::UseToken(false),
+                    cx,
+                )
             } else {
                 self.link(
                     "setup-use-token",
-                    &format!("Use an {what} instead"),
+                    &t!("ui-use-an-instead", what = what),
                     Action::UseToken(true),
                     cx,
                 )
@@ -10681,7 +10943,7 @@ impl MailApp {
         if self.step == Step::Welcome {
             actions = actions.child(self.link(
                 "onboard-sample",
-                "Explore a sample inbox",
+                t!("ui-explore-a-sample-inbox"),
                 Action::Sample,
                 cx,
             ));
@@ -10689,7 +10951,7 @@ impl MailApp {
         if self.step == Step::Done {
             actions = actions.child(self.link(
                 "onboard-another",
-                "Add another account",
+                t!("ui-add-another-account"),
                 Action::Connect,
                 cx,
             ));
@@ -10977,13 +11239,13 @@ impl MailApp {
                 div()
                     .text_size(px(14.))
                     .font_weight(FontWeight::MEDIUM)
-                    .child(format!("Remove {email}?")),
+                    .child(t!("ui-remove", email = email)),
             )
             .child(
                 div()
                     .text_size(px(12.))
                     .text_color(rgb(c.muted))
-                    .child("Its local mail and drafts are deleted. Mail on the server is kept."),
+                    .child(t!("ui-its-local-mail-and-drafts-are")),
             )
             .into_any_element()
     }
@@ -11047,9 +11309,7 @@ impl MailApp {
                 div()
                     .text_size(px(12.))
                     .text_color(rgb(c.muted))
-                    .child(format!(
-                        "Your message wasn't sent and is back in its composer. From was reset to {from}; send it from there, or choose another address in From."
-                    )),
+                    .child(t!("ui-your-message-wasnt-sent-and-is", from = from)),
             )
             .into_any_element()
     }
@@ -11064,22 +11324,22 @@ impl MailApp {
                 {
                     label
                 } else if self.connecting && self.sign_in_step == SignInStep::Verifying {
-                    "Waiting for Proton's check…"
+                    t!("ui-waiting-for-protons-check")
                 } else if self.connecting {
-                    "Connecting…"
+                    t!("ui-connecting")
                 } else if !self.sign_in().typed() {
-                    "Open Browser Again"
+                    t!("ui-open-browser-again")
                 } else {
-                    "Connect"
+                    t!("ui-connect")
                 },
                 Action::SubmitAccount,
             )
         } else {
             (
                 if self.discovering {
-                    "Looking up…"
+                    t!("ui-looking-up")
                 } else {
-                    "Continue"
+                    t!("ui-continue")
                 },
                 Action::Discover,
             )
@@ -11096,26 +11356,26 @@ impl MailApp {
         let c = self.colors();
         let modal = self.modal.as_ref().unwrap();
         let title = match modal {
-            Modal::Connect => "Add Account",
-            Modal::Reconnect(_) => "Sign In Again",
-            Modal::Settings => "Settings",
-            Modal::About => "About Picacho",
-            Modal::RemoveAccount(_) => "Remove Account",
-            Modal::DeleteFolder(..) => "Delete Folder",
-            Modal::Erase(Erase::Mail(_)) => "Delete Permanently",
-            Modal::Erase(Erase::Mailbox(_, Folder::Junk)) => "Empty Spam",
-            Modal::Erase(Erase::Mailbox(..)) => "Empty Trash",
-            Modal::NewLabel(_) => "New Label",
+            Modal::Connect => t!("ui-add-account"),
+            Modal::Reconnect(_) => t!("ui-sign-in-again"),
+            Modal::Settings => t!("ui-settings"),
+            Modal::About => t!("ui-about-picacho-2"),
+            Modal::RemoveAccount(_) => t!("ui-remove-account-2"),
+            Modal::DeleteFolder(..) => t!("ui-delete-folder-2"),
+            Modal::Erase(Erase::Mail(_)) => t!("ui-delete-permanently-3"),
+            Modal::Erase(Erase::Mailbox(_, Folder::Junk)) => t!("ui-empty-spam-2"),
+            Modal::Erase(Erase::Mailbox(..)) => t!("ui-empty-trash-2"),
+            Modal::NewLabel(_) => t!("ui-new-label-2"),
             Modal::Original => match self.source_view {
-                SourceView::Headers => "Message Headers",
-                SourceView::Html => "Message HTML",
-                SourceView::Original => "Raw Message",
+                SourceView::Headers => t!("ui-message-headers"),
+                SourceView::Html => t!("ui-message-html"),
+                SourceView::Original => t!("ui-raw-message-2"),
             },
-            Modal::AvatarPresets(_) => "Choose a Picture",
-            Modal::AliasGone(..) => "Alias No Longer Exists",
-            Modal::Snooze(ids) if ids.len() > 1 => "Snooze Messages",
-            Modal::Snooze(_) => "Snooze",
-            Modal::LinkWarning(_) => "Check This Link",
+            Modal::AvatarPresets(_) => t!("ui-choose-a-picture"),
+            Modal::AliasGone(..) => t!("ui-alias-no-longer-exists"),
+            Modal::Snooze(ids) if ids.len() > 1 => t!("ui-snooze-messages"),
+            Modal::Snooze(_) => t!("ui-snooze-3"),
+            Modal::LinkWarning(_) => t!("ui-check-this-link"),
         };
         let content = match modal {
             Modal::Connect => self.setup_view(cx),
@@ -11201,7 +11461,7 @@ impl MailApp {
                     })
                     .child(self.button(
                         "modal-close",
-                        "@Close dialog",
+                        t!("ui-close-dialog"),
                         "close",
                         Action::Close,
                         false,
@@ -11295,20 +11555,48 @@ impl MailApp {
         } else if let Modal::LinkWarning(url) = modal {
             footer = footer
                 .child(div().flex_1())
-                .child(self.button("link-warning-copy", "Copy Link", "", Action::CopyText(url.clone()), false, cx))
-                .child(self.button("link-warning-cancel", "Don't Open", "", Action::Close, true, cx))
+                .child(self.button(
+                    "link-warning-copy",
+                    t!("ui-copy-link"),
+                    "",
+                    Action::CopyText(url.clone()),
+                    false,
+                    cx,
+                ))
+                .child(self.button(
+                    "link-warning-cancel",
+                    t!("ui-dont-open"),
+                    "",
+                    Action::Close,
+                    true,
+                    cx,
+                ))
                 .child(
-                    self.button("link-warning-open", "Open Anyway", "", Action::OpenUrl(url.clone()), false, cx)
-                        .text_color(rgb(c.danger)),
+                    self.button(
+                        "link-warning-open",
+                        t!("ui-open-anyway"),
+                        "",
+                        Action::OpenUrl(url.clone()),
+                        false,
+                        cx,
+                    )
+                    .text_color(rgb(c.danger)),
                 );
         } else if let Modal::RemoveAccount(id) = modal {
             footer = footer
                 .child(div().flex_1())
-                .child(self.button("remove-cancel", "Cancel", "", Action::Close, false, cx))
+                .child(self.button(
+                    "remove-cancel",
+                    t!("ui-cancel"),
+                    "",
+                    Action::Close,
+                    false,
+                    cx,
+                ))
                 .child(
                     self.button(
                         "remove-confirm",
-                        "Remove",
+                        t!("ui-remove-2"),
                         "",
                         Action::Remove(id.clone()),
                         true,
@@ -11320,11 +11608,22 @@ impl MailApp {
             let deleting = self.deleting_folders.contains(&(id.clone(), name.clone()));
             footer = footer
                 .child(div().flex_1())
-                .child(self.button("delete-folder-cancel", "Cancel", "", Action::Close, false, cx))
+                .child(self.button(
+                    "delete-folder-cancel",
+                    t!("ui-cancel"),
+                    "",
+                    Action::Close,
+                    false,
+                    cx,
+                ))
                 .child(
                     self.button(
                         "delete-folder-confirm",
-                        if deleting { "Deleting…" } else { "Delete" },
+                        if deleting {
+                            t!("ui-deleting")
+                        } else {
+                            t!("ui-delete-2")
+                        },
                         "",
                         Action::ConfirmDeleteFolder(id.clone(), name.clone()),
                         true,
@@ -11336,14 +11635,21 @@ impl MailApp {
         } else if let Modal::Erase(erase) = modal {
             footer = footer
                 .child(div().flex_1())
-                .child(self.button("erase-cancel", "Cancel", "", Action::Close, false, cx))
+                .child(self.button(
+                    "erase-cancel",
+                    t!("ui-cancel"),
+                    "",
+                    Action::Close,
+                    false,
+                    cx,
+                ))
                 .child(
                     self.button(
                         "erase-confirm",
                         match erase {
-                            Erase::Mail(_) => "Delete",
-                            Erase::Mailbox(_, Folder::Junk) => "Empty Spam",
-                            Erase::Mailbox(..) => "Empty Trash",
+                            Erase::Mail(_) => t!("ui-delete-2"),
+                            Erase::Mailbox(_, Folder::Junk) => t!("ui-empty-spam-2"),
+                            Erase::Mailbox(..) => t!("ui-empty-trash-2"),
                         },
                         "",
                         Action::ConfirmErase(erase.clone()),
@@ -11355,14 +11661,28 @@ impl MailApp {
         } else if matches!(modal, Modal::NewLabel(_)) {
             footer = footer
                 .child(div().flex_1())
-                .child(self.button("new-label-cancel", "Cancel", "", Action::Close, false, cx))
-                .child(self.button("new-label-save", "Add Label", "", Action::SaveLabel, true, cx));
+                .child(self.button(
+                    "new-label-cancel",
+                    t!("ui-cancel"),
+                    "",
+                    Action::Close,
+                    false,
+                    cx,
+                ))
+                .child(self.button(
+                    "new-label-save",
+                    t!("ui-add-label"),
+                    "",
+                    Action::SaveLabel,
+                    true,
+                    cx,
+                ));
         } else if let Modal::Reconnect(id) = modal {
             footer = footer.child(div().flex_1());
             if self.sign_in_retry && !self.connecting {
                 footer = footer.child(self.button(
                     "reconnect-retry",
-                    "Try Again",
+                    t!("ui-try-again"),
                     "",
                     Action::RetrySignIn,
                     false,
@@ -11372,7 +11692,11 @@ impl MailApp {
             if self.proton_reconnecting().is_some() && self.proton_stage.is_some() {
                 footer = footer.child(self.button(
                     "proton-back",
-                    if self.connecting { "Cancel" } else { "Back" },
+                    if self.connecting {
+                        t!("ui-cancel")
+                    } else {
+                        t!("ui-back")
+                    },
                     "",
                     Action::ProtonBack,
                     false,
@@ -11395,25 +11719,25 @@ impl MailApp {
                     cx,
                 ));
             } else {
-            footer = footer.child(self.button(
-                "reconnect-submit",
-                if !self.connecting {
-                    "Sign In"
-                } else if self.sign_in_step == SignInStep::Browser {
-                    "Signing in…"
-                } else {
-                    self.sign_in_step.label()
-                },
-                "",
-                Action::SubmitReconnect(id.clone()),
-                true,
-                cx,
-            ));
+                footer = footer.child(self.button(
+                    "reconnect-submit",
+                    if !self.connecting {
+                        t!("ui-sign-in-2")
+                    } else if self.sign_in_step == SignInStep::Browser {
+                        t!("ui-signing-in")
+                    } else {
+                        self.sign_in_step.label()
+                    },
+                    "",
+                    Action::SubmitReconnect(id.clone()),
+                    true,
+                    cx,
+                ));
             }
         } else {
             footer = footer.child(div().flex_1()).child(self.button(
                 "done",
-                "Done",
+                t!("ui-done"),
                 "",
                 Action::Close,
                 true,
@@ -11472,7 +11796,7 @@ impl MailApp {
         let next = next_text_zoom(self.text_zoom(), direction);
         let _ = self.backend.store.set_preference(TEXT_ZOOM, &next.to_string());
         self.html_view.update(cx, |v, cx| v.set_text_zoom(next, cx));
-        self.notice(format!("Emails at {}%", (next * 100.).round()), false, cx);
+        self.notice(t!("ui-emails-at", round = (next * 100.).round()), false, cx);
     }
 }
 
@@ -11937,19 +12261,27 @@ impl MailApp {
                         // Undo, then a gap and a rule before the close button.
                         .when(self.undo.is_some() && !self.error, |d| {
                             d.child(
-                                self.button("toast-undo", "Undo", "", Action::Undo, false, cx)
-                                    .h(px(28.))
-                                    .text_color(rgb(c.accent))
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .tooltip(|w, cx| {
-                                        Tooltip::new(shortcuts::tip("Undo", "undo", cx)).build(w, cx)
-                                    }),
+                                self.button(
+                                    "toast-undo",
+                                    t!("ui-undo"),
+                                    "",
+                                    Action::Undo,
+                                    false,
+                                    cx,
+                                )
+                                .h(px(28.))
+                                .text_color(rgb(c.accent))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .tooltip(|w, cx| {
+                                    Tooltip::new(shortcuts::tip(t!("ui-undo"), "undo", cx))
+                                        .build(w, cx)
+                                }),
                             )
                             .child(div().w(px(1.)).h(px(20.)).flex_shrink_0().bg(rgb(c.border)))
                         })
                         .child(self.button(
                             "dismiss",
-                            "@Dismiss notification",
+                            t!("ui-dismiss-notification"),
                             "close",
                             Action::Dismiss,
                             false,
@@ -11970,17 +12302,19 @@ fn swallow_press(_: &MouseDownEvent, _: &mut Window, cx: &mut App) {
 pub(super) fn human_size(bytes: u64) -> String {
     match bytes {
         0..1024 => format!("{bytes} B"),
-        1024..1_048_576 => format!("{} KB", bytes / 1024),
-        _ => format!("{:.1} MB", bytes as f64 / 1_048_576.),
+        1024..1_048_576 => t!("ui-kb", kb = bytes / 1024),
+        _ => t!("ui-mb", mb = format!("{:.1}", bytes as f64 / 1_048_576.)),
     }
 }
 /// A count with thousands separators: 12,345.
 fn fmt_count(n: usize) -> String {
     let digits = n.to_string();
+    // "1,234" in English; the language's own mark between thousands.
+    let separator = t!("ui-thousands-separator");
     let mut out = String::new();
     for (i, ch) in digits.chars().enumerate() {
         if i > 0 && (digits.len() - i).is_multiple_of(3) {
-            out.push(',');
+            out.push_str(separator);
         }
         out.push(ch);
     }
@@ -12309,7 +12643,7 @@ fn menu_size(entries: &[Entry], viewport: f32) -> (f32, f32) {
 }
 /// The alias a sent message went out as: its icon and address.
 fn alias_tag(id: &str, alias: String, c: Colors) -> Stateful<Div> {
-    let tip = format!("Sent as {alias}");
+    let tip = t!("ui-sent-as", alias = alias);
     let selector = id.to_owned();
     div()
         .id(SharedString::from(id.to_owned()))
@@ -12416,11 +12750,11 @@ fn date_short(ts: i64) -> String {
     let now = chrono::Local::now();
     let local = date.with_timezone(&chrono::Local);
     if local.date_naive() == now.date_naive() {
-        local.format("%-I:%M %p").to_string()
+        local.local(t!("dates-time"))
     } else if local.year() == now.year() {
-        local.format("%b %-d").to_string()
+        local.local(t!("dates-month-day"))
     } else {
-        local.format("%b %-d, %Y").to_string()
+        local.local(t!("dates-month-day-year"))
     }
 }
 #[cfg(test)]
@@ -12453,11 +12787,7 @@ fn short_dates_name_the_year_only_when_it_differs() {
 }
 fn date_full(ts: i64) -> String {
     chrono::DateTime::from_timestamp(ts, 0)
-        .map(|d| {
-            d.with_timezone(&chrono::Local)
-                .format("%b %-d, %Y · %-I:%M %p")
-                .to_string()
-        })
+        .map(|d| crate::i18n::dates::format(&d.with_timezone(&chrono::Local), t!("dates-full")))
         .unwrap_or_default()
 }
 
@@ -12483,8 +12813,8 @@ pub(super) fn app_bindings_from(path: &std::path::Path, cx: &App) -> (Vec<KeyBin
     // The main window's, as the shortcuts file changes them.
     let (mut bindings, warnings) = shortcuts::bindings_from(path, cx);
     bindings.extend([
-        key(cx, "secondary-w", CloseWindow, Some("Detached")),
-        key(cx, "escape", Close, Some("Detached")),
+        key(cx, "secondary-w", CloseWindow, Some(t!("ui-detached"))),
+        key(cx, "escape", Close, Some(t!("ui-detached"))),
         key(cx, "cmd-h", Hide, None),
         key(cx, "alt-cmd-h", HideOthers, None),
     ]);
@@ -12507,6 +12837,13 @@ pub fn new_backend(store: Arc<Store>) -> Arc<Backend> {
     // What notifications may say (Settings → Privacy), for every process
     // that shows them.
     crate::manage::applock::load_hiding(&store);
+    // The interface's language, as Settings chose it (or the system's).
+    crate::i18n::set_preference(store.preference(crate::i18n::PREFERENCE).as_deref());
+    crate::i18n::set_outgoing(
+        store
+            .preference(crate::i18n::OUTGOING_PREFERENCE)
+            .as_deref(),
+    );
     let settings = store.clone();
     let backend = Arc::new(Backend::new(store));
     backend.on_proton_notice(|a, title, body| {
@@ -12526,7 +12863,7 @@ pub fn new_backend(store: Arc<Store>) -> Arc<Backend> {
             let subject = if crate::manage::local_ai::otp_enabled(&settings)
                 && crate::manage::mail_kinds::might_be_code(subject, "")
             {
-                "Sign-in code"
+                t!("ui-sign-in-code")
             } else {
                 subject
             };
@@ -12673,8 +13010,8 @@ fn start(app: Application, open: impl FnOnce(&mut App) + 'static) {
 /// `PICACHO_CHANNEL=beta`), otherwise "Version X.Y.Z".
 pub(crate) fn version_label() -> String {
     match option_env!("PICACHO_CHANNEL") {
-        Some("beta") => "Beta Build".into(),
-        _ => format!("Version {}", env!("CARGO_PKG_VERSION")),
+        Some("beta") => t!("ui-beta-build").into(),
+        _ => t!("ui-version", version = env!("CARGO_PKG_VERSION")),
     }
 }
 
@@ -12725,11 +13062,7 @@ fn open_main_window(
                 close_view
                     .update(cx, |this, cx| {
                         if this.sending {
-                            this.notice(
-                                "Wait for the current message to finish sending.",
-                                true,
-                                cx,
-                            );
+                            this.notice(t!("ui-wait-for-the-current-message-to"), true, cx);
                             false
                         } else {
                             this.persist_draft(cx);
@@ -12760,117 +13093,117 @@ fn menus() -> Vec<Menu> {
         menu(
             "Picacho",
             vec![
-                MenuItem::action("About Picacho", ShowAbout),
+                MenuItem::action(t!("ui-about-picacho-2"), ShowAbout),
                 MenuItem::separator(),
-                MenuItem::action("Settings…", ShowAccounts),
-                MenuItem::action("Add Account…", AddAccount),
+                MenuItem::action(t!("ui-settings-2"), ShowAccounts),
+                MenuItem::action(t!("ui-add-account-2"), AddAccount),
                 MenuItem::separator(),
-                MenuItem::action("Lock Picacho", LockApp),
+                MenuItem::action(t!("ui-lock-picacho"), LockApp),
                 MenuItem::separator(),
-                MenuItem::os_submenu("Services", SystemMenuType::Services),
+                MenuItem::os_submenu(t!("ui-services"), SystemMenuType::Services),
                 MenuItem::separator(),
-                MenuItem::action("Hide Picacho", Hide),
-                MenuItem::action("Hide Others", HideOthers),
-                MenuItem::action("Show All", ShowAll),
+                MenuItem::action(t!("ui-hide-picacho"), Hide),
+                MenuItem::action(t!("ui-hide-others"), HideOthers),
+                MenuItem::action(t!("ui-show-all"), ShowAll),
                 MenuItem::separator(),
-                MenuItem::action("Quit Picacho", Quit),
+                MenuItem::action(t!("ui-quit-picacho"), Quit),
             ],
         ),
         menu(
-            "File",
+            t!("ui-file"),
             vec![
-                MenuItem::action("New Message", Compose),
-                MenuItem::action("Add Account…", AddAccount),
+                MenuItem::action(t!("ui-new-message-3"), Compose),
+                MenuItem::action(t!("ui-add-account-2"), AddAccount),
                 MenuItem::separator(),
-                MenuItem::action("Check for New Mail", Refresh),
+                MenuItem::action(t!("ui-check-for-new-mail"), Refresh),
                 MenuItem::separator(),
-                MenuItem::action("Print…", PrintMessage),
-                MenuItem::action("Save as PDF…", SaveAsPdf),
+                MenuItem::action(t!("ui-print"), PrintMessage),
+                MenuItem::action(t!("ui-save-as-pdf"), SaveAsPdf),
                 MenuItem::separator(),
-                MenuItem::action("Close Window", CloseWindow),
+                MenuItem::action(t!("ui-close-window"), CloseWindow),
             ],
         ),
         menu(
-            "Edit",
+            t!("ui-edit"),
             vec![
-                MenuItem::os_action("Undo", input::Undo, OsAction::Undo),
-                MenuItem::os_action("Redo", input::Redo, OsAction::Redo),
+                MenuItem::os_action(t!("ui-undo"), input::Undo, OsAction::Undo),
+                MenuItem::os_action(t!("ui-redo"), input::Redo, OsAction::Redo),
                 MenuItem::separator(),
-                MenuItem::os_action("Cut", input::Cut, OsAction::Cut),
-                MenuItem::os_action("Copy", input::Copy, OsAction::Copy),
-                MenuItem::os_action("Paste", input::Paste, OsAction::Paste),
-                MenuItem::os_action("Select All", input::SelectAll, OsAction::SelectAll),
+                MenuItem::os_action(t!("ui-cut"), input::Cut, OsAction::Cut),
+                MenuItem::os_action(t!("ui-copy"), input::Copy, OsAction::Copy),
+                MenuItem::os_action(t!("ui-paste"), input::Paste, OsAction::Paste),
+                MenuItem::os_action(t!("ui-select-all"), input::SelectAll, OsAction::SelectAll),
                 MenuItem::separator(),
-                MenuItem::action("Find in Message", FindInMessage),
-                MenuItem::action("Search Mailbox", Search),
+                MenuItem::action(t!("ui-find-in-message-2"), FindInMessage),
+                MenuItem::action(t!("ui-search-mailbox"), Search),
             ],
         ),
         menu(
-            "View",
+            t!("ui-view"),
             vec![
-                MenuItem::action("All Messages", ShowAllMail),
-                MenuItem::action("Unread", ShowUnread),
-                MenuItem::action("Starred", ShowStarred),
-                MenuItem::action("Has Attachments", ShowAttachments),
+                MenuItem::action(t!("ui-all-messages"), ShowAllMail),
+                MenuItem::action(t!("ui-unread"), ShowUnread),
+                MenuItem::action(t!("ui-starred"), ShowStarred),
+                MenuItem::action(t!("ui-has-attachments"), ShowAttachments),
                 MenuItem::separator(),
-                MenuItem::action("Group by Conversation", ToggleThreads),
+                MenuItem::action(t!("ui-group-by-conversation"), ToggleThreads),
                 MenuItem::separator(),
-                MenuItem::action("Toggle Sidebar", ToggleSidebar),
-                MenuItem::action("Toggle Dark Mode", ToggleTheme),
+                MenuItem::action(t!("ui-toggle-sidebar"), ToggleSidebar),
+                MenuItem::action(t!("ui-toggle-dark-mode"), ToggleTheme),
                 MenuItem::separator(),
-                MenuItem::action("Zoom In", ZoomIn),
-                MenuItem::action("Zoom Out", ZoomOut),
-                MenuItem::action("Actual Size", ActualSize),
+                MenuItem::action(t!("ui-zoom-in"), ZoomIn),
+                MenuItem::action(t!("ui-zoom-out"), ZoomOut),
+                MenuItem::action(t!("ui-actual-size"), ActualSize),
             ],
         ),
         menu(
-            "Mailbox",
+            t!("ui-mailbox"),
             vec![
-                MenuItem::action("Inbox", GoInbox),
-                MenuItem::action("Starred", GoStarred),
-                MenuItem::action("Sent", GoSent),
-                MenuItem::action("Drafts", GoDrafts),
-                MenuItem::action("Archive", GoArchive),
-                MenuItem::action("Spam", GoSpam),
-                MenuItem::action("Trash", GoTrash),
-                MenuItem::action("All Mail", GoAllMail),
+                MenuItem::action(t!("ui-inbox"), GoInbox),
+                MenuItem::action(t!("ui-starred"), GoStarred),
+                MenuItem::action(t!("ui-sent"), GoSent),
+                MenuItem::action(t!("ui-drafts"), GoDrafts),
+                MenuItem::action(t!("ui-archive-2"), GoArchive),
+                MenuItem::action(t!("ui-spam"), GoSpam),
+                MenuItem::action(t!("ui-trash"), GoTrash),
+                MenuItem::action(t!("ui-all-mail"), GoAllMail),
                 MenuItem::separator(),
-                MenuItem::action("Mark All as Read", MarkAllRead),
-                MenuItem::action("Refresh", Refresh),
+                MenuItem::action(t!("ui-mark-all-as-read"), MarkAllRead),
+                MenuItem::action(t!("ui-refresh"), Refresh),
             ],
         ),
         menu(
-            "Message",
+            t!("ui-message"),
             vec![
-                MenuItem::action("Reply", Reply),
-                MenuItem::action("Reply All", ReplyAll),
-                MenuItem::action("Forward", ForwardMail),
+                MenuItem::action(t!("ui-reply"), Reply),
+                MenuItem::action(t!("ui-reply-all"), ReplyAll),
+                MenuItem::action(t!("ui-forward"), ForwardMail),
                 MenuItem::separator(),
-                MenuItem::action("Mark as Read / Unread", ToggleRead),
-                MenuItem::action("Star / Unstar", ToggleStar),
+                MenuItem::action(t!("ui-mark-as-read-unread"), ToggleRead),
+                MenuItem::action(t!("ui-star-unstar"), ToggleStar),
                 MenuItem::separator(),
-                MenuItem::action("Archive", Archive),
-                MenuItem::action("Move to Spam", MoveToSpam),
-                MenuItem::action("Move to Trash", DeleteMail),
+                MenuItem::action(t!("ui-archive-2"), Archive),
+                MenuItem::action(t!("ui-move-to-spam-2"), MoveToSpam),
+                MenuItem::action(t!("ui-move-to-trash-2"), DeleteMail),
                 MenuItem::separator(),
-                MenuItem::action("Next Message", Next),
-                MenuItem::action("Previous Message", Previous),
+                MenuItem::action(t!("ui-next-message"), Next),
+                MenuItem::action(t!("ui-previous-message"), Previous),
                 MenuItem::separator(),
-                MenuItem::action("Send", SendMail),
+                MenuItem::action(t!("ui-send"), SendMail),
             ],
         ),
         menu(
-            "Window",
+            t!("ui-window"),
             vec![
-                MenuItem::action("Minimize", Minimize),
-                MenuItem::action("Zoom", Zoom),
+                MenuItem::action(t!("ui-minimize"), Minimize),
+                MenuItem::action(t!("ui-zoom"), Zoom),
                 MenuItem::separator(),
-                MenuItem::action("Desktop Widget", ShowWidget),
+                MenuItem::action(t!("ui-desktop-widget"), ShowWidget),
             ],
         ),
         menu(
-            "Help",
-            vec![MenuItem::action("Keyboard Shortcuts", ShowHelp)],
+            t!("ui-help"),
+            vec![MenuItem::action(t!("ui-keyboard-shortcuts"), ShowHelp)],
         ),
     ]
 }

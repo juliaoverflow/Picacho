@@ -502,10 +502,10 @@ pub fn session_url(host: &str, port: u16) -> String {
 /// so one `github.io` site can't send Picacho to another); an IP address
 /// only to itself.
 fn session_redirect_allowed(first: &url::Url, next: &url::Url) -> Result<()> {
-    let target = next.host_str().unwrap_or("another server").to_owned();
+    let target = next.host_str().unwrap_or(t!("sync-jmap-another-server")).to_owned();
     ensure!(
         next.scheme() == "https" || (cfg!(test) && next.scheme() == first.scheme()),
-        "The JMAP server sent Picacho on to {target} without https://, so it wasn't followed."
+        t!("sync-jmap-the-jmap-server-sent-picacho-on", target = target)
     );
     let same = match (first.host(), next.host()) {
         (Some(url::Host::Domain(a)), Some(url::Host::Domain(b))) => {
@@ -521,7 +521,7 @@ fn session_redirect_allowed(first: &url::Url, next: &url::Url) -> Result<()> {
     };
     ensure!(
         same,
-        "The JMAP server sent Picacho on to {target}; enter that as the server instead."
+        t!("sync-jmap-the-jmap-server-sent-picacho-on-2", target = target)
     );
     Ok(())
 }
@@ -537,13 +537,13 @@ const REPLY_LIMIT: u64 = 256 * 1024 * 1024;
 /// The most read of an error's text.
 const ERROR_LIMIT: u64 = 64 * 1024;
 
-fn transport(e: reqwest::Error, what: &str) -> anyhow::Error {
+/// `what`: the step that failed, one of the keys `sync-jmap-jmap-failed`
+/// selects on (sign-in, request, download, upload, event-stream).
+fn transport(e: reqwest::Error, what: &'static str) -> anyhow::Error {
     let kind = if e.is_timeout() {
         Some(std::io::ErrorKind::TimedOut)
     } else if e.is_connect() {
-        return anyhow::Error::new(crate::sync::retry::Unreachable(format!(
-            "Couldn't reach the JMAP server: {e}"
-        )));
+        return anyhow::Error::new(crate::sync::retry::Unreachable(t!("sync-jmap-couldnt-reach-the-jmap-server", error = e.to_string())));
     } else if e.is_request() || e.is_body() {
         Some(std::io::ErrorKind::ConnectionAborted)
     } else {
@@ -551,8 +551,8 @@ fn transport(e: reqwest::Error, what: &str) -> anyhow::Error {
     };
     match kind {
         Some(kind) => anyhow::Error::new(std::io::Error::new(kind, e.to_string()))
-            .context(format!("JMAP {what} failed")),
-        None => anyhow::Error::new(e).context(format!("JMAP {what} failed")),
+            .context(t!("sync-jmap-jmap-failed", what = what)),
+        None => anyhow::Error::new(e).context(t!("sync-jmap-jmap-failed", what = what)),
     }
 }
 
@@ -564,8 +564,10 @@ fn problem(status: reqwest::StatusCode, body: &str) -> anyhow::Error {
     if status == reqwest::StatusCode::TOO_MANY_REQUESTS
         || status == reqwest::StatusCode::SERVICE_UNAVAILABLE
     {
+        // The code stays outside the words: `imap::throttled` looks for it.
         return anyhow::anyhow!(
-            "[THROTTLED] The JMAP server is limiting requests ({status}); background sync waits a while."
+            "[THROTTLED] {}",
+            t!("sync-jmap-the-jmap-server-is-limiting-requests", status = status)
         );
     }
     let v: Value = serde_json::from_str(body).unwrap_or(Value::Null);
@@ -575,7 +577,7 @@ fn problem(status: reqwest::StatusCode, body: &str) -> anyhow::Error {
         .or(v["type"].as_str())
         .map(str::to_owned)
         .unwrap_or_else(|| body.chars().take(200).collect());
-    anyhow::anyhow!("The JMAP server answered {status}: {detail}")
+    anyhow::anyhow!(t!("sync-jmap-the-jmap-server-answered", status = status, detail = detail))
 }
 
 fn usize_of(v: &Value, default: usize) -> usize {
@@ -597,7 +599,7 @@ impl Session {
         account: &str,
         tls: native_tls::TlsConnector,
     ) -> Result<Self> {
-        ensure!(!password.is_empty(), "Enter your password or API token.");
+        ensure!(!password.is_empty(), t!("sync-jmap-enter-your-password-or-api-token"));
         // Fastmail's API tokens are bearer tokens: no need to try Basic first.
         let order = if password.starts_with("fmu") && !password.contains(char::is_whitespace) {
             [Auth::Bearer, Auth::Basic]
@@ -616,7 +618,7 @@ impl Session {
     ) -> Result<Self> {
         ensure!(
             !token.is_empty(),
-            "Your sign-in expired. Reconnect the account."
+            t!("sync-jmap-your-sign-in-expired-reconnect-the")
         );
         Self::open_with(start, "", token, account, &[Auth::Bearer], tls)
     }
@@ -682,7 +684,7 @@ impl Session {
                     .headers()
                     .get(reqwest::header::LOCATION)
                     .and_then(|l| l.to_str().ok())
-                    .context("The JMAP server redirected without saying where.")?;
+                    .with_context(|| t!("sync-jmap-the-jmap-server-redirected-without-saying"))?;
                 let next = url.join(next)?;
                 session_redirect_allowed(&first, &next)?;
                 url = next;
@@ -691,23 +693,21 @@ impl Session {
             if status == reqwest::StatusCode::UNAUTHORIZED
                 || status == reqwest::StatusCode::FORBIDDEN
             {
-                return Err(anyhow::Error::new(AccessFailure::Authentication).context(
-                    "The JMAP server didn't accept the sign-in. Check the password, or use an API token if the server asks for one.",
-                ));
+                return Err(anyhow::Error::new(AccessFailure::Authentication).context(t!("sync-jmap-the-jmap-server-didnt-accept-the")));
             }
             if status == reqwest::StatusCode::NOT_FOUND {
-                bail!("{} doesn't offer JMAP (no /.well-known/jmap).", host);
+                bail!(t!("sync-jmap-doesnt-offer-jmap-no-well-known", host = host));
             }
             let body = crate::sync::public_net::bounded_text(response, SESSION_LIMIT)
-                .context("Couldn't read the JMAP server's session.")?;
+                .with_context(|| t!("sync-jmap-couldnt-read-the-jmap-servers-session"))?;
             if !status.is_success() {
                 return Err(problem(status, &body));
             }
             let resource = serde_json::from_str(&body)
-                .context("The JMAP server's session isn't JSON Picacho can read.")?;
+                .with_context(|| t!("sync-jmap-the-jmap-servers-session-isnt-json"))?;
             return Ok((resource, url.to_string()));
         }
-        bail!("The JMAP server redirected too many times.")
+        bail!(t!("sync-jmap-the-jmap-server-redirected-too-many"))
     }
 
     /// The session for the mail account `chosen` (empty: the sign-in's
@@ -724,17 +724,17 @@ impl Session {
         let caps = &v["capabilities"];
         ensure!(
             caps.get(MAIL).is_some(),
-            "This JMAP server doesn't offer mail."
+            t!("sync-jmap-this-jmap-server-doesnt-offer-mail")
         );
         let account_id = if chosen.is_empty() {
             v["primaryAccounts"][MAIL]
                 .as_str()
-                .context("This JMAP account has no mail.")?
+                .with_context(|| t!("sync-jmap-this-jmap-account-has-no-mail"))?
                 .to_owned()
         } else {
             ensure!(
                 v["accounts"][chosen]["accountCapabilities"].get(MAIL).is_some(),
-                "This shared mail account is no longer shared with you."
+                t!("sync-jmap-this-shared-mail-account-is-no")
             );
             chosen.to_owned()
         };
@@ -786,12 +786,12 @@ impl Session {
         let url = |key: &str| -> Result<String> {
             let u = v[key]
                 .as_str()
-                .with_context(|| format!("The JMAP session has no {key}."))?;
+                .with_context(|| t!("sync-jmap-the-jmap-session-has-no", key = key))?;
             let parsed = url::Url::parse(u)
-                .with_context(|| format!("The JMAP session's {key} isn't an address."))?;
+                .with_context(|| t!("sync-jmap-the-jmap-sessions-isnt-an-address", key = key))?;
             ensure!(
                 parsed.scheme() == "https" || cfg!(test),
-                "The JMAP server's {key} doesn't use https://."
+                t!("sync-jmap-the-jmap-servers-doesnt-use-https", key = key)
             );
             Ok(u.to_owned())
         };
@@ -959,8 +959,7 @@ impl Session {
         if calls.len() > self.max_calls {
             ensure!(
                 !calls.iter().any(|(_, args)| uses_result_references(args)),
-                "This JMAP server takes only {} method calls at a time.",
-                self.max_calls
+                t!("sync-jmap-this-jmap-server-takes-only-method", max_calls = self.max_calls)
             );
             let mut created = Some(Map::new());
             let mut out = Vec::with_capacity(calls.len());
@@ -1051,8 +1050,7 @@ impl Session {
         let body = serde_json::to_vec(&request)?;
         ensure!(
             body.len() <= self.max_request,
-            "This request is larger than the JMAP server takes ({} bytes at most).",
-            self.max_request
+            t!("sync-jmap-this-request-is-larger-than-the", max_request = self.max_request)
         );
         let _turn = self.requests.take();
         let response = self
@@ -1065,15 +1063,15 @@ impl Session {
         let status = response.status();
         if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
             return Err(anyhow::Error::new(AccessFailure::Authentication)
-                .context("The JMAP server no longer accepts the sign-in."));
+                .context(t!("sync-jmap-the-jmap-server-no-longer-accepts")));
         }
         let text = crate::sync::public_net::bounded_text(response, REPLY_LIMIT)
-            .context("Couldn't read the JMAP server's reply.")?;
+            .with_context(|| t!("sync-jmap-couldnt-read-the-jmap-servers-reply"))?;
         if !status.is_success() {
             return Err(problem(status, &text));
         }
         let v: Value =
-            serde_json::from_str(&text).context("The JMAP server's reply isn't JSON.")?;
+            serde_json::from_str(&text).with_context(|| t!("sync-jmap-the-jmap-servers-reply-isnt-json"))?;
         if let Some(state) = v["sessionState"].as_str()
             && !self.session_state.is_empty()
             && state != self.session_state
@@ -1085,7 +1083,7 @@ impl Session {
         }
         let responses = v["methodResponses"]
             .as_array()
-            .context("The JMAP server's reply has no method responses.")?;
+            .with_context(|| t!("sync-jmap-the-jmap-servers-reply-has-no"))?;
         Ok(answers(calls, responses))
     }
     /// One method call's response arguments.
@@ -1093,7 +1091,7 @@ impl Session {
         self.call(&[(name, args)])?
             .into_iter()
             .next()
-            .with_context(|| format!("The JMAP server didn't answer {name}."))?
+            .with_context(|| t!("sync-jmap-the-jmap-server-didnt-answer", name = name))?
             .into_value()
     }
 
@@ -1121,7 +1119,7 @@ impl Session {
             json!({ "accountId": self.account_id, "ids": null, "properties": PROPERTIES }),
         )?;
         let list: Vec<Mailbox> = serde_json::from_value(v["list"].clone())
-            .context("The JMAP server's mailboxes aren't in a form Picacho can read.")?;
+            .with_context(|| t!("sync-jmap-the-jmap-servers-mailboxes-arent-in"))?;
         *self.mailboxes.lock().unwrap() = list.clone();
         *self.mailbox_state.lock().unwrap() = v["state"].as_str().unwrap_or_default().to_owned();
         Ok(list)
@@ -1174,9 +1172,7 @@ impl Session {
         for (name, v) in &responses {
             if name == "Mailbox/get" {
                 fresh.extend(
-                    serde_json::from_value::<Vec<Mailbox>>(v["list"].clone()).context(
-                        "The JMAP server's mailboxes aren't in a form Picacho can read.",
-                    )?,
+                    serde_json::from_value::<Vec<Mailbox>>(v["list"].clone()).with_context(|| t!("sync-jmap-the-jmap-servers-mailboxes-arent-in"))?,
                 );
             }
         }
@@ -1204,17 +1200,16 @@ impl Session {
         let limits = self.mail_limits;
         ensure!(
             name.len() <= limits.max_size_mailbox_name,
-            "This server takes folder names of up to {} bytes.",
-            limits.max_size_mailbox_name
+            t!("sync-jmap-this-server-takes-folder-names-of", max_size_mailbox_name = limits.max_size_mailbox_name)
         );
         ensure!(
             parent.is_some() || limits.may_create_top_level_mailbox,
-            "This server makes new folders only inside others."
+            t!("sync-jmap-this-server-makes-new-folders-only")
         );
         if let Some(p) = parent {
             let boxes = self.mailboxes.lock().unwrap();
             if let Some(m) = boxes.iter().find(|m| m.id == p) {
-                ensure!(m.may_create_child(), "You may not make folders inside “{}”.", m.name);
+                ensure!(m.may_create_child(), t!("sync-jmap-you-may-not-make-folders-inside", name = m.name));
             }
             // RFC 8621 §1.3.1: `maxMailboxDepth` counts the top as 1.
             if let Some(most) = limits.max_mailbox_depth {
@@ -1227,7 +1222,7 @@ impl Session {
                         break;
                     }
                 }
-                ensure!(depth <= most, "This server takes folders only {most} deep.");
+                ensure!(depth <= most, t!("sync-jmap-this-server-takes-folders-only-deep", most = most));
             }
         }
         let v = self.one(
@@ -1238,11 +1233,11 @@ impl Session {
             }),
         )?;
         if let Some(e) = v["notCreated"].get("new") {
-            bail!("The server didn't make the folder: {}", set_error(e));
+            bail!(t!("sync-jmap-the-server-didnt-make-the-folder", error = set_error(e)));
         }
         let id = v["created"]["new"]["id"]
             .as_str()
-            .context("The server didn't say which folder it made.")?
+            .with_context(|| t!("sync-jmap-the-server-didnt-say-which-folder"))?
             .to_owned();
         self.reload_mailboxes()?;
         Ok(id)
@@ -1262,14 +1257,14 @@ impl Session {
     // Backend-only until the UI calls it: subscribing to a mailbox (`Backend::subscribe_folder_jmap`).
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn subscribe_mailbox(&self, id: &str, subscribed: bool) -> Result<()> {
-        self.update_mailbox(id, json!({ "isSubscribed": subscribed }), "subscribe to")
+        self.update_mailbox(id, json!({ "isSubscribed": subscribed }), "subscribe")
     }
-    fn update_mailbox(&self, id: &str, patch: Value, what: &str) -> Result<()> {
+    /// `what`: rename, move or subscribe (the keys the messages select on).
+    fn update_mailbox(&self, id: &str, patch: Value, what: &'static str) -> Result<()> {
         if let Some(name) = patch["name"].as_str() {
             ensure!(
                 name.len() <= self.mail_limits.max_size_mailbox_name,
-                "This server takes folder names of up to {} bytes.",
-                self.mail_limits.max_size_mailbox_name
+                t!("sync-jmap-this-server-takes-folder-names-of", max_size_mailbox_name = self.mail_limits.max_size_mailbox_name)
             );
         }
         let known = self.mailboxes.lock().unwrap().iter().find(|m| m.id == id).cloned();
@@ -1277,14 +1272,14 @@ impl Session {
         if let Some(m) = &known
             && (patch.get("name").is_some() || patch.get("parentId").is_some())
         {
-            ensure!(m.may_rename(), "You may not {what} the folder “{}”.", m.name);
+            ensure!(m.may_rename(), t!("sync-jmap-you-may-not-the-folder", what = what, name = m.name));
         }
         let v = self.one(
             "Mailbox/set",
             json!({ "accountId": self.account_id, "update": { id: patch } }),
         )?;
         if let Some(e) = v["notUpdated"].get(id) {
-            bail!("The server didn't {what} the folder: {}", set_error(e));
+            bail!(t!("sync-jmap-the-server-didnt-the-folder", what = what, error = set_error(e)));
         }
         self.reload_mailboxes()?;
         Ok(())
@@ -1332,7 +1327,7 @@ impl Session {
     /// rather than the server refusing a mailbox with mail in it.
     pub fn destroy_mailbox_with(&self, id: &str, remove_emails: bool) -> Result<()> {
         if let Some(m) = self.mailboxes.lock().unwrap().iter().find(|m| m.id == id) {
-            ensure!(m.may_delete(), "You may not delete the folder “{}”.", m.name);
+            ensure!(m.may_delete(), t!("sync-jmap-you-may-not-delete-the-folder", name = m.name));
         }
         let v = self.one(
             "Mailbox/set",
@@ -1344,12 +1339,12 @@ impl Session {
         )?;
         if let Some(e) = v["notDestroyed"].get(id) {
             if e["type"] == "mailboxHasEmail" {
-                bail!("The folder still has mail in it. Move or delete its mail first.");
+                bail!(t!("sync-jmap-the-folder-still-has-mail-in"));
             }
             if e["type"] == "mailboxHasChild" {
-                bail!("The folder has folders inside it. Delete those first.");
+                bail!(t!("sync-jmap-the-folder-has-folders-inside-it"));
             }
-            bail!("The server didn't delete the folder: {}", set_error(e));
+            bail!(t!("sync-jmap-the-server-didnt-delete-the-folder", error = set_error(e)));
         }
         self.reload_mailboxes()?;
         Ok(())
@@ -1390,18 +1385,18 @@ impl Session {
         ])?;
         let query = responses
             .first()
-            .context("The JMAP server didn't answer the query.")?
+            .with_context(|| t!("sync-jmap-the-jmap-server-didnt-answer-the"))?
             .value()?;
         let get = responses
             .get(1)
-            .context("The JMAP server didn't answer the query.")?
+            .with_context(|| t!("sync-jmap-the-jmap-server-didnt-answer-the"))?
             .value()?;
         let order: Vec<&str> = query["ids"]
             .as_array()
             .map(|ids| ids.iter().filter_map(Value::as_str).collect())
             .unwrap_or_default();
         let mut emails: Vec<Email> = serde_json::from_value(get["list"].clone())
-            .context("The JMAP server's messages aren't in a form Picacho can read.")?;
+            .with_context(|| t!("sync-jmap-the-jmap-servers-messages-arent-in"))?;
         // In the query's order, which Email/get needn't keep.
         emails.sort_by_key(|e| {
             order
@@ -1448,7 +1443,7 @@ impl Session {
                 json!({ "accountId": self.account_id, "ids": chunk, "properties": LIST_PROPERTIES }),
             )?;
             let list: Vec<Email> = serde_json::from_value(v["list"].clone())
-                .context("The JMAP server's messages aren't in a form Picacho can read.")?;
+                .with_context(|| t!("sync-jmap-the-jmap-servers-messages-arent-in"))?;
             out.extend(list);
         }
         Ok(out)
@@ -1508,7 +1503,7 @@ impl Session {
                 });
                 for id in targets {
                     if let Some(m) = boxes.iter().find(|m| m.id == id) {
-                        ensure!(m.may_add_items(), "You may not put messages in the folder “{}”.", m.name);
+                        ensure!(m.may_add_items(), t!("sync-jmap-you-may-not-put-messages-in", name = m.name));
                     }
                 }
                 if let Some(all) = patch["mailboxIds"].as_object() {
@@ -1534,10 +1529,7 @@ impl Session {
                 .collect();
             if !failed.is_empty() {
                 bail!(
-                    "The server didn't change {} {}: {}",
-                    failed.len(),
-                    if failed.len() == 1 { "message" } else { "messages" },
-                    failed.join("; ")
+                    t!("sync-jmap-the-server-didnt-change", count = failed.len(), reasons = failed.join("; "))
                 );
             }
         }
@@ -1559,10 +1551,7 @@ impl Session {
                 .collect();
             if !failed.is_empty() {
                 bail!(
-                    "The server didn't delete {} {}: {}",
-                    failed.len(),
-                    if failed.len() == 1 { "message" } else { "messages" },
-                    failed.join("; ")
+                    t!("sync-jmap-the-server-didnt-delete", count = failed.len(), reasons = failed.join("; "))
                 );
             }
         }
@@ -1589,7 +1578,7 @@ impl Session {
         let blob = self
             .blob_ids(&[id.to_owned()])?
             .remove(id)
-            .context("Message no longer exists on the server")?;
+            .with_context(|| t!("sync-jmap-message-no-longer-exists-on-the"))?;
         self.download(&blob, "message.eml", "message/rfc822", limit)
     }
     /// The header block of a message's source, without downloading the
@@ -1599,7 +1588,7 @@ impl Session {
         let blob = self
             .blob_ids(&[id.to_owned()])?
             .remove(id)
-            .context("Message no longer exists on the server")?;
+            .with_context(|| t!("sync-jmap-message-no-longer-exists-on-the"))?;
         // Headers rarely run past 64 KiB, even with long Received chains.
         let Some(start) = self.blob_range(&blob, 0, 64 * 1024)? else {
             return Ok(None);
@@ -1626,10 +1615,10 @@ impl Session {
         let status = response.status();
         if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
             return Err(anyhow::Error::new(AccessFailure::Authentication)
-                .context("The JMAP server no longer accepts the sign-in."));
+                .context(t!("sync-jmap-the-jmap-server-no-longer-accepts")));
         }
         if status == reqwest::StatusCode::NOT_FOUND {
-            bail!("Message no longer exists on the server");
+            bail!(t!("sync-jmap-message-no-longer-exists-on-the"));
         }
         if !status.is_success() {
             let body = crate::sync::public_net::bounded_text(response, ERROR_LIMIT).unwrap_or_default();
@@ -1639,15 +1628,15 @@ impl Session {
             .content_length()
             .is_some_and(|n| n as usize > limit)
         {
-            bail!("Message exceeds the download limit.");
+            bail!(t!("sync-jmap-message-exceeds-the-download-limit"));
         }
         let mut bytes = Vec::new();
         use std::io::Read;
         response
             .take(limit as u64 + 1)
             .read_to_end(&mut bytes)
-            .map_err(|e| anyhow::Error::new(e).context("JMAP download failed"))?;
-        ensure!(bytes.len() <= limit, "Message exceeds the download limit.");
+            .map_err(|e| anyhow::Error::new(e).context(t!("sync-jmap-jmap-download-failed")))?;
+        ensure!(bytes.len() <= limit, t!("sync-jmap-message-exceeds-the-download-limit"));
         Ok(bytes)
     }
     /// GETs a download, following redirects (a CDN's, or a presigned
@@ -1655,7 +1644,7 @@ impl Session {
     /// download address's own origin: a redirect elsewhere is followed
     /// without them, as such addresses carry their own authorization.
     fn get_following(&self, start: &str) -> Result<reqwest::blocking::Response> {
-        let origin = url::Url::parse(start).context("The JMAP download address isn't an address.")?;
+        let origin = url::Url::parse(start).with_context(|| t!("sync-jmap-the-jmap-download-address-isnt-an"))?;
         let mut url = origin.clone();
         for _ in 0..=5 {
             let request = self.http.get(url.clone()).timeout(DOWNLOAD_TIMEOUT);
@@ -1668,21 +1657,21 @@ impl Session {
                 .headers()
                 .get(reqwest::header::LOCATION)
                 .and_then(|l| l.to_str().ok())
-                .context("The JMAP server redirected the download without saying where.")?;
+                .with_context(|| t!("sync-jmap-the-jmap-server-redirected-the-download"))?;
             let next = url.join(next)?;
             ensure!(
                 next.scheme() == "https" || (cfg!(test) && url.scheme() == next.scheme()),
-                "The JMAP server redirected the download to an address that isn't https://."
+                t!("sync-jmap-the-jmap-server-redirected-the-download-2")
             );
             url = next;
         }
-        bail!("The JMAP server redirected the download too many times.")
+        bail!(t!("sync-jmap-the-jmap-server-redirected-the-download-3"))
     }
     /// Uploads a blob, returning its id.
     pub fn upload(&self, bytes: &[u8], kind: &str) -> Result<String> {
         ensure!(
             bytes.len() <= self.max_upload,
-            "The message is larger than the server accepts."
+            t!("sync-jmap-the-message-is-larger-than-the")
         );
         let url = expand_template(&self.upload_url, &[("accountId", &self.account_id)]);
         let _turn = self.uploads.take();
@@ -1696,18 +1685,18 @@ impl Session {
         let status = response.status();
         if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
             return Err(anyhow::Error::new(AccessFailure::Authentication)
-                .context("The JMAP server no longer accepts the sign-in."));
+                .context(t!("sync-jmap-the-jmap-server-no-longer-accepts")));
         }
         let text = crate::sync::public_net::bounded_text(response, SESSION_LIMIT)
-            .context("Couldn't read the JMAP server's answer to the upload.")?;
+            .with_context(|| t!("sync-jmap-couldnt-read-the-jmap-servers-answer"))?;
         if !status.is_success() {
             return Err(problem(status, &text));
         }
         let v: Value =
-            serde_json::from_str(&text).context("The JMAP upload's reply isn't JSON.")?;
+            serde_json::from_str(&text).with_context(|| t!("sync-jmap-the-jmap-uploads-reply-isnt-json"))?;
         Ok(v["blobId"]
             .as_str()
-            .context("The JMAP server didn't say where the upload went.")?
+            .with_context(|| t!("sync-jmap-the-jmap-server-didnt-say-where"))?
             .to_owned())
     }
     /// Adds a message to mailboxes from its source, with keywords
@@ -1736,7 +1725,7 @@ impl Session {
     /// RFC 8621 §1.3.1: a message may be in at most `maxMailboxesPerEmail`.
     fn check_mailbox_count(&self, n: usize) -> Result<()> {
         if let Some(most) = self.mail_limits.max_mailboxes_per_email {
-            ensure!(n <= most, "This server keeps a message in at most {most} folders.");
+            ensure!(n <= most, t!("sync-jmap-this-server-keeps-a-message-in", most = most));
         }
         Ok(())
     }
@@ -1761,8 +1750,7 @@ impl Session {
         }
         ensure!(
             total <= most,
-            "The attachments are larger than this server sends ({} MB at most).",
-            most / 1_000_000
+            t!("sync-jmap-the-attachments-are-larger-than-this", megabytes = most / 1_000_000)
         );
         Ok(())
     }
@@ -1782,7 +1770,7 @@ impl Session {
         )?;
         let e = v["list"]
             .get(0)
-            .context("Message no longer exists on the server")?;
+            .with_context(|| t!("sync-jmap-message-no-longer-exists-on-the"))?;
         let values = &e["bodyValues"];
         let joined = |key: &str, kind: &str| -> String {
             e[key]
@@ -1828,20 +1816,20 @@ impl Session {
     }
     /// The identities and the Identity state they were read in.
     pub fn identities_with_state(&self) -> Result<(Vec<Identity>, String)> {
-        ensure!(self.submission, "This JMAP server doesn't send mail.");
+        ensure!(self.submission, t!("sync-jmap-this-jmap-server-doesnt-send-mail"));
         let v = self.one(
             "Identity/get",
             json!({ "accountId": self.account_id, "ids": null }),
         )?;
         let list = serde_json::from_value(v["list"].clone())
-            .context("The JMAP server's identities aren't in a form Picacho can read.")?;
+            .with_context(|| t!("sync-jmap-the-jmap-servers-identities-arent-in"))?;
         Ok((list, v["state"].as_str().unwrap_or_default().to_owned()))
     }
     /// `known` brought up to date with what changed since `since`
     /// (Identity/changes, RFC 8620 §5.2, then Identity/get of those), and
     /// the new state; `None` where the server can't say.
     pub fn identity_changes(&self, since: &str, known: &[Identity]) -> Result<Option<(Vec<Identity>, String)>> {
-        ensure!(self.submission, "This JMAP server doesn't send mail.");
+        ensure!(self.submission, t!("sync-jmap-this-jmap-server-doesnt-send-mail"));
         let v = match self.one(
             "Identity/changes",
             json!({ "accountId": self.account_id, "sinceState": since }),
@@ -1866,7 +1854,7 @@ impl Session {
         if !changed.is_empty() {
             let got = self.one("Identity/get", json!({ "accountId": self.account_id, "ids": changed }))?;
             let fresh: Vec<Identity> = serde_json::from_value(got["list"].clone())
-                .context("The JMAP server's identities aren't in a form Picacho can read.")?;
+                .with_context(|| t!("sync-jmap-the-jmap-servers-identities-arent-in"))?;
             list.extend(fresh);
         }
         Ok(Some((list, v["newState"].as_str().unwrap_or_default().to_owned())))
@@ -1884,14 +1872,14 @@ impl Session {
         sent: Option<&str>,
         options: &SendOptions,
     ) -> Result<Submitted> {
-        ensure!(self.submission, "This JMAP server doesn't send mail.");
+        ensure!(self.submission, t!("sync-jmap-this-jmap-server-doesnt-send-mail"));
         // The envelope's SMTP parameters (RFC 8621 §7: `parameters`).
         let mut from_params = Map::new();
         let mut rcpt_params = Map::new();
         if options.require_tls {
             ensure!(
                 self.submits_with("REQUIRETLS"),
-                "This JMAP server can't promise this message stays encrypted all the way (it doesn't offer REQUIRETLS), so it wasn't sent. Turn off Require encryption in transit (Settings → Sending) to send it anyway."
+                t!("sync-jmap-this-jmap-server-cant-promise-this")
             );
             from_params.insert("REQUIRETLS".into(), Value::Null);
         }
@@ -1905,10 +1893,10 @@ impl Session {
             let ahead = (at - chrono::Utc::now().timestamp()).max(0) as u64;
             ensure!(
                 self.max_delayed_send() >= ahead,
-                "This JMAP server can't hold a message that long before sending it."
+                t!("sync-jmap-this-jmap-server-cant-hold-a")
             );
             let when = chrono::DateTime::from_timestamp(at, 0)
-                .context("The time to send is out of range.")?;
+                .with_context(|| t!("sync-jmap-the-time-to-send-is-out"))?;
             from_params.insert(
                 "HOLDUNTIL".into(),
                 json!(when.format("%Y-%m-%dT%H:%M:%SZ").to_string()),
@@ -1947,7 +1935,7 @@ impl Session {
         let first: Vec<&str> = drafts.or(sent).into_iter().collect();
         ensure!(
             !first.is_empty(),
-            "The account has neither a Drafts nor a Sent folder to send from."
+            t!("sync-jmap-the-account-has-neither-a-drafts")
         );
         let mut after = Map::new();
         after.insert("keywords/$draft".into(), Value::Null);
@@ -1980,7 +1968,7 @@ impl Session {
             ),
         ])?;
         let [import, submission] = <[Answer; 2]>::try_from(responses)
-            .map_err(|_| anyhow::anyhow!("The JMAP server didn't answer the send."))?;
+            .map_err(|_| anyhow::anyhow!(t!("sync-jmap-the-jmap-server-didnt-answer-the-2")))?;
         let id = imported(import.value()?, "m")?;
         // The submission refused as a whole (RFC 8620 §3.6.2): the copy
         // the import added goes again, as for a refused creation.
@@ -1988,17 +1976,17 @@ impl Session {
             Ok(v) => v,
             Err(e) => {
                 let _ = self.destroy(&[id]);
-                return Err(e.context("The server didn't send the message."));
+                return Err(e.context(t!("sync-jmap-the-server-didnt-send-the-message")));
             }
         };
         if let Some(e) = submission["notCreated"].get("s") {
             // Not sent: the copy added for sending goes again.
             let _ = self.destroy(&[id]);
-            bail!("The server didn't send the message: {}", set_error(e));
+            bail!(t!("sync-jmap-the-server-didnt-send-the-message-2", error = set_error(e)));
         }
         let created = submission["created"]
             .get("s")
-            .context("The server didn't say whether it sent the message.")?;
+            .with_context(|| t!("sync-jmap-the-server-didnt-say-whether-it"))?;
         Ok(Submitted {
             receipts,
             id: created["id"].as_str().unwrap_or_default().to_owned(),
@@ -2054,7 +2042,7 @@ impl Session {
     /// What became of a submission, and whether it can still be cancelled
     /// (`undoStatus`). `None` once the server no longer has it.
     pub fn submission_status(&self, id: &str) -> Result<Option<SubmissionStatus>> {
-        ensure!(self.submission, "This JMAP server doesn't send mail.");
+        ensure!(self.submission, t!("sync-jmap-this-jmap-server-doesnt-send-mail"));
         let v = self.one(
             "EmailSubmission/get",
             json!({
@@ -2159,7 +2147,7 @@ impl Session {
     // (EmailSubmission/set destroy).
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn forget_submissions(&self, ids: &[String]) -> Result<()> {
-        ensure!(self.submission, "This JMAP server doesn't send mail.");
+        ensure!(self.submission, t!("sync-jmap-this-jmap-server-doesnt-send-mail"));
         for chunk in ids.chunks(self.max_set()) {
             let v = self.one(
                 "EmailSubmission/set",
@@ -2172,7 +2160,7 @@ impl Session {
                 .filter(|(_, e)| e["type"] != "notFound")
                 .map(|(id, e)| format!("{id}: {}", set_error(e)))
                 .collect();
-            ensure!(failed.is_empty(), "The server kept its record of sending: {}", failed.join("; "));
+            ensure!(failed.is_empty(), t!("sync-jmap-the-server-kept-its-record-of", error = failed.join("; ")));
         }
         Ok(())
     }
@@ -2181,7 +2169,7 @@ impl Session {
     /// undo window), and moves its message back to `drafts` as a draft.
     /// False if it had already gone.
     pub fn cancel_submission(&self, id: &str, drafts: Option<&str>) -> Result<bool> {
-        ensure!(self.submission, "This JMAP server doesn't send mail.");
+        ensure!(self.submission, t!("sync-jmap-this-jmap-server-doesnt-send-mail"));
         let v = self.one(
             "EmailSubmission/set",
             json!({
@@ -2193,7 +2181,7 @@ impl Session {
             if e["type"] == "cannotUnsend" || e["type"] == "notFound" {
                 return Ok(false);
             }
-            bail!("The server couldn't take the message back: {}", set_error(e));
+            bail!(t!("sync-jmap-the-server-couldnt-take-the-message", error = set_error(e)));
         }
         // Its message, back as a draft where it was moved to Sent.
         let got = self.one(
@@ -2215,7 +2203,7 @@ impl Session {
     }
     /// Changes a sending identity: its name, Reply-To and signatures.
     pub fn update_identity(&self, id: &str, change: &IdentityChange) -> Result<()> {
-        ensure!(self.submission, "This JMAP server doesn't send mail.");
+        ensure!(self.submission, t!("sync-jmap-this-jmap-server-doesnt-send-mail"));
         let mut patch = Map::new();
         if let Some(name) = &change.name {
             patch.insert("name".into(), json!(name));
@@ -2242,14 +2230,14 @@ impl Session {
             json!({ "accountId": self.account_id, "update": { id: patch } }),
         )?;
         if let Some(e) = v["notUpdated"].get(id) {
-            bail!("The server didn't change the sending address: {}", set_error(e));
+            bail!(t!("sync-jmap-the-server-didnt-change-the-sending", error = set_error(e)));
         }
         Ok(())
     }
     /// Adds a sending identity for `email` (which the server must allow
     /// this account to send as), returning its id.
     pub fn create_identity(&self, email: &str, name: &str) -> Result<String> {
-        ensure!(self.submission, "This JMAP server doesn't send mail.");
+        ensure!(self.submission, t!("sync-jmap-this-jmap-server-doesnt-send-mail"));
         let v = self.one(
             "Identity/set",
             json!({
@@ -2259,13 +2247,13 @@ impl Session {
         )?;
         if let Some(e) = v["notCreated"].get("i") {
             if e["type"] == "forbiddenFrom" {
-                bail!("The server doesn't let this account send as {email}.");
+                bail!(t!("sync-jmap-the-server-doesnt-let-this-account", email = email));
             }
-            bail!("The server didn't add the sending address: {}", set_error(e));
+            bail!(t!("sync-jmap-the-server-didnt-add-the-sending", error = set_error(e)));
         }
         Ok(v["created"]["i"]["id"]
             .as_str()
-            .context("The server didn't say which sending address it added.")?
+            .with_context(|| t!("sync-jmap-the-server-didnt-say-which-sending"))?
             .to_owned())
     }
     /// Removes a sending identity.
@@ -2277,7 +2265,7 @@ impl Session {
         if let Some(e) = v["notDestroyed"].get(id)
             && e["type"] != "notFound"
         {
-            bail!("The server didn't remove the sending address: {}", set_error(e));
+            bail!(t!("sync-jmap-the-server-didnt-remove-the-sending", error = set_error(e)));
         }
         Ok(())
     }
@@ -2395,7 +2383,7 @@ impl Session {
             if refused.is_none()
                 && let Some((id, e)) = v["notCreated"].as_object().and_then(|m| m.iter().next())
             {
-                refused = Some(format!("The server didn't copy message {id}: {}", set_error(e)));
+                refused = Some(t!("sync-jmap-the-server-didnt-copy-message", id = id, error = set_error(e)));
             }
             copied.extend(
                 v["created"]
@@ -2455,9 +2443,7 @@ impl Session {
                 parsed[k] = d;
             }
         }
-        let email = serde_json::from_value(parsed).context(
-            "The JMAP server's reading of the message isn't in a form Picacho can read.",
-        )?;
+        let email = serde_json::from_value(parsed).with_context(|| t!("sync-jmap-the-jmap-servers-reading-of-the"))?;
         Ok(Some((email, text)))
     }
     /// Copies blobs from another account this sign-in reaches (Blob/copy,
@@ -2503,11 +2489,11 @@ impl Session {
             }),
         )?;
         if let Some(e) = v["notCreated"].get("b") {
-            bail!("The server didn't take the data: {}", set_error(e));
+            bail!(t!("sync-jmap-the-server-didnt-take-the-data", error = set_error(e)));
         }
         Ok(v["created"]["b"]["id"]
             .as_str()
-            .context("The server didn't say where it kept the data.")?
+            .with_context(|| t!("sync-jmap-the-server-didnt-say-where-it"))?
             .to_owned())
     }
     /// Part of a blob, where the server has the Blob extension (Blob/get
@@ -2539,11 +2525,11 @@ impl Session {
         };
         let bytes = base64::engine::general_purpose::STANDARD
             .decode(data)
-            .context("The server's data isn't base64.")?;
+            .with_context(|| t!("sync-jmap-the-servers-data-isnt-base64"))?;
         if let Some(d) = digest
             && let Some(said) = got[format!("digest:{d}")].as_str()
         {
-            ensure!(blob_digest(d, &bytes) == said, "The server's data doesn't match its digest; it was changed on the way.");
+            ensure!(blob_digest(d, &bytes) == said, t!("sync-jmap-the-servers-data-doesnt-match-its"));
         }
         Ok(Some(bytes))
     }
@@ -2553,7 +2539,7 @@ impl Session {
     // Backend-only until the UI calls it: finding what uses a blob.
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn lookup_blobs(&self, blobs: &[String], types: &[&str]) -> Result<HashMap<String, HashMap<String, Vec<String>>>> {
-        ensure!(self.has(BLOB), "This JMAP server can't say what uses its data.");
+        ensure!(self.has(BLOB), t!("sync-jmap-this-jmap-server-cant-say-what"));
         let mut out = HashMap::new();
         for chunk in blobs.chunks(self.max_get()) {
             let v = self.one(
@@ -2578,7 +2564,7 @@ impl Session {
     /// Sends a read receipt for message `id` (MDN/send, RFC 9007), from
     /// `identity`; the server marks the message `$mdnsent`.
     pub fn send_receipt(&self, id: &str, identity: &str, receipt: &Receipt) -> Result<()> {
-        ensure!(self.has(MDN), "This JMAP server can't send read receipts.");
+        ensure!(self.has(MDN), t!("sync-jmap-this-jmap-server-cant-send-read"));
         // RFC 9007 §2: the MDN object; the server fills in what's left out
         // (`reportingUA`, `finalRecipient`, `originalMessageId`).
         let mut mdn = json!({
@@ -2614,7 +2600,7 @@ impl Session {
             }),
         )?;
         if let Some(e) = v["notSent"].get("r") {
-            bail!("The server didn't send the read receipt: {}", set_error(e));
+            bail!(t!("sync-jmap-the-server-didnt-send-the-read", error = set_error(e)));
         }
         Ok(())
     }
@@ -2623,7 +2609,7 @@ impl Session {
     // Backend-only until the UI calls it: reading receipts by MDN/parse.
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn parse_receipts(&self, blobs: &[String]) -> Result<HashMap<String, ParsedReceipt>> {
-        ensure!(self.has(MDN), "This JMAP server can't read read receipts.");
+        ensure!(self.has(MDN), t!("sync-jmap-this-jmap-server-cant-read-read"));
         let mut out = HashMap::new();
         for chunk in blobs.chunks(self.max_get()) {
             let v = self.one("MDN/parse", json!({ "accountId": self.account_id, "blobIds": chunk }))?;
@@ -2659,13 +2645,13 @@ impl Session {
             .get(0)
             .map(|r| serde_json::from_value(r.clone()))
             .transpose()
-            .context("The JMAP server's away reply isn't in a form Picacho can read.")
+            .with_context(|| t!("sync-jmap-the-jmap-servers-away-reply-isnt"))
     }
     /// Sets the automatic reply while away.
     pub fn set_vacation(&self, reply: &VacationResponse) -> Result<()> {
         ensure!(
             self.vacation,
-            "This JMAP server doesn't offer an automatic reply while away."
+            t!("sync-jmap-this-jmap-server-doesnt-offer-an")
         );
         let v = self.one(
             "VacationResponse/set",
@@ -2684,7 +2670,7 @@ impl Session {
             }),
         )?;
         if let Some(e) = v["notUpdated"].get("singleton") {
-            bail!("The server didn't save the away reply: {}", set_error(e));
+            bail!(t!("sync-jmap-the-server-didnt-save-the-away", error = set_error(e)));
         }
         Ok(())
     }
@@ -2773,7 +2759,7 @@ impl Session {
     // Backend-only until the UI calls it: listing quotas by Quota/query.
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn query_quotas(&self, types: &[&str]) -> Result<Vec<String>> {
-        ensure!(self.quota, "This JMAP server doesn't report storage.");
+        ensure!(self.quota, t!("sync-jmap-this-jmap-server-doesnt-report-storage"));
         let v = self.one(
             "Quota/query",
             json!({ "accountId": self.account_id, "filter": { "types": types } }),
@@ -2827,7 +2813,7 @@ impl Session {
         stop: &std::sync::atomic::AtomicBool,
         heard: &mut dyn FnMut() -> Result<()>,
     ) -> Result<()> {
-        ensure!(self.pushes(), "This JMAP server doesn't push changes.");
+        ensure!(self.pushes(), t!("sync-jmap-this-jmap-server-doesnt-push-changes"));
         if self.event_source_url.is_empty() {
             return self.listen_websocket(push, stop, heard);
         }
@@ -2860,15 +2846,15 @@ impl Session {
             // streams anyway.
             .timeout(Duration::from_secs(10 * 60))
             .send()
-            .map_err(|e| transport(e, "event stream"))?;
+            .map_err(|e| transport(e, "event-stream"))?;
         let status = response.status();
         if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
             return Err(anyhow::Error::new(AccessFailure::Authentication)
-                .context("The JMAP server no longer accepts the sign-in."));
+                .context(t!("sync-jmap-the-jmap-server-no-longer-accepts")));
         }
         ensure!(
             status.is_success(),
-            "The JMAP event stream answered {status}."
+            t!("sync-jmap-the-jmap-event-stream-answered", status = status)
         );
         // RFC 8620 §7.3: the server pings every `ping` seconds, so a stream
         // silent for a few intervals is dead. Blocking reads have no
@@ -2962,7 +2948,7 @@ impl std::io::Read for Watched<'_> {
                     Err(RecvTimeoutError::Timeout) if since.elapsed() >= self.silence => {
                         return Err(std::io::Error::new(
                             std::io::ErrorKind::TimedOut,
-                            "The JMAP event stream went silent.",
+                            t!("sync-jmap-the-jmap-event-stream-went-silent"),
                         ));
                     }
                     Err(RecvTimeoutError::Timeout) => {}
@@ -3093,7 +3079,7 @@ fn read_events(
             Ok(_) => {}
         }
         if !line.ends_with('\n') || data.len() as u64 > MOST {
-            bail!("The JMAP event stream sent more than an event can be.");
+            bail!(t!("sync-jmap-the-jmap-event-stream-sent-more"));
         }
         let line = line.trim_end_matches(['\r', '\n']);
         if line.is_empty() {
@@ -3133,7 +3119,7 @@ impl Session {
     fn require_sieve(&self) -> Result<()> {
         ensure!(
             self.sieve.is_some(),
-            "This JMAP server doesn't offer server filters (JMAP for Sieve Scripts)."
+            t!("sync-jmap-this-jmap-server-doesnt-offer-server")
         );
         Ok(())
     }
@@ -3145,7 +3131,7 @@ impl Session {
             json!({ "accountId": self.account_id, "ids": null }),
         )?;
         serde_json::from_value(v["list"].clone())
-            .context("The JMAP server's filter scripts aren't in a form Picacho can read.")
+            .with_context(|| t!("sync-jmap-the-jmap-servers-filter-scripts-arent"))
     }
     /// A script's text.
     pub fn sieve_text(&self, script: &SieveScript) -> Result<String> {
@@ -3160,7 +3146,7 @@ impl Session {
         if let Some(most) = self.sieve_limits.0 {
             ensure!(
                 text.len() <= most,
-                "These filters are larger than the server keeps ({most} bytes at most). Remove some rules."
+                t!("sync-jmap-these-filters-are-larger-than-the", most = most)
             );
         }
         self.upload_inline(text.as_bytes(), "application/sieve")
@@ -3190,9 +3176,9 @@ impl Session {
         )?;
         if let Some(e) = v["notUpdated"].get(id) {
             if e["type"] == "alreadyExists" {
-                bail!("A filter script named “{name}” is already on the server.");
+                bail!(t!("sync-jmap-a-filter-script-named-is-already", name = name));
             }
-            bail!("The server didn't rename the filters: {}", set_error(e));
+            bail!(t!("sync-jmap-the-server-didnt-rename-the-filters", error = set_error(e)));
         }
         Ok(())
     }
@@ -3210,15 +3196,15 @@ impl Session {
             && e["type"] != "notFound"
         {
             if e["type"] == "sieveIsActive" {
-                bail!("These are the filters in use; turn them off before removing them.");
+                bail!(t!("sync-jmap-these-are-the-filters-in-use"));
             }
-            bail!("The server didn't remove the filters: {}", set_error(e));
+            bail!(t!("sync-jmap-the-server-didnt-remove-the-filters", error = set_error(e)));
         }
         Ok(())
     }
     fn check_sieve_name(&self, name: &str) -> Result<()> {
         if let Some(most) = self.sieve_limits.1 {
-            ensure!(name.len() <= most, "This server takes filter names of up to {most} bytes.");
+            ensure!(name.len() <= most, t!("sync-jmap-this-server-takes-filter-names-of", most = most));
         }
         Ok(())
     }
@@ -3232,8 +3218,7 @@ impl Session {
         )?;
         if !v["error"].is_null() {
             bail!(
-                "The filter server rejected the filters: {}",
-                set_error(&v["error"])
+                t!("sync-jmap-the-filter-server-rejected-the-filters", error = set_error(&v["error"]))
             );
         }
         Ok(())
@@ -3247,7 +3232,7 @@ impl Session {
             if let Some(most) = self.sieve_limits.2 {
                 ensure!(
                     self.sieve_scripts()?.len() < most,
-                    "The server keeps at most {most} filter scripts, and has that many. Remove one first."
+                    t!("sync-jmap-the-server-keeps-at-most-filter", most = most)
                 );
             }
         }
@@ -3269,7 +3254,7 @@ impl Session {
         let v = self.one("SieveScript/set", args)?;
         for failed in ["notCreated", "notUpdated"] {
             if let Some(e) = v[failed].get(&key) {
-                bail!("The server didn't save the filters: {}", set_error(e));
+                bail!(t!("sync-jmap-the-server-didnt-save-the-filters", error = set_error(e)));
             }
         }
         Ok(())
@@ -3695,16 +3680,16 @@ fn imported(v: &Value, key: &str) -> Result<String> {
         {
             return Ok(id.to_owned());
         }
-        bail!("The server didn't take the message: {}", set_error(e));
+        bail!(t!("sync-jmap-the-server-didnt-take-the-message", error = set_error(e)));
     }
     Ok(v["created"][key]["id"]
         .as_str()
-        .context("The server didn't say where the message went.")?
+        .with_context(|| t!("sync-jmap-the-server-didnt-say-where-the"))?
         .to_owned())
 }
 /// A SetError's type and description.
 fn set_error(e: &Value) -> String {
-    let kind = e["type"].as_str().unwrap_or("refused");
+    let kind = e["type"].as_str().unwrap_or(t!("sync-jscal-refused"));
     match e["description"].as_str() {
         Some(d) if !d.is_empty() => format!("{d} ({kind})"),
         _ => kind.to_owned(),
@@ -3732,7 +3717,7 @@ impl Answer {
             .find(|(n, _)| *n == self.method)
             .or(self.responses.first())
             .map(|(_, v)| v)
-            .with_context(|| format!("The JMAP server didn't answer {}.", self.method))
+            .with_context(|| t!("sync-jmap-the-jmap-server-didnt-answer-2", method = self.method))
     }
     pub fn into_value(self) -> Result<Value> {
         self.value().cloned()
@@ -3786,7 +3771,7 @@ pub struct ReadOnly {
 }
 impl std::fmt::Display for ReadOnly {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "This account is shared with you read-only, so it can't be changed ({}).", self.method)
+        f.write_str(&t!("sync-jmap-this-account-is-shared-with-you", method = self.method))
     }
 }
 impl std::error::Error for ReadOnly {}
@@ -3801,7 +3786,7 @@ pub struct CannotCalculateChanges {
 }
 impl std::fmt::Display for CannotCalculateChanges {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "The JMAP server can't say what changed ({}), so everything is read again.", self.method)
+        f.write_str(&t!("sync-jmap-the-jmap-server-cant-say-what", method = self.method))
     }
 }
 impl std::error::Error for CannotCalculateChanges {}
@@ -3857,11 +3842,10 @@ impl MethodError {
 }
 impl std::fmt::Display for MethodError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("The JMAP server refused ")?;
         if self.method.is_empty() {
-            f.write_str("the request")?;
+            f.write_str(t!("sync-jmap-the-jmap-server-refused-the-request"))?;
         } else {
-            write!(f, "{}", self.method)?;
+            f.write_str(&t!("sync-jmap-the-jmap-server-refused-method", method = self.method))?;
         }
         if !self.description.is_empty() {
             write!(f, ": {}", self.description)?;

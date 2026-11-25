@@ -129,7 +129,7 @@ impl Backend {
             return self.mail_account_secret(&server.mail_account);
         }
         store::read_secret_text(PASSWORD)?
-            .context("The calendar server's password is missing. Set it up again.")
+            .with_context(|| t!("manage-calendar-the-calendar-servers-password-is-missing"))
     }
     /// Signs in to a CalDAV server and reads its calendars and events.
     pub fn connect_calendar(&self, server: caldav::Server, password: &str) -> Result<usize> {
@@ -166,18 +166,18 @@ impl Backend {
     pub fn set_server_scheduling(&self, on: bool) -> Result<()> {
         let mut server = self
             .calendar_server()
-            .context("No calendar server is set up.")?;
+            .with_context(|| t!("manage-calendar-no-calendar-server-is-set-up"))?;
         // A JMAP server sends them where it names the addresses it sends
         // as (ParticipantIdentity); CalDAV, where it auto-schedules.
         if on && let Some(a) = self.calendar_jmap(&server)? {
             ensure!(
                 self.with_jmap_calendars(&a, crate::sync::jscal::server_can_schedule)?,
-                "This JMAP server doesn't say which of your addresses it sends invitations as, so Picacho keeps emailing them."
+                t!("manage-calendar-this-jmap-server-doesnt-say-which")
             );
         } else if on {
             ensure!(
                 caldav::schedules(&server, &self.calendar_password()?, self.tls_connector()?)?,
-                "This calendar server doesn't send invitations itself (it doesn't offer calendar-auto-schedule), so Picacho keeps emailing them."
+                t!("manage-calendar-this-calendar-server-doesnt-send-invitations")
             );
         }
         server.server_schedules = on;
@@ -212,7 +212,10 @@ impl Backend {
     /// Uses the calendars of a JMAP account's server (JMAP for Calendars)
     /// instead of a CalDAV server: its sign-in is the account's own.
     pub fn connect_jmap_calendar(&self, a: &Account) -> Result<usize> {
-        ensure!(a.provider == Provider::Jmap, "Only JMAP accounts keep calendars this way.");
+        ensure!(
+            a.provider == Provider::Jmap,
+            t!("manage-calendar-only-jmap-accounts-keep-calendars-this")
+        );
         self.with_jmap_calendars(a, crate::sync::jscal::ensure_calendars)?;
         let server = caldav::Server {
             url: a.incoming_host.clone(),
@@ -247,7 +250,7 @@ impl Backend {
                 .accounts()?
                 .into_iter()
                 .find(|a| a.id == server.jmap_account)
-                .context("The account your calendars come from was removed. Set up a calendar again.")?,
+                .with_context(|| t!("manage-calendar-the-account-your-calendars-come-from"))?,
         ))
     }
     /// Saves an event where the calendars are: CalDAV, or a JMAP server.
@@ -269,7 +272,9 @@ impl Backend {
                 max_size,
             );
         };
-        let calendar_id = calendar.strip_prefix("jmap:").context("Not a JMAP calendar.")?;
+        let calendar_id = calendar
+            .strip_prefix("jmap:")
+            .with_context(|| t!("manage-calendar-not-a-jmap-calendar"))?;
         let event_id = stored.href.strip_prefix("jmap:").filter(|i| !i.is_empty());
         let scheduling = self.jmap_scheduling(server, &stored.event);
         let (id, version) = self.with_jmap_calendars(&a, |s| {
@@ -320,10 +325,13 @@ impl Backend {
     /// Makes a new calendar on the server (MKCALENDAR, or Calendar/set),
     /// returning it.
     pub fn create_calendar(&self, name: &str, color: &str) -> Result<caldav::Calendar> {
-        ensure!(!name.trim().is_empty(), "Give the calendar a name.");
+        ensure!(
+            !name.trim().is_empty(),
+            t!("manage-calendar-give-the-calendar-a-name")
+        );
         let server = self
             .calendar_server()
-            .context("Set up a calendar server in Settings → Calendar first.")?;
+            .with_context(|| t!("manage-calendar-set-up-a-calendar-server-in"))?;
         let made = match self.calendar_jmap(&server)? {
             Some(a) => {
                 let id = self.with_jmap_calendars(&a, |s| {
@@ -478,7 +486,7 @@ impl Backend {
     pub fn sync_tasks(&self) -> Result<usize> {
         let server = self
             .calendar_server()
-            .context("No calendar server is set up.")?;
+            .with_context(|| t!("manage-calendar-no-calendar-server-is-set-up"))?;
         if self.calendar_jmap(&server)?.is_some() {
             return Ok(0);
         }
@@ -497,12 +505,12 @@ impl Backend {
     pub fn complete_task(&self, uid: &str, done: bool) -> Result<()> {
         let server = self
             .calendar_server()
-            .context("No calendar server is set up.")?;
+            .with_context(|| t!("manage-calendar-no-calendar-server-is-set-up"))?;
         let mut tasks = self.calendar_tasks();
         let task = tasks
             .iter_mut()
             .find(|t| t.event.uid == uid)
-            .context("This task is no longer on your list. Read it again.")?;
+            .with_context(|| t!("manage-calendar-this-task-is-no-longer-on"))?;
         task.event.completed = done;
         // The source is kept: only what changed is rewritten (`ical::update_task`).
         task.event.sequence += 1;
@@ -524,15 +532,18 @@ impl Backend {
         due: i64,
         all_day: bool,
     ) -> Result<Stored> {
-        ensure!(!summary.trim().is_empty(), "Give the task a name.");
+        ensure!(
+            !summary.trim().is_empty(),
+            t!("manage-calendar-give-the-task-a-name")
+        );
         let server = self
             .calendar_server()
-            .context("No calendar server is set up.")?;
+            .with_context(|| t!("manage-calendar-no-calendar-server-is-set-up"))?;
         let mut tasks = self.calendar_tasks();
         let task = tasks
             .iter_mut()
             .find(|t| t.event.uid == uid)
-            .context("This task is no longer on your list. Read it again.")?;
+            .with_context(|| t!("manage-calendar-this-task-is-no-longer-on"))?;
         task.event.summary = summary.trim().to_owned();
         task.event.description = notes.trim().to_owned();
         task.event.start = due;
@@ -551,7 +562,7 @@ impl Backend {
     pub fn delete_task(&self, uid: &str) -> Result<()> {
         let server = self
             .calendar_server()
-            .context("No calendar server is set up.")?;
+            .with_context(|| t!("manage-calendar-no-calendar-server-is-set-up"))?;
         let mut tasks = self.calendar_tasks();
         if let Some(task) = tasks.iter().find(|t| t.event.uid == uid) {
             self.calendar_delete(&server, task)?;
@@ -563,13 +574,16 @@ impl Backend {
     /// Adds a task due at `due` (0: no due date), in the calendar new
     /// events go to.
     pub fn add_task(&self, summary: &str, due: i64) -> Result<Stored> {
-        ensure!(!summary.trim().is_empty(), "Give the task a name.");
+        ensure!(
+            !summary.trim().is_empty(),
+            t!("manage-calendar-give-the-task-a-name")
+        );
         let server = self
             .calendar_server()
-            .context("Set up a calendar server in Settings → Calendar first.")?;
+            .with_context(|| t!("manage-calendar-set-up-a-calendar-server-in"))?;
         let calendar = self
             .task_calendar()
-            .context("None of your calendars can take new tasks.")?
+            .with_context(|| t!("manage-calendar-none-of-your-calendars-can-take"))?
             .href;
         let stored = Stored {
             event: Event {
@@ -639,10 +653,13 @@ impl Backend {
         from: i64,
         to: i64,
     ) -> Result<Vec<ical::FreeBusy>> {
-        ensure!(!attendees.is_empty(), "Add someone to see when they're free.");
+        ensure!(
+            !attendees.is_empty(),
+            t!("manage-calendar-add-someone-to-see-when-theyre")
+        );
         let server = self
             .calendar_server()
-            .context("Set up a calendar server in Settings → Calendar first.")?;
+            .with_context(|| t!("manage-calendar-set-up-a-calendar-server-in"))?;
         if let Some(a) = self.calendar_jmap(&server)? {
             return self.with_jmap_calendars(&a, |s| {
                 crate::sync::jscal::free_busy(s, attendees, from, to)
@@ -668,7 +685,7 @@ impl Backend {
     pub fn sync_calendar(&self) -> Result<usize> {
         let server = self
             .calendar_server()
-            .context("No calendar server is set up.")?;
+            .with_context(|| t!("manage-calendar-no-calendar-server-is-set-up"))?;
         if let Some(a) = self.calendar_jmap(&server)? {
             return self.sync_jmap_calendar(&a);
         }
@@ -727,17 +744,25 @@ impl Backend {
                         let answer = match a.status {
                             Some(PartStat::Accepted) => "accepted",
                             Some(PartStat::Declined) => "declined",
-                            Some(PartStat::Tentative) => "may come to",
-                            _ => "answered",
+                            Some(PartStat::Tentative) => "tentative",
+                            _ => "other",
                         };
-                        format!("{} {answer} {}.", who(a), e.summary)
+                        t!(
+                            "manage-calendar-guest-answered",
+                            answer = answer,
+                            who = who(a),
+                            event = e.summary
+                        )
                     }),
-                    "REQUEST" => Some(format!(
-                        "{} invited you to {}.",
-                        e.organizer.as_ref().map(who).unwrap_or_else(|| "Someone".into()),
-                        e.summary
-                    )),
-                    "CANCEL" => Some(format!("{} was cancelled.", e.summary)),
+                    "REQUEST" => Some(match e.organizer.as_ref() {
+                        Some(o) => t!(
+                            "manage-calendar-invited-you",
+                            who = who(o),
+                            event = e.summary
+                        ),
+                        None => t!("manage-calendar-someone-invited-you", event = e.summary),
+                    }),
+                    "CANCEL" => Some(t!("manage-calendar-was-cancelled", event = e.summary)),
                     _ => None,
                 };
                 notes.extend(note);
@@ -755,13 +780,18 @@ impl Backend {
     /// Renames a calendar (and changes its colour; empty: as it is), on its
     /// server: PROPPATCH, or Calendar/set.
     pub fn rename_calendar(&self, href: &str, name: &str, color: &str) -> Result<()> {
-        ensure!(!name.trim().is_empty(), "Give the calendar a name.");
+        ensure!(
+            !name.trim().is_empty(),
+            t!("manage-calendar-give-the-calendar-a-name")
+        );
         let server = self
             .calendar_server()
-            .context("No calendar server is set up.")?;
+            .with_context(|| t!("manage-calendar-no-calendar-server-is-set-up"))?;
         match self.calendar_jmap(&server)? {
             Some(a) => {
-                let id = href.strip_prefix("jmap:").context("Not a JMAP calendar.")?;
+                let id = href
+                    .strip_prefix("jmap:")
+                    .with_context(|| t!("manage-calendar-not-a-jmap-calendar"))?;
                 self.with_jmap_calendars(&a, |s| {
                     crate::sync::jscal::update_calendar(s, id, name.trim(), color)
                 })?
@@ -789,10 +819,12 @@ impl Backend {
     pub fn delete_calendar(&self, href: &str) -> Result<()> {
         let server = self
             .calendar_server()
-            .context("No calendar server is set up.")?;
+            .with_context(|| t!("manage-calendar-no-calendar-server-is-set-up"))?;
         match self.calendar_jmap(&server)? {
             Some(a) => {
-                let id = href.strip_prefix("jmap:").context("Not a JMAP calendar.")?;
+                let id = href
+                    .strip_prefix("jmap:")
+                    .with_context(|| t!("manage-calendar-not-a-jmap-calendar"))?;
                 self.with_jmap_calendars(&a, |s| crate::sync::jscal::delete_calendar(s, id))?
             }
             None => caldav::delete_calendar(
@@ -819,7 +851,7 @@ impl Backend {
     pub fn calendar_quota(&self) -> Result<Option<(u64, u64)>> {
         let server = self
             .calendar_server()
-            .context("No calendar server is set up.")?;
+            .with_context(|| t!("manage-calendar-no-calendar-server-is-set-up"))?;
         if self.calendar_jmap(&server)?.is_some() {
             return Ok(None);
         }
@@ -830,14 +862,14 @@ impl Backend {
     pub fn attach_to_event(&self, uid: &str, path: &std::path::Path) -> Result<()> {
         let server = self
             .calendar_server()
-            .context("No calendar server is set up.")?;
+            .with_context(|| t!("manage-calendar-no-calendar-server-is-set-up"))?;
         ensure!(
             self.calendar_jmap(&server)?.is_none(),
-            "Attach files to events on a CalDAV calendar."
+            t!("manage-calendar-attach-files-to-events-on-a")
         );
         let stored = self
             .stored_event(uid)
-            .context("This event is no longer in your calendar. Read it again.")?;
+            .with_context(|| t!("manage-calendar-this-event-is-no-longer-in"))?;
         caldav::attach(&server, &self.calendar_password()?, self.tls_connector()?, &stored, path, None, None)?;
         self.sync_calendar()?;
         Ok(())
@@ -845,11 +877,16 @@ impl Backend {
     /// Takes a file the calendar server keeps (its MANAGED-ID, RFC 8607
     /// §3.6) off an event, then reads the calendar again.
     pub fn remove_event_attachment(&self, uid: &str, managed_id: &str) -> Result<()> {
-        let server = self.calendar_server().context("No calendar server is set up.")?;
-        ensure!(self.calendar_jmap(&server)?.is_none(), "Attachments are kept on CalDAV calendars.");
+        let server = self
+            .calendar_server()
+            .with_context(|| t!("manage-calendar-no-calendar-server-is-set-up"))?;
+        ensure!(
+            self.calendar_jmap(&server)?.is_none(),
+            t!("manage-calendar-attachments-are-kept-on-caldav-calendars")
+        );
         let stored = self
             .stored_event(uid)
-            .context("This event is no longer in your calendar. Read it again.")?;
+            .with_context(|| t!("manage-calendar-this-event-is-no-longer-in"))?;
         caldav::remove_attachment(&server, &self.calendar_password()?, self.tls_connector()?, &stored, managed_id, None)?;
         self.sync_calendar()?;
         Ok(())
@@ -865,11 +902,17 @@ impl Backend {
     }
     /// Adds an event, or saves changes to one (by UID), on the server.
     pub fn save_event(&self, mut event: Event, calendar: Option<&str>) -> Result<Stored> {
-        ensure!(!event.summary.trim().is_empty(), "Give the event a title.");
-        ensure!(event.end >= event.start, "The event ends before it starts.");
+        ensure!(
+            !event.summary.trim().is_empty(),
+            t!("manage-calendar-give-the-event-a-title")
+        );
+        ensure!(
+            event.end >= event.start,
+            t!("manage-calendar-the-event-ends-before-it-starts")
+        );
         let server = self
             .calendar_server()
-            .context("Set up a calendar server in Settings → Calendar first.")?;
+            .with_context(|| t!("manage-calendar-set-up-a-calendar-server-in"))?;
         if event.tzid.is_empty() && !event.all_day && !event.utc {
             event.tzid = local_zone().unwrap_or_default();
         }
@@ -889,7 +932,7 @@ impl Backend {
             (None, Some(s)) => s.calendar.clone(),
             (None, None) => {
                 self.default_calendar()
-                    .context("None of your calendars can take new events.")?
+                    .with_context(|| t!("manage-calendar-none-of-your-calendars-can-take-2"))?
                     .href
             }
         };
@@ -962,20 +1005,20 @@ impl Backend {
     pub fn save_occurrence(&self, uid: &str, occurrence: i64, mut changed: Event) -> Result<()> {
         ensure!(
             !changed.summary.trim().is_empty(),
-            "Give the event a title."
+            t!("manage-calendar-give-the-event-a-title")
         );
         ensure!(
             changed.end >= changed.start,
-            "The event ends before it starts."
+            t!("manage-calendar-the-event-ends-before-it-starts")
         );
         let server = self
             .calendar_server()
-            .context("No calendar server is set up.")?;
+            .with_context(|| t!("manage-calendar-no-calendar-server-is-set-up"))?;
         let mut events = self.calendar_events();
         let stored = events
             .iter_mut()
             .find(|s| s.event.uid == uid)
-            .context("This event is no longer in your calendar. Read it again.")?;
+            .with_context(|| t!("manage-calendar-this-event-is-no-longer-in"))?;
         changed.uid = uid.to_owned();
         changed.recurrence = String::new();
         changed.exdates.clear();
@@ -1000,12 +1043,12 @@ impl Backend {
     pub fn delete_occurrence(&self, uid: &str, occurrence: i64) -> Result<()> {
         let server = self
             .calendar_server()
-            .context("No calendar server is set up.")?;
+            .with_context(|| t!("manage-calendar-no-calendar-server-is-set-up"))?;
         let mut events = self.calendar_events();
         let stored = events
             .iter_mut()
             .find(|s| s.event.uid == uid)
-            .context("This event is no longer in your calendar. Read it again.")?;
+            .with_context(|| t!("manage-calendar-this-event-is-no-longer-in"))?;
         stored
             .overrides
             .retain(|o| o.recurrence_id != Some(occurrence));
@@ -1072,13 +1115,16 @@ impl Backend {
     ) -> Result<Option<String>> {
         let cal = self
             .invitation(a, m)?
-            .context("This message has no invitation.")?;
+            .with_context(|| t!("manage-calendar-this-message-has-no-invitation"))?;
         let event = cal
             .events
             .first()
             .cloned()
-            .context("This message has no invitation.")?;
-        ensure!(!event.cancelled, "This event was cancelled.");
+            .with_context(|| t!("manage-calendar-this-message-has-no-invitation"))?;
+        ensure!(
+            !event.cancelled,
+            t!("manage-calendar-this-event-was-cancelled")
+        );
         // Answer as whichever of the account's addresses was invited.
         let mut mine: Vec<(String, String)> = vec![(a.email.clone(), a.name.clone())];
         mine.extend(
@@ -1099,7 +1145,7 @@ impl Backend {
         let organizer = event
             .organizer
             .clone()
-            .context("This invitation doesn't say who to answer.")?;
+            .with_context(|| t!("manage-calendar-this-invitation-doesnt-say-who-to"))?;
         let reply = ical::reply(&event, &me, &my_name, status)?;
         let raw = imip_message(
             &me,
@@ -1116,10 +1162,12 @@ impl Backend {
         if self.calendar_server().is_none() {
             return Ok(None);
         }
-        Ok(self
-            .file_answer(&event, &me, status)
-            .err()
-            .map(|e| format!("The answer was sent, but the calendar wasn't changed: {e:#}")))
+        Ok(self.file_answer(&event, &me, status).err().map(|e| {
+            t!(
+                "manage-calendar-the-answer-was-sent-but-the",
+                error = format!("{:#}", e)
+            )
+        }))
     }
     /// Puts your answer to an invitation in the calendar: declined, it goes
     /// (only that occurrence, where the invitation is for one: RFC 5546
@@ -1147,7 +1195,7 @@ impl Backend {
     fn save_invited(&self, event: Event) -> Result<()> {
         let server = self
             .calendar_server()
-            .context("No calendar server is set up.")?;
+            .with_context(|| t!("manage-calendar-no-calendar-server-is-set-up"))?;
         let mut events = self.calendar_events();
         let mut stored = events
             .iter()
@@ -1156,7 +1204,7 @@ impl Backend {
             .unwrap_or_default();
         let target = if stored.calendar.is_empty() {
             self.default_calendar()
-                .context("None of your calendars can take new events.")?
+                .with_context(|| t!("manage-calendar-none-of-your-calendars-can-take-2"))?
                 .href
         } else {
             stored.calendar.clone()
@@ -1187,30 +1235,32 @@ impl Backend {
     pub fn apply_reply(&self, a: &Account, m: &Mail) -> Result<String> {
         let cal = self
             .invitation(a, m)?
-            .context("This message has no answer to an invitation.")?;
+            .with_context(|| t!("manage-calendar-this-message-has-no-answer-to"))?;
         ensure!(
             cal.method == "REPLY",
-            "This message isn't an answer to an invitation."
+            t!("manage-calendar-this-message-isnt-an-answer-to")
         );
         let answer = cal
             .events
             .first()
-            .context("This message has no answer to an invitation.")?;
+            .with_context(|| t!("manage-calendar-this-message-has-no-answer-to"))?;
         let guest = answer
             .attendees
             .first()
-            .context("The answer doesn't say who it's from.")?;
+            .with_context(|| t!("manage-calendar-the-answer-doesnt-say-who-its"))?;
         let status = guest.status.unwrap_or(PartStat::NeedsAction);
         // The sender must be the guest answering: anyone can write a REPLY.
         ensure!(
             m.from.eq_ignore_ascii_case(&guest.email),
-            "This answer is for {}, but came from {}; it wasn't applied.",
-            guest.email,
-            m.from
+            t!(
+                "manage-calendar-this-answer-is-for-but-came",
+                email = guest.email,
+                from = m.from
+            )
         );
         let mut stored = self
             .stored_event(&answer.uid)
-            .context("The event this answers isn't in your calendar.")?;
+            .with_context(|| t!("manage-calendar-the-event-this-answers-isnt-in"))?;
         let target = match answer.recurrence_id {
             Some(at) => stored
                 .overrides
@@ -1228,7 +1278,10 @@ impl Backend {
             .find(|g| g.email.eq_ignore_ascii_case(&guest.email))
         {
             Some(g) => g.status = Some(status),
-            None => bail!("{} isn't a guest of this event.", guest.email),
+            None => bail!(t!(
+                "manage-calendar-isnt-a-guest-of-this-event",
+                email = guest.email
+            )),
         }
         let changed = match answer.recurrence_id {
             Some(at) => stored.overrides.iter_mut().find(|o| o.recurrence_id == Some(at)),
@@ -1252,12 +1305,15 @@ impl Backend {
     pub fn accept_counter(&self, a: &Account, m: &Mail) -> Result<usize> {
         let cal = self
             .invitation(a, m)?
-            .context("This message proposes no time.")?;
-        ensure!(cal.method == "COUNTER", "This message proposes no time.");
+            .with_context(|| t!("manage-calendar-this-message-proposes-no-time"))?;
+        ensure!(
+            cal.method == "COUNTER",
+            t!("manage-calendar-this-message-proposes-no-time")
+        );
         let proposed = cal
             .events
             .first()
-            .context("This message proposes no time.")?;
+            .with_context(|| t!("manage-calendar-this-message-proposes-no-time"))?;
         let guest = proposed
             .attendees
             .first()
@@ -1265,12 +1321,15 @@ impl Backend {
             .unwrap_or_default();
         ensure!(
             guest.is_empty() || m.from.eq_ignore_ascii_case(&guest),
-            "This proposal is for {guest}, but came from {}.",
-            m.from
+            t!(
+                "manage-calendar-this-proposal-is-for-but-came",
+                guest = guest,
+                from = m.from
+            )
         );
         let mut stored = self
             .stored_event(&proposed.uid)
-            .context("The event this proposal is for isn't in your calendar.")?;
+            .with_context(|| t!("manage-calendar-the-event-this-proposal-is-for"))?;
         let length = proposed.end - proposed.start;
         match proposed.recurrence_id {
             // One repeat moves.
@@ -1312,24 +1371,30 @@ impl Backend {
     pub fn decline_counter(&self, a: &Account, m: &Mail) -> Result<()> {
         let cal = self
             .invitation(a, m)?
-            .context("This message proposes no time.")?;
-        ensure!(cal.method == "COUNTER", "This message proposes no time.");
+            .with_context(|| t!("manage-calendar-this-message-proposes-no-time"))?;
+        ensure!(
+            cal.method == "COUNTER",
+            t!("manage-calendar-this-message-proposes-no-time")
+        );
         let proposed = cal
             .events
             .first()
-            .context("This message proposes no time.")?;
+            .with_context(|| t!("manage-calendar-this-message-proposes-no-time"))?;
         let guest = proposed
             .attendees
             .first()
             .map(|g| g.email.clone())
-            .context("The proposal doesn't say who it's from.")?;
+            .with_context(|| t!("manage-calendar-the-proposal-doesnt-say-who-its"))?;
         // As accepting does: the answer goes to the guest the proposal
         // names, who must be whoever sent it, or anyone's address could be
         // sent a reply.
         ensure!(
             m.from.eq_ignore_ascii_case(&guest),
-            "This proposal is for {guest}, but came from {}.",
-            m.from
+            t!(
+                "manage-calendar-this-proposal-is-for-but-came",
+                guest = guest,
+                from = m.from
+            )
         );
         let stored = self.stored_event(&proposed.uid);
         let event = stored.as_ref().map(|s| &s.event).unwrap_or(proposed);
@@ -1361,29 +1426,35 @@ impl Backend {
     ) -> Result<()> {
         let cal = self
             .invitation(a, m)?
-            .context("This message has no invitation.")?;
+            .with_context(|| t!("manage-calendar-this-message-has-no-invitation"))?;
         let event = cal
             .events
             .first()
             .cloned()
-            .context("This message has no invitation.")?;
-        ensure!(!event.cancelled, "This event was cancelled.");
+            .with_context(|| t!("manage-calendar-this-message-has-no-invitation"))?;
+        ensure!(
+            !event.cancelled,
+            t!("manage-calendar-this-event-was-cancelled")
+        );
         let (me, my_name) = self.invited_as(a, &event);
         let organizer = event
             .organizer
             .clone()
-            .context("This invitation doesn't say who to answer.")?;
+            .with_context(|| t!("manage-calendar-this-invitation-doesnt-say-who-to"))?;
         let counter = ical::counter(&event, &me, &my_name, start, end, note)?;
         let when = ical::describe_when(&Event {
             start,
             end,
             ..event.clone()
         });
-        let text = format!(
-            "{} proposes another time for {}:\r\n{when}\r\n\r\n{note}\r\n",
-            if my_name.is_empty() { &me } else { &my_name },
-            event.summary
-        );
+        let proposes = crate::i18n::in_outgoing(|| {
+            t!(
+                "outgoing-proposes",
+                name = if my_name.is_empty() { &me } else { &my_name },
+                event = event.summary,
+            )
+        });
+        let text = format!("{proposes}\r\n{when}\r\n\r\n{note}\r\n");
         let raw = imip(
             &me,
             &my_name,
@@ -1414,27 +1485,29 @@ impl Backend {
     pub fn take_update(&self, a: &Account, m: &Mail) -> Result<()> {
         let cal = self
             .invitation(a, m)?
-            .context("This message has no invitation.")?;
+            .with_context(|| t!("manage-calendar-this-message-has-no-invitation"))?;
         let mut event = cal
             .events
             .first()
             .cloned()
-            .context("This message has no invitation.")?;
+            .with_context(|| t!("manage-calendar-this-message-has-no-invitation"))?;
         let (me, _) = self.invited_as(a, &event);
         // Only from the organizer, and not older than what's kept (RFC
         // 5546 §2.1.5: SEQUENCE orders revisions).
         if let Some(organizer) = &event.organizer {
             ensure!(
                 m.from.eq_ignore_ascii_case(&organizer.email),
-                "This update is from {}, not the event's organizer {}; it wasn't applied.",
-                m.from,
-                organizer.email
+                t!(
+                    "manage-calendar-this-update-is-from-not-the",
+                    from = m.from,
+                    email = organizer.email
+                )
             );
         }
         if let Some(kept) = self.stored_event(&event.uid) {
             ensure!(
                 event.sequence >= kept.event.sequence,
-                "This update is older than the event in your calendar; it wasn't applied."
+                t!("manage-calendar-this-update-is-older-than-the")
             );
         }
         if let Some(answer) = self.invitation_answer(&event.uid) {
@@ -1489,19 +1562,30 @@ impl Backend {
     pub fn answer_refresh(&self, a: &Account, m: &Mail) -> Result<()> {
         let cal = self
             .invitation(a, m)?
-            .context("This message asks for no event.")?;
-        ensure!(cal.method == "REFRESH", "This message asks for no event.");
-        let asked = cal.events.first().context("This message asks for no event.")?;
+            .with_context(|| t!("manage-calendar-this-message-asks-for-no-event"))?;
+        ensure!(
+            cal.method == "REFRESH",
+            t!("manage-calendar-this-message-asks-for-no-event")
+        );
+        let asked = cal
+            .events
+            .first()
+            .with_context(|| t!("manage-calendar-this-message-asks-for-no-event"))?;
         let stored = self
             .stored_event(&asked.uid)
-            .context("The event they ask about isn't in your calendar.")?;
+            .with_context(|| t!("manage-calendar-the-event-they-ask-about-isnt"))?;
         // Only to a guest of it, from the address they're invited at.
         let guest = stored
             .event
             .attendees
             .iter()
             .find(|g| g.email.eq_ignore_ascii_case(&m.from))
-            .with_context(|| format!("{} isn't a guest of this event.", m.from))?
+            .with_context(|| {
+                t!(
+                    "manage-calendar-isnt-a-guest-of-this-event-2",
+                    from = m.from
+                )
+            })?
             .email
             .clone();
         let me = stored
@@ -1514,9 +1598,10 @@ impl Backend {
             &me,
             &a.name,
             std::slice::from_ref(&guest),
-            &format!("Invitation: {}", stored.event.summary),
+            &crate::i18n::in_outgoing(|| t!("outgoing-invitation", event = stored.event.summary)),
             &format!(
-                "The event as it is now.\r\n\r\n{}\r\n",
+                "{}\r\n\r\n{}\r\n",
+                crate::i18n::in_outgoing(|| t!("outgoing-the-event-as-it-is-now")),
                 ical::describe_when(&stored.event)
             ),
             "REQUEST",
@@ -1531,18 +1616,24 @@ impl Backend {
     pub fn take_added(&self, a: &Account, m: &Mail) -> Result<()> {
         let cal = self
             .invitation(a, m)?
-            .context("This message adds nothing.")?;
-        ensure!(cal.method == "ADD", "This message adds nothing.");
-        let first = cal.events.first().context("This message adds nothing.")?;
+            .with_context(|| t!("manage-calendar-this-message-adds-nothing"))?;
+        ensure!(
+            cal.method == "ADD",
+            t!("manage-calendar-this-message-adds-nothing")
+        );
+        let first = cal
+            .events
+            .first()
+            .with_context(|| t!("manage-calendar-this-message-adds-nothing"))?;
         let mut stored = self
             .stored_event(&first.uid)
-            .context("The event this adds to isn't in your calendar; ask the organizer for it.")?;
+            .with_context(|| t!("manage-calendar-the-event-this-adds-to-isnt"))?;
         ensure!(
             first
                 .organizer
                 .as_ref()
                 .is_none_or(|o| o.email.eq_ignore_ascii_case(&m.from)),
-            "This addition isn't from the event's organizer; it wasn't applied."
+            t!("manage-calendar-this-addition-isnt-from-the-events")
         );
         for added in &cal.events {
             if !stored.event.rdates.contains(&added.start) {
@@ -1569,7 +1660,7 @@ impl Backend {
     fn store_updated(&self, stored: Stored) -> Result<()> {
         let server = self
             .calendar_server()
-            .context("No calendar server is set up.")?;
+            .with_context(|| t!("manage-calendar-no-calendar-server-is-set-up"))?;
         let calendar = stored.calendar.clone();
         let saved = self.calendar_save(&server, &calendar, &stored)?;
         let mut events = self.calendar_events();
@@ -1582,7 +1673,7 @@ impl Backend {
     pub fn remove_cancelled(&self, a: &Account, m: &Mail) -> Result<()> {
         let cal = self
             .invitation(a, m)?
-            .context("This message has no invitation.")?;
+            .with_context(|| t!("manage-calendar-this-message-has-no-invitation"))?;
         for e in cal.events.iter().filter(|e| e.cancelled) {
             // Only the organizer cancels (RFC 5546 §3.2.5).
             if let (Some(kept), Some(organizer)) = (self.stored_event(&e.uid), &e.organizer) {
@@ -1593,7 +1684,7 @@ impl Backend {
                             .organizer
                             .as_ref()
                             .is_none_or(|o| o.email.eq_ignore_ascii_case(&organizer.email)),
-                    "This cancellation isn't from the event's organizer; it wasn't applied."
+                    t!("manage-calendar-this-cancellation-isnt-from-the-events")
                 );
             }
             // One occurrence cancelled: only it goes, not the series.
@@ -1620,7 +1711,7 @@ impl Backend {
             .calendar_events()
             .into_iter()
             .find(|s| s.event.uid == uid)
-            .context("This event is no longer in your calendar.")?;
+            .with_context(|| t!("manage-calendar-this-event-is-no-longer-in-2"))?;
         self.invite(a, &stored.event, &stored.overrides, false)
     }
     /// Sends an event's invitations again, though nothing changed: by mail,
@@ -1629,18 +1720,36 @@ impl Backend {
     /// matters. For guests whose invitation got lost (SCHEDULE-STATUS 3.x
     /// or 5.x, `Attendee::delivery_failed`).
     pub fn resend_invitations(&self, a: &Account, uid: &str) -> Result<usize> {
-        if !self.server_schedules() || self.calendar_jmap(&self.calendar_server().context("No calendar server is set up.")?)?.is_some() {
+        if !self.server_schedules()
+            || self
+                .calendar_jmap(
+                    &self
+                        .calendar_server()
+                        .with_context(|| t!("manage-calendar-no-calendar-server-is-set-up"))?,
+                )?
+                .is_some()
+        {
             return self.send_invitations(a, uid);
         }
-        let mut stored = self.stored_event(uid).context("This event is no longer in your calendar.")?;
-        ensure!(self.organized_here(&stored.event), "Only the organizer sends the invitations.");
-        for g in std::iter::once(&mut stored.event).chain(&mut stored.overrides).flat_map(|e| &mut e.attendees) {
+        let mut stored = self
+            .stored_event(uid)
+            .with_context(|| t!("manage-calendar-this-event-is-no-longer-in-2"))?;
+        ensure!(
+            self.organized_here(&stored.event),
+            t!("manage-calendar-only-the-organizer-sends-the-invitations")
+        );
+        for g in std::iter::once(&mut stored.event)
+            .chain(&mut stored.overrides)
+            .flat_map(|e| &mut e.attendees)
+        {
             g.force_send = "REQUEST".into();
         }
         let count = stored.event.attendees.len();
         // Written from its fields, so the parameter is in what's sent.
         stored.event.source.clear();
-        let server = self.calendar_server().context("No calendar server is set up.")?;
+        let server = self
+            .calendar_server()
+            .with_context(|| t!("manage-calendar-no-calendar-server-is-set-up"))?;
         let calendar = stored.calendar.clone();
         let mut saved = self.calendar_save(&server, &calendar, &stored)?;
         // Once: a later save mustn't send them all again.
@@ -1665,7 +1774,7 @@ impl Backend {
             .calendar_events()
             .into_iter()
             .find(|s| s.event.uid == uid)
-            .context("This event is no longer in your calendar.")?;
+            .with_context(|| t!("manage-calendar-this-event-is-no-longer-in-2"))?;
         self.invite(a, &stored.event, &[], true)
     }
     fn invite(
@@ -1683,7 +1792,7 @@ impl Backend {
         };
         ensure!(
             event.organizer.as_ref().is_none_or(|o| mine(&o.email)),
-            "Only the organizer can send this event's invitations."
+            t!("manage-calendar-only-the-organizer-can-send-this")
         );
         let guests: Vec<String> = event
             .attendees
@@ -1691,7 +1800,10 @@ impl Backend {
             .map(|g| g.email.trim().to_owned())
             .filter(|g| !g.is_empty() && !mine(g))
             .collect();
-        ensure!(!guests.is_empty(), "This event has no guests to invite.");
+        ensure!(
+            !guests.is_empty(),
+            t!("manage-calendar-this-event-has-no-guests-to")
+        );
         let me = event
             .organizer
             .as_ref()
@@ -1707,27 +1819,35 @@ impl Backend {
         }
         let calendar = ical::request(&event, overrides, cancel);
         let when = crate::sync::ical::describe_when(&event);
-        let (subject, text) = if cancel {
-            (
-                format!("Cancelled: {}", event.summary),
-                format!("{} was cancelled.\r\n\r\n{when}\r\n", event.summary),
-            )
-        } else {
-            let place = if event.location.is_empty() {
-                String::new()
+        let (subject, text) = crate::i18n::in_outgoing(|| {
+            if cancel {
+                (
+                    t!("outgoing-cancelled", event = event.summary),
+                    format!(
+                        "{}\r\n\r\n{when}\r\n",
+                        t!("outgoing-was-cancelled", event = event.summary)
+                    ),
+                )
             } else {
-                format!("\r\n{}", event.location)
-            };
-            (
-                format!("Invitation: {}", event.summary),
-                format!(
-                    "{} invites you to {}.\r\n\r\n{when}{place}\r\n\r\n{}\r\n",
-                    a.label(),
-                    event.summary,
-                    event.description
-                ),
-            )
-        };
+                let place = if event.location.is_empty() {
+                    String::new()
+                } else {
+                    format!("\r\n{}", event.location)
+                };
+                (
+                    t!("outgoing-invitation", event = event.summary),
+                    format!(
+                        "{}\r\n\r\n{when}{place}\r\n\r\n{}\r\n",
+                        t!(
+                            "outgoing-invites-you",
+                            name = a.label(),
+                            event = event.summary
+                        ),
+                        event.description
+                    ),
+                )
+            }
+        });
         let raw = imip(
             &me,
             &a.name,
@@ -1752,7 +1872,7 @@ impl Backend {
         ensure!(
             !to.contains(|c: char| c.is_control() || c.is_whitespace() || c == '<' || c == '>')
                 && to.contains('@'),
-            "“{to}” isn't a valid address."
+            t!("manage-calendar-isnt-a-valid-address", to = to)
         );
         let lock = self.account_lock(&a.id);
         let _operation = lock.lock().unwrap();

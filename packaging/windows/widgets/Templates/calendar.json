@@ -16,7 +16,7 @@
           "items": [
             {
               "type": "TextBlock",
-              "text": "Calendar",
+              "text": "${heading}",
               "weight": "Bolder",
               "size": "Medium"
             }
@@ -88,12 +88,12 @@
   "actions": [
     {
       "type": "Action.OpenUrl",
-      "title": "Open Calendar",
+      "title": "${openText}",
       "url": "picacho://widget/calendar"
     },
     {
       "type": "Action.Execute",
-      "title": "Refresh",
+      "title": "${refreshText}",
       "verb": "refresh"
     }
   ]

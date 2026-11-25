@@ -203,24 +203,24 @@ impl MailApp {
         let size = |kib: u64| {
             let bytes = kib as f64 * 1024.0;
             if bytes >= 1024.0 * 1024.0 * 1024.0 {
-                format!("{:.1} GB", bytes / (1024.0 * 1024.0 * 1024.0))
+                t!("settings-gb", size = format!("{:.1}", bytes / (1024.0 * 1024.0 * 1024.0)))
             } else {
-                format!("{:.0} MB", bytes / (1024.0 * 1024.0))
+                t!("settings-mb", size = format!("{:.0}", bytes / (1024.0 * 1024.0)))
             }
         };
         let (text, share) = match self.quotas.get(&a.id) {
-            None => ("Checking with the server…".to_owned(), None),
-            Some(None) => ("The server doesn't limit this mailbox's storage, or doesn't say.".to_owned(), None),
-            Some(Some(q)) if q.limit_kib == 0 => (format!("{} used", size(q.used_kib)), None),
+            None => (t!("settings-checking-with-the-server").to_owned(), None),
+            Some(None) => (
+                t!("settings-the-server-doesnt-limit-this-mailboxs").to_owned(),
+                None,
+            ),
+            Some(Some(q)) if q.limit_kib == 0 => {
+                (t!("settings-used", used = size(q.used_kib)), None)
+            }
             Some(Some(q)) => {
                 let share = (q.used_kib as f64 / q.limit_kib as f64).clamp(0., 1.);
                 (
-                    format!(
-                        "{} of {} used ({:.0}%)",
-                        size(q.used_kib),
-                        size(q.limit_kib),
-                        share * 100.
-                    ),
+                    t!("settings-of-used", used = size(q.used_kib), limit = size(q.limit_kib), percent = format!("{:.0}", share * 100.)),
                     Some(share),
                 )
             }
@@ -313,7 +313,7 @@ impl MailApp {
         let mut nav = div()
             .id("settings-nav")
             .role(Role::TabList)
-            .aria_label("Settings")
+            .aria_label(t!("settings-settings"))
             .debug_selector(|| "settings-nav".into())
             .w(px(210.))
             .flex_shrink_0()
@@ -341,70 +341,70 @@ impl MailApp {
             .border_color(rgb(c.border))
             .child(self.settings_nav(
                 "settings-general".into(),
-                "General".into(),
+                t!("settings-general").into(),
                 icon_el("settings", 15., c.muted).into_any_element(),
                 Page::General,
                 cx,
             ))
             .child(self.settings_nav(
                 "settings-reading".into(),
-                "Reading".into(),
+                t!("settings-reading").into(),
                 icon_el("mail", 15., c.muted).into_any_element(),
                 Page::Reading,
                 cx,
             ))
             .child(self.settings_nav(
                 "settings-composing".into(),
-                "Composing".into(),
+                t!("settings-composing").into(),
                 icon_el("compose", 15., c.muted).into_any_element(),
                 Page::Composing,
                 cx,
             ))
             .child(self.settings_nav(
                 "settings-forwarding".into(),
-                "Forwarding".into(),
+                t!("settings-forwarding").into(),
                 icon_el("alias", 15., c.muted).into_any_element(),
                 Page::Forwarding,
                 cx,
             ))
             .child(self.settings_nav(
                 "settings-contacts".into(),
-                "Contacts".into(),
+                t!("settings-contacts").into(),
                 icon_el("contact", 15., c.muted).into_any_element(),
                 Page::Contacts,
                 cx,
             ))
             .child(self.settings_nav(
                 "settings-calendar".into(),
-                "Calendar".into(),
+                t!("settings-calendar").into(),
                 icon_el("clock", 15., c.muted).into_any_element(),
                 Page::Calendar,
                 cx,
             ))
             .child(self.settings_nav(
                 "settings-encryption".into(),
-                "Encryption".into(),
+                t!("settings-encryption").into(),
                 icon_el("lock", 15., c.muted).into_any_element(),
                 Page::Encryption,
                 cx,
             ))
             .child(self.settings_nav(
                 "settings-privacy".into(),
-                "Privacy".into(),
+                t!("settings-privacy").into(),
                 icon_el("shield", 15., c.muted).into_any_element(),
                 Page::Privacy,
                 cx,
             ))
             .child(self.settings_nav(
                 "settings-local-ai".into(),
-                "Local AI".into(),
+                t!("settings-local-ai").into(),
                 icon_el("sparkle", 15., c.muted).into_any_element(),
                 Page::LocalAi,
                 cx,
             ))
             .child(self.settings_nav(
                 "settings-organizing".into(),
-                "Rules & Layout".into(),
+                t!("settings-rules-layout").into(),
                 icon_el("filter", 15., c.muted).into_any_element(),
                 Page::Organizing,
                 cx,
@@ -412,7 +412,7 @@ impl MailApp {
             .when(!self.mobile.on, |nav| {
                 nav.child(self.settings_nav(
                     "settings-shortcuts".into(),
-                    "Keyboard Shortcuts".into(),
+                    t!("settings-keyboard-shortcuts").into(),
                     icon_el("keyboard", 15., c.muted).into_any_element(),
                     Page::Shortcuts,
                     cx,
@@ -455,7 +455,7 @@ impl MailApp {
                 .text_color(rgb(c.muted))
                 .hover(move |s| s.bg(rgb(c.surface)).text_color(rgb(c.text)))
                 .child(icon_el("plus", 15., c.muted))
-                .child("Add Account")
+                .child(t!("settings-add-account"))
                 .on_click(cx.listener(|this, _, w, cx| this.handle(Action::Connect, w, cx))),
         );
         // The reverse aliases subpage scrolls on its own, in place of
@@ -503,9 +503,9 @@ impl MailApp {
         let appearance = self.segmented(
             "appearance",
             [
-                (Appearance::System, "Automatic"),
-                (Appearance::Light, "Light"),
-                (Appearance::Dark, "Dark"),
+                (Appearance::System, t!("settings-automatic")),
+                (Appearance::Light, t!("settings-light")),
+                (Appearance::Dark, t!("settings-dark")),
             ]
             .into_iter()
             .map(|(a, label)| {
@@ -554,39 +554,99 @@ impl MailApp {
             .flex()
             .flex_col()
             .gap_5()
-            .child(self.section("Appearance"))
+            .child(self.section(t!("settings-appearance")))
+            // Offered once Picacho has more than one language.
+            .when(crate::i18n::languages().len() > 1, |d| {
+                let chosen = self
+                    .backend
+                    .store
+                    .preference(crate::i18n::PREFERENCE)
+                    .unwrap_or_default();
+                let choices = std::iter::once((
+                    t!("settings-language-automatic").to_owned(),
+                    Action::SetLanguage(String::new()),
+                    chosen.is_empty(),
+                ))
+                .chain(crate::i18n::languages().iter().map(|(code, name)| {
+                    (
+                        (*name).to_owned(),
+                        Action::SetLanguage((*code).to_owned()),
+                        chosen == *code,
+                    )
+                }))
+                .collect();
+                let outgoing = self
+                    .backend
+                    .store
+                    .preference(crate::i18n::OUTGOING_PREFERENCE)
+                    .unwrap_or_default();
+                let outgoing_choices = std::iter::once((
+                    t!("settings-outgoing-language-same").to_owned(),
+                    Action::SetOutgoingLanguage(String::new()),
+                    outgoing.is_empty(),
+                ))
+                .chain(crate::i18n::languages().iter().map(|(code, name)| {
+                    (
+                        (*name).to_owned(),
+                        Action::SetOutgoingLanguage((*code).to_owned()),
+                        outgoing == *code,
+                    )
+                }))
+                .collect();
+                d.child(self.setting(
+                    t!("settings-language"),
+                    t!("settings-language-caption"),
+                    self.segmented("language", choices, cx),
+                ))
+                .child(self.setting(
+                    t!("settings-outgoing-language"),
+                    t!("settings-outgoing-language-caption"),
+                    self.segmented("outgoing-language", outgoing_choices, cx),
+                ))
+            })
             .child(self.setting(
-                "Theme",
-                "Automatic follows your system's light and dark setting.",
+                t!("settings-theme"),
+                t!("settings-automatic-follows-your-systems-light-and"),
                 appearance,
             ))
             .child(self.setting(
-                "Theme color",
-                &format!(
-                    "Used for buttons, selection and highlights. {}",
-                    self.accent.label()
+                t!("settings-theme-color"),
+                &t!(
+                    "settings-used-for-buttons-selection-and-highlights",
+                    label = self.accent.label()
                 ),
                 swatches,
             ))
-            .child(self.setting(
-                "Reduce motion",
-                "Panes, menus and messages appear without sliding or fading, and spinners stand still. Automatic follows your system's accessibility setting.",
-                self.segmented(
-                    "reduce-motion",
-                    [super::motion::Motion::System, super::motion::Motion::Reduced, super::motion::Motion::Full]
+            .child(
+                self.setting(
+                    t!("settings-reduce-motion"),
+                    t!("settings-panes-menus-and-messages-appear-without"),
+                    self.segmented(
+                        "reduce-motion",
+                        [
+                            super::motion::Motion::System,
+                            super::motion::Motion::Reduced,
+                            super::motion::Motion::Full,
+                        ]
                         .into_iter()
                         .map(|m| (m.label().to_owned(), Action::SetMotion(m), self.motion == m))
                         .collect(),
-                    cx,
-                )
-                .max_w(px(320.)),
-            ))
-            .child(self.setting(
-                "Contrast in emails",
-                "Emails that style themselves for more contrast (prefers-contrast) use those styles. Automatic follows your system's high-contrast setting.",
-                self.segmented(
-                    "email-contrast",
-                    [super::motion::Contrast::System, super::motion::Contrast::More, super::motion::Contrast::Standard]
+                        cx,
+                    )
+                    .max_w(px(320.)),
+                ),
+            )
+            .child(
+                self.setting(
+                    t!("settings-contrast-in-emails"),
+                    t!("settings-emails-that-style-themselves-for-more"),
+                    self.segmented(
+                        "email-contrast",
+                        [
+                            super::motion::Contrast::System,
+                            super::motion::Contrast::More,
+                            super::motion::Contrast::Standard,
+                        ]
                         .into_iter()
                         .map(|c| (c.label().to_owned(), Action::SetContrast(c), self.contrast == c))
                         .collect(),
@@ -594,11 +654,17 @@ impl MailApp {
                 )
                 .max_w(px(320.)),
             ))
-            .child(self.section("Mailboxes"))
-            .child(self.toggle_row(
-                "All Accounts",
-                "With more than one account, list every account's inbox, drafts, spam and other mail together at the top of the sidebar.",
-                self.switch("all-mail".into(), self.all_mail, Action::SetAllMail(!self.all_mail), cx)
+            .child(self.section(t!("settings-mailboxes")))
+            .child(
+                self.toggle_row(
+                    t!("settings-all-accounts"),
+                    t!("settings-with-more-than-one-account-list"),
+                    self.switch(
+                        "all-mail".into(),
+                        self.all_mail,
+                        Action::SetAllMail(!self.all_mail),
+                        cx,
+                    )
                     .debug_selector(|| "all-mail".into()),
             ))
             .map(|d| self.background_settings(d, cx))
@@ -606,26 +672,30 @@ impl MailApp {
             .when(!self.mobile.on, |d| {
                 let is_default = self.find.default_mail_app == Some(true);
                 let default_desc = if is_default {
-                    "Picacho is currently your default email app for mailto: links, .eml and .msg files."
+                    t!("settings-picacho-is-currently-your-default-email")
                 } else if cfg!(windows) {
-                    "Picacho is registered in Windows Default apps for mailto: links, .eml and .msg files. Click below to jump straight to Picacho's page in Default apps."
+                    t!("settings-picacho-is-registered-in-windows-default")
                 } else if cfg!(target_os = "macos") {
-                    "Use Picacho for mailto: links, .eml and .msg files (chosen in Apple Mail → Settings → General)."
+                    t!("settings-use-picacho-for-mailto-links-eml")
                 } else {
-                    "Use Picacho as your default app for mailto: links, .eml and .msg files."
+                    t!("settings-use-picacho-as-your-default-app")
                 };
                 let default_label = if cfg!(windows) {
-                    if is_default { "Manage in Default Apps…" } else { "Open Default Apps…" }
+                    if is_default {
+                        t!("settings-manage-in-default-apps")
+                    } else {
+                        t!("settings-open-default-apps")
+                    }
                 } else if cfg!(target_os = "macos") {
-                    "Choose Default Email Reader…"
+                    t!("settings-choose-default-email-reader")
                 } else if is_default {
-                    "Reapply as Default Email App"
+                    t!("settings-reapply-as-default-email-app")
                 } else {
-                    "Set as Default Email App"
+                    t!("settings-set-as-default-email-app")
                 };
                 d.child(self.section("Picacho"))
                     .child(self.setting(
-                        "Default email app",
+                        t!("settings-default-email-app"),
                         default_desc,
                         div().flex().items_center().gap_2().child(
                             self.button(
@@ -640,9 +710,16 @@ impl MailApp {
                     ))
                     .child(
                         div().flex().flex_wrap().gap_2().child(
-                            self.button("open-about", "About Picacho", "", Action::About, false, cx)
-                                .border_1()
-                                .border_color(rgb(c.border)),
+                            self.button(
+                                "open-about",
+                                t!("settings-about-picacho"),
+                                "",
+                                Action::About,
+                                false,
+                                cx,
+                            )
+                            .border_1()
+                            .border_color(rgb(c.border)),
                         ),
                     )
             })
@@ -701,9 +778,9 @@ impl MailApp {
                     .text_color(rgb(tone))
                     .child(icon_el("warning", 16., tone))
                     .child(if critical {
-                        "Mailbox needs attention"
+                        t!("settings-mailbox-needs-attention")
                     } else {
-                        "Something didn't work"
+                        t!("settings-something-didnt-work")
                     }),
             )
             .children(issues.into_iter().map(|(source, issue)| {
@@ -737,7 +814,7 @@ impl MailApp {
                             div().flex().child(
                                 self.button(
                                     format!("dismiss-issue-{}", source.label()),
-                                    "Dismiss",
+                                    t!("settings-dismiss"),
                                     "",
                                     Action::DismissIssue(a.id.clone(), source.clone()),
                                     false,
@@ -756,7 +833,11 @@ impl MailApp {
                     .child(
                         self.button(
                             "account-retry",
-                            if busy { "Checking…" } else { "Try Again" },
+                            if busy {
+                                t!("settings-checking")
+                            } else {
+                                t!("settings-try-again")
+                            },
                             "refresh",
                             Action::RetryAccount(a.id.clone()),
                             false,
@@ -769,7 +850,7 @@ impl MailApp {
                     .when(sign_in, |d| {
                         d.child(self.button(
                             "account-reconnect",
-                            "Sign In Again",
+                            t!("settings-sign-in-again"),
                             "",
                             Action::Reconnect(a.id.clone()),
                             false,
@@ -807,9 +888,9 @@ impl MailApp {
             .segmented(
                 "default-theme",
                 [
-                    ("Light", EmailTheme::Light),
-                    ("Dark", EmailTheme::Dark),
-                    ("Match app", EmailTheme::App),
+                    (t!("settings-light"), EmailTheme::Light),
+                    (t!("settings-dark"), EmailTheme::Dark),
+                    (t!("settings-match-app"), EmailTheme::App),
                 ]
                 .into_iter()
                 .map(|(label, theme)| {
@@ -832,20 +913,32 @@ impl MailApp {
             )
             .debug_selector(|| "clean-links".into());
         div().flex().flex_col().gap_5()
-            .child(self.section("Reading"))
-            .child(div().text_size(px(12.)).text_color(rgb(self.colors().muted))
-                .child("Defaults for all accounts. Each email has its own controls above the message. Emails with saved choices keep those choices."))
+            .child(self.section(t!("settings-reading")))
+            .child(
+                div()
+                    .text_size(px(12.))
+                    .text_color(rgb(self.colors().muted))
+                    .child(t!("settings-defaults-for-all-accounts-each-email")),
+            )
             .child(self.setting(
-                "Render HTML", "Show the email's original formatting and interactive content.", html,
+                t!("settings-render-html"),
+                t!("settings-show-the-emails-original-formatting-and"),
+                html,
             ))
             .child(self.setting(
-                "Email colors", "Show email bodies light or dark. Emails designed for dark mode use their own dark colors; others are recolored.", theme,
+                t!("settings-email-colors"),
+                t!("settings-show-email-bodies-light-or-dark"),
+                theme,
             ))
             .child(self.setting(
-                "Block remote content", "Prevent images, stylesheets and fonts from contacting remote servers. Loading them may reveal that you opened an email.", remote,
+                t!("settings-block-remote-content"),
+                t!("settings-prevent-images-stylesheets-and-fonts-from"),
+                remote,
             ))
             .child(self.setting(
-                "Remove tracking from links", "Take campaign and click identifiers (such as utm_source and fbclid) out of links, and open the real address behind known redirects (Google, Outlook Safe Links, Facebook). Applies to every email.", clean,
+                t!("settings-remove-tracking-from-links"),
+                t!("settings-take-campaign-and-click-identifiers-such"),
+                clean,
             ))
             // Phones warn before opening a link; desktops show its address
             // on hover instead.
@@ -869,17 +962,17 @@ impl MailApp {
             .flex_col()
             .gap_5()
             .child(self.setting(
-                "Warn before opening links",
-                "Show where a link in an email goes, and ask before opening it. Links are how fake sign-in pages steal passwords.",
+                t!("settings-warn-before-opening-links"),
+                t!("settings-show-where-a-link-in-an"),
                 warn,
             ))
             .when(self.links.warn, |d| {
                 d.child(self.setting(
-                    "Trusted sites",
+                    t!("settings-trusted-sites"),
                     if trusted.is_empty() {
-                        "Links to sites you trust open without asking. Trust a site from the warning."
+                        t!("settings-links-to-sites-you-trust-open")
                     } else {
-                        "Links to these sites, and the sites under them, open without asking."
+                        t!("settings-links-to-these-sites-and-the")
                     },
                     div().flex().flex_col().gap_2().children(trusted.iter().enumerate().map(
                         |(i, site)| {
@@ -891,7 +984,7 @@ impl MailApp {
                                 .child(div().flex_1().min_w_0().truncate().child(site.clone()))
                                 .child(self.button(
                                     format!("untrust-site-{i}"),
-                                    "Remove",
+                                    t!("settings-remove"),
                                     "",
                                     Action::UntrustSite(site.clone()),
                                     false,
@@ -915,12 +1008,12 @@ impl MailApp {
                 "reply-placement",
                 vec![
                     (
-                        "Below the message".into(),
+                        t!("settings-below-the-message").into(),
                         set(&|o| o.reply_placement = ReplyPlacement::Inline),
                         o.reply_placement == ReplyPlacement::Inline,
                     ),
                     (
-                        "In a compose window".into(),
+                        t!("settings-in-a-compose-window").into(),
                         set(&|o| o.reply_placement = ReplyPlacement::Window),
                         o.reply_placement == ReplyPlacement::Window,
                     ),
@@ -932,9 +1025,9 @@ impl MailApp {
             .segmented(
                 "compose-open",
                 [
-                    ("Floating panel", ComposeOpen::Floating),
-                    ("Full size", ComposeOpen::Maximized),
-                    ("New window", ComposeOpen::Window),
+                    (t!("settings-floating-panel"), ComposeOpen::Floating),
+                    (t!("settings-full-size"), ComposeOpen::Maximized),
+                    (t!("settings-new-window"), ComposeOpen::Window),
                 ]
                 .into_iter()
                 .map(|(label, value)| {
@@ -953,12 +1046,12 @@ impl MailApp {
                 "compose-format",
                 vec![
                     (
-                        "Formatted".into(),
+                        t!("settings-formatted").into(),
                         set(&|o| o.formatted = true),
                         o.formatted,
                     ),
                     (
-                        "Plain text".into(),
+                        t!("settings-plain-text").into(),
                         set(&|o| o.formatted = false),
                         !o.formatted,
                     ),
@@ -974,7 +1067,7 @@ impl MailApp {
                     .map(|secs| {
                         (
                             if secs == 0 {
-                                "Off".to_string()
+                                t!("settings-off").to_string()
                             } else {
                                 format!("{secs} s")
                             },
@@ -1023,64 +1116,64 @@ impl MailApp {
             .flex()
             .flex_col()
             .gap_5()
-            .child(self.section("Composing"))
+            .child(self.section(t!("settings-composing")))
             .child(self.setting(
-                "Replies",
-                "Write replies right below the message, like a conversation, or in a compose window.",
+                t!("settings-replies"),
+                t!("settings-write-replies-right-below-the-message"),
                 replies,
             ))
             .child(self.setting(
-                "New messages open",
-                "A panel you can move, minimize and resize, the full window, or a separate window.",
+                t!("settings-new-messages-open"),
+                t!("settings-a-panel-you-can-move-minimize"),
                 open_in,
             ))
             .child(self.setting(
-                "Message format",
-                "Formatted messages can use bold, lists, links and quotes, and are sent with a plain text version.",
+                t!("settings-message-format"),
+                t!("settings-formatted-messages-can-use-bold-lists"),
                 format,
             ))
             .child(row(
-                "Reply to everyone by default",
-                "Reply answers all recipients. Reply all stays available.",
+                t!("settings-reply-to-everyone-by-default"),
+                t!("settings-reply-answers-all-recipients-reply-all"),
                 toggle("default-reply-all", o.default_reply_all, &|o| {
                     o.default_reply_all = !o.default_reply_all
                 }),
             ))
             .child(row(
-                "Include the original message",
-                "Replies quote the message they answer.",
+                t!("settings-include-the-original-message"),
+                t!("settings-replies-quote-the-message-they-answer"),
                 toggle("quote-original", o.quote_original, &|o| {
                     o.quote_original = !o.quote_original
                 }),
             ))
             .child(row(
-                "Paste with formatting",
-                "Text copied with bold, links or lists keeps them. After pasting you can switch to the other.",
+                t!("settings-paste-with-formatting"),
+                t!("settings-text-copied-with-bold-links-or"),
                 toggle("paste-formatted", o.paste_formatted, &|o| {
                     o.paste_formatted = !o.paste_formatted
                 }),
             ))
-            .child(self.section("Sending"))
+            .child(self.section(t!("settings-sending")))
             .child(self.setting(
-                "Undo send",
-                "Wait a moment before a message leaves, so you can take it back.",
+                t!("settings-undo-send"),
+                t!("settings-wait-a-moment-before-a-message"),
                 undo,
             ))
             .child(row(
-                "Attachment reminder",
-                "Ask before sending a message that mentions an attachment but has none.",
+                t!("settings-attachment-reminder"),
+                t!("settings-ask-before-sending-a-message-that"),
                 toggle("attachment-reminder", o.attachment_reminder, &|o| {
                     o.attachment_reminder = !o.attachment_reminder
                 }),
             ))
             .child(row(
-                "Missing subject warning",
-                "Ask before sending a message without a subject.",
+                t!("settings-missing-subject-warning"),
+                t!("settings-ask-before-sending-a-message-without"),
                 toggle("empty-subject", o.warn_empty_subject, &|o| {
                     o.warn_empty_subject = !o.warn_empty_subject
                 }),
             ))
-            .child(self.section("Signature"))
+            .child(self.section(t!("settings-signature")))
             .children(self.signature_chooser(cx))
             .child(
                 div()
@@ -1096,12 +1189,12 @@ impl MailApp {
                     .child(if crate::manage::composing::is_html(&self.signature_input.read(cx).value()) {
                         "HTML: formatted messages show it as written, plain-text ones its text. Changing From in a message changes its signature too."
                     } else {
-                        "Markdown (**bold**, [links](https://…), ![pictures](https://…)), or paste HTML. Changing From in a message changes its signature too."
+                        t!("settings-markdown-bold-links-https-pictures-https")
                     }),
             )
             .child(row(
-                "Sign replies and forwards",
-                "Without this, only new messages get the signature.",
+                t!("settings-sign-replies-and-forwards"),
+                t!("settings-without-this-only-new-messages-get"),
                 toggle("signature-replies", o.signature_on_replies, &|o| {
                     o.signature_on_replies = !o.signature_on_replies
                 }),
@@ -1115,9 +1208,9 @@ impl MailApp {
         let sync = a.sync;
         let set = |next: SyncSettings| Action::SetSync(a.id.clone(), next);
         let auth = if a.service == Service::Pinal {
-            "Signed in with Pinal"
+            t!("settings-signed-in-with-pinal")
         } else if a.oauth {
-            "Browser sign-in"
+            t!("settings-browser-sign-in")
         } else {
             a.service.password_label()
         };
@@ -1165,58 +1258,58 @@ impl MailApp {
             .when(self.settings_page_has_errors(), |page| {
                 page.child(self.account_error_details(a, cx))
             })
-            .child(self.section("Nickname"))
-            .child(self.setting(
-                "Nickname",
-                &format!(
-                    "Shown for this mailbox in the sidebar and Settings. Leave empty to show {}.",
-                    a.name
-                ),
-                div()
-                    .id("account-nickname")
-                    .debug_selector(|| "account-nickname".into())
-                    .max_w(px(320.))
-                    .child(field(Input::new(&self.nickname_input), c, false)),
-            ))
-            .when(!a.oauth && a.service != Service::Pinal, |page| {
-                page.child(self.section("Sign-in")).child(self.setting(
-                    "Sign-in name",
-                    &format!(
-                        "The user name your mail servers know you by, if it isn't {}. Leave empty to use the address.",
-                        a.email
-                    ),
+            .child(self.section(t!("settings-nickname")))
+            .child(
+                self.setting(
+                    t!("settings-nickname"),
+                    &t!("settings-shown-for-this-mailbox-in-the", name = a.name),
                     div()
-                        .id("account-login")
-                        .debug_selector(|| "account-login".into())
+                        .id("account-nickname")
+                        .debug_selector(|| "account-nickname".into())
                         .max_w(px(320.))
-                        .child(field(Input::new(&self.login_input), c, false)),
-                ))
+                        .child(field(Input::new(&self.nickname_input), c, false)),
+                ),
+            )
+            .when(!a.oauth && a.service != Service::Pinal, |page| {
+                page.child(self.section(t!("settings-sign-in"))).child(
+                    self.setting(
+                        t!("settings-sign-in-name"),
+                        &t!("settings-the-user-name-your-mail-servers", email = a.email),
+                        div()
+                            .id("account-login")
+                            .debug_selector(|| "account-login".into())
+                            .max_w(px(320.))
+                            .child(field(Input::new(&self.login_input), c, false)),
+                    ),
+                )
             })
-            .child(self.section("Sending"))
-            .child(self.setting(
-                "Reply-To",
-                if crate::sync::smtp::recipients(&a.reply_to).is_err() {
-                    "This isn't a valid address; messages can't be sent until it is fixed or removed."
-                } else {
-                    "Where replies to your messages go, if not to the address they're sent from. A message can set its own in the composer."
-                },
-                div()
-                    .id("account-reply-to")
-                    .debug_selector(|| "account-reply-to".into())
-                    .max_w(px(320.))
-                    .child(field(Input::new(&self.reply_to_input), c, false)),
-            ))
+            .child(self.section(t!("settings-sending")))
+            .child(
+                self.setting(
+                    t!("settings-reply-to"),
+                    if crate::sync::smtp::recipients(&a.reply_to).is_err() {
+                        t!("settings-this-isnt-a-valid-address-messages")
+                    } else {
+                        t!("settings-where-replies-to-your-messages-go")
+                    },
+                    div()
+                        .id("account-reply-to")
+                        .debug_selector(|| "account-reply-to".into())
+                        .max_w(px(320.))
+                        .child(field(Input::new(&self.reply_to_input), c, false)),
+                ),
+            )
             .child(self.switch_setting(
-                "Ask for read receipts",
-                "Recipients' mail apps may offer to tell you when they open your messages. Many people decline.",
+                t!("settings-ask-for-read-receipts"),
+                t!("settings-recipients-mail-apps-may-offer-to"),
                 format!("read-receipts-{}", a.id),
                 a.read_receipts,
                 Action::ToggleReadReceipts(a.id.clone()),
                 cx,
             ))
             .child(self.switch_setting(
-                "Ask for delivery receipts",
-                "The receiving mail servers report when your messages arrive, where your outgoing server supports it.",
+                t!("settings-ask-for-delivery-receipts"),
+                t!("settings-the-receiving-mail-servers-report-when"),
                 format!("delivery-receipts-{}", a.id),
                 a.delivery_receipts,
                 Action::ToggleDeliveryReceipts(a.id.clone()),
@@ -1226,26 +1319,45 @@ impl MailApp {
             // message a failure report returns.
             .when(a.delivery_receipts, |page| {
                 let dsn = a.dsn;
-                let toggle = |title: &str, caption: &str, key: &str, on: bool, change: DsnChange| {
-                    self.switch_setting(
-                        title,
-                        caption,
-                        format!("dsn-{key}-{}", a.id),
-                        on,
-                        Action::SetDsn(a.id.clone(), change),
-                        cx,
-                    )
-                };
-                page.child(toggle("Report delivery", "When it arrives.", "success", dsn.success, DsnChange::Success))
-                    .child(toggle("Report failure", "When it can't be delivered.", "failure", dsn.failure, DsnChange::Failure))
-                    .child(toggle("Report delays", "When delivery is taking longer than usual.", "delay", dsn.delay, DsnChange::Delay))
-                    .child(toggle(
-                        "Return the full message",
-                        "A failure report includes the whole message rather than only its headers.",
-                        "full",
-                        dsn.return_full,
-                        DsnChange::ReturnFull,
-                    ))
+                let toggle =
+                    |title: &str, caption: &str, key: &str, on: bool, change: DsnChange| {
+                        self.switch_setting(
+                            title,
+                            caption,
+                            format!("dsn-{key}-{}", a.id),
+                            on,
+                            Action::SetDsn(a.id.clone(), change),
+                            cx,
+                        )
+                    };
+                page.child(toggle(
+                    t!("settings-report-delivery"),
+                    t!("settings-when-it-arrives"),
+                    "success",
+                    dsn.success,
+                    DsnChange::Success,
+                ))
+                .child(toggle(
+                    t!("settings-report-failure"),
+                    t!("settings-when-it-cant-be-delivered"),
+                    "failure",
+                    dsn.failure,
+                    DsnChange::Failure,
+                ))
+                .child(toggle(
+                    t!("settings-report-delays"),
+                    t!("settings-when-delivery-is-taking-longer-than"),
+                    "delay",
+                    dsn.delay,
+                    DsnChange::Delay,
+                ))
+                .child(toggle(
+                    t!("settings-return-the-full-message"),
+                    t!("settings-a-failure-report-includes-the-whole"),
+                    "full",
+                    dsn.return_full,
+                    DsnChange::ReturnFull,
+                ))
             })
             .when_some(a.sso.as_ref(), |page, sso| {
                 let c = self.colors();
@@ -1256,16 +1368,16 @@ impl MailApp {
                         .flex()
                         .flex_col()
                         .gap(px(2.))
-                        .child(div().text_size(px(13.)).font_weight(FontWeight::MEDIUM).child("Single sign-on"))
                         .child(
                             div()
-                                .text_size(px(12.))
-                                .text_color(rgb(c.muted))
-                                .child(format!(
-                                    "Signed in through {} in the browser. When the sign-in expires, Sign In Again opens it there.",
-                                    sso.issuer
-                                )),
-                        ),
+                                .text_size(px(13.))
+                                .font_weight(FontWeight::MEDIUM)
+                                .child(t!("settings-single-sign-on")),
+                        )
+                        .child(div().text_size(px(12.)).text_color(rgb(c.muted)).child(t!(
+                            "settings-signed-in-through-in-the-browser",
+                            issuer = sso.issuer
+                        ))),
                 )
             })
             .when(
@@ -1274,11 +1386,11 @@ impl MailApp {
                     && !cfg!(any(target_os = "android", target_os = "ios")),
                 |page| {
                     page.child(self.switch_setting(
-                        "Sign in with Kerberos",
+                        t!("settings-sign-in-with-kerberos"),
                         if a.kerberos {
-                            "Picacho signs in to this account's servers with this computer's Kerberos ticket, not a password. A server that doesn't take Kerberos is reported, never tried with a password."
+                            t!("settings-picacho-signs-in-to-this-accounts")
                         } else {
-                            "Use this computer's Kerberos ticket (kinit, or your domain sign-in) instead of the password. Picacho checks it works before switching."
+                            t!("settings-use-this-computers-kerberos-ticket-kinit")
                         },
                         format!("kerberos-{}", a.id),
                         a.kerberos,
@@ -1288,8 +1400,8 @@ impl MailApp {
                 },
             )
             .child(self.switch_setting(
-                "Require encryption in transit",
-                "Messages only go if every server on the way can use encryption (REQUIRETLS); where that can't be promised they bounce instead. Your outgoing server has to support it, and Picacho tells you when a recipient's domain publishes no policy (MTA-STS or DANE) to insist on it by.",
+                t!("settings-require-encryption-in-transit"),
+                t!("settings-messages-only-go-if-every-server"),
                 format!("require-tls-{}", a.id),
                 a.require_tls,
                 Action::ToggleRequireTls(a.id.clone()),
@@ -1298,12 +1410,17 @@ impl MailApp {
             // A JMAP server takes it as its submissions' BY parameter
             // (RFC 8621 §7); Proton has no such option.
             .when(a.provider != Provider::Proton, |page| {
-                page.child(self.setting(
-                    "Give up on delivery after",
-                    "Where your outgoing server supports it (DELIVERBY), a message that can't be delivered in time comes back to you instead of arriving late. Servers that don't keep trying for days as usual.",
-                    self.segmented(
-                        &format!("deliver-within-{}", a.id),
-                        [(0, "Days, as usual"), (4, "4 hours"), (24, "1 day")]
+                page.child(
+                    self.setting(
+                        t!("settings-give-up-on-delivery-after"),
+                        t!("settings-where-your-outgoing-server-supports-it"),
+                        self.segmented(
+                            &format!("deliver-within-{}", a.id),
+                            [
+                                (0, t!("settings-days-as-usual")),
+                                (4, t!("settings-4-hours")),
+                                (24, t!("settings-1-day")),
+                            ]
                             .into_iter()
                             .map(|(hours, label)| {
                                 (
@@ -1322,12 +1439,16 @@ impl MailApp {
             .when(
                 a.provider != Provider::Proton && a.deliver_within_hours > 0,
                 |page| {
-                    page.child(self.setting(
-                        "If it's late",
-                        "Return it to you, or deliver it anyway and tell you it was late.",
-                        self.segmented(
-                            &format!("deliver-late-{}", a.id),
-                            [(false, "Return it"), (true, "Deliver and tell me")]
+                    page.child(
+                        self.setting(
+                            t!("settings-if-its-late"),
+                            t!("settings-return-it-to-you-or-deliver"),
+                            self.segmented(
+                                &format!("deliver-late-{}", a.id),
+                                [
+                                    (false, t!("settings-return-it")),
+                                    (true, t!("settings-deliver-and-tell-me")),
+                                ]
                                 .into_iter()
                                 .map(|(notify, label)| {
                                     (
@@ -1341,8 +1462,8 @@ impl MailApp {
                         ),
                     ))
                     .child(self.switch_setting(
-                        "Trace its delivery",
-                        "Each server on the way reports passing it on, where they support it (DELIVERBY trace).",
+                        t!("settings-trace-its-delivery"),
+                        t!("settings-each-server-on-the-way-reports"),
                         format!("deliver-by-trace-{}", a.id),
                         a.deliver_by_trace,
                         Action::ToggleDeliverByTrace(a.id.clone()),
@@ -1352,8 +1473,8 @@ impl MailApp {
             )
             .when(a.provider != Provider::Proton, |page| {
                 page.child(self.switch_setting(
-                    "Let the server send scheduled messages",
-                    "A message sent later goes to your outgoing server right away, which sends it at its time even with Picacho closed, where the server can hold it (FUTURERELEASE). Once handed over it can't be changed or taken back, and with SMTP its copy is in Sent from then. Where the server can't, Picacho sends it itself, as without this.",
+                    t!("settings-let-the-server-send-scheduled-messages"),
+                    t!("settings-a-message-sent-later-goes-to"),
                     format!("server-send-later-{}", a.id),
                     a.server_send_later,
                     Action::ToggleServerSendLater(a.id.clone()),
@@ -1363,99 +1484,104 @@ impl MailApp {
             .child(self.identities_setting(a, cx))
             .children(self.server_identities_setting(a, cx))
             .when(a.provider != Provider::Pop3, |page| {
-                page.child(self.section("Storage"))
+                page.child(self.section(t!("settings-storage")))
                     .child(self.storage(a))
                     .children(self.server_notes_view(a))
                     .children(self.jmap_access_note(a))
                     .children(self.offline_note(a))
             })
             .when(Backend::may_filter(a), |page| {
-                page.child(self.section("Filters & vacation"))
+                page.child(self.section(t!("settings-filters-vacation")))
                     .child(self.filters_setting(a, cx))
             })
-            .child(self.section("Profile picture"))
-            .child(self.setting(
-                "Picture",
-                if a.provider == Provider::Gmail && a.oauth {
-                    "Shown beside this mailbox. Your Google profile picture is used until you choose another."
-                } else {
-                    "Shown beside this mailbox. Load one from Gravatar, pick a preset or upload your own."
-                },
-                div()
-                    .flex()
-                    .flex_wrap()
-                    .items_center()
-                    .gap_3()
-                    .child(
-                        div()
-                            .id(SharedString::from(format!("avatar-picker-{}", a.id)))
-                            .debug_selector(|| "avatar-picker".into())
-                            .rounded_full()
-                            .cursor_pointer()
-                            .hover(|s| s.opacity(0.85))
-                            .child(self.account_avatar(a, index, 48.))
-                            .tooltip(|w, cx| Tooltip::new("Change picture").build(w, cx))
-                            .on_click({
-                                let id = a.id.clone();
-                                cx.listener(move |this, _, w, cx| {
-                                    this.handle(Action::AvatarMenu(id.clone()), w, cx)
+            .child(self.section(t!("settings-profile-picture")))
+            .child(
+                self.setting(
+                    t!("settings-picture"),
+                    if a.provider == Provider::Gmail && a.oauth {
+                        t!("settings-shown-beside-this-mailbox-your-google")
+                    } else {
+                        t!("settings-shown-beside-this-mailbox-load-one")
+                    },
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .items_center()
+                        .gap_3()
+                        .child(
+                            div()
+                                .id(SharedString::from(format!("avatar-picker-{}", a.id)))
+                                .debug_selector(|| "avatar-picker".into())
+                                .rounded_full()
+                                .cursor_pointer()
+                                .hover(|s| s.opacity(0.85))
+                                .child(self.account_avatar(a, index, 48.))
+                                .tooltip(|w, cx| {
+                                    Tooltip::new(t!("settings-change-picture")).build(w, cx)
                                 })
-                            }),
-                    )
-                    .child(
-                        self.button(
-                            format!("choose-avatar-{}", a.id),
-                            "Change Picture",
-                            "chevron-down",
-                            Action::AvatarMenu(a.id.clone()),
-                            false,
-                            cx,
+                                .on_click({
+                                    let id = a.id.clone();
+                                    cx.listener(move |this, _, w, cx| {
+                                        this.handle(Action::AvatarMenu(id.clone()), w, cx)
+                                    })
+                                }),
                         )
-                        .flex_row_reverse()
-                        .border_1()
-                        .border_color(rgb(c.border)),
-                    ),
-            ))
+                        .child(
+                            self.button(
+                                format!("choose-avatar-{}", a.id),
+                                t!("settings-change-picture-2"),
+                                "chevron-down",
+                                Action::AvatarMenu(a.id.clone()),
+                                false,
+                                cx,
+                            )
+                            .flex_row_reverse()
+                            .border_1()
+                            .border_color(rgb(c.border)),
+                        ),
+                ),
+            )
             .when(self.encrypted.contains(&a.id), |page| {
                 let locked = self.locked.contains(&a.id);
-                page.child(self.section("Encryption")).child(self.setting(
-                    "Zero-access encryption",
-                    if locked {
-                        "Your mail is stored encrypted. Open an encrypted message and enter your Pinal password to read it here."
-                    } else {
-                        "Your mail is stored encrypted and decrypted on this computer. The key stays in the system keychain until you remove it."
-                    },
-                    if locked {
-                        div().into_any_element()
-                    } else {
-                        self.button(
-                            format!("lock-{}", a.id),
-                            "Forget key",
-                            "lock",
-                            Action::LockMail(a.id.clone()),
-                            false,
-                            cx,
-                        )
-                        .border_1()
-                        .border_color(rgb(c.border))
-                        .into_any_element()
-                    },
-                ))
+                page.child(self.section(t!("settings-encryption")))
+                    .child(self.setting(
+                        t!("settings-zero-access-encryption"),
+                        if locked {
+                            t!("settings-your-mail-is-stored-encrypted-open")
+                        } else {
+                            t!("settings-your-mail-is-stored-encrypted-and")
+                        },
+                        if locked {
+                            div().into_any_element()
+                        } else {
+                            self.button(
+                                format!("lock-{}", a.id),
+                                t!("settings-forget-key"),
+                                "lock",
+                                Action::LockMail(a.id.clone()),
+                                false,
+                                cx,
+                            )
+                            .border_1()
+                            .border_color(rgb(c.border))
+                            .into_any_element()
+                        },
+                    ))
             })
-            .child(self.section("Sync"));
+            .child(self.section(t!("settings-sync")));
         if a.provider != Provider::Pop3 {
             page = page.child(
                 self.setting(
-                    "Keep mail from",
-                    "Older mail stays on the server and is removed from this computer.",
+                    t!("settings-keep-mail-from"),
+                    t!("settings-older-mail-stays-on-the-server"),
                     self.segmented(
                         &format!("days-{}", a.id),
                         [
-                            (14, "2 weeks"),
-                            (30, "1 month"),
-                            (90, "3 months"),
-                            (365, "1 year"),
-                            (0, "All"),
+                            (14, t!("settings-2-weeks")),
+                            (30, t!("settings-1-month")),
+                            (90, t!("settings-3-months")),
+                            (365, t!("settings-1-year")),
+                            (0, t!("settings-all")),
                         ]
                         .into_iter()
                         .map(|(days, label)| {
@@ -1473,15 +1599,15 @@ impl MailApp {
         }
         if a.provider != Provider::Pop3 {
             page = page.child(self.setting(
-                "Download for offline reading",
-                "Message contents in this range download in the background. Other messages download when you open them.",
+                t!("settings-download-for-offline-reading"),
+                t!("settings-message-contents-in-this-range-download"),
                 self.segmented(
                     &format!("offline-{}", a.id),
                     [
-                        (30, "1 month"),
-                        (365, "1 year"),
-                        (0, "All"),
-                        (OFFLINE_WHEN_OPENED, "When opened"),
+                        (30, t!("settings-1-month")),
+                        (365, t!("settings-1-year")),
+                        (0, t!("settings-all")),
+                        (OFFLINE_WHEN_OPENED, t!("settings-when-opened")),
                     ]
                     .into_iter()
                     .map(|(days, label)| {
@@ -1502,15 +1628,15 @@ impl MailApp {
         if a.provider == Provider::Pop3 {
             page = page
                 .child(self.setting(
-                    "Remove from the server",
-                    "Downloaded mail stays on this computer. Only messages saved here completely are removed, when the server confirms at the end of a check.",
+                    t!("settings-remove-from-the-server"),
+                    t!("settings-downloaded-mail-stays-on-this-computer"),
                     self.segmented(
                         &format!("pop-delete-{}", a.id),
                         [
-                            (None, "Never"),
-                            (Some(0), "After download"),
-                            (Some(7), "After 1 week"),
-                            (Some(30), "After 1 month"),
+                            (None, t!("settings-never")),
+                            (Some(0), t!("settings-after-download")),
+                            (Some(7), t!("settings-after-1-week")),
+                            (Some(30), t!("settings-after-1-month")),
                         ]
                         .into_iter()
                         .map(|(days, label)| {
@@ -1528,8 +1654,8 @@ impl MailApp {
                     ),
                 ))
                 .child(self.switch_setting(
-                    "Delete on the server too",
-                    "Deleting a message for good here also removes it from the server at the next check.",
+                    t!("settings-delete-on-the-server-too"),
+                    t!("settings-deleting-a-message-for-good-here"),
                     format!("pop-delete-local-{}", a.id),
                     sync.pop_delete_with_local,
                     Action::SetSync(
@@ -1544,34 +1670,52 @@ impl MailApp {
         }
         page = page
             .child(self.setting(
-                "Check for new mail",
+                t!("settings-check-for-new-mail"),
                 "",
                 self.segmented(
                     &format!("refresh-{}", a.id),
-                    [(1, "1 min"), (5, "5 min"), (15, "15 min"), (30, "30 min"), (60, "1 hour"), (0, "Manually")]
-                        .into_iter()
-                        .map(|(minutes, label)| {
-                            (
-                                label.to_owned(),
-                                set(SyncSettings { refresh_minutes: minutes, ..sync }),
-                                sync.refresh_minutes == minutes,
-                            )
-                        })
-                        .collect(),
+                    [
+                        (1, t!("settings-1-min")),
+                        (5, t!("settings-5-min")),
+                        (15, t!("settings-15-min")),
+                        (30, t!("settings-30-min")),
+                        (60, t!("settings-1-hour")),
+                        (0, t!("settings-manually")),
+                    ]
+                    .into_iter()
+                    .map(|(minutes, label)| {
+                        (
+                            label.to_owned(),
+                            set(SyncSettings {
+                                refresh_minutes: minutes,
+                                ..sync
+                            }),
+                            sync.refresh_minutes == minutes,
+                        )
+                    })
+                    .collect(),
                     cx,
                 ),
             ));
         if a.provider == Provider::Proton {
-            page = page.child(self.setting(
-                "Check Proton for changes",
-                if sync.proton_events_seconds == 0 {
-                    "New mail, moves and notices from Proton appear at the next check for new mail."
-                } else {
-                    "How often Picacho asks Proton about new mail, moves and notices. Less often uses less data and battery."
-                },
-                self.segmented(
-                    &format!("proton-events-{}", a.id),
-                    [(15, "15 sec"), (30, "30 sec"), (60, "1 min"), (300, "5 min"), (900, "15 min"), (0, "Off")]
+            page = page.child(
+                self.setting(
+                    t!("settings-check-proton-for-changes"),
+                    if sync.proton_events_seconds == 0 {
+                        t!("settings-new-mail-moves-and-notices-from")
+                    } else {
+                        t!("settings-how-often-picacho-asks-proton-about")
+                    },
+                    self.segmented(
+                        &format!("proton-events-{}", a.id),
+                        [
+                            (15, t!("settings-15-sec")),
+                            (30, t!("settings-30-sec")),
+                            (60, t!("settings-1-min")),
+                            (300, t!("settings-5-min")),
+                            (900, t!("settings-15-min")),
+                            (0, t!("settings-off")),
+                        ]
                         .into_iter()
                         .map(|(seconds, label)| {
                             (
@@ -1601,20 +1745,17 @@ impl MailApp {
                                 div()
                                     .text_size(px(13.))
                                     .font_weight(FontWeight::MEDIUM)
-                                    .child("Notifications"),
+                                    .child(t!("settings-notifications")),
                             )
-                            .child(
-                                div()
-                                    .text_size(px(12.))
-                                    .text_color(rgb(c.muted))
-                                    .child(if a.pushes_new_mail() {
-                                        "Announce new inbox mail. Proton's push notifications announce it as it arrives, so checks for new mail don't."
-                                    } else if sync.refresh_minutes == 0 {
-                                        "Announce new inbox mail. Only works while Picacho checks for mail."
-                                    } else {
-                                        "Announce new inbox mail while Picacho is in the background."
-                                    }),
-                            ),
+                            .child(div().text_size(px(12.)).text_color(rgb(c.muted)).child(
+                                if a.pushes_new_mail() {
+                                    t!("settings-announce-new-inbox-mail-protons-push")
+                                } else if sync.refresh_minutes == 0 {
+                                    t!("settings-announce-new-inbox-mail-only-works")
+                                } else {
+                                    t!("settings-announce-new-inbox-mail-while-picacho")
+                                },
+                            )),
                     )
                     .child(self.switch(
                         format!("notify-{}", a.id),
@@ -1633,8 +1774,8 @@ impl MailApp {
             })
             .when(a.provider.imap(), |page| {
                 page.child(self.switch_setting(
-                    "Only subscribed folders",
-                    "Show only the folders subscribed to on the server, as other mail apps do. Folders Picacho makes are subscribed. If none are, all show.",
+                    t!("settings-only-subscribed-folders"),
+                    t!("settings-show-only-the-folders-subscribed-to"),
                     format!("subscribed-only-{}", a.id),
                     sync.subscribed_only,
                     Action::SetSync(
@@ -1650,7 +1791,7 @@ impl MailApp {
             .when(a.provider == Provider::Jmap && a.credentials_of.is_empty(), |page| {
                 page.child(self.jmap_shared_setting(a, cx))
             })
-            .child(self.section("Account"))
+            .child(self.section(t!("settings-account")))
             .child(
                 div()
                     .flex()
@@ -1663,12 +1804,12 @@ impl MailApp {
                             .min_w(px(160.))
                             .text_size(px(12.))
                             .text_color(rgb(c.muted))
-                            .child("Removing this account deletes its mail and drafts from this computer. Mail on the server is kept."),
+                            .child(t!("settings-removing-this-account-deletes-its-mail")),
                     )
                     .child(
                         self.button(
                             format!("remove-{}", a.id),
-                            "Remove Account",
+                            t!("settings-remove-account"),
                             "trash",
                             Action::ConfirmRemove(a.id.clone()),
                             false,
@@ -1692,7 +1833,11 @@ impl MailApp {
         let find = self
             .button(
                 format!("find-shared-{}", a.id),
-                if looking { "Looking…" } else { "Look for Shared Accounts" },
+                if looking {
+                    t!("settings-looking")
+                } else {
+                    t!("settings-look-for-shared-accounts")
+                },
                 "",
                 Action::FindShared(a.id.clone()),
                 false,
@@ -1708,7 +1853,7 @@ impl MailApp {
                     div()
                         .text_size(px(12.))
                         .text_color(rgb(c.muted))
-                        .child("Nothing else is shared with this sign-in, or it's all added."),
+                        .child(t!("settings-nothing-else-is-shared-with-this")),
                 );
             }
             Some(Ok(found)) => {
@@ -1723,7 +1868,11 @@ impl MailApp {
                             .child(
                                 self.button(
                                     format!("add-shared-{}-{jmap_id}", a.id),
-                                    if adding { "Adding…" } else { "Add" },
+                                    if adding {
+                                        t!("settings-adding")
+                                    } else {
+                                        t!("settings-add")
+                                    },
                                     "",
                                     Action::AddShared(a.id.clone(), jmap_id.clone(), name.clone()),
                                     false,
@@ -1751,8 +1900,8 @@ impl MailApp {
             .flex_col()
             .gap_2()
             .child(self.setting(
-                "Shared with you",
-                "Mail accounts others share with this sign-in. Each is added as an account of its own, signing in as this one.",
+                t!("settings-shared-with-you"),
+                t!("settings-mail-accounts-others-share-with-this"),
                 find,
             ))
             .child(list)
@@ -1761,21 +1910,21 @@ impl MailApp {
     /// while its Notifications are on, and announcing new mail in place of
     /// the regular checks once turned on.
     fn proton_push_setting(&self, a: &Account, cx: &Context<Self>) -> Div {
-        const TITLE: &str = "Push notifications";
+        let title = t!("settings-push-notifications");
         let sync = a.sync;
         if !crate::sync::proton_push::available() {
+            return self.setting(title, t!("settings-this-copy-of-picacho-was-built"), div());
+        }
+        if !sync.notify {
             return self.setting(
-                TITLE,
-                "This copy of Picacho was built without a Firebase project, so it can't receive Proton's push notifications.",
+                title,
+                t!("settings-turn-on-notifications-to-receive-protons"),
                 div(),
             );
         }
-        if !sync.notify {
-            return self.setting(TITLE, "Turn on Notifications to receive Proton's push notifications.", div());
-        }
         self.switch_setting(
-            TITLE,
-            "Proton sends new mail and its notices here as it would to its Android app, so they arrive at once. Picacho must be running, in the background too.",
+            title,
+            t!("settings-proton-sends-new-mail-and-its"),
             format!("proton-push-{}", a.id),
             sync.proton_push,
             Action::SetSync(a.id.clone(), SyncSettings { proton_push: !sync.proton_push, ..sync }),
@@ -1795,8 +1944,8 @@ impl MailApp {
                 continue;
             }
             let through = match &identity.smtp {
-                Some(s) => format!("Through {}", s.host),
-                None => format!("Through {}'s server", a.email),
+                Some(s) => t!("settings-through", host = s.host),
+                None => t!("settings-through-s-server", email = a.email),
             };
             let caption = if identity.name.is_empty() {
                 through
@@ -1839,7 +1988,7 @@ impl MailApp {
                     .child(
                         self.button(
                             format!("edit-identity-{i}"),
-                            "Edit",
+                            t!("settings-edit"),
                             "",
                             Action::EditIdentity(a.id.clone(), identity.id.clone()),
                             false,
@@ -1850,7 +1999,7 @@ impl MailApp {
                     .child(
                         self.button(
                             format!("remove-identity-{i}"),
-                            "@Remove address",
+                            t!("settings-remove-address"),
                             "trash",
                             Action::RemoveIdentity(a.id.clone(), identity.id.clone()),
                             false,
@@ -1867,30 +2016,25 @@ impl MailApp {
             .flex()
             .flex_col()
             .gap_3()
-            .child(
-                self.setting(
-                    "Other addresses",
-                    &format!(
-                        "Addresses {} also sends as, chosen in From when writing. Each can go through this mailbox's outgoing server, if it lets you send as that address, or through a server of its own.",
-                        a.email
-                    ),
-                    if adding {
-                        div().into_any_element()
-                    } else {
-                        self.button(
-                            format!("add-identity-{}", a.id),
-                            "Add Address",
-                            "",
-                            Action::AddIdentity(a.id.clone()),
-                            false,
-                            cx,
-                        )
-                        .border_1()
-                        .border_color(rgb(c.border))
-                        .into_any_element()
-                    },
-                ),
-            )
+            .child(self.setting(
+                t!("settings-other-addresses"),
+                &t!("settings-addresses-also-sends-as-chosen-in", email = a.email),
+                if adding {
+                    div().into_any_element()
+                } else {
+                    self.button(
+                        format!("add-identity-{}", a.id),
+                        t!("settings-add-address"),
+                        "",
+                        Action::AddIdentity(a.id.clone()),
+                        false,
+                        cx,
+                    )
+                    .border_1()
+                    .border_color(rgb(c.border))
+                    .into_any_element()
+                },
+            ))
             .child(list)
     }
 
@@ -1932,11 +2076,19 @@ impl MailApp {
             .border_1()
             .border_color(rgb(c.border))
             .bg(rgb(c.raised))
-            .child(row().child(labeled("Address", 0, "identity-email")).child(labeled("Name", 1, "identity-name")))
-            .child(row().child(labeled("Reply-To (optional)", 2, "identity-reply-to")))
+            .child(
+                row()
+                    .child(labeled(t!("settings-address"), 0, "identity-email"))
+                    .child(labeled(t!("settings-name"), 1, "identity-name")),
+            )
+            .child(row().child(labeled(
+                t!("settings-reply-to-optional"),
+                2,
+                "identity-reply-to",
+            )))
             .child(self.switch_setting(
-                "Use its own outgoing server",
-                "Send through another provider's SMTP server, signing in there, instead of this mailbox's.",
+                t!("settings-use-its-own-outgoing-server"),
+                t!("settings-send-through-another-providers-smtp-server"),
                 "identity-own-server".into(),
                 edit.own_server,
                 Action::ToggleIdentityServer,
@@ -1946,21 +2098,29 @@ impl MailApp {
             form = form
                 .child(
                     row()
-                        .child(labeled("Outgoing server", 3, "identity-host"))
-                        .child(labeled("Port", 4, "identity-port").max_w(px(100.)).min_w(px(80.))),
+                        .child(labeled(t!("settings-outgoing-server"), 3, "identity-host"))
+                        .child(
+                            labeled(t!("settings-port"), 4, "identity-port")
+                                .max_w(px(100.))
+                                .min_w(px(80.)),
+                        ),
                 )
                 .child(
                     row()
-                        .child(labeled("Sign-in name", 5, "identity-login"))
+                        .child(labeled(t!("settings-sign-in-name"), 5, "identity-login"))
                         .child(labeled(
-                            if edit.had_password { "Password (empty keeps the saved one)" } else { "Password" },
+                            if edit.had_password {
+                                t!("settings-password-empty-keeps-the-saved-one")
+                            } else {
+                                t!("settings-password")
+                            },
                             6,
                             "identity-password",
                         )),
                 )
                 .child(self.switch_setting(
-                    "TLS from the start",
-                    "On for servers that encrypt from the first byte (usually port 465); off for STARTTLS (usually 587). Picacho signs in once to check before saving.",
+                    t!("settings-tls-from-the-start"),
+                    t!("settings-on-for-servers-that-encrypt-from"),
                     "identity-tls".into(),
                     self.identity_tls(cx),
                     Action::ToggleIdentityTls,
@@ -1985,7 +2145,7 @@ impl MailApp {
                 .child(div().flex_1())
                 .child(self.button(
                     "identity-cancel",
-                    "Cancel",
+                    t!("settings-cancel"),
                     "",
                     Action::CancelIdentity,
                     false,
@@ -1995,9 +2155,9 @@ impl MailApp {
                     self.button(
                         "identity-save",
                         if edit.saving {
-                            "Checking…"
+                            t!("settings-checking")
                         } else {
-                            "Save Address"
+                            t!("settings-save-address")
                         },
                         "",
                         Action::SaveIdentity,
@@ -2023,18 +2183,22 @@ impl MailApp {
             )
             .debug_selector(|| "background".into());
         if cfg!(target_os = "ios") {
-            return page.child(self.section("Background")).child(self.toggle_row(
-                "Check for mail in the background",
-                "While Picacho isn't open, check for new mail from time to time and notify you of it, send scheduled mail, and bring back snoozed mail. iOS decides how often, by how you use Picacho, and only while Background App Refresh is on for it in Settings.",
-                background,
-            ));
+            return page
+                .child(self.section(t!("settings-background")))
+                .child(self.toggle_row(
+                    t!("settings-check-for-mail-in-the-background"),
+                    t!("settings-while-picacho-isnt-open-check-for"),
+                    background,
+                ));
         }
         if cfg!(target_os = "android") {
-            return page.child(self.section("Background")).child(self.toggle_row(
-                "Check for mail in the background",
-                "After Picacho is closed, keep checking for new mail and notify you of it, send scheduled mail, and bring back snoozed mail. Android shows an ongoing notification while Picacho does.",
-                background,
-            ));
+            return page
+                .child(self.section(t!("settings-background")))
+                .child(self.toggle_row(
+                    t!("settings-check-for-mail-in-the-background"),
+                    t!("settings-after-picacho-is-closed-keep-checking"),
+                    background,
+                ));
         }
         let tray = self
             .switch(
@@ -2044,15 +2208,15 @@ impl MailApp {
                 cx,
             )
             .debug_selector(|| "tray-icon".into());
-        page.child(self.section("Background"))
+        page.child(self.section(t!("settings-background")))
             .child(self.toggle_row(
-                "Keep running in the background",
-                "When you close Picacho's window, keep checking for new mail and notify you of it, send scheduled mail, and bring back snoozed mail. Open Picacho again or quit it from its icon in the tray.",
+                t!("settings-keep-running-in-the-background"),
+                t!("settings-when-you-close-picachos-window-keep"),
                 background,
             ))
             .child(self.toggle_row(
-                "Show tray icon while open",
-                "Also show Picacho's tray icon while its window is open. It always shows while Picacho runs in the background.",
+                t!("settings-show-tray-icon-while-open"),
+                t!("settings-also-show-picachos-tray-icon-while"),
                 tray,
             ))
     }
@@ -2082,7 +2246,7 @@ impl MailApp {
             cx.defer(move |cx| {
                 let bounds = Bounds::centered(None, size(px(900.), px(680.)), cx);
                 let opened = cx.open_window(
-                    window::detached_options("Settings".into(), bounds),
+                    window::detached_options(t!("settings-settings").into(), bounds),
                     move |window, cx| {
                         let view = cx.new(|cx| SettingsWindow::new(app, colors, cx));
                         { let focus = view.read(cx).focus.clone(); focus.focus(window, cx); }
@@ -2157,9 +2321,9 @@ impl MailApp {
             .child(self.button(
                 "settings-maximize",
                 if maximized {
-                    "@Exit full size"
+                    t!("settings-exit-full-size")
                 } else {
-                    "@Full size"
+                    t!("settings-full-size-2")
                 },
                 if maximized { "shrink" } else { "expand" },
                 Action::PlaceSettings(if maximized {
@@ -2172,7 +2336,7 @@ impl MailApp {
             ))
             .child(self.button(
                 "settings-popout",
-                "@Open in new window",
+                t!("settings-open-in-new-window"),
                 "popout",
                 Action::PlaceSettings(SettingsPlace::Window),
                 false,
@@ -2239,7 +2403,7 @@ impl MailApp {
                             )
                             .child(self.button(
                                 format!("{id}-close"),
-                                "@Close dialog",
+                                t!("settings-close-dialog"),
                                 "close",
                                 close,
                                 false,
@@ -2281,7 +2445,7 @@ impl MailApp {
         self.sheet_over_settings(
             Sheet {
                 id: "presets-sheet",
-                title: "Choose a Picture",
+                title: t!("settings-choose-a-picture"),
                 width: 540.,
                 close: Action::ClosePresets,
             },
@@ -2340,7 +2504,7 @@ fn close_settings_window(app: &WeakEntity<MailApp>, w: &mut Window, cx: &mut App
 impl Render for SettingsWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let c = self.colors;
-        super::window::set_title(window, "Settings");
+        super::window::set_title(window, t!("settings-settings"));
         if super::applock::covered(cx) {
             return super::applock::cover(c, window);
         }
@@ -2373,7 +2537,7 @@ impl Render for SettingsWindow {
                 .hover(move |s| s.bg(rgb(c.raised)))
                 .active(|s| s.opacity(0.75))
                 .child(icon_el("shrink", 15., c.muted))
-                .tooltip(|w, cx| Tooltip::new("Move into main window").build(w, cx))
+                .tooltip(|w, cx| Tooltip::new(t!("settings-move-into-main-window")).build(w, cx))
                 .on_click(cx.listener(|this, _, w, cx| {
                     this.act(Action::PlaceSettings(SettingsPlace::Dialog), w, cx)
                 })),
@@ -2386,7 +2550,7 @@ impl Render for SettingsWindow {
                     .truncate()
                     .text_size(px(13.))
                     .font_weight(FontWeight::SEMIBOLD)
-                    .child("Settings"),
+                    .child(t!("settings-settings")),
             )
             .child(dock);
         let app = self.app.downgrade();

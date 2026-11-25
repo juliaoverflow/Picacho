@@ -18,7 +18,7 @@ struct AccountOption: AppEntity {
         DisplayRepresentation(title: "\(name)")
     }
 
-    static let all = AccountOption(id: "", name: "All Accounts")
+    static let all = AccountOption(id: "", name: String(localized: "All Accounts", bundle: .picacho, comment: "The choice of every account in a widget's settings"))
 }
 
 struct AccountOptionQuery: EntityQuery {
@@ -41,7 +41,7 @@ struct AccountOptionQuery: EntityQuery {
         for account in snap.accounts {
             let label = account.name.isEmpty || account.name == account.email
                 ? account.email
-                : "\(account.name) (\(account.email))"
+                : String(localized: "\(account.name) (\(account.email))", bundle: .picacho, comment: "An account in a widget's settings: its name, then its address")
             options.append(AccountOption(id: account.id, name: label))
         }
         return options
@@ -217,7 +217,10 @@ struct InboxWidgetView: View {
         let accent = snap.accent(for: colorScheme)
         let unread = snap.unread(for: entry.accountId)
         let messages = snap.filteredMessages(accountId: entry.accountId, unreadOnly: entry.unreadOnly, limit: rowLimit)
-        let title = entry.unreadOnly ? "\(snap.label(for: entry.accountId)) · Unread" : snap.label(for: entry.accountId)
+        let label = snap.label(for: entry.accountId)
+        let title = entry.unreadOnly
+            ? String(localized: "\(label) · Unread", bundle: .picacho, comment: "The Inbox widget's title when it shows only unread messages: the account, or All Inboxes")
+            : label
 
         VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 6) {
@@ -275,8 +278,10 @@ struct InboxWidgetView: View {
     }
 
     private func emptyText(snap: WidgetSnapshot) -> String {
-        if snap.accounts.isEmpty { return "Open Picacho to sign in" }
-        return entry.unreadOnly ? "All caught up" : "No messages in Inbox"
+        if snap.accounts.isEmpty { return String(localized: "Open Picacho to sign in", bundle: .picacho) }
+        return entry.unreadOnly
+            ? String(localized: "All caught up", bundle: .picacho, comment: "No unread messages")
+            : String(localized: "No messages in Inbox", bundle: .picacho)
     }
 
     private func messageRow(_ msg: WidgetMessage, accent: Color, compact: Bool) -> some View {
@@ -287,7 +292,7 @@ struct InboxWidgetView: View {
                 .padding(.top, 5)
             VStack(alignment: .leading, spacing: 1) {
                 HStack(spacing: 4) {
-                    Text(msg.sender.isEmpty ? "(Unknown sender)" : msg.sender)
+                    Text(msg.sender.isEmpty ? String(localized: "(Unknown sender)", bundle: .picacho) : msg.sender)
                         .privacySensitive()
                         .font(.system(size: 12, weight: msg.unread ? .semibold : .regular))
                         .foregroundStyle(msg.unread ? .primary : .secondary)
@@ -309,7 +314,7 @@ struct InboxWidgetView: View {
                         .font(.system(size: 10))
                         .foregroundStyle(.secondary)
                 }
-                Text(msg.subject.isEmpty ? "(No subject)" : msg.subject)
+                Text(msg.subject.isEmpty ? String(localized: "(No subject)", bundle: .picacho) : msg.subject)
                     .privacySensitive()
                     .font(.system(size: 12, weight: msg.unread ? .medium : .regular))
                     .foregroundStyle(msg.unread ? .primary : .secondary)
@@ -380,7 +385,9 @@ struct UnreadWidgetView: View {
                 HStack(spacing: 4) {
                     Image(systemName: "envelope.fill")
                         .font(.system(size: 11, weight: .semibold))
-                    Text(unread == 0 ? "All caught up" : "\(unread) unread")
+                    Text(unread == 0
+                         ? String(localized: "All caught up", bundle: .picacho, comment: "No unread messages")
+                         : String(localized: "\(unread) unread", bundle: .picacho, comment: "How many unread messages there are"))
                         .font(.system(size: 12, weight: .semibold))
                 }
                 if let latest {
@@ -388,7 +395,7 @@ struct UnreadWidgetView: View {
                         .privacySensitive()
                         .font(.system(size: 11, weight: .medium))
                         .lineLimit(1)
-                    Text(latest.subject.isEmpty ? "(No subject)" : latest.subject)
+                    Text(latest.subject.isEmpty ? String(localized: "(No subject)", bundle: .picacho) : latest.subject)
                         .privacySensitive()
                         .font(.system(size: 11))
                         .foregroundStyle(.secondary)
@@ -433,7 +440,9 @@ struct UnreadWidgetView: View {
                 Text(unread > 999 ? "999+" : "\(unread)")
                     .font(.system(size: 32, weight: .bold, design: .rounded))
                     .foregroundStyle(unread > 0 ? accent : .primary)
-                Text(unread == 0 ? "Caught up" : "unread")
+                Text(unread == 0
+                     ? String(localized: "Caught up", bundle: .picacho, comment: "Under an unread count of 0, shown larger beside it")
+                     : String(localized: "unread", bundle: .picacho, comment: "Beside the unread count, which is shown larger"))
                     .font(.system(size: 12))
                     .foregroundStyle(.secondary)
             }
@@ -443,7 +452,7 @@ struct UnreadWidgetView: View {
                     .privacySensitive()
                     .font(.system(size: 11, weight: .semibold))
                     .lineLimit(1)
-                Text(latest.subject.isEmpty ? "(No subject)" : latest.subject)
+                Text(latest.subject.isEmpty ? String(localized: "(No subject)", bundle: .picacho) : latest.subject)
                     .privacySensitive()
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
@@ -508,7 +517,7 @@ struct CalendarWidgetView: View {
                 HStack(spacing: 4) {
                     Image(systemName: "calendar")
                         .font(.system(size: 11, weight: .semibold))
-                    Text(entry.date.formatted(.dateTime.weekday(.abbreviated).month(.abbreviated).day()))
+                    Text(entry.date.formatted(.dateTime.weekday(.abbreviated).month(.abbreviated).day().locale(PicachoLanguage.locale)))
                         .font(.system(size: 11, weight: .semibold))
                 }
                 if let first = events.first {
@@ -521,7 +530,7 @@ struct CalendarWidgetView: View {
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
                 } else {
-                    Text("No upcoming events")
+                    Text(String(localized: "No upcoming events", bundle: .picacho))
                         .font(.system(size: 11))
                         .foregroundStyle(.secondary)
                 }
@@ -542,10 +551,10 @@ struct CalendarWidgetView: View {
                 Image(systemName: "calendar")
                     .font(.system(size: 13, weight: .semibold))
                     .foregroundStyle(accent)
-                Text("Calendar")
+                Text(String(localized: "Calendar", bundle: .picacho))
                     .font(.system(size: 14, weight: .semibold))
                 Spacer(minLength: 4)
-                Text(entry.date.formatted(.dateTime.weekday(.abbreviated).month(.abbreviated).day()))
+                Text(entry.date.formatted(.dateTime.weekday(.abbreviated).month(.abbreviated).day().locale(PicachoLanguage.locale)))
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
             }
@@ -554,7 +563,9 @@ struct CalendarWidgetView: View {
 
             if events.isEmpty {
                 Spacer()
-                Text(snap.calendarConnected ? "No upcoming events" : "Connect a calendar in Settings")
+                Text(snap.calendarConnected
+                     ? String(localized: "No upcoming events", bundle: .picacho)
+                     : String(localized: "Connect a calendar in Settings", bundle: .picacho))
                     .font(.footnote)
                     .foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, alignment: .center)
@@ -669,7 +680,9 @@ struct PackagesWidgetView: View {
         let matching = snap.filteredPackages(accountId: entry.accountId, limit: Int.max)
         let total = snap.packageTotal(accountId: entry.accountId)
         let hasAccountFilter = !(entry.accountId ?? "").isEmpty
-        let title = hasAccountFilter ? "Packages · \(snap.accountLabel(for: entry.accountId))" : "Packages"
+        let title = hasAccountFilter
+            ? String(localized: "Packages · \(snap.accountLabel(for: entry.accountId))", bundle: .picacho, comment: "The Packages widget's title when it shows one account's")
+            : String(localized: "Packages", bundle: .picacho)
         let showAccount = !hasAccountFilter && snap.accounts.count > 1
 
         VStack(alignment: .leading, spacing: 6) {
@@ -691,7 +704,7 @@ struct PackagesWidgetView: View {
 
             if matching.isEmpty {
                 Spacer()
-                Text("No recent packages")
+                Text(String(localized: "No recent packages", bundle: .picacho))
                     .font(.footnote)
                     .foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, alignment: .center)
@@ -724,7 +737,7 @@ struct PackagesWidgetView: View {
             var parts = [pkg.status]
             if !pkg.carrier.isEmpty { parts.append(pkg.carrier) }
             if !pkg.expected.isEmpty {
-                parts.append("Expected \(pkg.expected)")
+                parts.append(String(localized: "Expected \(pkg.expected)", bundle: .picacho, comment: "When a package should arrive, for example Expected Nov 26"))
             } else {
                 let d = WidgetFormatting.messageDate(pkg.updated)
                 if !d.isEmpty { parts.append(d) }
@@ -740,7 +753,7 @@ struct PackagesWidgetView: View {
                 .foregroundStyle(pkg.delivered ? .secondary : accent)
                 .padding(.top, 2)
             VStack(alignment: .leading, spacing: 2) {
-                Text(pkg.title.isEmpty ? "Package" : pkg.title)
+                Text(pkg.title.isEmpty ? String(localized: "Package", bundle: .picacho, comment: "Stands in for a package without a name") : pkg.title)
                     .privacySensitive()
                     .font(.system(size: 12, weight: .semibold))
                     .foregroundStyle(.primary)
@@ -776,7 +789,7 @@ struct ViewAllLabel: View {
     let link: URL
 
     var body: some View {
-        let label = Text("View all \(total)")
+        let label = Text(String(localized: "View all \(total)", bundle: .picacho, comment: "Opens the whole list; the number is how many there are"))
             .font(.system(size: 11, weight: .semibold))
             .foregroundStyle(accent)
             .lineLimit(1)
@@ -820,7 +833,9 @@ struct ReceiptsWidgetView: View {
         let matching = snap.filteredReceipts(accountId: entry.accountId, limit: Int.max)
         let total = snap.receiptTotal(accountId: entry.accountId)
         let hasAccountFilter = !(entry.accountId ?? "").isEmpty
-        let title = hasAccountFilter ? "Receipts · \(snap.accountLabel(for: entry.accountId))" : "Receipts"
+        let title = hasAccountFilter
+            ? String(localized: "Receipts · \(snap.accountLabel(for: entry.accountId))", bundle: .picacho, comment: "The Receipts widget's title when it shows one account's")
+            : String(localized: "Receipts", bundle: .picacho)
         let showAccount = !hasAccountFilter && snap.accounts.count > 1
 
         VStack(alignment: .leading, spacing: 6) {
@@ -842,7 +857,7 @@ struct ReceiptsWidgetView: View {
 
             if matching.isEmpty {
                 Spacer()
-                Text("No recent receipts")
+                Text(String(localized: "No recent receipts", bundle: .picacho))
                     .font(.footnote)
                     .foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, alignment: .center)
@@ -873,7 +888,7 @@ struct ReceiptsWidgetView: View {
     private func receiptRow(_ rcpt: WidgetReceipt, accent: Color, compact: Bool, showAccount: Bool) -> some View {
         let subtitle: String = {
             var parts: [String] = []
-            if !compact && !rcpt.order.isEmpty { parts.append("Order \(rcpt.order)") }
+            if !compact && !rcpt.order.isEmpty { parts.append(String(localized: "Order \(rcpt.order)", bundle: .picacho, comment: "A receipt's order number")) }
             let d = WidgetFormatting.messageDate(rcpt.updated > 0 ? rcpt.updated : rcpt.date)
             if !d.isEmpty { parts.append(d) }
             if showAccount && !rcpt.accountLabel.isEmpty {
@@ -884,13 +899,13 @@ struct ReceiptsWidgetView: View {
         return HStack(alignment: .center, spacing: 6) {
             VStack(alignment: .leading, spacing: 1) {
                 HStack(spacing: 4) {
-                    Text(rcpt.merchant.isEmpty ? "Receipt" : rcpt.merchant)
+                    Text(rcpt.merchant.isEmpty ? String(localized: "Receipt", bundle: .picacho, comment: "Stands in for a receipt without a shop name") : rcpt.merchant)
                         .privacySensitive()
                         .font(.system(size: 12, weight: .semibold))
                         .foregroundStyle(.primary)
                         .lineLimit(1)
                     if rcpt.refund && !compact {
-                        Text("Refund")
+                        Text(String(localized: "Refund", bundle: .picacho))
                             .font(.system(size: 9, weight: .semibold))
                             .foregroundStyle(accent)
                     }

@@ -56,7 +56,7 @@ impl Backend {
             .accounts()?
             .into_iter()
             .find(|a| a.id == id)
-            .context("The mail account your calendars or contacts use was removed. Choose another in Settings.")?;
+            .with_context(|| t!("manage-dav-accounts-the-mail-account-your-calendars-or"))?;
         let s = self.credentials(&a)?;
         Ok(if a.oauth { s.access_token } else { s.password })
     }
@@ -64,7 +64,7 @@ impl Backend {
     /// The server calendars would use with `a` as their provider: where it
     /// is and how to sign in.
     fn mail_caldav(&self, a: &Account) -> Result<caldav::Server> {
-        let kind = MailProvider::of(a).context("This account's provider doesn't offer calendars to other apps.")?;
+        let kind = MailProvider::of(a).with_context(|| t!("manage-dav-accounts-this-accounts-provider-doesnt-offer-calendars"))?;
         Ok(match kind {
             MailProvider::Jmap => bail!("JMAP calendars are set up with connect_jmap_calendar."),
             MailProvider::Google => caldav::Server {
@@ -85,7 +85,7 @@ impl Backend {
 
     /// As `mail_caldav`, for contacts.
     fn mail_carddav(&self, a: &Account) -> Result<carddav::Server> {
-        let kind = MailProvider::of(a).context("This account's provider doesn't offer contacts to other apps.")?;
+        let kind = MailProvider::of(a).with_context(|| t!("manage-dav-accounts-this-accounts-provider-doesnt-offer-contacts"))?;
         Ok(match kind {
             MailProvider::Jmap => bail!("JMAP contacts are set up with connect_jmap_contacts."),
             MailProvider::Google => carddav::Server {
@@ -184,7 +184,7 @@ fn mail_domain(a: &Account) -> Result<String> {
         .rsplit_once('@')
         .map(|(_, d)| d.trim())
         .filter(|d| !d.is_empty())
-        .context("This account's address has no domain to find a server by.")?;
+        .with_context(|| t!("manage-dav-accounts-this-accounts-address-has-no-domain"))?;
     Ok(domain.to_owned())
 }
 

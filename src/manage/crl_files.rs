@@ -98,8 +98,8 @@ impl Backend {
     /// Adds the revocation lists in a file (PEM or DER). Returns how many
     /// it held; one already added counts but is kept once.
     pub fn add_crl_file(&self, data: &[u8]) -> Result<usize> {
-        let crls = parse(data).context("That isn't a certificate revocation list (.crl or .pem).")?;
-        ensure!(!crls.is_empty(), "That isn't a certificate revocation list (.crl or .pem).");
+        let crls = parse(data).with_context(|| t!("manage-crl-files-that-isnt-a-certificate-revocation-list"))?;
+        ensure!(!crls.is_empty(), t!("manage-crl-files-that-isnt-a-certificate-revocation-list"));
         let folder = self.crl_folder();
         std::fs::create_dir_all(&folder)?;
         for crl in &crls {
@@ -142,7 +142,7 @@ impl Backend {
                 i.issued(&cert) == openssl::x509::X509VerifyResult::OK && i.to_der().ok().as_deref() != Some(der)
             });
             let Some(issuer) = issuer else {
-                unknown.push(format!("{who}: its issuer's certificate isn't here"));
+                unknown.push(t!("manage-crl-files-its-issuers-certificate-isnt-here", who = who));
                 continue;
             };
             match status(&cert, issuer, &cache, Some(fetcher), now) {
@@ -155,18 +155,18 @@ impl Backend {
             if let Some(v) = self.smime_verdicts.lock().unwrap().get_mut(id) {
                 v.signature = crate::manage::smime::Signature::Revoked(first.clone());
             }
-            return Some((format!("Revoked: {}'s certificate has been revoked.", revoked.join(", ")), false));
+            return Some((t!("manage-crl-files-revoked-s-certificate-has-been-revoked", who = revoked.join(", ")), false));
         }
         if !unknown.is_empty() {
-            return Some((format!("Revocation couldn't be checked ({}).", unknown.join("; ")), false));
+            return Some((t!("manage-crl-files-revocation-couldnt-be-checked", reasons = unknown.join("; ")), false));
         }
-        Some(("Not revoked: checked with the certificate's issuer.".into(), true))
+        Some((t!("manage-crl-files-not-revoked-checked-with-the-certificates").into(), true))
     }
     /// Removes the list with this id (see `CrlInfo::id`).
     pub fn remove_crl_file(&self, id: &str) -> Result<()> {
         ensure!(
             !id.is_empty() && id.chars().all(|c| c.is_ascii_hexdigit()),
-            "There's no such revocation list."
+            t!("manage-crl-files-theres-no-such-revocation-list")
         );
         let path = self.crl_folder().join(format!("{id}.pem"));
         if path.exists() {

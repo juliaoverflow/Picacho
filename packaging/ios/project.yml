@@ -36,6 +36,9 @@ targets:
       # What the Share extension hands over.
       - Shares.swift
       - Assets.xcassets
+      # The permission prompts' text (Info.plist's usage descriptions), by
+      # language. The extensions' text is in their folders' Localizable.xcstrings.
+      - InfoPlist.xcstrings
     dependencies:
       - target: PicachoWidgets
         embed: true
@@ -55,6 +58,10 @@ targets:
         CFBundleDisplayName: Picacho
         CFBundleShortVersionString: $(MARKETING_VERSION)
         CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        # The languages Picacho has (locales/), so iOS offers them in its
+        # per-app language setting. A test (src/i18n/tests.rs) keeps this
+        # list the same as Picacho's.
+        CFBundleLocalizations: [en]
         LSRequiresIPhoneOS: true
         ITSAppUsesNonExemptEncryption: false
         UILaunchScreen:
@@ -164,6 +171,8 @@ targets:
       - path: ShareExtension
         excludes:
           - "*.entitlements"
+      # The language Picacho shows, shared with the widgets.
+      - Shared/PicachoLanguage.swift
     entitlements:
       path: ShareExtension/PicachoShare.entitlements
       properties:
@@ -210,6 +219,8 @@ targets:
       - path: Widgets
         excludes:
           - "*.entitlements"
+      # The language Picacho shows, shared with the Share extension.
+      - Shared/PicachoLanguage.swift
     entitlements:
       path: Widgets/PicachoWidgets.entitlements
       properties:

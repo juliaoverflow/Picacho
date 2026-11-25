@@ -154,8 +154,14 @@ unsafe extern "C" {
     /// BackgroundRefresh.swift: asks for background app refresh, or stops.
     fn picacho_ios_set_background(on: bool);
     /// Verify.swift: shows Proton's verification page at `url` for request
-    /// `id`; false if it couldn't be shown.
-    fn picacho_ios_verify_start(id: i32, url: *const u8, len: usize) -> bool;
+    /// `id`, under `title`; false if it couldn't be shown.
+    fn picacho_ios_verify_start(
+        id: i32,
+        url: *const u8,
+        len: usize,
+        title: *const u8,
+        title_len: usize,
+    ) -> bool;
     /// Verify.swift: closes request `id`'s page, if it still shows.
     fn picacho_ios_verify_close(id: i32);
 }
@@ -188,8 +194,9 @@ pub fn notify(key: &str, title: &str, subtitle: &str, body: &str, target: &str, 
     unsafe { picacho_ios_notify(json.as_ptr(), json.len()) };
 }
 
-/// Tells the Swift side which buttons each category of notification has.
-fn register_categories() {
+/// Tells the Swift side which buttons each category of notification has
+/// (at launch, and again when the language changes: the buttons' words).
+pub fn register_categories() {
     let categories: Vec<_> = display::notify::categories()
         .iter()
         .map(|(id, buttons)| {
@@ -224,12 +231,12 @@ pub fn verify(url: &str, cancel: &AtomicBool) -> anyhow::Result<Option<(String, 
     use requests::{Request, Waited};
     let request = Request::new();
     let id = request.id();
-    // Safety: `url` is valid for the call; Swift copies it.
-    let shown = unsafe { picacho_ios_verify_start(id, url.as_ptr(), url.len()) };
-    anyhow::ensure!(
-        shown,
-        "Proton wants to check that it's you, but its check couldn't be shown."
-    );
+    let title = t!("ios-verify-that-its-you");
+    // Safety: `url` and `title` are valid for the call; Swift copies them.
+    let shown = unsafe {
+        picacho_ios_verify_start(id, url.as_ptr(), url.len(), title.as_ptr(), title.len())
+    };
+    anyhow::ensure!(shown, t!("ios-proton-wants-to-check-that-its"));
     let deadline = std::time::Instant::now() + Duration::from_secs(30 * 60);
     let outcome = loop {
         match request.next(cancel, deadline) {
@@ -241,7 +248,7 @@ pub fn verify(url: &str, cancel: &AtomicBool) -> anyhow::Result<Option<(String, 
                 }
             }
             Waited::Answer(None) | Waited::TimedOut => break Ok(None),
-            Waited::Cancelled => break Err(anyhow::anyhow!("Sign-in cancelled.")),
+            Waited::Cancelled => break Err(anyhow::anyhow!(t!("ios-sign-in-cancelled"))),
         }
     };
     // Safety: no pointers.

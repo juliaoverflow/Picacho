@@ -164,7 +164,7 @@ pub fn act(backend: &Backend, target: &Target, change: Change) -> anyhow::Result
         .accounts()?
         .into_iter()
         .find(|a| a.id == target.account)
-        .ok_or_else(|| anyhow::anyhow!("The account is gone"))?;
+        .ok_or_else(|| anyhow::anyhow!(t!("notify-the-account-is-gone")))?;
     let mails: Vec<_> = target
         .message_ids()
         .iter()
@@ -212,24 +212,28 @@ pub fn clicked(target: &str) {
 
 /// Buttons a new message's notification offers: their action keys and
 /// labels, for one message and for several.
-const QUICK_ONE: [(&str, &str); 4] = [
-    ("read", "Mark as Read"),
-    ("archive", "Archive"),
-    ("trash", "Delete"),
-    ("reply", "Reply"),
-];
-const QUICK_SEVERAL: [(&str, &str); 3] = [
-    ("read", "Mark All as Read"),
-    ("archive", "Archive All"),
-    ("trash", "Delete All"),
-];
+fn quick_one() -> [(&'static str, &'static str); 4] {
+    [
+        ("read", t!("notify-mark-as-read")),
+        ("archive", t!("notify-archive")),
+        ("trash", t!("notify-delete")),
+        ("reply", t!("notify-reply")),
+    ]
+}
+fn quick_several() -> [(&'static str, &'static str); 3] {
+    [
+        ("read", t!("notify-mark-all-as-read")),
+        ("archive", t!("notify-archive-all")),
+        ("trash", t!("notify-delete-all")),
+    ]
+}
 /// iOS's notification categories: each names the buttons its
 /// notifications have (registered once, `ios::register_categories`).
 #[cfg(target_os = "ios")]
-pub fn categories() -> [(&'static str, &'static [(&'static str, &'static str)]); 2] {
+pub fn categories() -> [(&'static str, Vec<(&'static str, &'static str)>); 2] {
     [
-        (CATEGORY_ONE, &QUICK_ONE),
-        (CATEGORY_SEVERAL, &QUICK_SEVERAL),
+        (CATEGORY_ONE, quick_one().to_vec()),
+        (CATEGORY_SEVERAL, quick_several().to_vec()),
     ]
 }
 #[cfg(target_os = "ios")]
@@ -250,7 +254,7 @@ fn category(buttons: &[(&str, &str)]) -> &'static str {
 /// Whether `action` is one of the buttons.
 #[cfg_attr(not(any(target_os = "linux", target_os = "freebsd", windows, target_os = "macos")), allow(dead_code))]
 fn is_quick(action: &str) -> bool {
-    QUICK_ONE.iter().any(|(k, _)| *k == action)
+    quick_one().iter().any(|(k, _)| *k == action)
 }
 /// Notification buttons pressed, until the window takes them: the
 /// notification's target and the button's key.
@@ -312,16 +316,12 @@ pub fn new_mail(
     }
     // Settings → Privacy → Hide mail outside Picacho: how many, not who or what.
     let (title, body) = if crate::manage::applock::hiding() {
-        if count == 1 {
-            ("New message".to_owned(), String::new())
-        } else {
-            (format!("{count} new messages"), String::new())
-        }
+        (t!("notify-new-messages", count = count), String::new())
     } else if count == 1 {
         (latest.0.to_owned(), latest.1.to_owned())
     } else {
         (
-            format!("{count} new messages"),
+            t!("notify-new-messages", count = count),
             format!("{} — {}", latest.0, latest.1),
         )
     };
@@ -334,7 +334,7 @@ pub fn new_mail(
             .map(|m| (*m).to_owned())
             .collect();
     }
-    let buttons: &[(&str, &str)] = if messages.len() > 1 { &QUICK_SEVERAL } else { &QUICK_ONE };
+    let buttons: &[(&str, &str)] = if messages.len() > 1 { &quick_several() } else { &quick_one() };
     show_with(
         format!("mail:{account}"),
         title,
@@ -396,15 +396,15 @@ pub fn announce(announcement: crate::manage::background::Announcement<'_>) {
         } => {
             let hiding = crate::manage::applock::hiding();
             let body = if count == 1 && hiding {
-                "A snoozed message is back in the inbox".to_owned()
+                t!("notify-a-snoozed-message-is-back-in").to_owned()
             } else if count == 1 {
                 format!("{sender} — {}", or_untitled(subject))
             } else {
-                format!("{count} snoozed messages are back in the inbox")
+                t!("notify-snoozed-messages-are-back-in-the", count = count)
             };
             show(
                 format!("snooze:{account}"),
-                "Back from snooze".to_owned(),
+                t!("notify-back-from-snooze").to_owned(),
                 account.to_owned(),
                 body,
                 // One message opens; several, the inbox they're back in.
@@ -422,12 +422,12 @@ pub fn announce(announcement: crate::manage::background::Announcement<'_>) {
             subject,
         } => show(
             format!("sent:{account}"),
-            "Scheduled message sent".to_owned(),
+            t!("notify-scheduled-message-sent").to_owned(),
             account.to_owned(),
             if crate::manage::applock::hiding() {
                 String::new()
             } else {
-                format!("{} — to {to}", or_untitled(subject))
+                t!("notify-to", subject = or_untitled(subject), to = to)
             },
             Some(Target::new(account_id, Folder::Sent, None)),
         ),
@@ -439,12 +439,12 @@ pub fn announce(announcement: crate::manage::background::Announcement<'_>) {
             error,
         } => show(
             format!("unsent:{draft}"),
-            "A scheduled message wasn't sent".to_owned(),
+            t!("notify-a-scheduled-message-wasnt-sent").to_owned(),
             account.to_owned(),
             if crate::manage::applock::hiding() {
-                "It's in Drafts.".to_owned()
+                t!("notify-its-in-drafts").to_owned()
             } else {
-                format!("{}: {error} It's in Drafts.", or_untitled(subject))
+                t!("notify-its-in-drafts-2", subject = or_untitled(subject), error = error)
             },
             account_id.map(|id| Target::new(id, Folder::Drafts, None)),
         ),
@@ -453,7 +453,7 @@ pub fn announce(announcement: crate::manage::background::Announcement<'_>) {
 
 fn or_untitled(subject: &str) -> &str {
     if subject.trim().is_empty() {
-        "(No subject)"
+        t!("notify-no-subject")
     } else {
         subject
     }
@@ -477,8 +477,8 @@ pub fn reminder(uid: &str, title: &str, body: &str) {
     let hiding = crate::manage::applock::hiding();
     show(
         format!("reminder:{uid}"),
-        if hiding { "Upcoming event".to_owned() } else { title.to_owned() },
-        "Calendar".to_owned(),
+        if hiding { t!("notify-upcoming-event").to_owned() } else { title.to_owned() },
+        t!("notify-calendar").to_owned(),
         if hiding { String::new() } else { body.to_owned() },
         None,
     );
@@ -573,7 +573,7 @@ fn show_with(
         // Clicking the notification is its default action.
         #[cfg(any(target_os = "linux", target_os = "freebsd"))]
         if !target.is_empty() {
-            note.action("default", "Open");
+            note.action("default", t!("notify-open"));
         }
         // Buttons only where a press can be heard (`Waiting`).
         #[cfg(any(target_os = "linux", target_os = "freebsd", windows, target_os = "macos"))]
@@ -586,7 +586,7 @@ fn show_with(
         #[cfg(target_os = "macos")]
         if buttons.len() > 1 {
             use notify_rust::NsNotificationExt;
-            note.actions_label("Actions");
+            note.actions_label(t!("notify-actions"));
         }
         #[cfg(not(any(target_os = "linux", target_os = "freebsd", windows, target_os = "macos")))]
         let _ = buttons;
@@ -681,8 +681,8 @@ mod tests {
 
     #[test]
     fn categories_follow_the_buttons() {
-        assert_eq!(category(&QUICK_ONE), "mail-one");
-        assert_eq!(category(&QUICK_SEVERAL), "mail-several");
+        assert_eq!(category(&quick_one()), "mail-one");
+        assert_eq!(category(&quick_several()), "mail-several");
         assert_eq!(category(&[]), "");
     }
 

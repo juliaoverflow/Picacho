@@ -1,0 +1,82 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Text Android shows outside Picacho's own screens: notifications and their
+  channels, the Proton check screen, and the home screen widgets. The rest
+  of Picacho's text is in locales/ at the top of the repository.
+
+  To translate, copy this file to values-<language>/strings.xml (for
+  example values-de/strings.xml) and translate the text between the tags.
+  Keep %1$s, %2$s and %1$d (filled in by Picacho), and write \' for an apostrophe.
+-->
+<resources>
+    <!-- Notification channels, listed in Android's settings for Picacho -->
+    <string name="channel_mail">New mail</string>
+    <string name="channel_mail_description">New messages in your inboxes, and notices from your mail provider.</string>
+    <string name="channel_background">Checking for mail</string>
+    <string name="channel_background_description">Shown while Picacho checks for new mail in the background.</string>
+    <string name="channel_sign_in">Signing in</string>
+    <string name="channel_sign_in_description">Shown while you sign in to an account in the browser.</string>
+
+    <!-- Notifications -->
+    <string name="notification_checking">Checking for new mail</string>
+    <string name="notification_checking_text">Picacho lets you know when new mail arrives.</string>
+    <!-- Button: stop checking for mail in the background -->
+    <string name="notification_stop">Stop</string>
+    <string name="notification_signing_in">Signing in</string>
+    <string name="notification_signing_in_text">Finish signing in in the browser, then come back to Picacho.</string>
+
+    <!-- Title of the screen where Proton checks that it's you (a CAPTCHA) -->
+    <string name="verify_title">Verify that it\'s you</string>
+
+    <!-- Home screen widgets -->
+    <string name="widget_inbox_label">Inbox</string>
+    <string name="widget_inbox_description">Recent inbox messages, unread count, and quick compose</string>
+    <string name="widget_unread_label">Unread Mail</string>
+    <string name="widget_unread_description">Unread count, latest message, and quick compose</string>
+    <string name="widget_calendar_label">Calendar</string>
+    <string name="widget_calendar_description">Upcoming calendar events</string>
+    <string name="widget_packages_label">Packages</string>
+    <string name="widget_packages_description">Your recent tracked packages and delivery progress</string>
+    <string name="widget_receipts_label">Receipts</string>
+    <string name="widget_receipts_description">Your recent receipts and refunds</string>
+    <!-- Link to the full list. %1$d: how many there are -->
+    <plurals name="widget_view_all">
+        <item quantity="one">View all %1$d</item>
+        <item quantity="other">View all %1$d</item>
+    </plurals>
+    <string name="widget_all_inboxes">All Inboxes</string>
+    <string name="widget_all_accounts">All Accounts</string>
+    <string name="widget_inbox_title">Inbox</string>
+    <string name="widget_unread_title">Unread</string>
+    <string name="widget_compose">Compose</string>
+    <string name="widget_refresh">Refresh</string>
+    <string name="widget_empty_inbox">No messages in Inbox</string>
+    <string name="widget_empty_unread">All caught up</string>
+    <string name="widget_empty_accounts">Open Picacho to add an account</string>
+    <string name="widget_empty_calendar">No upcoming events</string>
+    <string name="widget_no_calendar">Connect a calendar in Settings</string>
+    <string name="widget_empty_packages">No recent packages</string>
+    <string name="widget_empty_receipts">No recent receipts</string>
+    <string name="widget_refund_tag">Refund</string>
+    <string name="widget_config_title">Widget settings</string>
+    <string name="widget_config_account">Account</string>
+    <string name="widget_config_unread_only">Show unread messages only</string>
+    <string name="widget_config_done">Save</string>
+    <string name="widget_config_cancel">Cancel</string>
+    <string name="widget_unknown_sender">(Unknown sender)</string>
+    <string name="widget_no_subject">(No subject)</string>
+    <!-- Stands in for a package without a name -->
+    <string name="widget_package">Package</string>
+    <!-- Stands in for a receipt without a shop name -->
+    <string name="widget_receipt">Receipt</string>
+    <!-- %1$s: when the package should arrive, for example "Nov 26" -->
+    <string name="widget_expected">Expected %1$s</string>
+    <!-- %1$s: the order number -->
+    <string name="widget_order">Order %1$s</string>
+    <string name="widget_today">Today</string>
+    <string name="widget_tomorrow">Tomorrow</string>
+    <!-- An event that lasts all day, shown after its day -->
+    <string name="widget_all_day">All day</string>
+    <!-- An account in the widget settings. %1$s: its name; %2$s: its address -->
+    <string name="widget_config_account_name">%1$s (%2$s)</string>
+</resources>

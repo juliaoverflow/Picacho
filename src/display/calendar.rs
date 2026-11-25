@@ -18,12 +18,13 @@ pub(super) fn event_when(e: &Event) -> String {
                 .unwrap_or_default()
                 .with_timezone(&zone)
         };
-        text.push_str(&format!(
-            " ({} – {} in {})",
-            at(e.start).format("%H:%M"),
-            at(e.end).format("%H:%M"),
-            zone.name()
-        ));
+        text = t!(
+            "calendar-when-in-its-zone",
+            when = text,
+            start = at(e.start).local(t!("dates-calendar-time")),
+            end = at(e.end).local(t!("dates-calendar-time")),
+            zone = zone.name()
+        );
     }
     text
 }
@@ -38,25 +39,21 @@ fn event_when_here(e: &Event) -> String {
     if e.all_day {
         let last = local(e.end - 1);
         if last.date_naive() > start.date_naive() {
-            format!(
-                "{} – {}, all day",
-                start.format("%a, %b %-d"),
-                last.format("%a, %b %-d")
-            )
+            t!("calendar-all-day", first = start.local(t!("dates-weekday-month-day")), last = last.local(t!("dates-weekday-month-day")))
         } else {
-            format!("{}, all day", start.format("%a, %b %-d %Y"))
+            t!("calendar-all-day-2", day = start.local(t!("dates-weekday-month-day-year")))
         }
     } else if start.date_naive() == end.date_naive() {
         format!(
             "{} – {}",
-            start.format("%a, %b %-d %Y, %H:%M"),
-            end.format("%H:%M")
+            start.local(t!("dates-weekday-month-day-year-time")),
+            end.local(t!("dates-calendar-time"))
         )
     } else {
         format!(
             "{} – {}",
-            start.format("%a, %b %-d, %H:%M"),
-            end.format("%a, %b %-d, %H:%M")
+            start.local(t!("dates-weekday-month-day-time")),
+            end.local(t!("dates-weekday-month-day-time"))
         )
     }
 }
@@ -257,15 +254,15 @@ impl MailApp {
             .then(|| self.backend.invitation_changed(e))
             .flatten();
         let title = match inv.method.as_str() {
-            "CANCEL" => "Cancelled",
-            "REPLY" => "Answer to your invitation",
-            "COUNTER" => "New time proposed",
-            "DECLINECOUNTER" => "Your proposed time wasn't taken",
-            "REFRESH" => "A guest asks for the latest version",
-            "ADD" => "More times added",
-            "PUBLISH" | "" => "Event",
-            _ if changed.is_some() => "Updated invitation",
-            _ => "Invitation",
+            "CANCEL" => t!("calendar-cancelled"),
+            "REPLY" => t!("calendar-answer-to-your-invitation"),
+            "COUNTER" => t!("calendar-new-time-proposed"),
+            "DECLINECOUNTER" => t!("calendar-your-proposed-time-wasnt-taken"),
+            "REFRESH" => t!("calendar-a-guest-asks-for-the-latest"),
+            "ADD" => t!("calendar-more-times-added"),
+            "PUBLISH" | "" => t!("calendar-event"),
+            _ if changed.is_some() => t!("calendar-updated-invitation"),
+            _ => t!("calendar-invitation"),
         };
         let row = |label: &'static str, text: String| {
             div()
@@ -301,17 +298,17 @@ impl MailApp {
                 let role = ical::extra_param(&at.extra, "ROLE").unwrap_or_default();
                 let kind = ical::extra_param(&at.extra, "CUTYPE").unwrap_or_default();
                 let name = if role.eq_ignore_ascii_case("OPT-PARTICIPANT") {
-                    format!("{name}, optional")
+                    t!("calendar-optional", name = name)
                 } else if kind.eq_ignore_ascii_case("ROOM") || kind.eq_ignore_ascii_case("RESOURCE") {
                     format!("{name}, {}", kind.to_ascii_lowercase())
                 } else {
                     name
                 };
                 match at.status {
-                    Some(PartStat::Accepted) => format!("{name} (yes)"),
-                    Some(PartStat::Declined) => format!("{name} (no)"),
-                    Some(PartStat::Tentative) => format!("{name} (maybe)"),
-                    Some(PartStat::Delegated) => format!("{name} (delegated)"),
+                    Some(PartStat::Accepted) => t!("calendar-yes", name = name),
+                    Some(PartStat::Declined) => t!("calendar-no", name = name),
+                    Some(PartStat::Tentative) => t!("calendar-maybe", name = name),
+                    Some(PartStat::Delegated) => t!("calendar-delegated", name = name),
                     _ => name,
                 }
             })
@@ -375,30 +372,30 @@ impl MailApp {
                         .font_weight(FontWeight::SEMIBOLD)
                         .when(e.cancelled, |d| d.line_through())
                         .child(if e.summary.is_empty() {
-                            "(No title)".to_owned()
+                            t!("calendar-no-title").to_owned()
                         } else {
                             e.summary.clone()
                         }),
                 )
-                .child(row("When", event_when(e)))
+                .child(row(t!("calendar-when"), event_when(e)))
                 .when(!e.recurrence.is_empty(), |d| {
                     d.child(row(
-                        "Repeats",
+                        t!("calendar-repeats"),
                         match ical::Rule::parse(&e.recurrence) {
                             Some(r) if ical::Rule::understood(&e.recurrence) => r.describe(),
                             _ if ical::Rule::expandable(&e.recurrence) => {
-                                "Yes, on a schedule of its own (each time is listed in your calendar)".into()
+                                t!("calendar-yes-on-a-schedule-of-its").into()
                             }
-                            _ => "Yes".into(),
+                            _ => t!("calendar-yes-2").into(),
                         },
                     ))
                 })
                 .when(!e.location.is_empty(), |d| {
-                    d.child(row("Where", e.location.clone()))
+                    d.child(row(t!("calendar-where"), e.location.clone()))
                 })
                 .children(e.details().into_iter().map(|(label, text)| row(label, text)))
-                .when_some(organizer, |d, o| d.child(row("Organizer", o)))
-                .when(!people.is_empty(), |d| d.child(row("Guests", people)))
+                .when_some(organizer, |d, o| d.child(row(t!("calendar-organizer"), o)))
+                .when(!people.is_empty(), |d| d.child(row(t!("calendar-guests"), people)))
                 .when(invited, |d| {
                     d.child(
                         div()
@@ -406,9 +403,9 @@ impl MailApp {
                             .flex()
                             .flex_wrap()
                             .gap_2()
-                            .child(answer("Accept", "check", PartStat::Accepted))
-                            .child(answer("Maybe", "info", PartStat::Tentative))
-                            .child(answer("Decline", "close", PartStat::Declined)),
+                            .child(answer(t!("calendar-accept"), "check", PartStat::Accepted))
+                            .child(answer(t!("calendar-maybe-2"), "info", PartStat::Tentative))
+                            .child(answer(t!("calendar-decline"), "close", PartStat::Declined)),
                     )
                 })
                 .when(
@@ -416,7 +413,7 @@ impl MailApp {
                     |d| {
                         d.child(div().mt_2().flex().child(self.button(
                             "invite-remove",
-                            "Remove from Calendar",
+                            t!("calendar-remove-from-calendar"),
                             "trash",
                             Action::RemoveCancelled(m.id.clone()),
                             false,
@@ -429,7 +426,7 @@ impl MailApp {
                     |d| {
                         d.child(div().mt_2().flex().child(self.button(
                             "invite-add",
-                            "Add to Calendar",
+                            t!("calendar-add-to-calendar"),
                             "plus",
                             Action::AddEventFromMail(m.id.clone()),
                             false,
@@ -441,24 +438,24 @@ impl MailApp {
                 .when_some(changed.filter(|_| invited), |d, before| {
                     let mut what = Vec::new();
                     if before.event.start != e.start || before.event.end != e.end {
-                        what.push(format!("was {}", event_when(&before.event)));
+                        what.push(t!("calendar-was", when = event_when(&before.event)));
                     }
                     if before.event.location != e.location && !before.event.location.is_empty() {
-                        what.push(format!("was at {}", before.event.location));
+                        what.push(t!("calendar-was-at", location = before.event.location));
                     }
                     d.child(
                         div()
                             .text_size(px(11.5))
                             .text_color(rgb(c.muted))
                             .child(if what.is_empty() {
-                                "Changed since it's in your calendar.".to_owned()
+                                t!("calendar-changed-since-its-in-your-calendar").to_owned()
                             } else {
-                                format!("Changed: {}.", what.join("; "))
+                                t!("calendar-changed", changes = what.join("; "))
                             }),
                     )
                     .child(div().flex().child(self.button(
                         "invite-update",
-                        "Update My Calendar",
+                        t!("calendar-update-my-calendar"),
                         "refresh",
                         Action::TakeInvitationUpdate(m.id.clone()),
                         false,
@@ -469,7 +466,7 @@ impl MailApp {
                 .when(invited && self.proposing.as_deref() != Some(m.id.as_str()), |d| {
                     d.child(div().flex().child(self.link(
                         "invite-propose",
-                        "Propose a New Time…",
+                        t!("calendar-propose-a-new-time"),
                         Action::ProposeTime(m.id.clone()),
                         cx,
                     )))
@@ -481,7 +478,7 @@ impl MailApp {
                 .when(inv.method == "REPLY" && self.backend.stored_event(&e.uid).is_some(), |d| {
                     d.child(div().mt_2().flex().child(self.button(
                         "invite-apply",
-                        "Note Their Answer",
+                        t!("calendar-note-their-answer"),
                         "check",
                         Action::ApplyReply(m.id.clone()),
                         false,
@@ -494,7 +491,7 @@ impl MailApp {
                         div()
                             .text_size(px(11.5))
                             .text_color(rgb(c.muted))
-                            .child(format!("Now: {before}")),
+                            .child(t!("calendar-now", before = before)),
                     )
                     .child(
                         div()
@@ -503,7 +500,7 @@ impl MailApp {
                             .gap_2()
                             .child(self.button(
                                 "counter-accept",
-                                "Move the Event",
+                                t!("calendar-move-the-event"),
                                 "check",
                                 Action::AcceptCounter(m.id.clone()),
                                 true,
@@ -511,7 +508,7 @@ impl MailApp {
                             ))
                             .child(self.button(
                                 "counter-decline",
-                                "Keep the Time",
+                                t!("calendar-keep-the-time"),
                                 "close",
                                 Action::DeclineCounter(m.id.clone()),
                                 false,
@@ -522,7 +519,7 @@ impl MailApp {
                 .when(inv.method == "REFRESH" && self.backend.stored_event(&e.uid).is_some(), |d| {
                     d.child(div().mt_2().flex().child(self.button(
                         "invite-refresh",
-                        "Send It Again",
+                        t!("calendar-send-it-again"),
                         "send",
                         Action::AnswerRefresh(m.id.clone()),
                         true,
@@ -532,7 +529,7 @@ impl MailApp {
                 .when(inv.method == "ADD" && self.backend.stored_event(&e.uid).is_some(), |d| {
                     d.child(div().mt_2().flex().child(self.button(
                         "invite-add",
-                        "Add to Calendar",
+                        t!("calendar-add-to-calendar"),
                         "check",
                         Action::TakeAddedOccurrences(m.id.clone()),
                         true,
@@ -543,7 +540,7 @@ impl MailApp {
                 // Picachos wrote it as the description).
                 .when(inv.method == "COUNTER" && !(e.comment.is_empty() && e.description.is_empty()), |d| {
                     d.child(row(
-                        "Note",
+                        t!("calendar-note"),
                         if e.comment.is_empty() { e.description.clone() } else { e.comment.clone() },
                     ))
                 })
@@ -552,7 +549,7 @@ impl MailApp {
                         div()
                             .text_size(px(11.5))
                             .text_color(rgb(c.muted))
-                            .child(format!("You answered: {}", s.verb())),
+                            .child(t!("calendar-you-answered", verb = s.verb())),
                     )
                 })
                 .into_any_element(),
@@ -581,7 +578,7 @@ impl MailApp {
                 this.invitation_busy = None;
                 match result {
                     Ok(None) => this.notice(
-                        format!("{} — the organizer was told", status.verb()),
+                        t!("calendar-the-organizer-was-told", verb = status.verb()),
                         false,
                         cx,
                     ),
@@ -609,7 +606,7 @@ impl MailApp {
                     cx,
                     move |b| b.remove_cancelled(&a, &m),
                     |this, r, cx| match r {
-                        Ok(()) => this.notice("Removed from your calendar", false, cx),
+                        Ok(()) => this.notice(t!("calendar-removed-from-your-calendar"), false, cx),
                         Err(e) => this.notice(format!("{e:#}"), true, cx),
                     },
                 );
@@ -642,7 +639,7 @@ impl MailApp {
                     self.read_when(&value(&self.event_start, cx)),
                     self.read_when(&value(&self.event_end, cx)),
                 ) else {
-                    self.notice("Write the times as 2026-11-24 10:00.", true, cx);
+                    self.notice(t!("calendar-write-the-times-as-2026-11"), true, cx);
                     return;
                 };
                 let note = value(&self.event_notes, cx);
@@ -652,7 +649,7 @@ impl MailApp {
                     move |b| b.propose_time(&a, &m, start, end, &note),
                     |this, r, cx| match r {
                         Ok(()) => {
-                            this.notice("Your proposed time was sent to the organizer", false, cx)
+                            this.notice(t!("calendar-your-proposed-time-was-sent-to"), false, cx)
                         }
                         Err(e) => this.notice(format!("{e:#}"), true, cx),
                     },
@@ -661,10 +658,7 @@ impl MailApp {
             Action::ApplyReply(id) => self.on_invitation(&id, cx, |b, a, m| b.apply_reply(a, m)),
             Action::AcceptCounter(id) => self.on_invitation(&id, cx, |b, a, m| {
                 b.accept_counter(a, m).map(|n| {
-                    format!(
-                        "The event moved; {n} {} told",
-                        if n == 1 { "guest was" } else { "guests were" }
-                    )
+                    t!("calendar-the-event-moved-told", n = n)
                 })
             }),
             Action::DeclineCounter(id) => self.on_invitation(&id, cx, |b, a, m| {
@@ -695,7 +689,7 @@ impl MailApp {
                     cx,
                     move |b| b.save_event(event, None),
                     |this, r, cx| match r {
-                        Ok(_) => this.notice("Added to your calendar", false, cx),
+                        Ok(_) => this.notice(t!("calendar-added-to-your-calendar"), false, cx),
                         Err(e) => this.notice(format!("{e:#}"), true, cx),
                     },
                 );
@@ -711,13 +705,13 @@ impl MailApp {
                     .update(cx, |input, cx| input.set_text("", w, cx));
                 self.calendar_run(cx, move |b| {
                     b.connect_calendar(server, &password)
-                        .map(|n| format!("Read {n} events"))
+                        .map(|n| t!("calendar-read-events", n = n))
                 });
             }
             Action::SyncCalendar => {
                 self.calendar_run(cx, |b| {
                     let _ = b.sync_tasks();
-                    b.sync_calendar().map(|n| format!("Read {n} events"))
+                    b.sync_calendar().map(|n| t!("calendar-read-events", n = n))
                 });
             }
             Action::DismissCalendarNotices => {
@@ -825,10 +819,7 @@ impl MailApp {
                 let zone_text = value(&self.event_zone, cx);
                 let zone = find_zone(&zone_text);
                 if !zone_text.trim().is_empty() && zone.is_none() {
-                    self.calendar_error = Some(format!(
-                        "“{}” isn't a time zone Picacho knows. Write it as Europe/Berlin or America/New_York, or a city such as Tokyo.",
-                        zone_text.trim()
-                    ));
+                    self.calendar_error = Some(t!("calendar-isnt-a-time-zone-picacho-knows", trim = zone_text.trim()));
                     cx.notify();
                     return;
                 }
@@ -846,9 +837,9 @@ impl MailApp {
                     }
                     None => {
                         self.calendar_error = Some(if self.when.is_some() {
-                            "Picacho couldn't tell when it starts. Try “tomorrow at 10”, or 2026-11-24 10:00.".into()
+                            t!("calendar-picacho-couldnt-tell-when-it-starts").into()
                         } else {
-                            "Write the start as 2026-11-24 10:00, or 2026-11-24 for all day. (Settings → Local AI → Understand dates reads “tomorrow at 10” too.)".into()
+                            t!("calendar-write-the-start-as-2026-11").into()
                         });
                         cx.notify();
                         return;
@@ -877,7 +868,7 @@ impl MailApp {
                     }
                     _ => {
                         self.calendar_error =
-                            Some("Write the end the same way as the start, or leave it empty for an hour.".into());
+                            Some(t!("calendar-write-the-end-the-same-way").into());
                         cx.notify();
                         return;
                     }
@@ -956,7 +947,7 @@ impl MailApp {
                 if !guests.is_empty() {
                     let Some(a) = &organizer else {
                         self.calendar_error = Some(
-                            "Add an email account first: invitations are sent from it.".into(),
+                            t!("calendar-add-an-email-account-first-invitations").into(),
                         );
                         cx.notify();
                         return;
@@ -990,12 +981,9 @@ impl MailApp {
                     match organizer.filter(|_| invite) {
                         Some(a) => {
                             let n = b.send_invitations(&a, &saved.event.uid)?;
-                            Ok(format!(
-                                "Event saved, and {n} {} invited",
-                                if n == 1 { "guest" } else { "guests" }
-                            ))
+                            Ok(t!("calendar-event-saved-and-invited", n = n))
                         }
-                        None => Ok("Event saved".into()),
+                        None => Ok(t!("calendar-event-saved").into()),
                     }
                 });
                 self.event_editing = None;
@@ -1030,9 +1018,9 @@ impl MailApp {
                     };
                     b.delete_event(&uid)?;
                     Ok(if told > 0 {
-                        format!("Event deleted; {told} told it's cancelled")
+                        t!("calendar-event-deleted-told-its-cancelled", told = told)
                     } else {
-                        "Event deleted".into()
+                        t!("calendar-event-deleted").into()
                     })
                 });
             }
@@ -1045,20 +1033,20 @@ impl MailApp {
                 self.calendar_run(cx, move |b| {
                     let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
                     let n = b.use_mail_account_for_calendar(&a, cancel)?;
-                    Ok(format!("Read {n} events from {}", a.email))
+                    Ok(t!("calendar-read-events-from", n = n, email = a.email))
                 });
             }
             Action::RenameCalendar(href) => {
                 let name = self.collection_name.read(cx).value().trim().to_owned();
                 if name.is_empty() {
-                    self.calendar_error = Some("Write the new name in the field first.".into());
+                    self.calendar_error = Some(t!("calendar-write-the-new-name-in-the").into());
                     cx.notify();
                     return;
                 }
                 self.collection_name.update(cx, |i, cx| i.set_text("", w, cx));
                 self.calendar_run(cx, move |b| {
                     b.rename_calendar(&href, &name, "")?;
-                    Ok(format!("Renamed the calendar {name}"))
+                    Ok(t!("calendar-renamed-the-calendar", name = name))
                 });
             }
             Action::AttachToEvent(uid) => {
@@ -1066,7 +1054,7 @@ impl MailApp {
                     files: true,
                     directories: false,
                     multiple: false,
-                    prompt: Some("Attach".into()),
+                    prompt: Some(t!("calendar-attach").into()),
                 });
                 cx.spawn(async move |this, cx| {
                     if let Ok(Ok(Some(paths))) = picker.await
@@ -1075,7 +1063,7 @@ impl MailApp {
                         let _ = this.update(cx, |this, cx| {
                             this.calendar_run(cx, move |b| {
                                 b.attach_to_event(&uid, &path)?;
-                                Ok("Attached the file to the event".into())
+                                Ok(t!("calendar-attached-the-file-to-the-event").into())
                             });
                         });
                     }
@@ -1085,13 +1073,13 @@ impl MailApp {
             Action::RemoveEventAttachment(uid, managed_id) => {
                 self.calendar_run(cx, move |b| {
                     b.remove_event_attachment(&uid, &managed_id)?;
-                    Ok("Removed the attachment".into())
+                    Ok(t!("calendar-removed-the-attachment").into())
                 });
             }
             Action::DeleteCalendar(href) => {
                 self.calendar_run(cx, move |b| {
                     b.delete_calendar(&href)?;
-                    Ok("Deleted the calendar".into())
+                    Ok(t!("calendar-deleted-the-calendar").into())
                 });
             }
             Action::CreateCalendar => {
@@ -1099,7 +1087,7 @@ impl MailApp {
                 self.collection_name.update(cx, |i, cx| i.set_text("", w, cx));
                 self.calendar_run(cx, move |b| {
                     let made = b.create_calendar(&name, "")?;
-                    Ok(format!("Made the calendar {}", made.name))
+                    Ok(t!("calendar-made-the-calendar", name = made.name))
                 });
             }
             Action::AddTask => {
@@ -1112,7 +1100,7 @@ impl MailApp {
                     match self.read_when(&due_text) {
                         Some((t, ..)) => t,
                         None => {
-                            self.calendar_error = Some("Write the due date as 2026-11-24 17:00 or 2026-11-24, or leave it empty.".into());
+                            self.calendar_error = Some(t!("calendar-write-the-due-date-as-2026").into());
                             cx.notify();
                             return;
                         }
@@ -1122,7 +1110,7 @@ impl MailApp {
                 self.task_due.update(cx, |i, cx| i.set_text("", w, cx));
                 self.calendar_run(cx, move |b| {
                     let t = b.add_task(&name, due)?;
-                    Ok(format!("Added the task {}", t.event.summary))
+                    Ok(t!("calendar-added-the-task", summary = t.event.summary))
                 });
             }
             Action::CompleteTask(uid) => {
@@ -1176,7 +1164,7 @@ impl MailApp {
                     match parse_in(&due_text, zone).or_else(|| self.read_when(&due_text).map(|(t, d, _)| (t, d))) {
                         Some(read) => read,
                         None => {
-                            self.calendar_error = Some("Write the due date as 2026-11-24 17:00 or 2026-11-24, or leave it empty.".into());
+                            self.calendar_error = Some(t!("calendar-write-the-due-date-as-2026").into());
                             cx.notify();
                             return;
                         }
@@ -1186,7 +1174,7 @@ impl MailApp {
                 self.task_due.update(cx, |i, cx| i.set_text("", w, cx));
                 self.calendar_run(cx, move |b| {
                     b.edit_task(&uid, &title, &notes, due, all_day)
-                        .map(|t| format!("Saved the task {}", t.event.summary))
+                        .map(|t| t!("calendar-saved-the-task", summary = t.event.summary))
                 });
             }
             Action::DeleteTask(uid) => {
@@ -1197,9 +1185,9 @@ impl MailApp {
                 self.calendar_run(cx, move |b| {
                     b.set_server_scheduling(on).map(|()| {
                         if on {
-                            "The calendar server now sends your invitations".into()
+                            t!("calendar-the-calendar-server-now-sends-your").into()
                         } else {
-                            "Picacho emails your invitations again".into()
+                            t!("calendar-picacho-emails-your-invitations-again").into()
                         }
                     })
                 });
@@ -1207,13 +1195,13 @@ impl MailApp {
             Action::ResendInvitations(uid) => {
                 let Some(stored) = self.backend.stored_event(&uid) else { return };
                 let Some(a) = self.organizer_account(&stored.event) else {
-                    self.calendar_error = Some("Add an email account first: invitations are sent from it.".into());
+                    self.calendar_error = Some(t!("calendar-add-an-email-account-first-invitations").into());
                     cx.notify();
                     return;
                 };
                 self.calendar_run(cx, move |b| {
                     let n = b.resend_invitations(&a, &uid)?;
-                    Ok(format!("Invitations sent again to {n} {}", if n == 1 { "guest" } else { "guests" }))
+                    Ok(t!("calendar-invitations-sent-again-to", n = n))
                 });
             }
             Action::CheckFreeBusy => {
@@ -1232,7 +1220,7 @@ impl MailApp {
                 let Some(organizer) = self.accounts.first().map(|a| a.email.clone()) else {
                     return;
                 };
-                self.free_busy = Some("Looking…".into());
+                self.free_busy = Some(t!("calendar-looking").into());
                 self.task(
                     cx,
                     move |b| {
@@ -1242,7 +1230,7 @@ impl MailApp {
                     |this, result, cx| {
                         this.free_busy = Some(match result {
                             Ok(found) if found.iter().all(|f| f.busy.is_empty()) => {
-                                "Everyone is free that day.".into()
+                                t!("calendar-everyone-is-free-that-day").into()
                             }
                             Ok(found) => found
                                 .iter()
@@ -1255,16 +1243,15 @@ impl MailApp {
                                                 chrono::DateTime::from_timestamp(t, 0)
                                                     .unwrap_or_default()
                                                     .with_timezone(&chrono::Local)
-                                                    .format("%H:%M")
-                                                    .to_string()
+                                                    .local(t!("dates-calendar-time"))
                                             };
                                             format!("{}–{}", at(*s), at(*e))
                                         })
                                         .collect();
                                     if times.is_empty() {
-                                        format!("{} is free", f.attendee)
+                                        t!("calendar-is-free", attendee = f.attendee)
                                     } else {
-                                        format!("{} is busy {}", f.attendee, times.join(", "))
+                                        t!("calendar-is-busy", attendee = f.attendee, times = times.join(", "))
                                     }
                                 })
                                 .collect::<Vec<_>>()
@@ -1300,9 +1287,9 @@ impl MailApp {
                 }
                 self.calendar_run(cx, move |b| {
                     Ok(if b.cancel_held(&a, &submission)? {
-                        "Taken back; it's in Drafts".into()
+                        t!("calendar-taken-back-its-in-drafts").into()
                     } else {
-                        "It had already been sent".into()
+                        t!("calendar-it-had-already-been-sent").into()
                     })
                 });
             }
@@ -1346,21 +1333,22 @@ impl MailApp {
         }
         let mut list = div().id("event-attachments").flex().flex_col().gap_1();
         for (i, f) in files.into_iter().enumerate() {
-            let size = f.size.map(|s| format!(" ({} KB)", s.div_ceil(1024))).unwrap_or_default();
+            let name = if f.name.is_empty() { t!("calendar-attachment").to_owned() } else { f.name.clone() };
+            let named = match f.size {
+                Some(s) => t!("calendar-file-and-size", name = name, kb = s.div_ceil(1024)),
+                None => name,
+            };
             list = list.child(
                 div()
                     .flex()
                     .items_center()
                     .gap_2()
                     .child(icon_el("paperclip", 13., c.muted))
-                    .child(div().flex_1().min_w_0().truncate().text_size(px(12.)).child(format!(
-                        "{}{size}",
-                        if f.name.is_empty() { "Attachment".to_owned() } else { f.name.clone() }
-                    )))
+                    .child(div().flex_1().min_w_0().truncate().text_size(px(12.)).child(named))
                     .when(!f.managed_id.is_empty(), |d| {
                         d.child(self.button(
                             format!("event-attachment-remove-{i}"),
-                            "Remove",
+                            t!("calendar-remove"),
                             "",
                             Action::RemoveEventAttachment(uid.to_owned(), f.managed_id.clone()),
                             false,
@@ -1397,11 +1385,11 @@ impl MailApp {
                         .flex_1()
                         .text_size(px(11.5))
                         .text_color(rgb(c.danger))
-                        .child(format!("The server couldn't deliver the invitation to {}.", failed.join(", "))),
+                        .child(t!("calendar-the-server-couldnt-deliver-the-invitation", addresses = failed.join(", "))),
                 )
                 .child(self.button(
                     "event-resend",
-                    "Send Again",
+                    t!("calendar-send-again"),
                     "send",
                     Action::ResendInvitations(uid.to_owned()),
                     false,
@@ -1521,14 +1509,14 @@ impl MailApp {
         }
         let here = chrono::DateTime::from_timestamp(start, 0)?
             .with_timezone(&chrono::Local)
-            .format("%a, %b %-d, %H:%M");
+            .local(t!("dates-weekday-month-day-time"));
         Some(
             div()
                 .id("event-zone-note")
                 .debug_selector(|| "event-zone-note".into())
                 .text_size(px(11.5))
                 .text_color(rgb(c.muted))
-                .child(format!("That's {here} here."))
+                .child(t!("calendar-thats-here", here = here))
                 .into_any_element(),
         )
     }
@@ -1574,16 +1562,16 @@ impl MailApp {
             .id("invite-propose-form")
             .debug_selector(|| "invite-propose-form".into())
             .role(Role::Form)
-            .aria_label("Propose a new time")
+            .aria_label(t!("calendar-propose-a-new-time-2"))
             .mt_2()
             .flex()
             .flex_col()
             .gap_2()
             .max_w(px(420.))
-            .child(labelled("Starts", "propose-start", &self.event_start))
-            .child(labelled("Ends", "propose-end", &self.event_end))
+            .child(labelled(t!("calendar-starts"), "propose-start", &self.event_start))
+            .child(labelled(t!("calendar-ends"), "propose-end", &self.event_end))
             .child(labelled(
-                "Note to the organizer (optional)",
+                t!("calendar-note-to-the-organizer-optional"),
                 "propose-note",
                 &self.event_notes,
             ))
@@ -1593,7 +1581,7 @@ impl MailApp {
                     .gap_2()
                     .child(self.button(
                         "propose-send",
-                        "Send Proposal",
+                        t!("calendar-send-proposal"),
                         "send",
                         Action::SendProposal(id.to_owned()),
                         true,
@@ -1601,7 +1589,7 @@ impl MailApp {
                     ))
                     .child(self.button(
                         "propose-cancel",
-                        "Cancel",
+                        t!("calendar-cancel"),
                         "close",
                         Action::CancelProposal,
                         false,
@@ -1640,7 +1628,7 @@ impl MailApp {
                     div()
                         .text_size(px(12.))
                         .text_color(rgb(c.muted))
-                        .child("Or use your email provider's, signed in as the account already is (Google asks once for access):"),
+                        .child(t!("calendar-or-use-your-email-providers-signed")),
                 )
                 .child(div().flex().flex_wrap().gap_2().children(accounts.into_iter().map(|a| {
                     self.button(
@@ -1679,16 +1667,16 @@ impl MailApp {
             .flex()
             .flex_col()
             .gap_5()
-            .child(self.section("Calendar"))
+            .child(self.section(t!("calendar-calendar")))
             .child(
                 div()
                     .text_size(px(12.))
                     .text_color(rgb(c.muted))
-                    .child("Invitations in mail show what, when and where, with Accept, Maybe and Decline; the organizer is told. With a calendar server, answered invitations go in your calendar, and you can add and change events here."),
+                    .child(t!("calendar-invitations-in-mail-show-what-when")),
             );
         let Some(server) = self.backend.calendar_server() else {
             return page
-                .child(self.section("Calendar server (CalDAV)"))
+                .child(self.section(t!("calendar-calendar-server-caldav")))
                 .child(
                     div()
                         .flex()
@@ -1699,16 +1687,16 @@ impl MailApp {
                             div()
                                 .text_size(px(12.))
                                 .text_color(rgb(c.muted))
-                                .child("Fastmail, iCloud, Nextcloud, Radicale, mailbox.org or another CalDAV server. iCloud and Fastmail need an app password."),
+                                .child(t!("calendar-fastmail-icloud-nextcloud-radicale-mailbox-org")),
                         )
                         .children(self.jmap_sources("calendar-jmap", Action::ConnectJmapCalendar, cx))
-                        .child(labelled("Server", "calendar-url", &self.calendar_url))
-                        .child(labelled("User name", "calendar-user", &self.calendar_user))
-                        .child(labelled("Password", "calendar-password", &self.calendar_password))
+                        .child(labelled(t!("calendar-server"), "calendar-url", &self.calendar_url))
+                        .child(labelled(t!("calendar-user-name"), "calendar-user", &self.calendar_user))
+                        .child(labelled(t!("calendar-password"), "calendar-password", &self.calendar_password))
                         .child(div().flex().child(
                             self.button(
                                 "calendar-connect",
-                                if busy { "Connecting…" } else { "Connect" },
+                                if busy { t!("calendar-connecting") } else { t!("calendar-connect") },
                                 "plus",
                                 Action::ConnectCalendar,
                                 true,
@@ -1728,37 +1716,40 @@ impl MailApp {
             .and_then(|t| chrono::DateTime::from_timestamp(t, 0))
             .map(|t| {
                 t.with_timezone(&chrono::Local)
-                    .format("%b %-d, %H:%M")
-                    .to_string()
+                    .local(t!("dates-month-day-time"))
             })
-            .unwrap_or_else(|| "never".into());
+            .unwrap_or_else(|| t!("calendar-never-read").to_owned());
         let over_jmap = !server.jmap_account.is_empty();
         page = page
             .child(self.section(if over_jmap {
-                "Calendar server (JMAP)"
+                t!("calendar-calendar-server-jmap")
             } else {
-                "Calendar server (CalDAV)"
+                t!("calendar-calendar-server-caldav")
             }))
             .child(
             self.setting(
                 &server.url,
-                &format!(
-                    "{} {}{}. Read {synced}; read again each time Picacho starts.",
-                    if over_jmap { "The calendars of" } else { "Signed in as" },
-                    server.user,
-                    // Kept apart from mail, signing in as a mail account does.
-                    match self.backend.calendar_mail_account().and_then(|id| self.accounts.iter().find(|a| a.id == id)) {
-                        Some(a) if !over_jmap => format!(", with your {} account's sign-in", a.email),
-                        _ => String::new(),
-                    }
-                ),
+                &{
+                    let account = self
+                        .backend
+                        .calendar_mail_account()
+                        .and_then(|id| self.accounts.iter().find(|a| a.id == id))
+                        .filter(|_| !over_jmap);
+                    t!(
+                        "calendar-read-read-again-each-time-picacho",
+                        how = if over_jmap { "jmap" } else if account.is_some() { "account" } else { "password" },
+                        user = server.user,
+                        email = account.map(|a| a.email.as_str()).unwrap_or_default(),
+                        synced = synced
+                    )
+                },
                 div()
                     .flex()
                     .gap_2()
                     .child(
                         self.button(
                             "calendar-sync",
-                            if busy { "Reading…" } else { "Read Now" },
+                            if busy { t!("calendar-reading") } else { t!("calendar-read-now") },
                             "refresh",
                             Action::SyncCalendar,
                             false,
@@ -1768,7 +1759,7 @@ impl MailApp {
                     )
                     .child(self.button(
                         "calendar-disconnect",
-                        "Disconnect",
+                        t!("calendar-disconnect"),
                         "close",
                         Action::DisconnectCalendar,
                         false,
@@ -1781,11 +1772,11 @@ impl MailApp {
         if !notices.is_empty() {
             page = page.child(
                 self.setting(
-                    "Shared calendars",
+                    t!("calendar-shared-calendars"),
                     &notices.join("\n"),
                     self.button(
                         "calendar-notices-dismiss",
-                        "Dismiss",
+                        t!("calendar-dismiss"),
                         "close",
                         Action::DismissCalendarNotices,
                         false,
@@ -1804,8 +1795,8 @@ impl MailApp {
         if calendars.len() > 1 {
             page = page.child(
                 self.setting(
-                    "New events go to",
-                    "Also where invitations you accept are put.",
+                    t!("calendar-new-events-go-to"),
+                    t!("calendar-also-where-invitations-you-accept-are"),
                     self.segmented(
                         "calendar-default",
                         calendars
@@ -1826,11 +1817,11 @@ impl MailApp {
         }
         if !over_jmap {
             page = page.child(self.switch_setting(
-                "Let the server send invitations",
+                t!("calendar-let-the-server-send-invitations"),
                 if server.server_schedules {
-                    "The calendar server invites guests to events you organize, and tells them about changes and cancellations. Invitations you receive are still answered by mail."
+                    t!("calendar-the-calendar-server-invites-guests-to")
                 } else {
-                    "Picacho emails invitations, updates and cancellations for events you organize. Turn on to have the calendar server send them, where it can."
+                    t!("calendar-picacho-emails-invitations-updates-and-cancellations")
                 },
                 "calendar-server-scheduling".into(),
                 server.server_schedules,
@@ -1848,8 +1839,8 @@ impl MailApp {
         // A new calendar, or a task, named in one field.
         page = page.child(
             self.setting(
-                "New calendar or task",
-                "A calendar is made on the server. A task goes to the calendar new events go to (or the first that keeps tasks), due when written in Due, else with no due date.",
+                t!("calendar-new-calendar-or-task"),
+                t!("calendar-a-calendar-is-made-on-the"),
                 div()
                     .flex()
                     .flex_wrap()
@@ -1869,8 +1860,8 @@ impl MailApp {
                                 d.child(field(Input::new(&self.task_due), c, busy))
                             }),
                     )
-                    .child(self.button("calendar-create", "Make Calendar", "plus", Action::CreateCalendar, false, cx))
-                    .child(self.button("task-add", "Add Task", "check", Action::AddTask, false, cx)),
+                    .child(self.button("calendar-create", t!("calendar-make-calendar"), "plus", Action::CreateCalendar, false, cx))
+                    .child(self.button("task-add", t!("calendar-add-task"), "check", Action::AddTask, false, cx)),
             ),
         );
         // Each calendar, to rename (to the name in the field) or delete.
@@ -1886,7 +1877,7 @@ impl MailApp {
                         .child(div().flex_1().min_w_0().truncate().text_size(px(13.)).child(cal.name.clone()))
                         .child(self.button(
                             format!("calendar-rename-{}", cal.href),
-                            "Rename",
+                            t!("calendar-rename"),
                             "",
                             Action::RenameCalendar(cal.href.clone()),
                             false,
@@ -1895,7 +1886,7 @@ impl MailApp {
                         .child(
                             self.button(
                                 format!("calendar-delete-{}", cal.href),
-                                "Delete",
+                                t!("calendar-delete"),
                                 "",
                                 Action::DeleteCalendar(cal.href.clone()),
                                 false,
@@ -1907,14 +1898,17 @@ impl MailApp {
             }
             let storage = self.calendar_quota.map(|(used, left)| {
                 let mb = |b: u64| b as f64 / 1_048_576.0;
-                format!(" The server keeps {:.0} MB of yours, with {:.0} MB left.", mb(used), mb(left))
+                t!("calendar-the-server-keeps-mb-of-yours", used = format!("{:.0}", mb(used)), left = format!("{:.0}", mb(left)))
             });
             page = page.child(self.setting(
-                "Calendars",
-                &format!(
-                    "Rename uses the name written in the field above. Deleting removes the calendar and its events from the server.{}",
-                    storage.unwrap_or_default()
-                ),
+                t!("calendar-calendars"),
+                &{
+                    let rename = t!("calendar-rename-uses-the-name-written-in");
+                    match storage {
+                        Some(storage) => crate::i18n::sentences(rename, &storage),
+                        None => rename.to_owned(),
+                    }
+                },
                 list,
             ));
         }
@@ -1922,11 +1916,11 @@ impl MailApp {
         let tasks = self.backend.calendar_tasks();
         if !tasks.is_empty() {
             let count = tasks.len();
-            page = page.child(self.section("Tasks")).child(
+            page = page.child(self.section(t!("calendar-tasks"))).child(
                 div()
                     .id("calendar-tasks")
                     .role(Role::List)
-                    .aria_label("Tasks")
+                    .aria_label(t!("calendar-tasks"))
                     .rounded(px(12.))
                     .border_1()
                     .border_color(rgb(c.border))
@@ -1936,21 +1930,21 @@ impl MailApp {
                     .flex_col()
                     .children(tasks.into_iter().take(50).enumerate().map(|(i, t)| {
                         let due = if t.event.start == 0 {
-                            "no due date".to_owned()
+                            t!("calendar-no-due-date").to_owned()
                         } else if t.event.all_day {
                             chrono::DateTime::from_timestamp(t.event.start, 0)
-                                .map(|d| d.format("%a %b %-d").to_string())
+                                .map(|d| d.local(t!("dates-weekday-month-day")))
                                 .unwrap_or_default()
                         } else {
                             chrono::DateTime::from_timestamp(t.event.start, 0)
-                                .map(|d| d.with_timezone(&chrono::Local).format("%a %b %-d, %H:%M").to_string())
+                                .map(|d| d.with_timezone(&chrono::Local).local(t!("dates-weekday-month-day-time")))
                                 .unwrap_or_default()
                         };
                         let overdue = t.event.start != 0 && t.event.start < chrono::Utc::now().timestamp();
                         div()
                             .id(SharedString::from(format!("task-{i}")))
                             .role(Role::ListItem)
-                            .aria_label(format!("{}, due {due}", t.event.summary))
+                            .aria_label(t!("calendar-due", summary = t.event.summary, due = due))
                             .aria_position_in_set(i + 1)
                             .aria_size_of_set(count)
                             .px_4()
@@ -1972,17 +1966,17 @@ impl MailApp {
                                             .text_size(px(11.5))
                                             .text_color(rgb(if overdue { c.danger } else { c.muted }))
                                             .child(if t.event.start == 0 {
-                                                "No due date".to_owned()
+                                                t!("calendar-no-due-date-2").to_owned()
                                             } else if overdue {
-                                                format!("Overdue: {due}")
+                                                t!("calendar-overdue", due = due)
                                             } else {
-                                                format!("Due {due}")
+                                                t!("calendar-due-2", due = due)
                                             }),
                                     ),
                             )
                             .child(div().debug_selector(move || format!("task-edit-{i}")).child(self.button(
                                 SharedString::from(format!("task-edit-{i}")),
-                                "Edit",
+                                t!("calendar-edit"),
                                 "compose",
                                 Action::EditTask(t.event.uid.clone()),
                                 false,
@@ -1990,7 +1984,7 @@ impl MailApp {
                             )))
                             .child(self.button(
                                 SharedString::from(format!("task-done-{i}")),
-                                "Done",
+                                t!("calendar-done"),
                                 "check",
                                 Action::CompleteTask(t.event.uid.clone()),
                                 false,
@@ -2006,7 +2000,7 @@ impl MailApp {
                     .id("task-editor")
                     .debug_selector(|| "task-editor".into())
                     .role(Role::Form)
-                    .aria_label("Edit task")
+                    .aria_label(t!("calendar-edit-task"))
                     .p_4()
                     .rounded(px(12.))
                     .border_1()
@@ -2016,18 +2010,18 @@ impl MailApp {
                     .flex_col()
                     .gap_3()
                     .max_w(px(480.))
-                    .child(div().text_size(px(14.)).font_weight(FontWeight::SEMIBOLD).child("Edit Task"))
-                    .child(labelled("Task", "task-title", &self.task_title))
-                    .child(labelled("Due (2026-11-24 17:00, a date, or empty for none)", "task-due", &self.task_due))
-                    .child(labelled("Notes", "task-notes", &self.task_notes))
+                    .child(div().text_size(px(14.)).font_weight(FontWeight::SEMIBOLD).child(t!("calendar-edit-task-2")))
+                    .child(labelled(t!("calendar-task"), "task-title", &self.task_title))
+                    .child(labelled(t!("calendar-due-2026-11-24-17-00"), "task-due", &self.task_due))
+                    .child(labelled(t!("calendar-notes"), "task-notes", &self.task_notes))
                     .child(
                         div()
                             .flex()
                             .flex_wrap()
                             .gap_2()
-                            .child(self.button("task-save", "Save", "check", Action::SaveTask, true, cx))
-                            .child(self.button("task-cancel", "Cancel", "close", Action::CancelTaskEdit, false, cx))
-                            .child(self.button("task-delete", "Delete", "trash", Action::DeleteTask(uid.clone()), false, cx)),
+                            .child(self.button("task-save", t!("calendar-save"), "check", Action::SaveTask, true, cx))
+                            .child(self.button("task-cancel", t!("calendar-cancel"), "close", Action::CancelTaskEdit, false, cx))
+                            .child(self.button("task-delete", t!("calendar-delete"), "trash", Action::DeleteTask(uid.clone()), false, cx)),
                     ),
             );
         }
@@ -2038,20 +2032,20 @@ impl MailApp {
             .filter(|a| a.provider == crate::manage::model::Provider::Jmap)
             .collect();
         if !jmap_accounts.is_empty() {
-            page = page.child(self.section("Held to send later"));
+            page = page.child(self.section(t!("calendar-held-to-send-later")));
             for a in jmap_accounts {
                 let listed = self.held.as_ref().filter(|(id, _)| *id == a.id);
                 let detail = match listed {
-                    None => "Messages handed to the server to send later can be taken back until they go.".to_owned(),
-                    Some((_, held)) if held.is_empty() => "Nothing is waiting.".to_owned(),
-                    Some((_, held)) => format!("{} waiting.", held.len()),
+                    None => t!("calendar-messages-handed-to-the-server-to").to_owned(),
+                    Some((_, held)) if held.is_empty() => t!("calendar-nothing-is-waiting").to_owned(),
+                    Some((_, held)) => t!("calendar-waiting", count = held.len()),
                 };
                 page = page.child(self.setting(
                     &a.email,
                     &detail,
                     self.button(
                         SharedString::from(format!("held-{}", a.id)),
-                        "Show",
+                        t!("calendar-show"),
                         "refresh",
                         Action::ListHeld(a.id.clone()),
                         false,
@@ -2060,14 +2054,14 @@ impl MailApp {
                 ));
                 for h in listed.map(|(_, h)| h.as_slice()).unwrap_or_default() {
                     let when = chrono::DateTime::from_timestamp(h.send_at, 0)
-                        .map(|d| d.with_timezone(&chrono::Local).format("%a %b %-d, %H:%M").to_string())
+                        .map(|d| d.with_timezone(&chrono::Local).local(t!("dates-weekday-month-day-time")))
                         .unwrap_or_default();
                     page = page.child(self.setting(
-                        if h.subject.is_empty() { "(No subject)" } else { &h.subject },
-                        &format!("Goes {when}"),
+                        if h.subject.is_empty() { t!("calendar-no-subject") } else { &h.subject },
+                        &t!("calendar-goes", when = when),
                         self.button(
                             SharedString::from(format!("held-cancel-{}", h.id)),
-                            "Take Back",
+                            t!("calendar-take-back"),
                             "undo",
                             Action::CancelHeld(a.id.clone(), h.id.clone()),
                             false,
@@ -2084,9 +2078,9 @@ impl MailApp {
                     .id("event-editor")
                     .role(Role::Form)
                     .aria_label(if uid.is_empty() {
-                        "New event"
+                        t!("calendar-new-event")
                     } else {
-                        "Edit event"
+                        t!("calendar-edit-event")
                     })
                     .p_4()
                     .rounded(px(12.))
@@ -2102,23 +2096,23 @@ impl MailApp {
                             .text_size(px(14.))
                             .font_weight(FontWeight::SEMIBOLD)
                             .child(if uid.is_empty() {
-                                "New Event"
+                                t!("calendar-new-event-2")
                             } else {
-                                "Edit Event"
+                                t!("calendar-edit-event-2")
                             }),
                     )
-                    .child(labelled("Title", "event-title", &self.event_title))
+                    .child(labelled(t!("calendar-title"), "event-title", &self.event_title))
                     .child(labelled(
-                        "Starts (2026-11-24 10:00, a date for all day, or words like “tomorrow at 10” with Understand dates)",
+                        t!("calendar-starts-2026-11-24-10-00"),
                         "event-start",
                         &self.event_start,
                     ))
-                    .child(labelled("Ends (empty: an hour later)", "event-end", &self.event_end))
-                    .child(labelled("Time zone (the times above are in it)", "event-zone", &self.event_zone))
+                    .child(labelled(t!("calendar-ends-empty-an-hour-later"), "event-end", &self.event_end))
+                    .child(labelled(t!("calendar-time-zone-the-times-above-are"), "event-zone", &self.event_zone))
                     .children(self.zone_note(cx))
-                    .child(labelled("Where", "event-location", &self.event_location))
-                    .child(labelled("Notes", "event-notes", &self.event_notes))
-                    .child(labelled("Guests (invited by mail; separated by commas)", "event-guests", &self.event_guests))
+                    .child(labelled(t!("calendar-where"), "event-location", &self.event_location))
+                    .child(labelled(t!("calendar-notes"), "event-notes", &self.event_notes))
+                    .child(labelled(t!("calendar-guests-invited-by-mail-separated-by"), "event-guests", &self.event_guests))
                     .children(self.undelivered_guests(uid, cx))
                     .children(self.event_attachments(uid, cx))
                     .child(
@@ -2128,7 +2122,7 @@ impl MailApp {
                             .gap_2()
                             .child(self.button(
                                 "event-free-busy",
-                                "When Are They Free?",
+                                t!("calendar-when-are-they-free"),
                                 "calendar",
                                 Action::CheckFreeBusy,
                                 false,
@@ -2148,14 +2142,14 @@ impl MailApp {
                             .flex()
                             .flex_col()
                             .gap_1()
-                            .child(div().text_size(px(12.)).font_weight(FontWeight::MEDIUM).text_color(rgb(c.muted)).child("Remind me"))
+                            .child(div().text_size(px(12.)).font_weight(FontWeight::MEDIUM).text_color(rgb(c.muted)).child(t!("calendar-remind-me")))
                             .child(self.segmented(
                                 "event-alarm",
                                 [
-                                    ("Never", None),
-                                    ("10 minutes before", Some(600)),
-                                    ("An hour before", Some(3600)),
-                                    ("A day before", Some(86_400)),
+                                    (t!("calendar-never"), None),
+                                    (t!("calendar-10-minutes-before"), Some(600)),
+                                    (t!("calendar-an-hour-before"), Some(3600)),
+                                    (t!("calendar-a-day-before"), Some(86_400)),
                                 ]
                                 .into_iter()
                                 .map(|(label, a)| (label.to_owned(), Action::EventAlarm(a), self.event_alarm == a))
@@ -2169,12 +2163,12 @@ impl MailApp {
                                 .flex()
                                 .flex_col()
                                 .gap_1()
-                                .child(div().text_size(px(12.)).font_weight(FontWeight::MEDIUM).text_color(rgb(c.muted)).child("This event repeats. Change"))
+                                .child(div().text_size(px(12.)).font_weight(FontWeight::MEDIUM).text_color(rgb(c.muted)).child(t!("calendar-this-event-repeats-change")))
                                 .child(self.segmented(
                                     "event-scope",
                                     vec![
-                                        ("Only this one".into(), Action::EventScope(false), !self.event_all_repeats),
-                                        ("Every repeat".into(), Action::EventScope(true), self.event_all_repeats),
+                                        (t!("calendar-only-this-one").into(), Action::EventScope(false), !self.event_all_repeats),
+                                        (t!("calendar-every-repeat").into(), Action::EventScope(true), self.event_all_repeats),
                                     ],
                                     cx,
                                 )),
@@ -2182,14 +2176,14 @@ impl MailApp {
                     })
                     .when(self.event_occurrence.is_none() || self.event_all_repeats || self.event_repeat == Repeat::Never, |d| {
                         let mut choices = vec![
-                            ("Never".to_owned(), Repeat::Never),
-                            ("Daily".to_owned(), Repeat::Daily),
-                            ("Weekly".to_owned(), Repeat::Weekly),
-                            ("Monthly".to_owned(), Repeat::Monthly),
-                            ("Yearly".to_owned(), Repeat::Yearly),
+                            (t!("calendar-never").to_owned(), Repeat::Never),
+                            (t!("calendar-daily").to_owned(), Repeat::Daily),
+                            (t!("calendar-weekly").to_owned(), Repeat::Weekly),
+                            (t!("calendar-monthly").to_owned(), Repeat::Monthly),
+                            (t!("calendar-yearly").to_owned(), Repeat::Yearly),
                         ];
                         if let Repeat::Kept(rule) = &self.event_repeat {
-                            let text = ical::Rule::parse(rule).map(|r| r.describe()).unwrap_or_else(|| "As it was".into());
+                            let text = ical::Rule::parse(rule).map(|r| r.describe()).unwrap_or_else(|| t!("calendar-as-it-was").into());
                             choices.push((text, self.event_repeat.clone()));
                         }
                         d.child(
@@ -2197,7 +2191,7 @@ impl MailApp {
                                 .flex()
                                 .flex_col()
                                 .gap_1()
-                                .child(div().text_size(px(12.)).font_weight(FontWeight::MEDIUM).text_color(rgb(c.muted)).child("Repeats"))
+                                .child(div().text_size(px(12.)).font_weight(FontWeight::MEDIUM).text_color(rgb(c.muted)).child(t!("calendar-repeats")))
                                 .child(self.segmented(
                                     "event-repeat",
                                     choices
@@ -2219,7 +2213,7 @@ impl MailApp {
                             .gap_2()
                             .child(self.button(
                                 "event-save",
-                                "Save",
+                                t!("calendar-save"),
                                 "check",
                                 Action::SaveEvent,
                                 true,
@@ -2227,7 +2221,7 @@ impl MailApp {
                             ))
                             .child(self.button(
                                 "event-cancel",
-                                "Cancel",
+                                t!("calendar-cancel"),
                                 "close",
                                 Action::CancelEventEdit,
                                 false,
@@ -2236,7 +2230,7 @@ impl MailApp {
                             .when(!uid.is_empty(), |d| {
                                 d.child(self.button(
                                     "event-delete",
-                                    "Delete",
+                                    t!("calendar-delete"),
                                     "trash",
                                     Action::DeleteEvent(uid.clone()),
                                     false,
@@ -2248,7 +2242,7 @@ impl MailApp {
                             .when(!uid.is_empty() && !over_jmap, |d| {
                                 d.child(self.button(
                                     "event-attach",
-                                    "Attach File",
+                                    t!("calendar-attach-file"),
                                     "paperclip",
                                     Action::AttachToEvent(uid.clone()),
                                     false,
@@ -2265,7 +2259,7 @@ impl MailApp {
                 .when(default.is_some() && self.event_editing.is_none(), |d| {
                     d.child(div().flex().child(self.button(
                         "event-new",
-                        "New Event",
+                        t!("calendar-new-event-2"),
                         "plus",
                         Action::NewEvent,
                         false,
@@ -2286,11 +2280,11 @@ impl MailApp {
             div()
                 .flex()
                 .items_center()
-                .child(div().flex_1().child(self.section("Coming up")))
+                .child(div().flex_1().child(self.section(t!("calendar-coming-up"))))
                 .when(default.is_some() && self.event_editing.is_none(), |d| {
                     d.child(self.button(
                         "event-new",
-                        "New Event",
+                        t!("calendar-new-event-2"),
                         "plus",
                         Action::NewEvent,
                         false,
@@ -2301,7 +2295,7 @@ impl MailApp {
         let list = div()
             .id("calendar-events")
             .role(Role::List)
-            .aria_label("Coming events")
+            .aria_label(t!("calendar-coming-events"))
             .rounded(px(12.))
             .border_1()
             .border_color(rgb(c.border))
@@ -2316,7 +2310,7 @@ impl MailApp {
                     .py_3()
                     .text_size(px(12.))
                     .text_color(rgb(c.muted))
-                    .child("Nothing coming up."),
+                    .child(t!("calendar-nothing-coming-up")),
             )
         } else {
             let count = coming.len();

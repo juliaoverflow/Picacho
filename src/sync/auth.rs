@@ -365,7 +365,7 @@ pub fn check(raw: &[u8], details: &mut Details) {
 pub(crate) fn mta_sts_id(domain: &str) -> anyhow::Result<Option<String>> {
     use anyhow::Context as _;
     use mail_auth::{DnsError, Error};
-    let checker = checker().context("DNS isn't available")?;
+    let checker = checker().with_context(|| t!("sync-auth-dns-isnt-available"))?;
     let name = format!("_mta-sts.{domain}");
     let answer = checker.runtime.block_on(async {
         tokio::time::timeout(
@@ -380,7 +380,7 @@ pub(crate) fn mta_sts_id(domain: &str) -> anyhow::Result<Option<String>> {
         .await
     });
     match answer {
-        Err(_) => anyhow::bail!("DNS didn't answer in time"),
+        Err(_) => anyhow::bail!(t!("sync-auth-dns-didnt-answer-in-time")),
         Ok(Ok(record)) => Ok(Some(record.id.clone())),
         Ok(Err(Error::Dns(DnsError::RecordNotFound(_) | DnsError::InvalidRecordType))) => Ok(None),
         Ok(Err(e)) => Err(anyhow::anyhow!("{e}")),
@@ -392,7 +392,7 @@ pub(crate) fn mta_sts_id(domain: &str) -> anyhow::Result<Option<String>> {
 pub(crate) fn mx_hosts(domain: &str) -> anyhow::Result<Vec<String>> {
     use anyhow::Context as _;
     use mail_auth::{DnsError, Error};
-    let checker = checker().context("DNS isn't available")?;
+    let checker = checker().with_context(|| t!("sync-auth-dns-isnt-available"))?;
     checker.runtime.block_on(async {
         tokio::time::timeout(TIMEOUT, async {
             match checker
@@ -411,7 +411,7 @@ pub(crate) fn mx_hosts(domain: &str) -> anyhow::Result<Vec<String>> {
             }
         })
         .await
-        .map_err(|_| anyhow::anyhow!("DNS didn't answer in time"))?
+        .map_err(|_| anyhow::anyhow!(t!("sync-auth-dns-didnt-answer-in-time")))?
     })
 }
 
@@ -479,7 +479,7 @@ async fn validated_lookup(
     kind: mail_auth::hickory_resolver::proto::rr::RecordType,
 ) -> anyhow::Result<(Vec<mail_auth::hickory_resolver::proto::rr::RData>, Validation)> {
     use mail_auth::hickory_resolver::net::{DnsError, NetError};
-    let resolver = validating().ok_or_else(|| anyhow::anyhow!("DNS isn't available"))?;
+    let resolver = validating().ok_or_else(|| anyhow::anyhow!(t!("sync-auth-dns-isnt-available")))?;
     match resolver.lookup(name, kind).await {
         Ok(found) => {
             let records: Vec<_> = found
@@ -589,7 +589,7 @@ pub(crate) fn dane_hosts(domain: &str, mx: &[(u16, Vec<String>)]) -> Option<Vec<
 pub(crate) fn dane(domain: &str) -> anyhow::Result<bool> {
     use anyhow::Context as _;
     use mail_auth::hickory_resolver::proto::rr::{RData, RecordType};
-    let checker = checker().context("DNS isn't available")?;
+    let checker = checker().with_context(|| t!("sync-auth-dns-isnt-available"))?;
     checker.runtime.block_on(async {
         tokio::time::timeout(TIMEOUT, async {
             // The MX records themselves must be secure for DANE to apply
@@ -597,7 +597,7 @@ pub(crate) fn dane(domain: &str) -> anyhow::Result<bool> {
             let (mx, validation) = validated_lookup(domain, RecordType::MX).await?;
             anyhow::ensure!(
                 validation != Validation::Bogus,
-                "{domain}'s mail servers' DNS records fail DNSSEC validation"
+                t!("sync-auth-s-mail-servers-dns-records-fail", domain = domain)
             );
             if validation == Validation::Insecure && !mx.is_empty() {
                 return Ok(false);
@@ -619,7 +619,7 @@ pub(crate) fn dane(domain: &str) -> anyhow::Result<bool> {
                 match dane_state(&records, validation) {
                     DaneState::Usable => any = true,
                     DaneState::Bogus => anyhow::bail!(
-                        "{host}'s DANE records fail DNSSEC validation, so mail to {domain} can't be delivered securely"
+                        t!("sync-auth-s-dane-records-fail-dnssec-validation", host = host, domain = domain)
                     ),
                     DaneState::None => {}
                 }
@@ -627,7 +627,7 @@ pub(crate) fn dane(domain: &str) -> anyhow::Result<bool> {
             Ok(any)
         })
         .await
-        .map_err(|_| anyhow::anyhow!("DNS didn't answer in time"))?
+        .map_err(|_| anyhow::anyhow!(t!("sync-auth-dns-didnt-answer-in-time")))?
     })
 }
 
@@ -664,7 +664,7 @@ pub(crate) fn dns_keys(keys: Vec<Vec<u8>>, validation: Validation) -> DnsKeys {
 fn hashed_name(email: &str, label: &str) -> anyhow::Result<String> {
     use anyhow::Context as _;
     use sha2::Digest as _;
-    let (local, domain) = email.trim().rsplit_once('@').context("Not an address")?;
+    let (local, domain) = email.trim().rsplit_once('@').with_context(|| t!("sync-auth-not-an-address"))?;
     let hash = sha2::Sha256::digest(local.as_bytes());
     let hex: String = hash[..28].iter().map(|b| format!("{b:02x}")).collect();
     Ok(format!("{hex}.{label}.{}.", domain.trim_end_matches('.')))
@@ -675,7 +675,7 @@ pub(crate) fn openpgpkey(email: &str) -> anyhow::Result<DnsKeys> {
     use anyhow::Context as _;
     use mail_auth::hickory_resolver::proto::rr::{RData, RecordType};
     let name = hashed_name(email, "_openpgpkey")?;
-    let checker = checker().context("DNS isn't available")?;
+    let checker = checker().with_context(|| t!("sync-auth-dns-isnt-available"))?;
     checker.runtime.block_on(async {
         tokio::time::timeout(TIMEOUT, async {
             let (found, validation) = validated_lookup(&name, RecordType::OPENPGPKEY).await?;
@@ -689,7 +689,7 @@ pub(crate) fn openpgpkey(email: &str) -> anyhow::Result<DnsKeys> {
             Ok(dns_keys(keys, validation))
         })
         .await
-        .map_err(|_| anyhow::anyhow!("DNS didn't answer in time"))?
+        .map_err(|_| anyhow::anyhow!(t!("sync-auth-dns-didnt-answer-in-time")))?
     })
 }
 /// The S/MIME certificates a domain publishes for an address in DNS
@@ -700,7 +700,7 @@ pub(crate) fn smimea(email: &str) -> anyhow::Result<DnsKeys> {
     use anyhow::Context as _;
     use mail_auth::hickory_resolver::proto::rr::{RData, RecordType};
     let name = hashed_name(email, "_smimecert")?;
-    let checker = checker().context("DNS isn't available")?;
+    let checker = checker().with_context(|| t!("sync-auth-dns-isnt-available"))?;
     checker.runtime.block_on(async {
         tokio::time::timeout(TIMEOUT, async {
             let (found, validation) = validated_lookup(&name, RecordType::SMIMEA).await?;
@@ -716,14 +716,14 @@ pub(crate) fn smimea(email: &str) -> anyhow::Result<DnsKeys> {
             Ok(dns_keys(keys, validation))
         })
         .await
-        .map_err(|_| anyhow::anyhow!("DNS didn't answer in time"))?
+        .map_err(|_| anyhow::anyhow!(t!("sync-auth-dns-didnt-answer-in-time")))?
     })
 }
 
 pub(crate) fn txt(name: &str) -> anyhow::Result<Vec<String>> {
     use anyhow::Context as _;
     use mail_auth::hickory_resolver::proto::rr::{RData, RecordType};
-    let checker = checker().context("DNS isn't available")?;
+    let checker = checker().with_context(|| t!("sync-auth-dns-isnt-available"))?;
     checker.runtime.block_on(async {
         tokio::time::timeout(TIMEOUT, async {
             let found = match checker
@@ -752,14 +752,14 @@ pub(crate) fn txt(name: &str) -> anyhow::Result<Vec<String>> {
                 .collect())
         })
         .await
-        .map_err(|_| anyhow::anyhow!("DNS didn't answer in time"))?
+        .map_err(|_| anyhow::anyhow!(t!("sync-auth-dns-didnt-answer-in-time")))?
     })
 }
 
 pub(crate) fn srv(name: &str) -> anyhow::Result<Vec<(String, u16)>> {
     use anyhow::Context as _;
     use mail_auth::hickory_resolver::proto::rr::{RData, RecordType};
-    let checker = checker().context("DNS isn't available")?;
+    let checker = checker().with_context(|| t!("sync-auth-dns-isnt-available"))?;
     checker.runtime.block_on(async {
         tokio::time::timeout(TIMEOUT, async {
             let found = match checker
@@ -800,7 +800,7 @@ pub(crate) fn srv(name: &str) -> anyhow::Result<Vec<(String, u16)>> {
             Ok(srv_order(records, &mut rand::rng()))
         })
         .await
-        .map_err(|_| anyhow::anyhow!("DNS didn't answer in time"))?
+        .map_err(|_| anyhow::anyhow!(t!("sync-auth-dns-didnt-answer-in-time")))?
     })
 }
 

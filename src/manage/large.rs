@@ -58,7 +58,7 @@ impl Backend {
     pub(super) fn download_resumable(&self, c: &mut Connection, m: &Mail) -> Result<Vec<u8>> {
         use std::io::Write;
         let path = self.partial_file(&m.id);
-        let dir = path.parent().context("Invalid download folder")?;
+        let dir = path.parent().with_context(|| t!("manage-large-invalid-download-folder"))?;
         std::fs::create_dir_all(dir)?;
         self.remove_stale_partials();
         let mut have = std::fs::read(&path).unwrap_or_default();
@@ -81,7 +81,7 @@ impl Backend {
                 // after a week.
                 drop(file);
                 let _ = std::fs::remove_file(&path);
-                bail!("This message is larger than Picacho downloads whole.");
+                bail!(t!("manage-large-this-message-is-larger-than-picacho"));
             }
             file.write_all(&piece)?;
             file.flush()?;
@@ -90,7 +90,7 @@ impl Backend {
                 break;
             }
         }
-        ensure!(!have.is_empty(), "Message no longer exists on the server");
+        ensure!(!have.is_empty(), t!("manage-large-message-no-longer-exists-on-the"));
         drop(file);
         let _ = std::fs::remove_file(&path);
         Ok(have)
@@ -110,7 +110,7 @@ impl Backend {
             .into_iter()
             .find(|r| r.uid == m.uid)
             .and_then(|r| r.header)
-            .context("Message no longer exists on the server")?;
+            .with_context(|| t!("manage-large-message-no-longer-exists-on-the"))?;
         let mut next = parse_message(&header, a, &m.id, m.folder, &m.remote_folder, m.uid)?;
         let leaves = structure(&mut c.session, m.uid)?;
         let mut body = None;
@@ -228,13 +228,13 @@ impl Backend {
         }
         ensure!(
             attachment.size <= MAX_PART,
-            "This attachment is larger than Picacho downloads (1 GB)."
+            t!("manage-large-this-attachment-is-larger-than-picacho")
         );
         ensure!(
             leaf.section
                 .bytes()
                 .all(|b| b.is_ascii_digit() || b == b'.'),
-            "Invalid IMAP section"
+            t!("manage-large-invalid-imap-section")
         );
         // Base64 (nearly every large attachment) is decoded piece by piece
         // as it arrives, so only the decoded file is held, not the encoded
@@ -252,14 +252,14 @@ impl Backend {
                 .into_iter()
                 .find(|r| r.uid == m.uid)
                 .and_then(|r| r.header)
-                .context("The message no longer exists on the server")?;
+                .with_context(|| t!("manage-large-the-message-no-longer-exists-on"))?;
             let done = piece.len() < CHUNK;
             offset += piece.len();
-            ensure!(offset <= MAX_PART * 2, "This attachment is too large.");
+            ensure!(offset <= MAX_PART * 2, t!("manage-large-this-attachment-is-too-large"));
             match &mut base64 {
                 Some(stream) => {
                     stream.feed(&piece)?;
-                    ensure!(stream.out.len() <= MAX_PART, "This attachment is too large.");
+                    ensure!(stream.out.len() <= MAX_PART, t!("manage-large-this-attachment-is-too-large"));
                 }
                 None => raw.extend_from_slice(&piece),
             }
@@ -313,7 +313,7 @@ impl Base64Stream {
         use base64::Engine as _;
         Self::ENGINE
             .decode_vec(&self.pending[start..end], &mut self.out)
-            .context("The attachment's encoding is damaged")
+            .with_context(|| t!("manage-large-the-attachments-encoding-is-damaged"))
     }
     fn finish(mut self) -> Result<Vec<u8>> {
         let len = self.pending.len();

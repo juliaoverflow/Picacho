@@ -10,7 +10,7 @@ KCM.SimpleKCM {
     property alias cfg_accountId: accountIdHolder.text
     property alias cfg_unreadOnly: unreadOnlyCheck.checked
 
-    property var accountModel: [{ id: "", label: "All Inboxes" }]
+    property var accountModel: [{ id: "", label: word("all-inboxes", "All Inboxes") }]
     property var execSource: null
 
     Text {
@@ -18,14 +18,23 @@ KCM.SimpleKCM {
         visible: false
     }
 
+    // The page's words in the language Picacho shows (the snapshot's
+    // labels), else in English. %1 and %2 stand for a and b.
+    property var labels: ({})
+    function word(name, english, a, b) {
+        var text = labels[name] || english;
+        return text.replace("%1", function () { return a; }).replace("%2", function () { return b; });
+    }
+
     function applyAccounts(snap) {
-        var items = [{ id: "", label: "All Inboxes" }];
+        labels = (snap && snap.labels) || {};
+        var items = [{ id: "", label: word("all-inboxes", "All Inboxes") }];
         if (snap && snap.accounts) {
             for (var i = 0; i < snap.accounts.length; i++) {
                 var a = snap.accounts[i];
                 var label = (!a.name || a.name === a.email)
                     ? a.email
-                    : (a.name + " (" + a.email + ")");
+                    : word("account-name", "%1 (%2)", a.name, a.email);
                 items.push({ id: a.id, label: label });
             }
         }
@@ -77,7 +86,7 @@ KCM.SimpleKCM {
     Kirigami.FormLayout {
         QQC2.ComboBox {
             id: accountCombo
-            Kirigami.FormData.label: "Account:"
+            Kirigami.FormData.label: word("account", "Account:")
             model: accountModel
             textRole: "label"
             onActivated: function(index) {
@@ -89,7 +98,7 @@ KCM.SimpleKCM {
 
         QQC2.CheckBox {
             id: unreadOnlyCheck
-            text: "Show unread messages only"
+            text: word("show-unread-only", "Show unread messages only")
         }
     }
 }

@@ -210,22 +210,22 @@ impl Composer {
             })
         };
         let recipients = [
-            field("Recipients", window, cx),
-            field("Cc", window, cx),
-            field("Bcc", window, cx),
-            field("Where replies go", window, cx),
+            field(t!("composer-recipients"), window, cx),
+            field(t!("composer-cc"), window, cx),
+            field(t!("composer-bcc"), window, cx),
+            field(t!("composer-where-replies-go"), window, cx),
         ];
         let subject = cx.new(|cx| {
             InputState::new(window, cx)
-                .placeholder("Subject")
+                .placeholder(t!("composer-subject"))
                 .input_action(TextInputAction::Next)
                 .autocorrect(true)
                 .autocapitalize(Autocapitalize::Sentences)
         });
-        let from_filter = field("Find an address", window, cx);
+        let from_filter = field(t!("composer-find-an-address"), window, cx);
         let body = cx.new(|cx| {
             TextareaState::new(window, cx)
-                .placeholder("Write your message…")
+                .placeholder(t!("composer-write-your-message"))
                 .autocorrect(true)
                 .autocapitalize(Autocapitalize::Sentences)
         });
@@ -398,13 +398,13 @@ impl Composer {
         let subject = self.subject.read(cx).value().trim().to_string();
         if self.placement == Placement::Inline {
             return if self.draft.subject.to_lowercase().starts_with("fwd:") {
-                "Forward".into()
+                t!("composer-forward").into()
             } else {
-                "Reply".into()
+                t!("composer-reply").into()
             };
         }
         if subject.is_empty() {
-            "New Message".into()
+            t!("composer-new-message").into()
         } else {
             subject
         }
@@ -720,7 +720,7 @@ impl Composer {
                     ClipboardEntry::Image(image) if !image.bytes.is_empty() => {
                         let extension = image.format.mime_type().rsplit('/').next().unwrap_or("png");
                         let extension = extension.split('+').next().unwrap_or(extension);
-                        let name = format!("Pasted image.{extension}");
+                        let name = t!("composer-pasted-image", extension = extension);
                         match self.backend.save_pasted(&self.draft.id, &name, &image.bytes) {
                             Ok(path) => {
                                 pictures.push(path.clone());
@@ -840,9 +840,9 @@ impl Composer {
 
     pub(super) fn paste_offer_label(&self) -> Option<&'static str> {
         Some(if self.paste.as_ref()?.inserted_formatted {
-            "Paste without formatting"
+            t!("composer-paste-without-formatting")
         } else {
-            "Paste with formatting"
+            t!("composer-paste-with-formatting")
         })
     }
 
@@ -910,7 +910,7 @@ impl Composer {
         }
         self.close_later();
         if at.is_some_and(|t| t <= chrono::Utc::now().timestamp() + 30) {
-            self.error = Some("Choose a time in the future.".into());
+            self.error = Some(t!("composer-choose-a-time-in-the-future").into());
             cx.notify();
             return;
         }
@@ -924,9 +924,7 @@ impl Composer {
                 .iter()
                 .find(|a| a.id == self.draft.account)
                 .map_or(String::new(), |a| a.email.clone());
-            self.error = Some(format!(
-                "{email} sends only as its aliases. Choose an alias in From."
-            ));
+            self.error = Some(t!("composer-sends-only-as-its-aliases-choose", email = email));
             self.from_open = true;
             cx.notify();
             return;
@@ -934,13 +932,13 @@ impl Composer {
         let d = self.snapshot(cx);
         let any = [&d.to, &d.cc, &d.bcc].iter().any(|f| !f.trim().is_empty());
         if !any {
-            self.error = Some("Add at least one recipient.".into());
+            self.error = Some(t!("composer-add-at-least-one-recipient").into());
             self.recipients[TO].update(cx, |s, cx| s.focus(window, cx));
             cx.notify();
             return;
         }
         if let Err(e) = crate::sync::smtp::recipients(&d.reply_to) {
-            self.error = Some(format!("Reply-To: {e:#}"));
+            self.error = Some(t!("composer-reply-to", e = format!("{:#}", e)));
             cx.notify();
             return;
         }
@@ -957,9 +955,9 @@ impl Composer {
         if !d.encrypt && self.answers_encrypted(&d) {
             let answer = window.prompt(
                 PromptLevel::Warning,
-                "Send unencrypted?",
+                t!("composer-send-unencrypted"),
                 Some(crate::manage::protected_reply::WARNING),
-                &["Send Without the Quote", "Keep Editing"],
+                &[t!("composer-send-without-the-quote"), t!("composer-keep-editing")],
                 cx,
             );
             cx.spawn_in(window, async move |this, cx| {
@@ -975,13 +973,13 @@ impl Composer {
         }
         let mut doubts = vec![];
         if self.options.warn_empty_subject && d.subject.trim().is_empty() {
-            doubts.push("This message has no subject.");
+            doubts.push(t!("composer-this-message-has-no-subject"));
         }
         if self.options.attachment_reminder
             && d.attachments.is_empty()
             && mentions_attachment(&d.body)
         {
-            doubts.push("The message mentions an attachment, but nothing is attached.");
+            doubts.push(t!("composer-the-message-mentions-an-attachment-but"));
         }
         if doubts.is_empty() {
             cx.emit(event());
@@ -990,14 +988,14 @@ impl Composer {
         let answer = window.prompt(
             PromptLevel::Warning,
             if at.is_some() {
-                "Schedule anyway?"
+                t!("composer-schedule-anyway")
             } else {
-                "Send anyway?"
+                t!("composer-send-anyway")
             },
             Some(&doubts.join("\n")),
             &[
-                if at.is_some() { "Schedule" } else { "Send" },
-                "Keep Editing",
+                if at.is_some() { t!("composer-schedule") } else { t!("composer-send") },
+                t!("composer-keep-editing"),
             ],
             cx,
         );
@@ -1052,7 +1050,7 @@ impl Composer {
             self.focus.focus(window, cx);
         }
         let picker = cx.new(|cx| {
-            let picker = DateTimePicker::new("later", "Send", presets, colors).phone(mobile);
+            let picker = DateTimePicker::new("later", t!("composer-send"), presets, colors).phone(mobile);
             let picker = match at {
                 Some(at) => picker.at(at),
                 None => picker,
@@ -1091,11 +1089,9 @@ impl Composer {
         let when = crate::manage::composing::describe_later(at, chrono::Local::now());
         let failed = !self.draft.send_error.is_empty();
         let text = if failed {
-            format!("Not sent {when}: {}", self.draft.send_error)
+            t!("composer-not-sent", when = when, send_error = self.draft.send_error)
         } else {
-            format!(
-                "Scheduled to send {when}. It waits in Drafts until then while Picacho is open."
-            )
+            t!("composer-scheduled-to-send-it-waits-in", when = when)
         };
         Some(
             div()
@@ -1127,7 +1123,7 @@ impl Composer {
                         .text_color(rgb(c.accent))
                         .cursor_pointer()
                         .hover(move |s| s.bg(rgb(c.border)))
-                        .child("Don't Send Later")
+                        .child(t!("composer-dont-send-later"))
                         .on_click(cx.listener(|this, _, _, cx| this.unschedule(cx))),
                 ),
         )
@@ -1155,7 +1151,7 @@ impl Composer {
             .active(|s| s.opacity(0.6))
             .text_size(px(14.))
             .text_color(rgb(if on { c.accent } else { c.muted }))
-            .child("Rich text")
+            .child(t!("composer-rich-text"))
             // A small switch, so on and off read at a glance.
             .child(
                 div()
@@ -1222,7 +1218,7 @@ impl Composer {
                         div()
                             .text_size(px(20.))
                             .font_weight(FontWeight::BOLD)
-                            .child("Send Later"),
+                            .child(t!("composer-send-later")),
                     ),
             )
             // The picker scrolls its middle and keeps its buttons in view.
@@ -1267,7 +1263,7 @@ impl Composer {
                     .text_size(px(11.))
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(rgb(c.muted))
-                    .child("SEND LATER"),
+                    .child(t!("composer-send-later-2")),
             )
             .children(self.later_picker.clone())
     }
@@ -1327,7 +1323,7 @@ impl Composer {
                     .py_1()
                     .text_size(px(12.))
                     .text_color(rgb(c.muted))
-                    .child("No templates yet. Write a message you send often, then save it here."),
+                    .child(t!("composer-no-templates-yet-write-a-message")),
             );
         }
         for (i, t) in self.options.templates.iter().enumerate() {
@@ -1340,7 +1336,7 @@ impl Composer {
             )));
         }
         menu.child(div().h(px(1.)).my_1().bg(rgb(c.border))).child(
-            row("template-save".into(), "Save This Message as a Template".into()).on_click(
+            row("template-save".into(), t!("composer-save-this-message-as-a-template").into()).on_click(
                 cx.listener(|this, _, _, cx| {
                     this.templates_open = false;
                     let subject = this.subject.read(cx).value().to_string();
@@ -1353,12 +1349,12 @@ impl Composer {
                         .trim_end()
                         .to_owned();
                     if body.trim().is_empty() && subject.trim().is_empty() {
-                        this.error = Some("Write something first, then save it as a template".into());
+                        this.error = Some(t!("composer-write-something-first-then-save-it").into());
                         cx.notify();
                         return;
                     }
                     let name = if subject.trim().is_empty() {
-                        body.lines().next().unwrap_or("Template").chars().take(40).collect()
+                        body.lines().next().unwrap_or(t!("composer-template")).chars().take(40).collect()
                     } else {
                         subject.clone()
                     };
@@ -1427,9 +1423,10 @@ impl Composer {
             email,
             my_name,
             my_email,
-            date: now.format("%B %-d, %Y").to_string(),
-            time: now.format("%-I:%M %p").to_string(),
-            weekday: now.format("%A").to_string(),
+            // Written into the message: in the language of mail Picacho writes.
+            date: crate::i18n::in_outgoing(|| now.local(t!("dates-month-name-day-year"))),
+            time: crate::i18n::in_outgoing(|| now.local(t!("dates-time"))),
+            weekday: crate::i18n::in_outgoing(|| now.local("%A")),
             subject: self.subject.read(cx).value().to_string(),
         }
     }
@@ -1447,7 +1444,7 @@ impl Composer {
             files: true,
             directories: false,
             multiple: true,
-            prompt: Some("Attach".into()),
+            prompt: Some(t!("composer-attach").into()),
         });
         cx.spawn(async move |this, cx| {
             if let Ok(Ok(Some(paths))) = picker.await {
@@ -1576,7 +1573,7 @@ impl Composer {
             .child(self.icon_button(
                 "save",
                 "save",
-                super::shortcuts::tip("Save draft", "save-draft", cx),
+                super::shortcuts::tip(t!("composer-save-draft"), "save-draft", cx),
                 false,
                 cx,
                 |this, _, cx| this.save(cx),
@@ -1584,7 +1581,7 @@ impl Composer {
             .child(self.icon_button(
                 "dock-main",
                 "shrink",
-                "Move into main window",
+                t!("composer-move-into-main-window"),
                 false,
                 cx,
                 |_, _, cx| cx.emit(ComposerEvent::Place(Placement::Floating)),
@@ -1649,7 +1646,7 @@ impl Composer {
         let save = self.icon_button(
             "save",
             "save",
-            super::shortcuts::tip("Save draft", "save-draft", cx),
+            super::shortcuts::tip(t!("composer-save-draft"), "save-draft", cx),
             false,
             cx,
             |this, _, cx| {
@@ -1665,9 +1662,9 @@ impl Composer {
                         "minimize",
                         if self.minimized { "undock" } else { "dock" },
                         if self.minimized {
-                            "Restore"
+                            t!("composer-restore")
                         } else {
-                            "Minimize"
+                            t!("composer-minimize")
                         },
                         false,
                         cx,
@@ -1683,9 +1680,9 @@ impl Composer {
                         "maximize",
                         if maximized { "shrink" } else { "expand" },
                         if maximized {
-                            "Exit full size"
+                            t!("composer-exit-full-size")
                         } else {
-                            "Full size"
+                            t!("composer-full-size")
                         },
                         false,
                         cx,
@@ -1701,7 +1698,7 @@ impl Composer {
                     .child(self.icon_button(
                         "new-window",
                         "popout",
-                        "Open in new window",
+                        t!("composer-open-in-new-window"),
                         false,
                         cx,
                         |_, _, cx| cx.emit(ComposerEvent::Place(Placement::Window)),
@@ -1712,7 +1709,7 @@ impl Composer {
                     .child(self.icon_button(
                         "pop-out",
                         "expand",
-                        "Pop out reply",
+                        t!("composer-pop-out-reply"),
                         false,
                         cx,
                         |_, _, cx| cx.emit(ComposerEvent::Place(Placement::Floating)),
@@ -1720,7 +1717,7 @@ impl Composer {
                     .child(self.icon_button(
                         "new-window",
                         "popout",
-                        "Open in new window",
+                        t!("composer-open-in-new-window"),
                         false,
                         cx,
                         |_, _, cx| cx.emit(ComposerEvent::Place(Placement::Window)),
@@ -1730,7 +1727,7 @@ impl Composer {
                 header = header.child(self.icon_button(
                     "dock-main",
                     "shrink",
-                    "Move into main window",
+                    t!("composer-move-into-main-window"),
                     false,
                     cx,
                     |_, _, cx| cx.emit(ComposerEvent::Place(Placement::Floating)),
@@ -1738,7 +1735,7 @@ impl Composer {
             }
         }
         header.child(
-            self.icon_button("close", "close", "Save and close", false, cx, |_, _, cx| {
+            self.icon_button("close", "close", t!("composer-save-and-close"), false, cx, |_, _, cx| {
                 cx.emit(ComposerEvent::Close)
             }),
         )
@@ -1840,7 +1837,7 @@ impl Composer {
     fn new_alias_button(&self, id: (&'static str, usize), account: &Account, cx: &Context<Self>) -> Option<Stateful<Div>> {
         let c = self.colors;
         let (service, kind, _) = self.alias_service_for(&account.id)?;
-        let tip = format!("New {} alias for {}", kind.label(), account.email);
+        let tip = t!("composer-new-alias-for", label = kind.label(), email = account.email);
         let (service, mailbox) = (service.clone(), account.id.clone());
         Some(
             div()
@@ -1976,17 +1973,14 @@ impl Composer {
         let missing = missing || gone;
         let (label, tip) = match alias {
             None if gone => (
-                "Removed address".to_owned(),
-                format!(
-                    "This address was removed from {}. Choose another.",
-                    current.email
-                ),
+                t!("composer-removed-address").to_owned(),
+                t!("composer-this-address-was-removed-from-choose", email = current.email),
             ),
             None if identity.is_some() => {
                 let i = identity.unwrap();
                 let through = match &i.smtp {
-                    Some(s) => format!("Sent through {}.", s.host),
-                    None => format!("Sent through {}'s server.", current.email),
+                    Some(s) => t!("composer-sent-through", host = s.host),
+                    None => t!("composer-sent-through-s-server", email = current.email),
                 };
                 let name = if i.name.is_empty() {
                     current.name.as_str()
@@ -2003,27 +1997,16 @@ impl Composer {
                 )
             }
             None if blocked => (
-                "Choose an alias".to_owned(),
-                format!(
-                    "{} sends only as its aliases (Settings → Forwarding).",
-                    current.email
-                ),
+                t!("composer-choose-an-alias").to_owned(),
+                t!("composer-sends-only-as-its-aliases-settings", email = current.email),
             ),
             None if missing => (
                 self.draft.send_as.clone(),
-                format!(
-                    "{} no longer exists. Choose another address.",
-                    self.draft.send_as
-                ),
+                t!("composer-no-longer-exists-choose-another-address", send_as = self.draft.send_as),
             ),
             Some(a) => (
                 a.email.clone(),
-                format!(
-                    "Sent through {} from {}. Recipients see {}.",
-                    a.service.label(),
-                    current.email,
-                    a.email
-                ),
+                t!("composer-sent-through-from-recipients-see", label = a.service.label(), email = current.email, email2 = a.email),
             ),
             None if current.name.is_empty() || current.name == current.email => {
                 (current.email.clone(), current.email.clone())
@@ -2070,7 +2053,7 @@ impl Composer {
             .min_w_0()
             .child(picker)
             .children(self.new_alias_button(("compose-new-alias", 0), current, cx));
-        let mut row = self.row("From", field).relative();
+        let mut row = self.row(t!("composer-from"), field).relative();
         if self.from_open && several {
             row = row.child(deferred(self.sender_menu(current, cx)).with_priority(2));
         }
@@ -2151,7 +2134,7 @@ impl Composer {
             .filter(|a| matches(&[&a.email, &a.name]))
             .collect();
         if !accounts.is_empty() && !self.aliases.is_empty() {
-            list = list.child(heading("Accounts".into()));
+            list = list.child(heading(t!("composer-accounts").into()));
         }
         let mut other = 0;
         for (i, a) in accounts.into_iter().enumerate() {
@@ -2175,8 +2158,8 @@ impl Composer {
                     continue;
                 }
                 let through = match &ident.smtp {
-                    Some(s) => format!("Through {}", s.host),
-                    None => format!("Through {}", a.email),
+                    Some(s) => t!("composer-through", host = s.host),
+                    None => t!("composer-through-2", email = a.email),
                 };
                 let caption = if ident.name.is_empty() {
                     through
@@ -2206,7 +2189,7 @@ impl Composer {
             }
             if service != Some(a.service) {
                 service = Some(a.service);
-                list = list.child(heading(format!("{} aliases", a.service.label())));
+                list = list.child(heading(t!("composer-aliases", label = a.service.label())));
             }
             // Through the mailbox the service delivers to, else this one.
             let through = a
@@ -2215,9 +2198,9 @@ impl Composer {
                 .and_then(|id| self.accounts.iter().find(|x| &x.id == id))
                 .unwrap_or(current);
             let caption = if a.note.is_empty() {
-                format!("Sends through {}", through.email)
+                t!("composer-sends-through", email = through.email)
             } else {
-                format!("{} · through {}", a.note, through.email)
+                t!("composer-through-3", note = a.note, email = through.email)
             };
             list = list.child(option(
                 ("from-alias", i),
@@ -2237,7 +2220,7 @@ impl Composer {
                     .py_2()
                     .text_size(px(12.))
                     .text_color(rgb(c.muted))
-                    .child("No address matches."),
+                    .child(t!("composer-no-address-matches")),
             );
         }
         div()
@@ -2284,7 +2267,7 @@ impl Composer {
 
     fn recipient_row(&self, field: usize, cx: &Context<Self>) -> Div {
         let c = self.colors;
-        let label = ["To", "Cc", "Bcc", "Reply-To"][field];
+        let label = [t!("composer-to"), t!("composer-cc"), t!("composer-bcc"), t!("composer-reply-to-2")][field];
         let mut input = self.input(&self.recipients[field]);
         if field == TO {
             let toggle = |id: &'static str, label: &'static str, on: bool, which: usize| {
@@ -2311,11 +2294,11 @@ impl Composer {
                 div()
                     .flex()
                     .gap_1()
-                    .child(toggle("compose-show-cc", "Cc", self.show_cc, CC))
-                    .child(toggle("compose-show-bcc", "Bcc", self.show_bcc, BCC))
+                    .child(toggle("compose-show-cc", t!("composer-cc"), self.show_cc, CC))
+                    .child(toggle("compose-show-bcc", t!("composer-bcc"), self.show_bcc, BCC))
                     .child(toggle(
                         "compose-show-reply-to",
-                        "Reply-To",
+                        t!("composer-reply-to-2"),
                         self.show_reply_to,
                         REPLY_TO,
                     )),
@@ -2395,14 +2378,14 @@ impl Composer {
             .border_b_1()
             .border_color(rgb(c.border))
             .child(
-                self.icon_button("bold", "bold", super::shortcuts::tip("Bold", "bold", cx), false, cx, |t, w, cx| {
+                self.icon_button("bold", "bold", super::shortcuts::tip(t!("composer-bold"), "bold", cx), false, cx, |t, w, cx| {
                     t.wrap("**", w, cx)
                 }),
             )
             .child(self.icon_button(
                 "italic",
                 "italic",
-                super::shortcuts::tip("Italic", "italic", cx),
+                super::shortcuts::tip(t!("composer-italic"), "italic", cx),
                 false,
                 cx,
                 |t, w, cx| t.wrap("_", w, cx),
@@ -2410,13 +2393,13 @@ impl Composer {
             .child(self.icon_button(
                 "strike",
                 "strike",
-                super::shortcuts::tip("Strikethrough", "strikethrough", cx),
+                super::shortcuts::tip(t!("composer-strikethrough"), "strikethrough", cx),
                 false,
                 cx,
                 |t, w, cx| t.wrap("~~", w, cx),
             ))
             .child(
-                self.icon_button("code", "code", super::shortcuts::tip("Code", "code", cx), false, cx, |t, w, cx| {
+                self.icon_button("code", "code", super::shortcuts::tip(t!("composer-code"), "code", cx), false, cx, |t, w, cx| {
                     t.wrap("`", w, cx)
                 }),
             )
@@ -2424,7 +2407,7 @@ impl Composer {
             .child(self.icon_button(
                 "heading",
                 "heading",
-                super::shortcuts::tip("Heading", "heading", cx),
+                super::shortcuts::tip(t!("composer-heading"), "heading", cx),
                 false,
                 cx,
                 |t, w, cx| t.prefix_lines(Lines::Heading, w, cx),
@@ -2432,7 +2415,7 @@ impl Composer {
             .child(self.icon_button(
                 "bullets",
                 "list",
-                super::shortcuts::tip("Bulleted list", "bulleted-list", cx),
+                super::shortcuts::tip(t!("composer-bulleted-list"), "bulleted-list", cx),
                 false,
                 cx,
                 |t, w, cx| t.prefix_lines(Lines::Bullets, w, cx),
@@ -2440,7 +2423,7 @@ impl Composer {
             .child(self.icon_button(
                 "numbers",
                 "list-ordered",
-                super::shortcuts::tip("Numbered list", "numbered-list", cx),
+                super::shortcuts::tip(t!("composer-numbered-list"), "numbered-list", cx),
                 false,
                 cx,
                 |t, w, cx| t.prefix_lines(Lines::Numbers, w, cx),
@@ -2448,13 +2431,13 @@ impl Composer {
             .child(self.icon_button(
                 "quote",
                 "quote",
-                super::shortcuts::tip("Quote", "quote", cx),
+                super::shortcuts::tip(t!("composer-quote"), "quote", cx),
                 false,
                 cx,
                 |t, w, cx| t.prefix_lines(Lines::Quote, w, cx),
             ))
             .child(
-                self.icon_button("link", "link", super::shortcuts::tip("Link", "link", cx), false, cx, |t, w, cx| {
+                self.icon_button("link", "link", super::shortcuts::tip(t!("composer-link"), "link", cx), false, cx, |t, w, cx| {
                     t.insert_link(w, cx)
                 }),
             )
@@ -2462,7 +2445,7 @@ impl Composer {
             .child(self.icon_button(
                 "preview",
                 "preview",
-                super::shortcuts::tip("Preview", "preview-formatting", cx),
+                super::shortcuts::tip(t!("composer-preview"), "preview-formatting", cx),
                 self.preview,
                 cx,
                 |t, _, cx| {
@@ -2578,7 +2561,7 @@ impl Composer {
                             .cursor_pointer()
                             .hover(move |s| s.bg(rgb(c.border)))
                             .child(icon_el("close", 11., c.muted))
-                            .tooltip(|w, cx| Tooltip::new("Remove").build(w, cx))
+                            .tooltip(|w, cx| Tooltip::new(t!("composer-remove")).build(w, cx))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 if i < this.draft.attachments.len() {
                                     this.draft.attachments.remove(i);
@@ -2611,8 +2594,8 @@ impl Composer {
             .active(|s| s.opacity(0.8))
             .when(self.sending, |d| d.opacity(0.6))
             .child(icon_el("send", 14., c.on_accent))
-            .child(if self.sending { "Sending…" } else { "Send" })
-            .tooltip(|w, cx| Tooltip::new(keys(&super::shortcuts::tip("Send", "send", cx))).build(w, cx))
+            .child(if self.sending { t!("composer-sending") } else { t!("composer-send") })
+            .tooltip(|w, cx| Tooltip::new(keys(&super::shortcuts::tip(t!("composer-send"), "send", cx))).build(w, cx))
             .on_click(cx.listener(|this, _, w, cx| this.request_send(w, cx)));
         let status = if let Some(error) = &self.error {
             div()
@@ -2626,9 +2609,9 @@ impl Composer {
                 .truncate()
                 .text_color(rgb(c.muted))
                 .when(self.saved && !self.draft.is_empty(), |d| {
-                    d.child("Draft saved")
+                    d.child(t!("composer-draft-saved"))
                 })
-                .when(!self.saved, |d| d.child("Editing…"))
+                .when(!self.saved, |d| d.child(t!("composer-editing")))
         };
         div()
             .h(px(if self.mobile { 60. } else { 52. }))
@@ -2644,7 +2627,7 @@ impl Composer {
             .child(self.icon_button(
                 "send-later",
                 "clock",
-                "Send later…",
+                t!("composer-send-later-3"),
                 self.later_open,
                 cx,
                 |t, w, cx| {
@@ -2666,7 +2649,7 @@ impl Composer {
             .child(self.icon_button(
                 "attach",
                 "paperclip",
-                "Attach files (or drop them here)",
+                t!("composer-attach-files-or-drop-them-here"),
                 false,
                 cx,
                 |t, _, cx| t.attach(cx),
@@ -2674,7 +2657,7 @@ impl Composer {
             .child(self.icon_button(
                 "templates",
                 "template",
-                "Templates",
+                t!("composer-templates"),
                 self.templates_open,
                 cx,
                 |t, _, cx| {
@@ -2692,9 +2675,9 @@ impl Composer {
                     "format",
                     "format",
                     if self.draft.formatted {
-                        "Formatting on: sent with bold, lists and links"
+                        t!("composer-formatting-on-sent-with-bold-lists")
                     } else {
-                        "Plain text: turn formatting on"
+                        t!("composer-plain-text-turn-formatting-on")
                     },
                     self.draft.formatted,
                     cx,
@@ -2712,10 +2695,10 @@ impl Composer {
                     "sign",
                     "shield-check",
                     match (self.draft.sign, smime) {
-                        (true, false) => "Signed with your OpenPGP key",
-                        (false, false) => "Sign with your OpenPGP key",
-                        (true, true) => "Signed with your S/MIME certificate",
-                        (false, true) => "Sign with your S/MIME certificate",
+                        (true, false) => t!("composer-signed-with-your-openpgp-key"),
+                        (false, false) => t!("composer-sign-with-your-openpgp-key"),
+                        (true, true) => t!("composer-signed-with-your-s-mime-certificate"),
+                        (false, true) => t!("composer-sign-with-your-s-mime-certificate"),
                     },
                     self.draft.sign,
                     cx,
@@ -2729,9 +2712,9 @@ impl Composer {
                     "priority",
                     "warning",
                     match self.draft.priority {
-                        crate::manage::model::Priority::Normal => "Normal priority: mark as important",
-                        crate::manage::model::Priority::High => "High priority: mark as low priority",
-                        crate::manage::model::Priority::Low => "Low priority: back to normal",
+                        crate::manage::model::Priority::Normal => t!("composer-normal-priority-mark-as-important"),
+                        crate::manage::model::Priority::High => t!("composer-high-priority-mark-as-low-priority"),
+                        crate::manage::model::Priority::Low => t!("composer-low-priority-back-to-normal"),
                     },
                     !self.draft.priority.is_normal(),
                     cx,
@@ -2745,10 +2728,10 @@ impl Composer {
                     "encrypt",
                     "lock",
                     match (self.draft.encrypt, smime) {
-                        (true, false) => "Encrypted to each recipient's OpenPGP key",
-                        (false, false) => "Encrypt with OpenPGP (Picacho looks up recipients' keys)",
-                        (true, true) => "Encrypted to each recipient's S/MIME certificate",
-                        (false, true) => "Encrypt with S/MIME (recipients must have sent you signed mail)",
+                        (true, false) => t!("composer-encrypted-to-each-recipients-openpgp-key"),
+                        (false, false) => t!("composer-encrypt-with-openpgp-picacho-looks-up"),
+                        (true, true) => t!("composer-encrypted-to-each-recipients-s-mime"),
+                        (false, true) => t!("composer-encrypt-with-s-mime-recipients-must"),
                     },
                     self.draft.encrypt,
                     cx,
@@ -2765,9 +2748,9 @@ impl Composer {
                         "encrypt-subject",
                         "eye-off",
                         if self.draft.encrypt_subject {
-                            "The subject is encrypted too (others see “...”)"
+                            t!("composer-the-subject-is-encrypted-too-others")
                         } else {
-                            "Encrypt the subject too"
+                            t!("composer-encrypt-the-subject-too")
                         },
                         self.draft.encrypt_subject,
                         cx,
@@ -2783,9 +2766,9 @@ impl Composer {
                         "protect-kind",
                         "key-round",
                         if smime {
-                            "Using S/MIME: switch to OpenPGP"
+                            t!("composer-using-s-mime-switch-to-openpgp")
                         } else {
-                            "Using OpenPGP: switch to S/MIME"
+                            t!("composer-using-openpgp-switch-to-s-mime")
                         },
                         smime,
                         cx,
@@ -2808,7 +2791,7 @@ impl Composer {
             .child(self.icon_button(
                 "discard",
                 "trash",
-                "Discard draft",
+                t!("composer-discard-draft"),
                 false,
                 cx,
                 |_, _, cx| cx.emit(ComposerEvent::Discard),
@@ -2823,7 +2806,7 @@ impl Render for Composer {
         let mut root = div()
             .id("composer")
             .role(Role::Form)
-            .aria_label("New message")
+            .aria_label(t!("composer-new-message-2"))
             .key_context("Composer")
             .track_focus(&self.focus)
             .debug_selector(|| "composer".into())
@@ -2872,7 +2855,7 @@ impl Render for Composer {
             root = root.child(self.recipient_row(REPLY_TO, cx));
         }
         if !inline {
-            root = root.child(self.row("Subject", self.input(&self.subject)));
+            root = root.child(self.row(t!("composer-subject"), self.input(&self.subject)));
         }
         if self.draft.formatted {
             root = root.child(self.toolbar(cx));

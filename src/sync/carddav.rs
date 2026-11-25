@@ -941,7 +941,7 @@ fn xml_text(text: &str) -> String {
 /// address books too large to read whole, and directories (such as an
 /// organization's) that list only what is asked for.
 pub fn search(server: &Server, password: &str, tls: native_tls::TlsConnector, text: &str, limit: u32) -> Result<Vec<Card>> {
-    ensure!(!text.trim().is_empty(), "Write something to look for.");
+    ensure!(!text.trim().is_empty(), t!("sync-carddav-write-something-to-look-for"));
     let client = client(server, password, tls)?;
     let books = dav::discover(&client, &server.url, "carddav", "addressbook", "addressbook-home-set", dav::CARDDAV)?;
     let query = search_query(&["FN", "NICKNAME", "EMAIL"], text.trim(), Some(limit));
@@ -1100,7 +1100,7 @@ pub fn quota(server: &Server, password: &str, tls: native_tls::TlsConnector) -> 
 }
 /// Renames an address book (PROPPATCH).
 pub fn rename_book(server: &Server, password: &str, tls: native_tls::TlsConnector, href: &str, name: &str) -> Result<()> {
-    ensure!(!name.trim().is_empty(), "Give the address book a name.");
+    ensure!(!name.trim().is_empty(), t!("sync-carddav-give-the-address-book-a-name"));
     client(server, password, tls)?.rename_collection(&url::Url::parse(href)?, name.trim(), "")
 }
 /// Deletes an address book and its cards.
@@ -1122,7 +1122,7 @@ pub fn save(
     let href = if card.href.is_empty() {
         ensure!(
             !server.book.is_empty(),
-            "No address book on the server can take new contacts."
+            t!("sync-carddav-no-address-book-on-the-server")
         );
         dav::new_href(&url::Url::parse(&server.book)?, &card.uid, "vcf")?
     } else {
@@ -1137,8 +1137,7 @@ pub fn save(
     }
     if limits.max_size > 0 && text.len() as u64 > limits.max_size {
         bail!(
-            "This contact is too large for the address book ({} KB at most). Use a smaller photo.",
-            limits.max_size / 1024
+            t!("sync-carddav-this-contact-is-too-large-for", kilobytes = limits.max_size / 1024)
         );
     }
     saved.etag = client.put(&href, "text/vcard; charset=utf-8", &card.etag, text.clone())?;

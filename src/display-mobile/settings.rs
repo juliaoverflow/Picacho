@@ -65,24 +65,24 @@ impl MailApp {
 
     fn page_title(&self, page: &Page) -> String {
         match page {
-            Page::General => "General".into(),
-            Page::Reading => "Reading".into(),
-            Page::Composing => "Composing".into(),
-            Page::Forwarding => "Forwarding".into(),
-            Page::Contacts => "Contacts".into(),
-            Page::Calendar => "Calendar".into(),
-            Page::Encryption => "Encryption".into(),
-            Page::Privacy => "Privacy".into(),
-            Page::LocalAi => "Local AI".into(),
-            Page::Organizing => "Rules & Layout".into(),
-            Page::Shortcuts => "Keyboard Shortcuts".into(),
-            Page::About => "About Picacho".into(),
+            Page::General => t!("mobile-settings-general").into(),
+            Page::Reading => t!("mobile-settings-reading").into(),
+            Page::Composing => t!("mobile-settings-composing").into(),
+            Page::Forwarding => t!("mobile-settings-forwarding").into(),
+            Page::Contacts => t!("mobile-settings-contacts").into(),
+            Page::Calendar => t!("mobile-settings-calendar").into(),
+            Page::Encryption => t!("mobile-settings-encryption").into(),
+            Page::Privacy => t!("mobile-settings-privacy").into(),
+            Page::LocalAi => t!("mobile-settings-local-ai").into(),
+            Page::Organizing => t!("mobile-settings-rules-layout").into(),
+            Page::Shortcuts => t!("mobile-settings-keyboard-shortcuts").into(),
+            Page::About => t!("mobile-settings-about-picacho").into(),
             Page::Account(id) => self
                 .accounts
                 .iter()
                 .find(|a| &a.id == id)
                 .map(|a| a.label().to_owned())
-                .unwrap_or_else(|| "Mailbox".into()),
+                .unwrap_or_else(|| t!("mobile-settings-mailbox").into()),
         }
     }
 
@@ -130,7 +130,7 @@ impl MailApp {
                     SharedString::from(format!("mobile-settings-account-{}", a.id)),
                     self.account_avatar(a, i, 28.),
                     a.label().to_owned(),
-                    issue.then(|| "Needs attention".to_owned()),
+                    issue.then(|| t!("mobile-settings-needs-attention").to_owned()),
                     !beside,
                     active,
                     Self::open_page(page),
@@ -143,7 +143,7 @@ impl MailApp {
             self.cell(
                 "mobile-settings-add-account",
                 icon_el("plus", 22., c.accent).into_any_element(),
-                "Add Account",
+                t!("mobile-settings-add-account"),
                 None,
                 false,
                 false,
@@ -177,7 +177,7 @@ impl MailApp {
                 row("mobile-settings-local-ai", "sparkle", Page::LocalAi),
                 row("mobile-settings-organizing", "filter", Page::Organizing),
             ]))
-            .child(self.group_label("Mailboxes"))
+            .child(self.group_label(t!("mobile-settings-mailboxes")))
             .child(self.group(mailboxes))
             .child(div().h_6())
             .child(self.group(vec![row("mobile-settings-about", "info", Page::About)]));
@@ -190,7 +190,7 @@ impl MailApp {
                 "mobile-settings-bar",
                 insets,
                 Some(self.back_icon("mobile-settings-done", cx)),
-                "Settings",
+                t!("mobile-settings-settings"),
                 None,
                 vec![],
             ))
@@ -364,7 +364,7 @@ impl MailApp {
             ),
             None => (
                 self.back_icon("mobile-subs-back", cx),
-                "Subscriptions".to_owned(),
+                t!("mobile-settings-subscriptions").to_owned(),
                 self.subscription_list(true, Corners::default(), cx)
                     .border_r_0()
                     .into_any_element(),
@@ -406,10 +406,10 @@ impl MailApp {
         let back = self.back_icon("mobile-app-view-back", cx);
         let (id, title, content) = match view {
             calendar_views::AppView::Calendar => {
-                ("mobile-calendar", "Calendar", self.calendar_page(cx))
+                ("mobile-calendar", t!("mobile-settings-calendar"), self.calendar_page(cx))
             }
             calendar_views::AppView::Contacts => {
-                ("mobile-contacts", "Contacts", self.contacts_page(cx))
+                ("mobile-contacts", t!("mobile-settings-contacts"), self.contacts_page(cx))
             }
         };
         div()
@@ -459,7 +459,7 @@ impl MailApp {
                 "mobile-summary-bar",
                 insets,
                 Some(back),
-                "Summary".to_owned(),
+                t!("mobile-settings-summary").to_owned(),
                 None,
                 vec![],
             ))
@@ -512,13 +512,13 @@ impl MailApp {
                     link(
                         "mobile-about-source",
                         "github",
-                        "Source Code",
+                        t!("mobile-settings-source-code"),
                         super::super::REPO_URL,
                     ),
                     link(
                         "mobile-about-website",
                         "globe",
-                        "Website",
+                        t!("mobile-settings-website"),
                         super::super::WEBSITE_URL,
                     ),
                 ])),

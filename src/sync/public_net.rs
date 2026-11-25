@@ -77,7 +77,7 @@ impl reqwest::dns::Resolve for PublicOnly {
                 .filter(|a| cfg!(test) || public_ip(a.ip()))
                 .collect();
             if public.is_empty() {
-                return Err("The address leads to a local network.".into());
+                return Err(t!("sync-public-net-the-address-leads-to-a-local").into());
             }
             Ok(Box::new(public.into_iter()) as reqwest::dns::Addrs)
         })
@@ -105,7 +105,7 @@ pub(crate) fn bounded_text(response: reqwest::blocking::Response, limit: u64) ->
     let mut bytes = Vec::new();
     response.take(limit + 1).read_to_end(&mut bytes)?;
     if bytes.len() as u64 > limit {
-        return Err(std::io::Error::other("The server's answer is too large."));
+        return Err(std::io::Error::other(t!("sync-public-net-the-servers-answer-is-too-large")));
     }
     Ok(match String::from_utf8(bytes) {
         Ok(text) => text,

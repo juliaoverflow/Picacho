@@ -6,6 +6,10 @@
   Picacho's AppUserModelID (src/display/windows.rs), so its notifications
   and taskbar button are Picacho's. Upgrades replace the earlier version.
 
+  Its words are in picacho.<culture>.wxl (picacho.en-US.wxl in English);
+  the build makes an installer for each (`-culture`, `-loc`), and WiX's UI
+  extension brings its dialogs' words in that language.
+
   Variables (-d on the command line):
     Version         the MSI's version, major.minor.patch (Cargo.toml's)
     ExeDir          the folder with picacho.exe and, for GNU builds,
@@ -15,15 +19,15 @@
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
      xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
   <Package Name="Picacho"
-           Language="1033"
+           Language="!(loc.Language)"
            Version="$(var.Version)"
            Manufacturer="Pinal Tech"
            UpgradeCode="6B7F5D0E-3C1A-4E8B-9A2F-5D4C3B2A1908"
            Scope="perUser">
-    <SummaryInformation Description="Picacho email" />
+    <SummaryInformation Description="!(loc.SummaryDescription)" />
 
     <MajorUpgrade AllowSameVersionUpgrades="yes"
-                  DowngradeErrorMessage="A newer version of Picacho is already installed." />
+                  DowngradeErrorMessage="!(loc.NewerInstalled)" />
     <MediaTemplate EmbedCab="yes" />
 
     <Icon Id="PicachoIcon" SourceFile="$(var.ExeDir)\picacho.exe" />
@@ -35,7 +39,7 @@
          installs with no more than a brief "Configuring" box. -->
     <ui:WixUI Id="WixUI_Minimal" />
     <WixVariable Id="WixUILicenseRtf" Value="$(sys.SOURCEFILEDIR)license.rtf" />
-    <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOXTEXT" Value="Open Picacho" />
+    <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOXTEXT" Value="!(loc.OpenPicacho)" />
     <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOX" Value="1" />
     <UI>
       <Publish Dialog="ExitDialog" Control="Finish" Event="DoAction" Value="OpenPicacho"
@@ -82,16 +86,16 @@
         <RegistryValue Root="HKCU" Key="Software\Classes\picacho" Name="URL Protocol" Value="" Type="string" />
         <RegistryValue Root="HKCU" Key="Software\Classes\picacho\DefaultIcon" Value="[INSTALLDIR]picacho.exe,0" Type="string" />
         <RegistryValue Root="HKCU" Key="Software\Classes\picacho\shell\open\command" Value="&quot;[INSTALLDIR]picacho.exe&quot; &quot;%1&quot;" Type="string" />
-        <RegistryValue Root="HKCU" Key="Software\Classes\Picacho.eml" Value="Email Message" Type="string" />
+        <RegistryValue Root="HKCU" Key="Software\Classes\Picacho.eml" Value="!(loc.EmailMessage)" Type="string" />
         <RegistryValue Root="HKCU" Key="Software\Classes\Picacho.eml\DefaultIcon" Value="[INSTALLDIR]picacho.exe,0" Type="string" />
         <RegistryValue Root="HKCU" Key="Software\Classes\Picacho.eml\shell\open\command" Value="&quot;[INSTALLDIR]picacho.exe&quot; &quot;%1&quot;" Type="string" />
         <RegistryValue Root="HKCU" Key="Software\Classes\.eml\OpenWithProgids" Name="Picacho.eml" Value="" Type="string" />
-        <RegistryValue Root="HKCU" Key="Software\Classes\Picacho.msg" Value="Outlook Email Message" Type="string" />
+        <RegistryValue Root="HKCU" Key="Software\Classes\Picacho.msg" Value="!(loc.OutlookEmailMessage)" Type="string" />
         <RegistryValue Root="HKCU" Key="Software\Classes\Picacho.msg\DefaultIcon" Value="[INSTALLDIR]picacho.exe,0" Type="string" />
         <RegistryValue Root="HKCU" Key="Software\Classes\Picacho.msg\shell\open\command" Value="&quot;[INSTALLDIR]picacho.exe&quot; &quot;%1&quot;" Type="string" />
         <RegistryValue Root="HKCU" Key="Software\Classes\.msg\OpenWithProgids" Name="Picacho.msg" Value="" Type="string" />
         <RegistryValue Root="HKCU" Key="Software\Pinal Tech\Picacho\Capabilities" Name="ApplicationName" Value="Picacho" Type="string" />
-        <RegistryValue Root="HKCU" Key="Software\Pinal Tech\Picacho\Capabilities" Name="ApplicationDescription" Value="Fast, native email for every inbox you have" Type="string" />
+        <RegistryValue Root="HKCU" Key="Software\Pinal Tech\Picacho\Capabilities" Name="ApplicationDescription" Value="!(loc.ApplicationDescription)" Type="string" />
         <RegistryValue Root="HKCU" Key="Software\Pinal Tech\Picacho\Capabilities\URLAssociations" Name="mailto" Value="Picacho.mailto" Type="string" />
         <RegistryValue Root="HKCU" Key="Software\Pinal Tech\Picacho\Capabilities\FileAssociations" Name=".eml" Value="Picacho.eml" Type="string" />
         <RegistryValue Root="HKCU" Key="Software\Pinal Tech\Picacho\Capabilities\FileAssociations" Name=".msg" Value="Picacho.msg" Type="string" />
@@ -105,7 +109,7 @@
       <Component Id="StartMenuShortcut" Guid="5A1E3C7B-2F94-4D06-A8B3-6E0C9D2F1A84">
         <Shortcut Id="PicachoShortcut"
                   Name="Picacho"
-                  Description="Email"
+                  Description="!(loc.ShortcutDescription)"
                   Target="[INSTALLDIR]picacho.exe"
                   WorkingDirectory="INSTALLDIR"
                   Icon="PicachoIcon">

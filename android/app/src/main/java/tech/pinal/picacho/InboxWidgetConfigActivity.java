@@ -3,6 +3,7 @@ package tech.pinal.picacho;
 import android.app.Activity;
 import android.appwidget.AppWidgetManager;
 import android.appwidget.AppWidgetProviderInfo;
+import android.content.Context;
 import android.content.Intent;
 import android.os.Bundle;
 import android.view.View;
@@ -22,6 +23,12 @@ public final class InboxWidgetConfigActivity extends Activity {
     private final List<String> accountIds = new ArrayList<>();
     private RadioGroup accountGroup;
     private CheckBox unreadOnlyBox;
+
+    @Override
+    protected void attachBaseContext(Context base) {
+        // Its text in Picacho's language, which may not be the phone's.
+        super.attachBaseContext(Lang.wrap(base));
+    }
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -65,7 +72,7 @@ public final class InboxWidgetConfigActivity extends Activity {
         for (WidgetStore.Account acc : snap.accounts) {
             String label = acc.name.isEmpty() || acc.name.equals(acc.email)
                     ? acc.email
-                    : acc.name + " (" + acc.email + ")";
+                    : getString(R.string.widget_config_account_name, acc.name, acc.email);
             addOption(label, acc.id, acc.id.equals(currentAccount));
         }
 

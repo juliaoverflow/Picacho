@@ -57,7 +57,7 @@ impl MailApp {
             self.touch_icon(
                 "mobile-reader-prev",
                 "chevron-up",
-                "Previous message",
+                t!("mobile-reader-previous-message"),
                 step(-1),
                 cx,
             )
@@ -66,7 +66,7 @@ impl MailApp {
             self.touch_icon(
                 "mobile-reader-next",
                 "chevron-down",
-                "Next message",
+                t!("mobile-reader-next-message"),
                 step(1),
                 cx,
             )
@@ -74,9 +74,9 @@ impl MailApp {
             .into_any_element(),
         ];
         let mut reply_entries = vec![
-            entry("Reply", "reply", Action::Reply(false)),
-            entry("Reply All", "reply-all", Action::Reply(true)),
-            entry("Forward", "forward", Action::Forward),
+            entry(t!("mobile-reader-reply"), "reply", Action::Reply(false)),
+            entry(t!("mobile-reader-reply-all"), "reply-all", Action::Reply(true)),
+            entry(t!("mobile-reader-forward"), "forward", Action::Forward),
         ];
         // Suggested replies, under the others, for mail one answers.
         if !drafts_or_sent {
@@ -96,7 +96,7 @@ impl MailApp {
             self.touch_icon(
                 "mobile-reader-archive",
                 "archive",
-                "Archive",
+                t!("mobile-reader-archive"),
                 act(Action::Move(Folder::Archive)),
                 cx,
             )
@@ -104,7 +104,7 @@ impl MailApp {
             self.touch_icon(
                 "mobile-reader-trash",
                 "trash",
-                "Move to trash",
+                t!("mobile-reader-move-to-trash"),
                 act(Action::Move(Folder::Trash)),
                 cx,
             )
@@ -112,7 +112,7 @@ impl MailApp {
             self.touch_icon(
                 "mobile-reader-move",
                 "folder",
-                "Move to folder",
+                t!("mobile-reader-move-to-folder"),
                 act(Action::MoveMenu(MoveTarget::Mail(vec![id.clone()]))),
                 cx,
             )
@@ -123,7 +123,7 @@ impl MailApp {
                 self.touch_icon(
                     "mobile-reader-snooze",
                     "snooze",
-                    "Snooze",
+                    t!("mobile-reader-snooze"),
                     act(Action::SnoozeMenu(vec![id.clone()])),
                     cx,
                 )
@@ -134,7 +134,7 @@ impl MailApp {
             self.touch_icon(
                 "mobile-reader-reply",
                 "reply",
-                "Reply",
+                t!("mobile-reader-reply"),
                 Rc::new(
                     move |this: &mut MailApp, w: &mut Window, cx: &mut Context<MailApp>| {
                         this.open_menu_here(reply_entries.clone(), w, cx)
@@ -148,22 +148,22 @@ impl MailApp {
             self.touch_icon(
                 "mobile-reader-more",
                 "ellipsis",
-                "More",
+                t!("mobile-reader-more"),
                 Rc::new(
                     move |this: &mut MailApp, w: &mut Window, cx: &mut Context<MailApp>| {
                         let mut entries = this.mail_entries(&more_id);
                         entries.push(Entry::Separator);
                         entries.push(entry(
                             if unread {
-                                "Mark as Read"
+                                t!("mobile-reader-mark-as-read")
                             } else {
-                                "Mark as Unread"
+                                t!("mobile-reader-mark-as-unread")
                             },
                             if unread { "mail-open" } else { "mail" },
                             Action::Read(more_id.clone()),
                         ));
-                        entries.push(entry("Message Details", "info", Action::ToggleDetails));
-                        entries.push(entry("View Raw", "code", Action::ShowOriginal));
+                        entries.push(entry(t!("mobile-reader-message-details"), "info", Action::ToggleDetails));
+                        entries.push(entry(t!("mobile-reader-view-raw"), "code", Action::ShowOriginal));
                         this.open_menu_here(entries, w, cx)
                     },
                 ),

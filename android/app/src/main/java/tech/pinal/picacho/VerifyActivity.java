@@ -109,6 +109,12 @@ public final class VerifyActivity extends Activity {
     }
 
     @Override
+    protected void attachBaseContext(Context base) {
+        // Its text in Picacho's language, which may not be the phone's.
+        super.attachBaseContext(Lang.wrap(base));
+    }
+
+    @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         id = getIntent().getIntExtra(EXTRA_ID, 0);
@@ -120,7 +126,7 @@ public final class VerifyActivity extends Activity {
             return;
         }
         current = this;
-        setTitle("Verify that it's you");
+        setTitle(R.string.verify_title);
         if (getActionBar() != null) {
             getActionBar().setDisplayHomeAsUpEnabled(true);
         }

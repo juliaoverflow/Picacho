@@ -15,7 +15,7 @@ pub(crate) fn tcp(host: &str, port: u16) -> Result<Wire> {
     let addrs = (host, port)
         .to_socket_addrs()
         .context(super::retry::Unreachable(
-            "Server hostname could not be resolved".into(),
+            t!("sync-imap-server-hostname-could-not-be-resolved").into(),
         ))?;
     let mut last = None;
     let deadline = Instant::now() + Duration::from_secs(12);
@@ -32,10 +32,7 @@ pub(crate) fn tcp(host: &str, port: u16) -> Result<Wire> {
             Err(e) => last = Some(e),
         }
     }
-    Err(super::retry::Unreachable(format!(
-        "Could not connect to {host}:{port}: {}",
-        last.map(|e| e.to_string()).unwrap_or_default()
-    ))
+    Err(super::retry::Unreachable(t!("sync-imap-could-not-connect-to", host = host, port = port, error = last.map(|e| e.to_string()).unwrap_or_default()))
     .into())
 }
 pub(crate) fn imap_login(
@@ -130,7 +127,7 @@ pub(crate) fn imap_login_interruptible(
     }
     let mut stream = ImapStream::new(
         tls.connect(&a.incoming_host, socket)
-            .map_err(|e| anyhow::anyhow!("IMAP TLS handshake failed: {e}"))?,
+            .map_err(|e| anyhow::anyhow!(t!("sync-imap-imap-tls-handshake-failed", error = e.to_string())))?,
     );
     let compressing = stream.compression_switch();
     let interrupter = stream.interrupter()?;
@@ -160,8 +157,7 @@ pub(crate) fn imap_login_interruptible(
         match Mechanism::choose(&sasl::KERBEROS_ORDER, offered.iter().map(String::as_str)) {
             Some(mechanism) => authenticate(client, mechanism, credentials(a.login(), "")),
             None => bail!(
-                "{} doesn't offer Kerberos sign-in (AUTH=GSSAPI). Turn off Kerberos for this account to use a password.",
-                a.incoming_host
+                t!("sync-imap-doesnt-offer-kerberos-sign-in-auth", host = a.incoming_host)
             ),
         }
     } else if a.oauth {
@@ -188,8 +184,7 @@ pub(crate) fn imap_login_interruptible(
         ) {
             Some(mechanism) => authenticate(client, mechanism, credentials(a.login(), &s.password)),
             None => bail!(
-                "{} offers no sign-in method Picacho supports.",
-                a.incoming_host
+                t!("sync-imap-offers-no-sign-in-method-picacho", host = a.incoming_host)
             ),
         }
     };
@@ -197,7 +192,7 @@ pub(crate) fn imap_login_interruptible(
         let rejected = e
             .downcast_ref::<imap::Error>()
             .is_some_and(|e| matches!(e, imap::Error::No(_) | imap::Error::Bad(_)));
-        let error = e.context("IMAP authentication failed");
+        let error = e.context(t!("sync-imap-imap-authentication-failed"));
         if rejected {
             error.context(crate::manage::status::AccessFailure::Authentication)
         } else {
@@ -288,7 +283,7 @@ fn authenticate(
             let reason = auth.exchange.borrow().refusal().map(str::to_owned);
             let e = anyhow::Error::new(e);
             return Err(match reason {
-                Some(reason) => e.context(format!("The server refused the token ({reason})")),
+                Some(reason) => e.context(t!("sync-imap-the-server-refused-the-token", reason = reason)),
                 None => e,
             });
         }
@@ -314,7 +309,7 @@ fn pre_auth_capabilities(stream: &mut ImapStream, greeting: bool) -> Result<Vec<
         let hello = read_line(stream)?;
         ensure!(
             hello.starts_with("* OK") && !hello.starts_with("* OKAY"),
-            "IMAP server rejected connection"
+            t!("sync-imap-imap-server-rejected-connection")
         );
         // Servers often list their capabilities in the greeting.
         if let Some((listed, _)) = hello
@@ -330,7 +325,7 @@ fn pre_auth_capabilities(stream: &mut ImapStream, greeting: bool) -> Result<Vec<
     loop {
         let reply = read_line(stream)?;
         if let Some(rest) = reply.strip_prefix("p0 ") {
-            ensure!(rest.starts_with("OK"), "The IMAP server refused CAPABILITY");
+            ensure!(rest.starts_with("OK"), t!("sync-imap-the-imap-server-refused-capability"));
             return Ok(caps);
         }
         if let Some(listed) = reply.strip_prefix("* CAPABILITY ") {
@@ -343,9 +338,9 @@ fn read_line(stream: &mut impl std::io::Read) -> Result<String> {
     let mut bytes = Vec::new();
     let mut byte = [0u8; 1];
     while !bytes.ends_with(b"\r\n") {
-        ensure!(bytes.len() <= 8192, "The IMAP server's reply is too long");
+        ensure!(bytes.len() <= 8192, t!("sync-imap-the-imap-servers-reply-is-too"));
         let n = stream.read(&mut byte)?;
-        ensure!(n == 1, "The IMAP server closed the connection");
+        ensure!(n == 1, t!("sync-imap-the-imap-server-closed-the-connection"));
         bytes.push(byte[0]);
     }
     Ok(String::from_utf8_lossy(&bytes).trim_end().to_owned())
@@ -704,19 +699,19 @@ pub(crate) fn gmail_system(name: &str) -> bool {
 /// leave them behind).
 pub(crate) fn deletable(names: &[Name], provider: Provider, name: &str) -> Result<()> {
     let Some(folder) = names.iter().find(|n| n.name == name) else {
-        bail!("“{name}” is no longer on the server.");
+        bail!(t!("sync-imap-is-no-longer-on-the-server", name = name));
     };
     ensure!(
         custom_folders(names).iter().any(|f| f.name == name)
             && !(provider == Provider::Gmail && name.starts_with("[Gmail]")),
-        "“{name}” is one of the mailbox's standard folders and can't be deleted."
+        t!("sync-imap-is-one-of-the-mailboxs-standard", name = name)
     );
     let delimiter = folder.delimiter.as_deref().filter(|d| !d.is_empty());
     if let Some(d) = delimiter {
         let prefix = format!("{name}{d}");
         ensure!(
             !names.iter().any(|n| n.name.starts_with(&prefix)),
-            "“{name}” has folders inside it. Delete those first."
+            t!("sync-imap-has-folders-inside-it-delete-those", name = name)
         );
     }
     Ok(())
@@ -759,20 +754,20 @@ fn top_prefix(names: &[Name]) -> String {
 /// misread (wildcards, the hierarchy delimiter), and encoded for IMAP.
 fn leaf_name(leaf: &str, delimiter: Option<&str>) -> Result<String> {
     let leaf = leaf.trim();
-    ensure!(!leaf.is_empty(), "Enter a name for the folder.");
+    ensure!(!leaf.is_empty(), t!("sync-imap-enter-a-name-for-the-folder"));
     ensure!(
         !leaf.chars().any(char::is_control),
-        "Folder names can't contain line breaks or control characters."
+        t!("sync-imap-folder-names-cant-contain-line-breaks")
     );
     ensure!(
         !leaf.contains(['*', '%']),
-        "Folder names can't contain * or %."
+        t!("sync-imap-folder-names-cant-contain-or")
     );
     if let Some(d) = delimiter {
-        ensure!(!leaf.contains(d), "Folder names can't contain “{d}”.");
+        ensure!(!leaf.contains(d), t!("sync-imap-folder-names-cant-contain", delimiter = d));
     }
     let encoded = encode_name(leaf);
-    ensure!(encoded.len() <= 200, "That folder name is too long.");
+    ensure!(encoded.len() <= 200, t!("sync-imap-that-folder-name-is-too-long"));
     Ok(encoded)
 }
 /// Whether `prefix` puts folders at the top of the folder list: nothing,
@@ -802,12 +797,12 @@ fn check_new_name(
             && (leaf.eq_ignore_ascii_case("INBOX")
                 || STANDARD_NAMES.iter().any(|s| s.eq_ignore_ascii_case(leaf))
                 || (provider == Provider::Gmail && leaf.eq_ignore_ascii_case("[Gmail]")))),
-        "“{label}” is the name of a standard folder. Choose another name."
+        t!("sync-imap-is-the-name-of-a-standard", label = label)
     );
     ensure!(
         !names.iter().any(|n| n.name == name
             || (n.name.eq_ignore_ascii_case("INBOX") && name.eq_ignore_ascii_case("INBOX"))),
-        "There's already a folder named “{label}” there."
+        t!("sync-imap-theres-already-a-folder-named-there", label = label)
     );
     Ok(name)
 }
@@ -825,18 +820,16 @@ pub(crate) fn new_folder_name(
         None => namespace.map_or_else(|| top_prefix(names), str::to_owned),
         Some(parent) => {
             let Some(folder) = names.iter().find(|n| n.name == parent) else {
-                bail!("“{}” is no longer on the server.", decode_name(parent));
+                bail!(t!("sync-imap-is-no-longer-on-the-server-2", folder = decode_name(parent)));
             };
             ensure!(
                 custom_folders(names).iter().any(|f| f.name == parent)
                     && !(provider == Provider::Gmail && parent.starts_with("[Gmail]")),
-                "Folders can't be made inside “{}”.",
-                decode_name(parent)
+                t!("sync-imap-folders-cant-be-made-inside", folder = decode_name(parent))
             );
             let Some(d) = folder.delimiter().filter(|_| folder.nestable()) else {
                 bail!(
-                    "The server doesn't allow folders inside “{}”.",
-                    decode_name(parent)
+                    t!("sync-imap-the-server-doesnt-allow-folders-inside", folder = decode_name(parent))
                 );
             };
             format!("{parent}{d}")
@@ -868,13 +861,12 @@ pub(crate) fn renamed_folder_name(
     namespace: Option<&str>,
 ) -> Result<String> {
     let Some(folder) = names.iter().find(|n| n.name == name) else {
-        bail!("“{}” is no longer on the server.", decode_name(name));
+        bail!(t!("sync-imap-is-no-longer-on-the-server-2", folder = decode_name(name)));
     };
     ensure!(
         custom_folders(names).iter().any(|f| f.name == name)
             && !(provider == Provider::Gmail && name.starts_with("[Gmail]")),
-        "“{}” is one of the mailbox's standard folders and can't be renamed.",
-        decode_name(name)
+        t!("sync-imap-is-one-of-the-mailboxs-standard-2", folder = decode_name(name))
     );
     let delimiter = folder.delimiter().or_else(|| hierarchy(names));
     let prefix = delimiter
@@ -984,7 +976,7 @@ pub(crate) fn encode_name(name: &str) -> String {
 }
 pub(crate) fn resolve_in(names: &[Name], provider: Provider, folder: Folder) -> Result<String> {
     // All Mail is every mailbox at once, not a server folder.
-    ensure!(folder != Folder::All, "All Mail is not a folder on the server.");
+    ensure!(folder != Folder::All, t!("sync-imap-all-mail-is-not-a-folder"));
     if folder == Folder::Inbox {
         return Ok("INBOX".into());
     }
@@ -1028,7 +1020,7 @@ pub(crate) fn resolve_in(names: &[Name], provider: Provider, folder: Folder) -> 
             return Ok(n.name.clone());
         }
     }
-    bail!("The server has no {} folder.", folder.label())
+    bail!(t!("sync-imap-the-server-has-no-folder", label = folder.label()))
 }
 
 fn starttls(socket: &mut Wire) -> Result<()> {
@@ -1039,14 +1031,14 @@ fn starttls(socket: &mut Wire) -> Result<()> {
         reader.take(8193).read_line(&mut line)?;
         ensure!(
             line.len() <= 8192 && line.ends_with("\r\n"),
-            "Invalid IMAP STARTTLS response"
+            t!("sync-imap-invalid-imap-starttls-response")
         );
         Ok(line)
     };
     let greeting = line(&mut reader)?;
     ensure!(
         greeting.starts_with("* OK ") || greeting == "* OK\r\n",
-        "IMAP server rejected connection"
+        t!("sync-imap-imap-server-rejected-connection")
     );
     reader.get_mut().write_all(b"p1 STARTTLS\r\n")?;
     reader.get_mut().flush()?;
@@ -1055,17 +1047,17 @@ fn starttls(socket: &mut Wire) -> Result<()> {
         if response.starts_with("p1 ") {
             ensure!(
                 response.starts_with("p1 OK ") || response == "p1 OK\r\n",
-                "IMAP STARTTLS was rejected; credentials were not sent"
+                t!("sync-imap-imap-starttls-was-rejected-credentials-were")
             );
             ensure!(
                 reader.buffer().is_empty(),
-                "Unexpected data following STARTTLS"
+                t!("sync-imap-unexpected-data-following-starttls")
             );
             return Ok(());
         }
         ensure!(
             response.starts_with("* ") && !response.starts_with("* BYE"),
-            "Invalid IMAP STARTTLS response"
+            t!("sync-imap-invalid-imap-starttls-response")
         );
     }
 }
@@ -1714,7 +1706,7 @@ pub(crate) fn set_acl(session: &mut ImapSession, mailbox: &str, identifier: &str
             .trim_start_matches(['+', '-'])
             .bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit()),
-        "Rights are written as letters (RFC 4314 §2.1), such as “lrs”."
+        t!("sync-imap-rights-are-written-as-letters-rfc")
     );
     session.run_command_and_check_ok(format!(
         "SETACL {} {} {}",
@@ -1800,26 +1792,25 @@ pub(crate) fn label_keyword(k: &str) -> bool {
 /// special characters.
 pub(crate) fn keyword(label: &str) -> Result<String> {
     let label = label.trim();
-    ensure!(!label.is_empty(), "Enter a name for the label.");
+    ensure!(!label.is_empty(), t!("sync-imap-enter-a-name-for-the-label"));
     ensure!(
         label.bytes().all(|b| b > b' '
             && b < 0x7f
             && !matches!(b, b'(' | b')' | b'{' | b'}' | b'%' | b'*' | b'"' | b'\\' | b']')),
-        "Labels on this server can't contain spaces, accents or ( ) {{ }} % * \" \\ ] — try “{}”.",
-        label
+        t!("sync-imap-labels-on-this-server-cant-contain", suggestion = label
             .chars()
             .map(|c| if c.is_ascii_alphanumeric() || "-_.$".contains(c) {
                 c
             } else {
                 '_'
             })
-            .collect::<String>()
+            .collect::<String>())
     );
     ensure!(
         !SYSTEM_KEYWORDS
             .iter()
             .any(|k| k.eq_ignore_ascii_case(label)),
-        "“{label}” is used by mail apps themselves. Choose another name."
+        t!("sync-imap-is-used-by-mail-apps-themselves", label = label)
     );
     Ok(label.into())
 }
@@ -1827,11 +1818,10 @@ pub(crate) fn keyword(label: &str) -> Result<String> {
 /// see `encode_name`), quoted.
 pub(crate) fn gmail_label(label: &str) -> Result<String> {
     let label = label.trim();
-    ensure!(!label.is_empty(), "Enter a name for the label.");
+    ensure!(!label.is_empty(), t!("sync-imap-enter-a-name-for-the-label"));
     ensure!(
         !label.starts_with('\\'),
-        "“{}” is one of Gmail's own labels.",
-        decode_name(label)
+        t!("sync-imap-is-one-of-gmails-own-labels", label = decode_name(label))
     );
     quote(label)
 }
@@ -1861,7 +1851,7 @@ pub(crate) struct Selected {
 pub(crate) fn quote(name: &str) -> Result<String> {
     ensure!(
         !name.contains(['\r', '\n', '\0']),
-        "Invalid mailbox name from the server"
+        t!("sync-imap-invalid-mailbox-name-from-the-server")
     );
     Ok(format!(
         "\"{}\"",
@@ -1922,7 +1912,7 @@ pub(crate) fn selected_from(data: &[u8], name: &str, condstore: bool) -> Result<
     selected.mailbox_id = mailbox_id(data).unwrap_or_default();
     selected.validity = validity
         .filter(|v| *v > 0)
-        .context("The server did not supply a valid UIDVALIDITY; cached mail has been kept.")?;
+        .with_context(|| t!("sync-imap-the-server-did-not-supply-a"))?;
     // UIDNEXT 0 is not a valid UID; treat it as missing.
     selected.uid_next = selected.uid_next.filter(|n| *n > 0);
     Ok(selected)
@@ -2055,7 +2045,7 @@ pub(crate) fn uid_fetch_rows(
 ) -> Result<Vec<Row>> {
     ensure!(
         !set.contains(['\r', '\n']) && !items.contains(['\r', '\n']),
-        "Invalid IMAP FETCH"
+        t!("sync-imap-invalid-imap-fetch")
     );
     let data = session.run_command_and_read_response(format!("UID FETCH {set} {items}"))?;
     rows_from(&data)
@@ -2126,7 +2116,7 @@ pub(crate) fn responses(data: &[u8]) -> Result<Vec<imap_proto::Response<'_>>> {
                 out.push(response);
                 rest = next;
             }
-            Err(_) => bail!("Invalid IMAP response"),
+            Err(_) => bail!(t!("sync-imap-invalid-imap-response")),
         }
     }
     Ok(out)
@@ -2172,23 +2162,23 @@ pub(crate) fn response_code_meaning(error: &anyhow::Error) -> Option<&'static st
     let text = format!("{error:#}").to_ascii_uppercase();
     let code = text.split('[').nth(1)?.split([']', ' ']).next()?;
     Some(match code {
-        "TOOBIG" => "The message is too large for this server.",
-        "ALREADYEXISTS" => "A folder with that name already exists.",
-        "NONEXISTENT" => "That folder doesn't exist on the server any more.",
-        "TRYCREATE" => "The folder doesn't exist on the server; make it first.",
-        "NOPERM" => "This account isn't allowed to do that here.",
-        "INUSE" => "Someone or something else is using that folder now; try again shortly.",
-        "CANNOT" => "The server can't do that (its rules don't allow it).",
-        "LIMIT" => "That goes past one of the server's limits.",
-        "EXPUNGEISSUED" => "Some of those messages were deleted meanwhile.",
-        "CORRUPTION" => "The server says that folder is damaged; ask its administrator.",
-        "SERVERBUG" => "The server failed; try again later.",
-        "PRIVACYREQUIRED" => "The server wants an encrypted connection for that.",
-        "CONTACTADMIN" => "The server asks you to contact its administrator.",
-        "HASCHILDREN" => "Delete the folders inside it first.",
-        "READ-ONLY" => "That folder can only be read, not changed.",
-        "UIDNOTSTICKY" => "This folder can't keep message numbers; it may be read again whole.",
-        "BADCHARSET" => "The server can't search for text in that alphabet.",
+        "TOOBIG" => t!("sync-imap-the-message-is-too-large-for"),
+        "ALREADYEXISTS" => t!("sync-imap-a-folder-with-that-name-already"),
+        "NONEXISTENT" => t!("sync-imap-that-folder-doesnt-exist-on-the"),
+        "TRYCREATE" => t!("sync-imap-the-folder-doesnt-exist-on-the"),
+        "NOPERM" => t!("sync-imap-this-account-isnt-allowed-to-do"),
+        "INUSE" => t!("sync-imap-someone-or-something-else-is-using"),
+        "CANNOT" => t!("sync-imap-the-server-cant-do-that-its"),
+        "LIMIT" => t!("sync-imap-that-goes-past-one-of-the"),
+        "EXPUNGEISSUED" => t!("sync-imap-some-of-those-messages-were-deleted"),
+        "CORRUPTION" => t!("sync-imap-the-server-says-that-folder-is"),
+        "SERVERBUG" => t!("sync-imap-the-server-failed-try-again-later"),
+        "PRIVACYREQUIRED" => t!("sync-imap-the-server-wants-an-encrypted-connection"),
+        "CONTACTADMIN" => t!("sync-imap-the-server-asks-you-to-contact"),
+        "HASCHILDREN" => t!("sync-imap-delete-the-folders-inside-it-first"),
+        "READ-ONLY" => t!("sync-imap-that-folder-can-only-be-read"),
+        "UIDNOTSTICKY" => t!("sync-imap-this-folder-cant-keep-message-numbers"),
+        "BADCHARSET" => t!("sync-imap-the-server-cant-search-for-text"),
         _ => return None,
     })
 }

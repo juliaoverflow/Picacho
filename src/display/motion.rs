@@ -34,9 +34,9 @@ impl Motion {
     }
     pub fn label(self) -> &'static str {
         match self {
-            Self::System => "Automatic",
-            Self::Reduced => "On",
-            Self::Full => "Off",
+            Self::System => t!("motion-automatic"),
+            Self::Reduced => t!("motion-on"),
+            Self::Full => t!("motion-off"),
         }
     }
     /// Whether motion is reduced with this choice.
@@ -157,9 +157,9 @@ impl Contrast {
     }
     pub fn label(self) -> &'static str {
         match self {
-            Self::System => "Automatic",
-            Self::More => "More",
-            Self::Standard => "Standard",
+            Self::System => t!("motion-automatic"),
+            Self::More => t!("motion-more"),
+            Self::Standard => t!("motion-standard"),
         }
     }
     /// Whether emails are asked for more contrast with this choice.

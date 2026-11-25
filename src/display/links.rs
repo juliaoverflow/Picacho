@@ -101,24 +101,24 @@ fn public_suffix(name: &str) -> bool {
 pub(super) fn link_dangers(url: &url::Url) -> Vec<&'static str> {
     let mut dangers = Vec::new();
     if url.scheme() == "http" {
-        dangers.push("Not secure: the page isn't encrypted (http).");
+        dangers.push(t!("links-not-secure-the-page-isnt-encrypted"));
     }
     match url.host() {
         Some(url::Host::Ipv4(_) | url::Host::Ipv6(_)) => {
-            dangers.push("It goes to a bare IP address, not a named site.");
+            dangers.push(t!("links-it-goes-to-a-bare-ip"));
         }
         Some(url::Host::Domain(host)) => {
             if confusable(host) {
-                dangers.push("Its address uses look-alike letters from other alphabets.");
+                dangers.push(t!("links-its-address-uses-look-alike-letters"));
             }
             if host.split('.').count() > 4 {
-                dangers.push("Its address is unusually long; the real site is at its end.");
+                dangers.push(t!("links-its-address-is-unusually-long-the"));
             }
         }
         None => {}
     }
     if !url.username().is_empty() || url.password().is_some() {
-        dangers.push("Its address hides the real site after an @.");
+        dangers.push(t!("links-its-address-hides-the-real-site"));
     }
     dangers
 }
@@ -178,7 +178,7 @@ impl MailApp {
                     self.pending_link = Some(format!("open:{}", m.id));
                     cx.notify();
                 }
-                None => self.notice("That message isn't in your mailbox.", true, cx),
+                None => self.notice(t!("links-that-message-isnt-in-your-mailbox"), true, cx),
             }
             return;
         }
@@ -189,7 +189,7 @@ impl MailApp {
             url
         };
         let Some(parsed) = crate::display::html::openable_url(&url) else {
-            self.notice("Picacho only opens web and email links.", true, cx);
+            self.notice(t!("links-picacho-only-opens-web-and-email"), true, cx);
             return;
         };
         let web = parsed.scheme() != "mailto";
@@ -222,7 +222,7 @@ impl MailApp {
         // GPUI's `open_url` does nothing on Android.
         #[cfg(target_os = "android")]
         if !crate::android::open_url(url) {
-            self.notice("No app on this phone can open this link.", true, cx);
+            self.notice(t!("links-no-app-on-this-phone-can"), true, cx);
         }
         #[cfg(not(target_os = "android"))]
         cx.open_url(url);
@@ -242,7 +242,7 @@ impl MailApp {
                     self.save_trusted();
                 }
                 self.notice(
-                    format!("Links to {} open without asking", confirm.site),
+                    t!("links-links-to-open-without-asking", site = confirm.site),
                     false,
                     cx,
                 );
@@ -250,7 +250,7 @@ impl MailApp {
             }
             LinkChoice::Copy => {
                 cx.write_to_clipboard(ClipboardItem::new_string(confirm.url));
-                self.notice("Link copied", false, cx);
+                self.notice(t!("links-link-copied"), false, cx);
             }
             LinkChoice::Cancel => {}
         }

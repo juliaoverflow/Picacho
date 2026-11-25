@@ -101,7 +101,7 @@ impl DateTimePicker {
         };
         let input = cx.new(|cx| {
             InputState::new(window, cx)
-                .placeholder("Type a time: tmrw at 6, next fri 9am, in 2 hrs…")
+                .placeholder(t!("datetime-type-a-time-tmrw-at-6"))
                 .input_action(TextInputAction::Done)
         });
         // Ready to type into as soon as the picker opens; on a phone that
@@ -184,16 +184,13 @@ impl DateTimePicker {
             Some(w) => {
                 let when = crate::manage::composing::describe_later(w.at, Local::now());
                 let line = match &w.rule {
-                    Some(rule) => format!(
-                        "{when} · the first time of a repeating time ({})",
-                        repeat_words(rule)
-                    ),
+                    Some(rule) => t!("datetime-the-first-time-of-a-repeating", when = when, repeat = repeat_words(rule)),
                     None => when,
                 };
                 (line, c.accent)
             }
             None => (
-                "Not a time Picacho can read. Try “tomorrow at 6”.".to_owned(),
+                t!("datetime-not-a-time-picacho-can-read").to_owned(),
                 c.muted,
             ),
         };
@@ -234,12 +231,12 @@ impl DateTimePicker {
                 cx.emit(PickerEvent::Picked(at))
             }
             Some(_) => {
-                self.error = Some("Choose a time in the future.".into());
+                self.error = Some(t!("datetime-choose-a-time-in-the-future").into());
                 cx.notify();
             }
             None => {
                 self.error = Some(
-                    "That time doesn't exist here (the clocks change). Choose another.".into(),
+                    t!("datetime-that-time-doesnt-exist-here-the").into(),
                 );
                 cx.notify();
             }
@@ -312,7 +309,7 @@ impl DateTimePicker {
         let phone = self.phone;
         let mut grid = div().flex().flex_col().gap(px(2.));
         grid = grid.child(div().flex().when(phone, |d| d.w_full()).children(
-            ["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"].map(|d| {
+            [t!("datetime-mo"), t!("datetime-tu"), t!("datetime-we"), t!("datetime-th"), t!("datetime-fr"), t!("datetime-sa"), t!("datetime-su")].map(|d| {
                 div()
                     .when(!phone, |d| d.w(px(34.)))
                     .when(phone, |d| d.flex_1())
@@ -392,7 +389,7 @@ impl DateTimePicker {
                             .flex_1()
                             .text_size(px(13.))
                             .font_weight(FontWeight::SEMIBOLD)
-                            .child(self.month.format("%B %Y").to_string()),
+                            .child(self.month.local(t!("dates-month-year"))),
                     )
                     .child(
                         self.small_button(format!("{key}-prev-month"), "", cx, |t, cx| {
@@ -611,7 +608,7 @@ impl Render for DateTimePicker {
                         .child(format!("{} {summary}", self.confirm)),
                 )
                 .child(
-                    self.small_button(format!("{key}-cancel"), "Cancel", cx, |_, cx| {
+                    self.small_button(format!("{key}-cancel"), t!("datetime-cancel"), cx, |_, cx| {
                         cx.emit(PickerEvent::Cancel)
                     })
                     .when(!phone, |d| d.h(px(30.)))
@@ -676,7 +673,7 @@ impl Render for DateTimePicker {
     }
 }
 
-/// A repeating rule in a few words: "every 2 weeks on MO, WE".
+/// A repeating rule in a few words: "every 2 weeks on Mon, Wed".
 fn repeat_words(rule: &str) -> String {
     let field = |name: &str| {
         rule.split(';')
@@ -690,12 +687,27 @@ fn repeat_words(rule: &str) -> String {
         Some("MONTHLY") => "month",
         _ => "year",
     };
-    let mut out = match field("INTERVAL").and_then(|n| n.parse::<u32>().ok()) {
-        Some(n) if n > 1 => format!("every {n} {unit}s"),
-        _ => format!("every {unit}"),
+    let interval = field("INTERVAL").and_then(|n| n.parse::<u32>().ok()).unwrap_or(1);
+    let repeat = t!("datetime-repeat", unit = unit, interval = interval);
+    let Some(days) = field("BYDAY") else {
+        return repeat;
     };
-    if let Some(days) = field("BYDAY") {
-        out.push_str(&format!(" on {}", days.replace(',', ", ")));
-    }
-    out
+    // MO, TU…: the days' short names; with a position (2TU, -1FR), as written.
+    let days: Vec<String> = days
+        .split(',')
+        .map(|code| {
+            let day = match code {
+                "MO" => Some(chrono::Weekday::Mon),
+                "TU" => Some(chrono::Weekday::Tue),
+                "WE" => Some(chrono::Weekday::Wed),
+                "TH" => Some(chrono::Weekday::Thu),
+                "FR" => Some(chrono::Weekday::Fri),
+                "SA" => Some(chrono::Weekday::Sat),
+                "SU" => Some(chrono::Weekday::Sun),
+                _ => None,
+            };
+            day.map_or_else(|| code.to_owned(), |d| crate::i18n::dates::weekday(d, true))
+        })
+        .collect();
+    t!("datetime-repeat-on-days", repeat = repeat, days = days.join(", "))
 }

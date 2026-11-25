@@ -27,24 +27,30 @@ pub struct Moved {
     pub marked_deleted: usize,
 }
 
+/// What was done with the messages, for `Moved::notice`.
+#[derive(Clone, Copy, Debug)]
+pub enum Done<'a> {
+    Exported,
+    Imported,
+    /// Moved to another account, named.
+    MovedTo(&'a str),
+}
+
 impl Moved {
     /// A notice for the user, such as "Exported 12 messages".
-    pub fn notice(&self, verb: &str) -> String {
-        let plural = |n: usize| if n == 1 { "message" } else { "messages" };
-        let mut text = format!("{verb} {} {}", self.done, plural(self.done));
+    pub fn notice(&self, done: Done) -> String {
+        let mut text = match done {
+            Done::Exported => t!("manage-archive-exported", count = self.done),
+            Done::Imported => t!("manage-archive-imported", count = self.done),
+            Done::MovedTo(name) => t!("manage-archive-moved-to", count = self.done, name = name),
+        };
+        // More to say, joined as the language joins such clauses.
+        let more = |text: String, more: String| t!("manage-archive-and", notice = text, more = more);
         if self.skipped > 0 {
-            text.push_str(&format!(
-                "; {} {} couldn't be",
-                self.skipped,
-                plural(self.skipped)
-            ));
+            text = more(text, t!("manage-archive-skipped", count = self.skipped));
         }
         if self.marked_deleted > 0 {
-            text.push_str(&format!(
-                "; {} marked deleted in the file {} kept",
-                self.marked_deleted,
-                if self.marked_deleted == 1 { "was" } else { "were" }
-            ));
+            text = more(text, t!("manage-archive-marked-deleted", count = self.marked_deleted));
         }
         text
     }
@@ -453,7 +459,7 @@ impl Backend {
         for m in &messages {
             if cancel.load(Ordering::Relaxed) {
                 drop(out);
-                bail!("The export was stopped.");
+                bail!(t!("manage-archive-the-export-was-stopped"));
             }
             let raw = (|| -> Result<Vec<u8>> {
                 let raw = self.original(a, m)?;
@@ -486,7 +492,7 @@ impl Backend {
     ) -> Result<Moved> {
         ensure!(
             !mailbox.folder().is_virtual() && mailbox.folder() != Folder::Drafts,
-            "Mail can't be imported into this mailbox. Choose the inbox, Archive or one of your folders."
+            t!("manage-archive-mail-cant-be-imported-into-this")
         );
         let mut moved = Moved::default();
         // IMAP servers with MULTIAPPEND take messages in batches, in one
@@ -517,7 +523,7 @@ impl Backend {
         };
         let mut add = |found: Option<MboxMessage>| -> Result<()> {
             if cancel.load(Ordering::Relaxed) {
-                bail!("The import was stopped.");
+                bail!(t!("manage-archive-the-import-was-stopped"));
             }
             let Some(found) = found else {
                 moved.skipped += 1;
@@ -629,10 +635,10 @@ impl Backend {
     /// Trash) moved to its Trash. Starred adds starred mail to the inbox,
     /// All Mail to Archive; one that couldn't be added stays where it was.
     pub fn move_to_account(&self, from: &Account, mails: &[Mail], to: &Account, mailbox: &Mailbox) -> Result<Moved> {
-        ensure!(from.id != to.id, "These messages are already in this account.");
+        ensure!(from.id != to.id, t!("manage-archive-these-messages-are-already-in-this"));
         ensure!(
             mails.iter().all(|m| m.account == from.id),
-            "Message belongs to another account"
+            t!("manage-archive-message-belongs-to-another-account")
         );
         let (target, star) = match mailbox {
             Mailbox::Standard(Folder::Starred) => (Mailbox::Standard(Folder::Inbox), true),
@@ -641,7 +647,7 @@ impl Backend {
         };
         ensure!(
             !matches!(target, Mailbox::Standard(Folder::Drafts | Folder::Other)),
-            "Mail can't be moved into this mailbox."
+            t!("manage-archive-mail-cant-be-moved-into-this")
         );
         let mut moved = Moved::default();
         let mut added = Vec::new();
@@ -1074,7 +1080,7 @@ mod tests {
                 done: 1,
                 ..Moved::default()
             }
-            .notice("Exported"),
+            .notice(Done::Exported),
             "Exported 1 message"
         );
         assert_eq!(
@@ -1083,7 +1089,7 @@ mod tests {
                 skipped: 2,
                 marked_deleted: 0,
             }
-            .notice("Imported"),
+            .notice(Done::Imported),
             "Imported 3 messages; 2 messages couldn't be"
         );
         assert_eq!(
@@ -1092,7 +1098,7 @@ mod tests {
                 skipped: 0,
                 marked_deleted: 1,
             }
-            .notice("Imported"),
+            .notice(Done::Imported),
             "Imported 2 messages; 1 marked deleted in the file was kept"
         );
     }

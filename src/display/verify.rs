@@ -103,7 +103,7 @@ pub fn run(url: &str) -> ! {
 fn show(url: &str) -> anyhow::Result<()> {
     let event_loop = EventLoop::new();
     let window = WindowBuilder::new()
-        .with_title("Proton: verify that it's you")
+        .with_title(t!("verify-proton-verify-that-its-you"))
         .with_inner_size(LogicalSize::new(480.0, 720.0))
         .with_min_inner_size(LogicalSize::new(360.0, 480.0))
         .with_focused(true)

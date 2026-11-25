@@ -62,7 +62,7 @@ impl Backend {
             return self.mail_account_secret(&server.mail_account);
         }
         store::read_secret_text(PASSWORD)?
-            .context("The contacts server's password is missing. Set it up again.")
+            .with_context(|| t!("manage-contacts-the-contacts-servers-password-is-missing"))
     }
     /// Signs in to a CardDAV server and reads its address books; the server
     /// and password are kept only once that works.
@@ -85,7 +85,7 @@ impl Backend {
     /// Uses the address books of a JMAP account's server (JMAP for
     /// Contacts) instead of a CardDAV server: its sign-in is the account's.
     pub fn connect_jmap_contacts(&self, a: &Account) -> Result<usize> {
-        ensure!(a.provider == Provider::Jmap, "Only JMAP accounts keep contacts this way.");
+        ensure!(a.provider == Provider::Jmap, t!("manage-contacts-only-jmap-accounts-keep-contacts-this"));
         self.with_jmap_contacts(a, crate::sync::jscal::ensure_contacts)?;
         let server = carddav::Server {
             url: a.incoming_host.clone(),
@@ -116,16 +116,16 @@ impl Backend {
                 .accounts()?
                 .into_iter()
                 .find(|a| a.id == server.jmap_account)
-                .context("The account your contacts come from was removed. Set up contacts again.")?,
+                .with_context(|| t!("manage-contacts-the-account-your-contacts-come-from"))?,
         ))
     }
     /// Makes a new address book on the server (MKCOL, or AddressBook/set),
     /// which new contacts then go to.
     pub fn create_address_book(&self, name: &str) -> Result<()> {
-        ensure!(!name.trim().is_empty(), "Give the address book a name.");
+        ensure!(!name.trim().is_empty(), t!("manage-contacts-give-the-address-book-a-name"));
         let mut server = self
             .contacts_server()
-            .context("Set up a contacts server in Settings → Contacts first.")?;
+            .with_context(|| t!("manage-contacts-set-up-a-contacts-server-in"))?;
         server.book = match self.contacts_jmap(&server)? {
             Some(a) => format!(
                 "jmap:{}",
@@ -145,7 +145,7 @@ impl Backend {
     pub fn address_books(&self) -> Result<Vec<(String, String, bool)>> {
         let server = self
             .contacts_server()
-            .context("No contacts server is set up.")?;
+            .with_context(|| t!("manage-contacts-no-contacts-server-is-set-up"))?;
         if let Some(a) = self.contacts_jmap(&server)? {
             return self.with_jmap_contacts(&a, |s| {
                 Ok(crate::sync::jscal::address_books(s)?
@@ -161,8 +161,8 @@ impl Backend {
     /// here yet: for address books and directories that don't list all
     /// they hold. Returns how many were new.
     pub fn search_server_contacts(&self, text: &str) -> Result<usize> {
-        let server = self.contacts_server().context("No contacts server is set up.")?;
-        ensure!(self.contacts_jmap(&server)?.is_none(), "This server's contacts are all read already.");
+        let server = self.contacts_server().with_context(|| t!("manage-contacts-no-contacts-server-is-set-up"))?;
+        ensure!(self.contacts_jmap(&server)?.is_none(), t!("manage-contacts-this-servers-contacts-are-all-read"));
         let found = carddav::search(&server, &self.contacts_password()?, self.tls_connector()?, text, 50)?;
         let mut all = self.contacts();
         let before = all.len();
@@ -180,7 +180,7 @@ impl Backend {
     /// The account's storage on the contacts server (used, left), where
     /// it says (RFC 4331); JMAP servers don't.
     pub fn contacts_quota(&self) -> Result<Option<(u64, u64)>> {
-        let server = self.contacts_server().context("No contacts server is set up.")?;
+        let server = self.contacts_server().with_context(|| t!("manage-contacts-no-contacts-server-is-set-up"))?;
         if self.contacts_jmap(&server)?.is_some() {
             return Ok(None);
         }
@@ -188,13 +188,13 @@ impl Backend {
     }
     /// Renames an address book on the server.
     pub fn rename_address_book(&self, href: &str, name: &str) -> Result<()> {
-        ensure!(!name.trim().is_empty(), "Give the address book a name.");
+        ensure!(!name.trim().is_empty(), t!("manage-contacts-give-the-address-book-a-name"));
         let server = self
             .contacts_server()
-            .context("No contacts server is set up.")?;
+            .with_context(|| t!("manage-contacts-no-contacts-server-is-set-up"))?;
         match self.contacts_jmap(&server)? {
             Some(a) => {
-                let id = href.strip_prefix("jmap:").context("Not a JMAP address book.")?;
+                let id = href.strip_prefix("jmap:").with_context(|| t!("manage-contacts-not-a-jmap-address-book"))?;
                 self.with_jmap_contacts(&a, |s| {
                     crate::sync::jscal::rename_address_book(s, id, name.trim())
                 })
@@ -213,10 +213,10 @@ impl Backend {
     pub fn delete_address_book(&self, href: &str) -> Result<usize> {
         let mut server = self
             .contacts_server()
-            .context("No contacts server is set up.")?;
+            .with_context(|| t!("manage-contacts-no-contacts-server-is-set-up"))?;
         match self.contacts_jmap(&server)? {
             Some(a) => {
-                let id = href.strip_prefix("jmap:").context("Not a JMAP address book.")?;
+                let id = href.strip_prefix("jmap:").with_context(|| t!("manage-contacts-not-a-jmap-address-book"))?;
                 self.with_jmap_contacts(&a, |s| crate::sync::jscal::delete_address_book(s, id))?;
                 server.states.remove(JMAP_STATE_KEY);
             }
@@ -248,7 +248,7 @@ impl Backend {
     pub fn sync_contacts(&self) -> Result<usize> {
         let mut server = self
             .contacts_server()
-            .context("No contacts server is set up.")?;
+            .with_context(|| t!("manage-contacts-no-contacts-server-is-set-up"))?;
         if let Some(a) = self.contacts_jmap(&server)? {
             // Once read, only what changed since (ContactCard/changes).
             let since = server
@@ -362,12 +362,12 @@ impl Backend {
             .collect();
         ensure!(
             !card.name.is_empty() || !card.emails.is_empty(),
-            "Give the contact a name or an email address."
+            t!("manage-contacts-give-the-contact-a-name-or")
         );
         for email in &card.emails {
             ensure!(
                 crate::sync::smtp::recipients(email).is_ok_and(|r| r.len() == 1),
-                "“{email}” isn't a valid email address."
+                t!("manage-contacts-isnt-a-valid-email-address", email = email)
             );
         }
         if card.uid.is_empty() {
@@ -425,8 +425,7 @@ impl Backend {
             // past this isn't one, and isn't read into memory whole.
             ensure!(
                 std::fs::metadata(path)?.len() <= 256 * 1024 * 1024,
-                "{} is too large to be an address book.",
-                path.display()
+                t!("manage-contacts-is-too-large-to-be-an", path = path.display())
             );
             let bytes = std::fs::read(path)?;
             added.extend(
@@ -444,7 +443,7 @@ impl Backend {
         }
         ensure!(
             !added.is_empty(),
-            "No contacts were found in that file."
+            t!("manage-contacts-no-contacts-were-found-in-that")
         );
         let count = added.len();
         let mut all = self.contacts();

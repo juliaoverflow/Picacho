@@ -69,12 +69,12 @@ impl Method {
     }
     pub fn label(self) -> &'static str {
         match self {
-            Self::SecurityKey => "Use a security key",
-            Self::Phone if cfg!(target_os = "android") => "Use a passkey",
-            Self::Phone if cfg!(target_os = "ios") => "Use a passkey on another device",
-            Self::Phone => "Use a passkey on your phone",
+            Self::SecurityKey => t!("sync-fido-use-a-security-key"),
+            Self::Phone if cfg!(target_os = "android") => t!("sync-fido-use-a-passkey"),
+            Self::Phone if cfg!(target_os = "ios") => t!("sync-fido-use-a-passkey-on-another-device"),
+            Self::Phone => t!("sync-fido-use-a-passkey-on-your-phone"),
             #[cfg(windows)]
-            Self::Windows => "Use a passkey or security key",
+            Self::Windows => t!("sync-fido-use-a-passkey-or-security-key"),
         }
     }
 }
@@ -155,13 +155,13 @@ impl UiCallback for Answers {
         self.show(Prompt::Qr(url));
     }
     fn dismiss_qr_code(&self) {
-        self.show(Prompt::Phone("Connecting to your phone…"));
+        self.show(Prompt::Phone(t!("sync-fido-connecting-to-your-phone")));
     }
     fn cable_status_update(&self, state: CableState) {
         self.show(Prompt::Phone(match state {
-            CableState::ConnectingToTunnelServer => "Connecting to your phone…",
-            CableState::WaitingForAuthenticatorResponse => "Confirm the sign-in on your phone.",
-            _ => "Talking to your phone…",
+            CableState::ConnectingToTunnelServer => t!("sync-fido-connecting-to-your-phone"),
+            CableState::WaitingForAuthenticatorResponse => t!("sync-fido-confirm-the-sign-in-on-your"),
+            _ => t!("sync-fido-talking-to-your-phone"),
         }));
     }
 }
@@ -188,20 +188,20 @@ fn proton_rp(rp_id: &str) -> bool {
 pub fn request_options(options: &Value) -> Result<PublicKeyCredentialRequestOptions> {
     let pk = options
         .get("publicKey")
-        .ok_or_else(|| anyhow!("Proton didn't say which security keys to use."))?;
+        .ok_or_else(|| anyhow!(t!("sync-fido-proton-didnt-say-which-security-keys")))?;
     let challenge =
-        bytes(pk.get("challenge")).ok_or_else(|| anyhow!("Proton sent no challenge."))?;
+        bytes(pk.get("challenge")).ok_or_else(|| anyhow!(t!("sync-fido-proton-sent-no-challenge")))?;
     let rp_id = pk
         .get("rpId")
         .and_then(Value::as_str)
-        .ok_or_else(|| anyhow!("Proton didn't name itself for the key."))?
+        .ok_or_else(|| anyhow!(t!("sync-fido-proton-didnt-name-itself-for-the")))?
         .to_ascii_lowercase();
     // The relying party becomes the origin a passkey is asked for (Android's
     // Credential Manager, Windows Hello): only Proton's own sites, so an
     // answer naming another site can't get its passkeys signed.
     anyhow::ensure!(
         proton_rp(&rp_id),
-        "Proton asked for a security key for {rp_id}, which isn't Proton."
+        t!("sync-fido-proton-asked-for-a-security-key", rp_id = rp_id)
     );
     let allow_credentials = pk
         .get("allowCredentials")
@@ -261,41 +261,41 @@ fn explain(e: WebauthnCError, answers: &Answers) -> anyhow::Error {
     use webauthn_authenticator_rs::error::CtapError::*;
     match e {
         WebauthnCError::Ctap(Ctap2PinInvalid | Ctap2PinAuthInvalid) => anyhow::Error::new(
-            NeedsPin("That PIN isn't right. Enter your security key's PIN."),
+            NeedsPin(t!("sync-fido-that-pin-isnt-right-enter-your")),
         ),
         WebauthnCError::Ctap(Ctap2PinBlocked | Ctap2PinAuthBlocked) => anyhow!(
-            "This security key is locked after too many wrong PINs. Unplug it and plug it in again, or reset it."
+            t!("sync-fido-this-security-key-is-locked-after")
         ),
         _ if answers.pin_asked.load(Ordering::Relaxed) && answers.pin.is_none() => {
             anyhow::Error::new(NeedsPin(
-                "This security key has a PIN. Enter it to use the key.",
+                t!("sync-fido-this-security-key-has-a-pin"),
             ))
         }
         WebauthnCError::PinTooShort | WebauthnCError::PinTooLong => anyhow::Error::new(NeedsPin(
-            "That PIN isn't the right length. Enter your security key's PIN.",
+            t!("sync-fido-that-pin-isnt-the-right-length"),
         )),
         WebauthnCError::Ctap(Ctap1Timeout | Ctap2UserActionTimeout | Ctap2ActionTimeout) => {
-            anyhow!("The security key wasn't touched in time. Try again.")
+            anyhow!(t!("sync-fido-the-security-key-wasnt-touched-in"))
         }
         WebauthnCError::Cancelled | WebauthnCError::Ctap(Ctap2KeepAliveCancel) => {
-            anyhow!("Using the security key was cancelled.")
+            anyhow!(t!("sync-fido-using-the-security-key-was-cancelled"))
         }
         WebauthnCError::PermissionDenied => anyhow!(
-            "Picacho isn't allowed to use Bluetooth or USB security keys here. Allow it in the system settings and try again."
+            t!("sync-fido-picacho-isnt-allowed-to-use-bluetooth")
         ),
         WebauthnCError::NoBluetoothAdapter if cfg!(target_os = "ios") => anyhow!(
-            "A passkey on another device needs Bluetooth on, here and there, to know it's nearby. Turn Bluetooth on (and allow Picacho to use it in Settings → Privacy & Security → Bluetooth), or use a security key."
+            t!("sync-fido-a-passkey-on-another-device-needs")
         ),
         WebauthnCError::NoBluetoothAdapter => anyhow!(
-            "A passkey on a phone needs Bluetooth on this computer, to know the phone is nearby. Turn Bluetooth on, or use a security key."
+            t!("sync-fido-a-passkey-on-a-phone-needs")
         ),
         WebauthnCError::Ctap(Ctap2NoCredentials) => anyhow!(
-            "That key or passkey isn't registered with this Proton account. Use another, or the code from your authenticator app."
+            t!("sync-fido-that-key-or-passkey-isnt-registered")
         ),
         WebauthnCError::ApduTransmission => anyhow!(
-            "The connection to the security key was lost. Keep it in place until it's done, and try again."
+            t!("sync-fido-the-connection-to-the-security-key")
         ),
-        other => anyhow!("The security key or passkey didn't work ({other:?})."),
+        other => anyhow!(t!("sync-fido-the-security-key-or-passkey-didnt", error = format!("{:?}", other))),
     }
 }
 
@@ -328,7 +328,7 @@ pub async fn assert(
         // again, as calling it without one would end the process.
         #[cfg(windows)]
         Method::Windows if !crate::display::windows::has_windows_hello() => Err(anyhow!(
-            "Windows Hello isn't available on this version of Windows."
+            t!("sync-fido-windows-hello-isnt-available-on-this")
         )
         .into()),
         #[cfg(windows)]
@@ -421,15 +421,15 @@ async fn android_key(
     answers.show(match search.nfc {
         Nfc::On => Prompt::Insert,
         Nfc::Off => Prompt::Phone(
-            "Plug in your security key, or turn on NFC to hold it against your phone…",
+            t!("sync-fido-plug-in-your-security-key-or"),
         ),
-        Nfc::Missing => Prompt::Phone("Plug in your security key…"),
+        Nfc::Missing => Prompt::Phone(t!("sync-fido-plug-in-your-security-key")),
     });
     let token = search.find(cancel, WAIT)?;
     let button = token.has_button();
     answers.show(Prompt::Working);
     let mut auth = CtapAuthenticator::new(token, answers).await.ok_or_else(|| {
-        anyhow!("That security key couldn't be used. Keep it in place until it's done, or try another.")
+        anyhow!(t!("sync-fido-that-security-key-couldnt-be-used"))
     })?;
     answers.show(if button { Prompt::Touch } else { Prompt::Working });
     let signed = AuthenticatorBackendHashedClientData::perform_auth(
@@ -480,9 +480,9 @@ async fn security_key(
     let mut auth = tokio::select! {
         found = tokio::time::timeout(WAIT, find) => match found {
             Ok(Some(auth)) => auth,
-            Ok(None) | Err(_) => return Err(anyhow!("No security key was found. Plug one in and try again.").into()),
+            Ok(None) | Err(_) => return Err(anyhow!(t!("sync-fido-no-security-key-was-found-plug")).into()),
         },
-        () = cancelled(cancel) => return Err(anyhow!("Sign-in cancelled.").into()),
+        () = cancelled(cancel) => return Err(anyhow!(t!("sync-fido-sign-in-cancelled")).into()),
     };
     answers.show(Prompt::Touch);
     let signed = AuthenticatorBackendHashedClientData::perform_auth(
@@ -506,9 +506,9 @@ async fn phone(
     let mut auth = tokio::select! {
         connected = tokio::time::timeout(WAIT * 2, connect) => match connected {
             Ok(auth) => auth?,
-            Err(_) => return Err(anyhow!("Your phone didn't connect in time. Try again, with Bluetooth on on both devices.").into()),
+            Err(_) => return Err(anyhow!(t!("sync-fido-your-phone-didnt-connect-in-time")).into()),
         },
-        () = cancelled(cancel) => return Err(anyhow!("Sign-in cancelled.").into()),
+        () = cancelled(cancel) => return Err(anyhow!(t!("sync-fido-sign-in-cancelled")).into()),
     };
     let signed = AuthenticatorBackendHashedClientData::perform_auth(
         &mut auth,
@@ -530,12 +530,12 @@ async fn phone(
 async fn windows(options: PublicKeyCredentialRequestOptions, cancel: &AtomicBool) -> Signed {
     use webauthn_authenticator_rs::{AuthenticatorBackend, win10::Win10};
     let origin = url::Url::parse(&format!("https://{}", options.rp_id))
-        .map_err(|_| anyhow!("Proton named itself oddly for the key."))?;
+        .map_err(|_| anyhow!(t!("sync-fido-proton-named-itself-oddly-for-the")))?;
     let hello = tokio::task::spawn_blocking(move || {
         Win10::default().perform_auth(origin, options, WAIT.as_millis() as u32)
     });
     let signed = tokio::select! {
-        done = hello => done.map_err(|e| anyhow!("Windows Hello stopped unexpectedly ({e})."))??,
+        done = hello => done.map_err(|e| anyhow!(t!("sync-fido-windows-hello-stopped-unexpectedly", error = e)))??,
         () = cancelled(cancel) => return Err(WebauthnCError::Cancelled.into()),
     };
     let client_data = signed.response.client_data_json.clone();
@@ -593,12 +593,12 @@ async fn ios_key(
     answers.show(Prompt::Insert);
     let search = NfcSearch::start(HOLD)?;
     let token = search.find(cancel, WAIT)?;
-    search.say("Keep holding your security key…");
+    search.say(t!("sync-fido-keep-holding-your-security-key"));
     answers.show(Prompt::Working);
     let Some(mut auth) = CtapAuthenticator::new(token, answers).await else {
-        search.finish(Some("That security key couldn't be used."));
+        search.finish(Some(t!("sync-fido-that-security-key-couldnt-be-used-3")));
         return Err(anyhow!(
-            "That security key couldn't be used. Hold it in place until it's done, or try another."
+            t!("sync-fido-that-security-key-couldnt-be-used-2")
         )
         .into());
     };
@@ -609,7 +609,7 @@ async fn ios_key(
         WAIT.as_millis() as u32,
     );
     drop(auth);
-    search.finish(signed.is_err().then_some("The security key didn't sign in."));
+    search.finish(signed.is_err().then_some(t!("sync-fido-the-security-key-didnt-sign-in")));
     Ok((signed?, None))
 }
 

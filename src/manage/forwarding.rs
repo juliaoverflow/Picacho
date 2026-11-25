@@ -68,8 +68,8 @@ impl ForwardingService {
     /// chosen per alias.
     pub fn mailboxes_label(self) -> Option<&'static str> {
         match self {
-            Self::SimpleLogin => Some("Mailboxes"),
-            Self::Addy => Some("Recipients"),
+            Self::SimpleLogin => Some(t!("manage-forwarding-mailboxes")),
+            Self::Addy => Some(t!("manage-forwarding-recipients")),
             Self::FirefoxRelay => None,
         }
     }
@@ -81,15 +81,15 @@ impl ForwardingService {
     pub fn key_help(self) -> (&'static str, &'static str) {
         match self {
             Self::SimpleLogin => (
-                "Make an API key in SimpleLogin under API Keys.",
+                t!("manage-forwarding-make-an-api-key-in-simplelogin"),
                 "https://app.simplelogin.io/dashboard/api_key",
             ),
             Self::Addy => (
-                "Make an API access token in addy.io under Settings, API.",
+                t!("manage-forwarding-make-an-api-access-token-in"),
                 "https://app.addy.io/settings/api",
             ),
             Self::FirefoxRelay => (
-                "Copy the API key from the bottom of Firefox Relay's settings.",
+                t!("manage-forwarding-copy-the-api-key-from-the"),
                 "https://relay.firefox.com/accounts/settings/",
             ),
         }
@@ -441,7 +441,7 @@ pub fn reverse_aliases(account: &ForwardingAccount, alias: &Alias) -> Result<Vec
         let contacts = client.contacts(alias);
         let activity = activity
             .join()
-            .unwrap_or_else(|_| Err(anyhow::anyhow!("Reading the alias's activity failed")));
+            .unwrap_or_else(|_| Err(anyhow::anyhow!(t!("manage-forwarding-reading-the-aliass-activity-failed"))));
         (contacts, activity)
     });
     let mut contacts = contacts?;
@@ -475,10 +475,10 @@ pub enum DomainKind {
 impl DomainKind {
     pub fn label(self) -> &'static str {
         match self {
-            Self::Custom => "Your domain",
-            Self::Username => "Your subdomain",
-            Self::Premium => "Premium",
-            Self::Shared => "Free",
+            Self::Custom => t!("manage-forwarding-your-domain"),
+            Self::Username => t!("manage-forwarding-your-subdomain"),
+            Self::Premium => t!("manage-forwarding-premium"),
+            Self::Shared => t!("manage-forwarding-free"),
         }
     }
 }
@@ -512,8 +512,8 @@ impl AliasFormat {
     pub const ALL: [Self; 3] = [Self::RandomWords, Self::RandomCharacters, Self::Uuid];
     pub fn label(self) -> &'static str {
         match self {
-            Self::RandomWords => "Random Words",
-            Self::RandomCharacters => "Random Characters",
+            Self::RandomWords => t!("manage-forwarding-random-words"),
+            Self::RandomCharacters => t!("manage-forwarding-random-characters"),
             Self::Uuid => "UUID",
         }
     }
@@ -730,8 +730,8 @@ pub struct AliasGone {
 impl std::fmt::Display for AliasGone {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self.service {
-            Some(s) => write!(f, "{} no longer exists at {}.", self.email, s.label()),
-            None => write!(f, "{} is no longer an alias Picacho can send as.", self.email),
+            Some(s) => f.write_str(&t!("manage-forwarding-no-longer-exists-at", email = self.email, service = s.label())),
+            None => f.write_str(&t!("manage-forwarding-is-no-longer-an-alias-picacho", email = self.email)),
         }
     }
 }
@@ -783,9 +783,7 @@ pub fn route(store: &Store, draft: &Draft) -> Result<Draft> {
     };
     anyhow::ensure!(
         alias.enabled,
-        "{} is turned off at {}. Turn it on in Forwarding settings, or choose another address in From.",
-        alias.email,
-        account.service.label()
+        t!("manage-forwarding-is-turned-off-at-turn-it", email = alias.email, label = account.service.label())
     );
     let fields = [&draft.to, &draft.cc, &draft.bcc]
         .map(|list| crate::sync::smtp::recipients(list))
@@ -1030,10 +1028,10 @@ fn addy_alias(address: &str, forwarding: &[ForwardingAccount]) -> Option<String>
 fn addy_route(alias: &str, recipient: &str) -> Result<String> {
     let (alias_local, alias_domain) = alias
         .rsplit_once('@')
-        .with_context(|| format!("{alias} is not an email address"))?;
+        .with_context(|| t!("manage-forwarding-is-not-an-email-address", alias = alias))?;
     let (local, domain) = recipient
         .rsplit_once('@')
-        .with_context(|| format!("{recipient} is not an email address"))?;
+        .with_context(|| t!("manage-forwarding-is-not-an-email-address-2", recipient = recipient))?;
     if domain.eq_ignore_ascii_case(alias_domain)
         && local
             .to_lowercase()

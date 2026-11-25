@@ -66,7 +66,7 @@ fn escape_html(text: &str) -> String {
 /// email's CSS never leaks into or hides the headers.
 fn header_html(m: &Mail, from: &str, date: &str) -> String {
     let subject = if m.subject.trim().is_empty() {
-        "(No subject)"
+        t!("html-print-no-subject")
     } else {
         m.subject.trim()
     };
@@ -79,10 +79,10 @@ fn header_html(m: &Mail, from: &str, date: &str) -> String {
             ));
         }
     };
-    add("From", from);
-    add("To", &m.to);
-    add("Cc", m.cc());
-    add("Date", date);
+    add(t!("html-print-from"), from);
+    add(t!("html-print-to"), &m.to);
+    add(t!("html-print-cc"), m.cc());
+    add(t!("html-print-date"), date);
     let attachments: Vec<String> = m
         .attachments()
         .iter()
@@ -90,7 +90,7 @@ fn header_html(m: &Mail, from: &str, date: &str) -> String {
         .filter(|n| !n.is_empty())
         .collect();
     if !attachments.is_empty() {
-        add("Attachments", &attachments.join(", "));
+        add(t!("html-print-attachments"), &attachments.join(", "));
     }
     format!(
         "<!doctype html><html><head><meta charset=\"utf-8\"><style>\
@@ -202,7 +202,7 @@ pub fn message_pdf(m: &Mail, from: &str, date: &str, remote: bool) -> Result<Vec
     let mut pdf = Document::new();
     let metadata = Metadata::new()
         .title(if m.subject.trim().is_empty() {
-            "Message".to_owned()
+            t!("html-print-message").to_owned()
         } else {
             m.subject.clone()
         })
@@ -210,7 +210,7 @@ pub fn message_pdf(m: &Mail, from: &str, date: &str, remote: bool) -> Result<Vec
     pdf.set_metadata(metadata);
 
     let page_settings = PageSettings::from_wh(page_w, page_h)
-        .ok_or_else(|| anyhow::anyhow!("Invalid PDF page size"))?;
+        .ok_or_else(|| anyhow::anyhow!(t!("html-print-invalid-pdf-page-size")))?;
     let mut resources = Resources::default();
 
     let mut scroll_y = 0.0_f32;
@@ -290,7 +290,7 @@ pub fn message_pdf(m: &Mail, from: &str, date: &str, remote: bool) -> Result<Vec
     }
 
     pdf.finish()
-        .map_err(|e| anyhow::anyhow!("Couldn't build PDF: {e:?}"))
+        .map_err(|e| anyhow::anyhow!(t!("html-print-couldnt-build-pdf", e = format!("{:?}", e))))
 }
 
 /// How long a PDF written for printing is kept: long enough for a print
@@ -338,7 +338,7 @@ fn temp_pdf(title: &str, pdf_bytes: &[u8]) -> Result<std::path::PathBuf> {
     let name = crate::manage::backend::opened::safe_file_name(&format!(
         "{}.pdf",
         if title.trim().is_empty() {
-            "Message"
+            t!("html-print-message")
         } else {
             title.trim()
         }
@@ -381,12 +381,12 @@ pub fn print_pdf(pdf_bytes: &[u8], title: &str) -> Result<Printed> {
         if futures::executor::block_on(linux_portal_print(&path, title)).is_ok() {
             return Ok(Printed::Dialog);
         }
-        open::that(&path).context("Couldn't open the PDF to print it")?;
+        open::that(&path).with_context(|| t!("html-print-couldnt-open-the-pdf-to-print"))?;
         Ok(Printed::Viewer)
     }
     #[cfg(any(target_os = "android", target_os = "ios"))]
     {
-        anyhow::bail!("Printing isn't available on this device yet.")
+        anyhow::bail!(t!("html-print-printing-isnt-available-on-this-device"))
     }
 }
 
@@ -443,7 +443,7 @@ pub fn print_pdf_macos(pdf_bytes: &[u8], title: &str) -> Result<()> {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
-        .context("Couldn't open the PDF for printing")?;
+        .with_context(|| t!("html-print-couldnt-open-the-pdf-for-printing"))?;
     Ok(())
 }
 
@@ -454,7 +454,7 @@ async fn linux_portal_print(path: &std::path::Path, title: &str) -> Result<()> {
 
     let file = std::fs::File::open(path)?;
     let title = if title.trim().is_empty() {
-        "Print Message"
+        t!("html-print-print-message")
     } else {
         title
     };

@@ -24,16 +24,16 @@ impl Biometry {
     /// What Settings and the lock screen call it.
     pub fn label(self) -> &'static str {
         match self {
-            Self::TouchId => "Touch ID",
-            Self::FaceId => "Face ID",
-            Self::OpticId => "Optic ID",
-            Self::Android => "fingerprint or face",
+            Self::TouchId => t!("biometric-touch-id"),
+            Self::FaceId => t!("biometric-face-id"),
+            Self::OpticId => t!("biometric-optic-id"),
+            Self::Android => t!("biometric-fingerprint-or-face"),
         }
     }
     /// The label at the start of a sentence or on a button.
     pub fn title(self) -> &'static str {
         match self {
-            Self::Android => "Fingerprint or Face",
+            Self::Android => t!("biometric-fingerprint-or-face-2"),
             other => other.label(),
         }
     }
@@ -170,7 +170,7 @@ mod platform {
 
     pub fn authenticate(_reason: &str, tx: oneshot::Sender<Answer>) {
         let _ = tx.send(Err(Failure::Failed(
-            "This computer has no biometrics Picacho can use.".into(),
+            t!("biometric-this-computer-has-no-biometrics-picacho").into(),
         )));
     }
 }

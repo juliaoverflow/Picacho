@@ -185,7 +185,7 @@ impl Backend {
                     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         backend.proton_events(&a, &stop, &*changed, &mut watched)
                     }))
-                    .unwrap_or_else(|_| Err(anyhow::anyhow!("Proton's events failed")));
+                    .unwrap_or_else(|_| Err(anyhow::anyhow!(t!("manage-watch-protons-events-failed"))));
                     let Err(error) = outcome else {
                         break;
                     };
@@ -319,7 +319,7 @@ impl Backend {
                     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         backend.jmap_events(&a, &stop, &*changed, &mut watched)
                     }))
-                    .unwrap_or_else(|_| Err(anyhow::anyhow!("JMAP's events failed")));
+                    .unwrap_or_else(|_| Err(anyhow::anyhow!(t!("manage-watch-jmaps-events-failed"))));
                     let Err(error) = outcome else {
                         break;
                     };
@@ -436,7 +436,7 @@ impl Backend {
                             &mut watched,
                         )
                     }))
-                    .unwrap_or_else(|_| Err(anyhow::anyhow!("IDLE failed")));
+                    .unwrap_or_else(|_| Err(anyhow::anyhow!(t!("manage-watch-idle-failed"))));
                     match outcome {
                         Ok(Ended::Unsupported) => break,
                         Ok(Ended::Stopped) => break,

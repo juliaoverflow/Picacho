@@ -22,10 +22,25 @@ final class ShareViewController: UIViewController {
         return own.hasSuffix(".share") ? String(own.dropLast(".share".count)) : own
     }
 
+    /// The language Picacho shows, from the widget snapshot it writes into
+    /// the App Group (empty before it has written one: the system's).
+    private func picachoLanguage() -> String {
+        guard
+            let container = FileManager.default.containerURL(
+                forSecurityApplicationGroupIdentifier: "group.\(appBundle)"),
+            let data = try? Data(contentsOf: container.appendingPathComponent("widget-snapshot.json")),
+            let snapshot = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+        else {
+            return ""
+        }
+        return snapshot["language"] as? String ?? ""
+    }
+
     override func viewDidLoad() {
         super.viewDidLoad()
+        PicachoLanguage.use(picachoLanguage())
         view.backgroundColor = .systemBackground
-        status.text = "Starting a message in Picacho…"
+        status.text = String(localized: "Starting a message in Picacho…", bundle: .picacho)
         status.textAlignment = .center
         status.numberOfLines = 0
         status.font = .preferredFont(forTextStyle: .body)
@@ -55,7 +70,7 @@ final class ShareViewController: UIViewController {
         guard
             let container = files.containerURL(forSecurityApplicationGroupIdentifier: "group.\(appBundle)")
         else {
-            return fail("Picacho couldn't take this. Open Picacho once, then share again.")
+            return fail(String(localized: "Picacho couldn't take this. Open Picacho once, then share again.", bundle: .picacho))
         }
         let id = UUID().uuidString
         let folder = container
@@ -64,7 +79,10 @@ final class ShareViewController: UIViewController {
         do {
             try files.createDirectory(at: folder, withIntermediateDirectories: true)
         } catch {
-            return fail("Picacho couldn't take this: \(error.localizedDescription)")
+            return fail(String(
+                localized: "Picacho couldn't take this: \(error.localizedDescription)",
+                bundle: .picacho,
+                comment: "After the colon: why, from the system"))
         }
 
         var subject = ""
@@ -99,7 +117,10 @@ final class ShareViewController: UIViewController {
             try data.write(to: folder.appendingPathComponent("share.json"), options: .atomic)
         } catch {
             try? files.removeItem(at: folder)
-            return fail("Picacho couldn't take this: \(error.localizedDescription)")
+            return fail(String(
+                localized: "Picacho couldn't take this: \(error.localizedDescription)",
+                bundle: .picacho,
+                comment: "After the colon: why, from the system"))
         }
 
         let url = URL(string: "\(appBundle)://share/\(id)")!
@@ -107,7 +128,7 @@ final class ShareViewController: UIViewController {
             extensionContext?.completeRequest(returningItems: nil)
         } else {
             spinner.stopAnimating()
-            status.text = "Open Picacho to finish your message."
+            status.text = String(localized: "Open Picacho to finish your message.", bundle: .picacho)
             DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { [weak self] in
                 self?.extensionContext?.completeRequest(returningItems: nil)
             }

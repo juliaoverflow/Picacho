@@ -1,0 +1,133 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  The Windows widgets' text (WidgetProvider.cs, through L.cs). To
+  translate, copy this file to Strings.<language>.resx (for example
+  Strings.de.resx) and translate each <value>. Keep {0}, which Picacho fills
+  in. The build makes a resource assembly for each language, and the widgets
+  pick the one for Windows' display language.
+-->
+<root>
+  <resheader name="resmimetype">
+    <value>text/microsoft-resx</value>
+  </resheader>
+  <resheader name="version">
+    <value>2.0</value>
+  </resheader>
+  <resheader name="reader">
+    <value>System.Resources.ResXResourceReader, System.Windows.Forms, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089</value>
+  </resheader>
+  <resheader name="writer">
+    <value>System.Resources.ResXResourceWriter, System.Windows.Forms, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089</value>
+  </resheader>
+  <data name="Inbox" xml:space="preserve">
+    <value>Inbox</value>
+  </data>
+  <data name="AllInboxes" xml:space="preserve">
+    <value>All Inboxes</value>
+  </data>
+  <data name="AllAccounts" xml:space="preserve">
+    <value>All Accounts</value>
+  </data>
+  <data name="UnknownSender" xml:space="preserve">
+    <value>(Unknown sender)</value>
+  </data>
+  <data name="NoSubject" xml:space="preserve">
+    <value>(No subject)</value>
+  </data>
+  <data name="NoTitle" xml:space="preserve">
+    <value>(No title)</value>
+    <comment>Stands in for an event without a title</comment>
+  </data>
+  <data name="OpenToAddAccount" xml:space="preserve">
+    <value>Open Picacho to add an account</value>
+  </data>
+  <data name="NoMessagesInInbox" xml:space="preserve">
+    <value>No messages in Inbox</value>
+  </data>
+  <data name="AllCaughtUp" xml:space="preserve">
+    <value>All caught up</value>
+    <comment>No unread messages</comment>
+  </data>
+  <data name="UnreadMessage" xml:space="preserve">
+    <value>unread message</value>
+    <comment>Under an unread count of 1, shown larger above it</comment>
+  </data>
+  <data name="UnreadMessages" xml:space="preserve">
+    <value>unread messages</value>
+    <comment>Under an unread count other than 1, shown larger above it</comment>
+  </data>
+  <data name="Compose" xml:space="preserve">
+    <value>Compose</value>
+    <comment>Button: write a new message</comment>
+  </data>
+  <data name="Refresh" xml:space="preserve">
+    <value>Refresh</value>
+    <comment>Button</comment>
+  </data>
+  <data name="Calendar" xml:space="preserve">
+    <value>Calendar</value>
+    <comment>The Calendar widget's title</comment>
+  </data>
+  <data name="OpenCalendar" xml:space="preserve">
+    <value>Open Calendar</value>
+    <comment>Button</comment>
+  </data>
+  <data name="NoUpcomingEvents" xml:space="preserve">
+    <value>No upcoming events</value>
+  </data>
+  <data name="ConnectCalendar" xml:space="preserve">
+    <value>Connect a calendar in Settings</value>
+  </data>
+  <data name="Today" xml:space="preserve">
+    <value>Today</value>
+  </data>
+  <data name="Tomorrow" xml:space="preserve">
+    <value>Tomorrow</value>
+  </data>
+  <data name="AllDay" xml:space="preserve">
+    <value>All day</value>
+    <comment>An event that lasts all day, after its day</comment>
+  </data>
+  <data name="Packages" xml:space="preserve">
+    <value>Packages</value>
+    <comment>The Packages widget's title</comment>
+  </data>
+  <data name="Package" xml:space="preserve">
+    <value>Package</value>
+    <comment>Stands in for a package without a name</comment>
+  </data>
+  <data name="Expected" xml:space="preserve">
+    <value>Expected {0}</value>
+    <comment>{0}: when the package should arrive, for example Nov 26</comment>
+  </data>
+  <data name="NoRecentPackages" xml:space="preserve">
+    <value>No recent packages</value>
+  </data>
+  <data name="AllPackages" xml:space="preserve">
+    <value>All Packages</value>
+    <comment>Button: opens every package in Picacho's Summary</comment>
+  </data>
+  <data name="Receipts" xml:space="preserve">
+    <value>Receipts</value>
+    <comment>The Receipts widget's title</comment>
+  </data>
+  <data name="Receipt" xml:space="preserve">
+    <value>Receipt</value>
+    <comment>Stands in for a receipt without a shop name</comment>
+  </data>
+  <data name="Order" xml:space="preserve">
+    <value>Order {0}</value>
+    <comment>{0}: the order number</comment>
+  </data>
+  <data name="NoRecentReceipts" xml:space="preserve">
+    <value>No recent receipts</value>
+  </data>
+  <data name="AllReceipts" xml:space="preserve">
+    <value>All Receipts</value>
+    <comment>Button: opens every receipt in Picacho's Summary</comment>
+  </data>
+  <data name="ViewAll" xml:space="preserve">
+    <value>View all {0}</value>
+    <comment>Opens the whole list. {0}: how many there are</comment>
+  </data>
+</root>

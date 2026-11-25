@@ -55,15 +55,15 @@ impl Field {
     ];
     pub fn label(self) -> &'static str {
         match self {
-            Self::From => "From",
-            Self::To => "To",
-            Self::Recipients => "To or Cc",
-            Self::Subject => "Subject",
-            Self::List => "Mailing list",
-            Self::Body => "Text",
-            Self::LargerThan => "Larger than (KB)",
-            Self::Header => "Header",
-            Self::DeliveredTo => "Delivered to",
+            Self::From => t!("sync-sieve-from"),
+            Self::To => t!("sync-sieve-to"),
+            Self::Recipients => t!("sync-sieve-to-or-cc"),
+            Self::Subject => t!("sync-sieve-subject"),
+            Self::List => t!("sync-sieve-mailing-list"),
+            Self::Body => t!("sync-sieve-text"),
+            Self::LargerThan => t!("sync-sieve-larger-than-kb"),
+            Self::Header => t!("sync-sieve-header"),
+            Self::DeliveredTo => t!("sync-sieve-delivered-to"),
         }
     }
     /// The Sieve extension it needs, if any.
@@ -91,10 +91,19 @@ impl Match {
     pub const ALL: [Self; 4] = [Self::Contains, Self::Is, Self::Matches, Self::Regex];
     pub fn label(self) -> &'static str {
         match self {
+            Self::Contains => t!("sync-sieve-contains"),
+            Self::Is => t!("sync-sieve-is"),
+            Self::Matches => t!("sync-sieve-matches"),
+            Self::Regex => t!("sync-sieve-matches-the-pattern"),
+        }
+    }
+    /// Its name in messages that choose words by it (`filters-rule`).
+    pub fn key(self) -> &'static str {
+        match self {
             Self::Contains => "contains",
             Self::Is => "is",
             Self::Matches => "matches",
-            Self::Regex => "matches the pattern",
+            Self::Regex => "pattern",
         }
     }
     fn tag(self) -> &'static str {
@@ -225,7 +234,7 @@ impl State {
 fn protocol_string(text: &str) -> Result<String> {
     anyhow::ensure!(
         !text.contains(['\r', '\n', '\0']),
-        "The server named a filter script with a line break in it."
+        t!("sync-sieve-the-server-named-a-filter-script")
     );
     Ok(format!("\"{}\"", text.replace('\\', "\\\\").replace('"', "\\\"")))
 }
@@ -250,7 +259,7 @@ pub fn script(filters: &Filters, extensions: &[String], addresses: &[String]) ->
     if let Some(other) = &filters.include {
         ensure!(
             has("include"),
-            "This server can't run another script from Picacho's."
+            t!("sync-sieve-this-server-cant-run-another-script")
         );
         require.push("include");
         // :optional (RFC 6609 §3.2): the other script being deleted must
@@ -259,10 +268,10 @@ pub fn script(filters: &Filters, extensions: &[String], addresses: &[String]) ->
     }
     let vacation = &filters.vacation;
     if vacation.on {
-        ensure!(has("vacation"), "This server can't send vacation replies.");
+        ensure!(has("vacation"), t!("sync-sieve-this-server-cant-send-vacation-replies"));
         ensure!(
             !vacation.body.trim().is_empty(),
-            "Write the vacation reply's message."
+            t!("sync-sieve-write-the-vacation-replys-message")
         );
         require.push("vacation");
         let mut tests = Vec::new();
@@ -270,11 +279,11 @@ pub fn script(filters: &Filters, extensions: &[String], addresses: &[String]) ->
             if let Some(date) = date.as_deref().filter(|d| !d.trim().is_empty()) {
                 ensure!(
                     chrono::NaiveDate::parse_from_str(date.trim(), "%Y-%m-%d").is_ok(),
-                    "Enter dates like 2026-12-24."
+                    t!("sync-sieve-enter-dates-like-2026-12-24")
                 );
                 ensure!(
                     has("date") && has("relational"),
-                    "This server can't limit vacation replies to dates."
+                    t!("sync-sieve-this-server-cant-limit-vacation-replies")
                 );
                 tests.push(format!(
                     "currentdate :value {} \"date\" {}",
@@ -291,7 +300,7 @@ pub fn script(filters: &Filters, extensions: &[String], addresses: &[String]) ->
                 let valid = zone.len() == 5
                     && zone.starts_with(['+', '-'])
                     && zone[1..].bytes().all(|b| b.is_ascii_digit());
-                ensure!(valid, "Enter the time zone like +0100.");
+                ensure!(valid, t!("sync-sieve-enter-the-time-zone-like-0100"));
                 for t in &mut tests {
                     *t = t.replacen("currentdate ", &format!("currentdate :zone {} ", string(zone)), 1);
                 }
@@ -302,7 +311,7 @@ pub fn script(filters: &Filters, extensions: &[String], addresses: &[String]) ->
         let period = match vacation.seconds {
             // RFC 6131 §2: :seconds in place of :days.
             Some(s) => {
-                ensure!(has("vacation-seconds"), "This server can't send vacation replies more often than daily.");
+                ensure!(has("vacation-seconds"), t!("sync-sieve-this-server-cant-send-vacation-replies-2"));
                 require.push("vacation-seconds");
                 format!(":seconds {s}")
             }
@@ -316,12 +325,12 @@ pub fn script(filters: &Filters, extensions: &[String], addresses: &[String]) ->
         if !sender.is_empty() {
             ensure!(
                 sender.contains('@') && !sender.contains(['\r', '\n']),
-                "Enter the address the vacation reply comes from."
+                t!("sync-sieve-enter-the-address-the-vacation-reply")
             );
             reply.push_str(&format!(" :from {}", string(sender)));
         }
         if !vacation.fcc.trim().is_empty() {
-            ensure!(has("fcc"), "This server can't keep copies of vacation replies.");
+            ensure!(has("fcc"), t!("sync-sieve-this-server-cant-keep-copies-of"));
             require.push("fcc");
             reply.push_str(&format!(" :fcc {}", string(&super::transport::decode_name(vacation.fcc.trim()))));
         }
@@ -346,15 +355,15 @@ pub fn script(filters: &Filters, extensions: &[String], addresses: &[String]) ->
         let value = rule.value.trim();
         ensure!(
             !value.is_empty(),
-            "Each filter needs something to look for."
+            t!("sync-sieve-each-filter-needs-something-to-look")
         );
         let m = rule.matching.tag();
         if rule.matching == Match::Regex {
-            ensure!(has("regex"), "This server can't match patterns in filters.");
+            ensure!(has("regex"), t!("sync-sieve-this-server-cant-match-patterns-in"));
             require.push("regex");
         }
         if let Some(ext) = rule.field.needs() {
-            ensure!(has(ext), "This server can't filter on {} ({ext}).", rule.field.label());
+            ensure!(has(ext), t!("sync-sieve-this-server-cant-filter-on", label = rule.field.label(), ext = ext));
             require.push(ext);
         }
         let test = match rule.field {
@@ -370,14 +379,14 @@ pub fn script(filters: &Filters, extensions: &[String], addresses: &[String]) ->
                     .parse()
                     .ok()
                     .filter(|n| *n > 0)
-                    .context("Enter a size in kilobytes, such as 5000.")?;
+                    .with_context(|| t!("sync-sieve-enter-a-size-in-kilobytes-such"))?;
                 format!("size :over {kb}K")
             }
             Field::Header => {
                 let name = rule.header.trim();
                 ensure!(
                     !name.is_empty() && name.bytes().all(|b| b.is_ascii_graphic() && b != b':'),
-                    "Name the header the filter looks at."
+                    t!("sync-sieve-name-the-header-the-filter-looks")
                 );
                 format!("header {m} {} {}", string(name), string(value))
             }
@@ -387,7 +396,7 @@ pub fn script(filters: &Filters, extensions: &[String], addresses: &[String]) ->
         let action = match &rule.act {
             Act::Inbox => "keep;".to_owned(),
             Act::Folder(name) => {
-                ensure!(has("fileinto"), "This server can't file mail into folders.");
+                ensure!(has("fileinto"), t!("sync-sieve-this-server-cant-file-mail-into"));
                 require.push("fileinto");
                 // A standard folder by its role (`\\Trash`): the server
                 // finds it by its special use (RFC 8579), whatever it's
@@ -398,7 +407,7 @@ pub fn script(filters: &Filters, extensions: &[String], addresses: &[String]) ->
                         "Trash" => "Trash",
                         "Archive" => "Archive",
                         "Sent" => "Sent",
-                        other => bail!("“{other}” isn't a folder filters can use."),
+                        other => bail!(t!("sync-sieve-isnt-a-folder-filters-can-use", folder = other)),
                     };
                     if has("special-use") {
                         require.push("special-use");
@@ -422,7 +431,7 @@ pub fn script(filters: &Filters, extensions: &[String], addresses: &[String]) ->
             Act::MarkRead => {
                 ensure!(
                     has("imap4flags"),
-                    "This server can't mark mail read from a filter."
+                    t!("sync-sieve-this-server-cant-mark-mail-read")
                 );
                 require.push("imap4flags");
                 "addflag \"\\\\Seen\";".to_owned()
@@ -430,7 +439,7 @@ pub fn script(filters: &Filters, extensions: &[String], addresses: &[String]) ->
             Act::Star => {
                 ensure!(
                     has("imap4flags"),
-                    "This server can't star mail from a filter."
+                    t!("sync-sieve-this-server-cant-star-mail-from")
                 );
                 require.push("imap4flags");
                 "addflag \"\\\\Flagged\";".to_owned()
@@ -440,10 +449,10 @@ pub fn script(filters: &Filters, extensions: &[String], addresses: &[String]) ->
                 let to = to.trim();
                 ensure!(
                     to.contains('@') && !to.contains(|c: char| c.is_whitespace() || c == ','),
-                    "Enter the one address mail is sent on to."
+                    t!("sync-sieve-enter-the-one-address-mail-is")
                 );
                 if rule.keep_copy {
-                    ensure!(has("copy"), "This server can't send a copy and keep the message too.");
+                    ensure!(has("copy"), t!("sync-sieve-this-server-cant-send-a-copy"));
                     require.push("copy");
                     format!("redirect :copy {};", string(to))
                 } else {
@@ -451,12 +460,12 @@ pub fn script(filters: &Filters, extensions: &[String], addresses: &[String]) ->
                 }
             }
             Act::Reject(reason) => {
-                ensure!(has("reject"), "This server can't refuse mail from a filter.");
+                ensure!(has("reject"), t!("sync-sieve-this-server-cant-refuse-mail-from"));
                 require.push("reject");
                 format!("reject {};", string(reason.trim()))
             }
             Act::Label(label) => {
-                ensure!(has("imap4flags"), "This server can't label mail from a filter.");
+                ensure!(has("imap4flags"), t!("sync-sieve-this-server-cant-label-mail-from"));
                 require.push("imap4flags");
                 let keyword = super::transport::keyword(label)?;
                 format!("addflag {};", string(&keyword))
@@ -535,20 +544,20 @@ impl Reply {
     /// What went wrong, in words, for refusals with a known code.
     fn explain(&self) -> String {
         let why = if self.is("QUOTA") {
-            "the account has no room for more filters"
+            t!("sync-sieve-the-account-has-no-room-for")
         } else if self.is("TRYLATER") {
-            "the server is busy; try again later"
+            t!("sync-sieve-the-server-is-busy-try-again")
         } else if self.is("NONEXISTENT") {
-            "the script doesn't exist"
+            t!("sync-sieve-the-script-doesnt-exist")
         } else if self.is("ALREADYEXISTS") {
-            "a script by that name already exists"
+            t!("sync-sieve-a-script-by-that-name-already")
         } else if self.is("ACTIVE") {
-            "the script is in use"
+            t!("sync-sieve-the-script-is-in-use")
         } else if self.is("REFERRAL") {
-            return format!(
-                "the account's filters are kept on another server ({})",
-                self.referral.as_deref().unwrap_or("not named")
-            );
+            return match self.referral.as_deref() {
+                Some(server) => t!("sync-sieve-the-accounts-filters-are-kept-on", server = server),
+                None => t!("sync-sieve-the-accounts-filters-are-kept-on-unnamed").to_owned(),
+            };
         } else {
             return self.text.clone();
         };
@@ -569,10 +578,10 @@ impl<S: Read + Write> Session<S> {
         (&mut self.reader)
             .take(65_537)
             .read_until(b'\n', &mut line)?;
-        ensure!(!line.is_empty(), "The filter server closed the connection.");
+        ensure!(!line.is_empty(), t!("sync-sieve-the-filter-server-closed-the-connection"));
         ensure!(
             line.len() <= 65_536,
-            "The filter server's reply is too long."
+            t!("sync-sieve-the-filter-servers-reply-is-too")
         );
         Ok(String::from_utf8_lossy(&line)
             .trim_end_matches(['\r', '\n'])
@@ -580,7 +589,7 @@ impl<S: Read + Write> Session<S> {
     }
     /// A literal's bytes after its `{n}` line, then the rest of that line.
     fn literal(&mut self, len: usize) -> Result<String> {
-        ensure!(len <= 1024 * 1024, "The filter server sent too much.");
+        ensure!(len <= 1024 * 1024, t!("sync-sieve-the-filter-server-sent-too-much"));
         let mut data = vec![0; len];
         self.reader.read_exact(&mut data)?;
         Ok(String::from_utf8_lossy(&data).into_owned())
@@ -631,12 +640,13 @@ impl<S: Read + Write> Session<S> {
         self.send(&format!("{line}\r\n"))?;
         self.response()
     }
-    fn expect(&mut self, line: &str, what: &str) -> Result<Vec<Vec<String>>> {
+    /// `what`: the step, one of the keys `sync-sieve-the-filter-server-refused-to`
+    /// selects on.
+    fn expect(&mut self, line: &str, what: &'static str) -> Result<Vec<Vec<String>>> {
         let (data, reply) = self.command(line)?;
         ensure!(
             reply.ok,
-            "The filter server refused to {what}: {}",
-            reply.explain()
+            t!("sync-sieve-the-filter-server-refused-to", what = what, explain = reply.explain())
         );
         Ok(data)
     }
@@ -723,10 +733,7 @@ fn open(
     tls: &native_tls::TlsConnector,
 ) -> Result<(Secured, Opened)> {
     let socket = crate::sync::transport::tcp(&endpoint.host, endpoint.port).with_context(|| {
-        format!(
-            "{} offers no filter server (ManageSieve) on port {}",
-            endpoint.host, endpoint.port
-        )
+        t!("sync-sieve-offers-no-filter-server-managesieve-on", host = endpoint.host, port = endpoint.port)
     })?;
     let mut plain = Session {
         reader: BufReader::new(socket),
@@ -734,22 +741,20 @@ fn open(
     let (greeting, reply) = plain.response()?;
     ensure!(
         reply.ok,
-        "The filter server refused the connection: {}",
-        reply.text
+        t!("sync-sieve-the-filter-server-refused-the-connection", text = reply.text)
     );
     ensure!(
         capabilities(&greeting).starttls,
-        "{}'s filter server doesn't offer encryption (STARTTLS); Picacho won't sign in to it.",
-        endpoint.host
+        t!("sync-sieve-s-filter-server-doesnt-offer-encryption", host = endpoint.host)
     );
-    plain.expect("STARTTLS", "start encryption")?;
+    plain.expect("STARTTLS", "start-encryption")?;
     ensure!(
         plain.reader.buffer().is_empty(),
-        "Unexpected data from the filter server before encryption started."
+        t!("sync-sieve-unexpected-data-from-the-filter-server")
     );
     let stream = tls
         .connect(&endpoint.host, plain.reader.into_inner())
-        .map_err(|e| anyhow::anyhow!("TLS with {}'s filter server failed: {e}", endpoint.host))?;
+        .map_err(|e| anyhow::anyhow!(t!("sync-sieve-tls-with-s-filter-server-failed", host = endpoint.host, error = e.to_string())))?;
     let binding = sasl::binding(&stream);
     let mut session = Session {
         reader: BufReader::new(stream),
@@ -758,8 +763,7 @@ fn open(
     let (lines, reply) = session.response()?;
     ensure!(
         reply.ok,
-        "The filter server failed after STARTTLS: {}",
-        reply.text
+        t!("sync-sieve-the-filter-server-failed-after-starttls", text = reply.text)
     );
     let caps = capabilities(&lines);
     let order: &[sasl::Mechanism] = if endpoint.kerberos {
@@ -771,7 +775,7 @@ fn open(
     };
     let mechanism =
         sasl::Mechanism::choose_bound(order, caps.sasl.iter().map(String::as_str), !binding.is_empty())
-        .context("The filter server offers no sign-in method Picacho supports.")?;
+        .with_context(|| t!("sync-sieve-the-filter-server-offers-no-sign"))?;
     let mut exchange = sasl::Exchange::new(
         mechanism,
         sasl::Credentials {
@@ -826,10 +830,10 @@ fn open(
                 return Err(e);
             }
             if parsed.is("TRYLATER") {
-                bail!("The filter server is busy; try again later.");
+                bail!(t!("sync-sieve-the-filter-server-is-busy-try"));
             }
             return Err(
-                anyhow::anyhow!("The filter server refused the sign-in: {reply}")
+                anyhow::anyhow!(t!("sync-sieve-the-filter-server-refused-the-sign", reply = reply))
                     .context(crate::manage::status::AccessFailure::Authentication),
             );
         }
@@ -859,7 +863,7 @@ fn open(
     let mut caps = caps;
     if caps.rfc5804 {
         let (lines, reply) = session.command("CAPABILITY")?;
-        ensure!(reply.ok, "The filter server isn't answering: {}", reply.explain());
+        ensure!(reply.ok, t!("sync-sieve-the-filter-server-isnt-answering", explain = reply.explain()));
         let after = capabilities(&lines);
         if !after.sieve.is_empty() {
             caps.sieve = after.sieve;
@@ -904,17 +908,17 @@ fn referral(reply: &Reply, endpoint: &Endpoint) -> Option<anyhow::Error> {
     if !same {
         let host: String = host.chars().filter(|c| !c.is_control()).take(253).collect();
         return Some(anyhow::anyhow!(
-            "The filter server sends this account to {host}, outside its domain; Picacho won't sign in there."
+            t!("sync-sieve-the-filter-server-sends-this-account", host = host)
         ));
     }
     let authority: String = authority.chars().filter(|c| !c.is_control()).take(260).collect();
     Some(anyhow::anyhow!(
-        "This account's filters are kept on {authority}; set it as the filter server."
+        t!("sync-sieve-this-accounts-filters-are-kept-on", authority = authority)
     ))
 }
 
 fn scripts(session: &mut Secured) -> Result<Vec<(String, bool)>> {
-    let lines = session.expect("LISTSCRIPTS", "list filter scripts")?;
+    let lines = session.expect("LISTSCRIPTS", "list-scripts")?;
     Ok(lines
         .iter()
         .filter_map(|w| {
@@ -934,7 +938,7 @@ pub fn load(endpoint: &Endpoint, secret: &str, tls: &native_tls::TlsConnector) -
     let own = if listed.iter().any(|(n, _)| n == SCRIPT) {
         let data = session.expect(
             &format!("GETSCRIPT {}", string(SCRIPT)),
-            "read Picacho's filters",
+            "read-filters",
         )?;
         data.into_iter().next().and_then(|w| w.into_iter().next())
     } else {
@@ -1004,20 +1008,20 @@ pub fn save(
             let next = filters.include.clone().unwrap_or_default();
             session.expect(
                 &format!("SETACTIVE {}", protocol_string(&next)?),
-                "turn the filters off",
+                "turn-off",
             )?;
         }
         // Then removed, so the rules don't come back on the next load.
         if listed.iter().any(|(n, _)| n == SCRIPT) {
             session.expect(
                 &format!("DELETESCRIPT {}", string(SCRIPT)),
-                "remove the filters",
+                "remove",
             )?;
         }
     } else {
         let literal = format!("{{{}+}}\r\n{text}", text.len());
         if extensions.is_empty() {
-            bail!("The filter server didn't say what its filters can do.");
+            bail!(t!("sync-sieve-the-filter-server-didnt-say-what"));
         }
         // Room for it first (HAVESPACE), so a full account says so before
         // anything is uploaded.
@@ -1027,18 +1031,18 @@ pub fn save(
             text.len()
         ))?;
         if !space.ok && (space.is("QUOTA") || !space.text.to_ascii_lowercase().contains("unknown")) {
-            bail!("The filter server can't take the filters: {}", space.explain());
+            bail!(t!("sync-sieve-the-filter-server-cant-take-the", explain = space.explain()));
         }
         let (_, check) = session.command(&format!("CHECKSCRIPT {literal}"))?;
         if !check.ok && !check.text.to_ascii_lowercase().contains("unknown command") {
-            bail!("The filter server rejected the filters: {}", check.explain());
+            bail!(t!("sync-sieve-the-filter-server-rejected-the-filters", explain = check.explain()));
         }
         // PUTSCRIPT replaces a script in one step (RFC 5804 §2.6), active
         // or not: no second copy that a quota (QUOTA/MAXSCRIPTS) could
         // refuse.
         {
             let (_, put) = session.command(&format!("PUTSCRIPT {} {literal}", string(SCRIPT)))?;
-            ensure!(put.ok, "The filter server refused to save the filters: {}", put.explain());
+            ensure!(put.ok, t!("sync-sieve-the-filter-server-refused-to-save", explain = put.explain()));
             // The script was saved, with warnings (RFC 5804 §1.3): worth
             // knowing, not a failure.
             if put.is("WARNINGS") {
@@ -1047,7 +1051,7 @@ pub fn save(
         }
         session.expect(
             &format!("SETACTIVE {}", string(SCRIPT)),
-            "turn the filters on",
+            "turn-on",
         )?;
     }
     let _ = session.command("LOGOUT");

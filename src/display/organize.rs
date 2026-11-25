@@ -78,13 +78,13 @@ impl RuleKind {
     ];
     fn label(self) -> &'static str {
         match self {
-            Self::MarkRead => "Mark read",
-            Self::Star => "Star",
-            Self::Archive => "Archive",
-            Self::Spam => "Spam",
-            Self::Trash => "Trash",
-            Self::MoveTo => "Move to folder",
-            Self::Label => "Label",
+            Self::MarkRead => t!("organize-mark-read"),
+            Self::Star => t!("organize-star"),
+            Self::Archive => t!("organize-archive"),
+            Self::Spam => t!("organize-spam"),
+            Self::Trash => t!("organize-trash"),
+            Self::MoveTo => t!("organize-move-to-folder"),
+            Self::Label => t!("organize-label"),
         }
     }
     fn action(self, name: &str) -> Option<RuleAction> {
@@ -143,9 +143,9 @@ pub(super) struct OrgUi {
 impl OrgUi {
     pub(super) fn new(window: &mut Window, cx: &mut App) -> Self {
         Self {
-            rule_text: input("Text to look for, as newsletter@shop.example", false, window, cx),
-            rule_name: input("Folder or label name", false, window, cx),
-            block: input("Address or @domain to block", false, window, cx),
+            rule_text: input(t!("organize-text-to-look-for-as-newsletter"), false, window, cx),
+            rule_name: input(t!("organize-folder-or-label-name"), false, window, cx),
+            block: input(t!("organize-address-or-domain-to-block"), false, window, cx),
             field: RuleField::default(),
             kind: RuleKind::default(),
         }
@@ -224,7 +224,7 @@ impl MailApp {
                     .map(|m| m.id.clone())
                     .collect();
                 if ids.is_empty() {
-                    self.notice("Already in All Mail", false, cx);
+                    self.notice(t!("organize-already-in-all-mail"), false, cx);
                     return;
                 }
                 (ids, Change::Move(Folder::Archive))
@@ -274,8 +274,7 @@ impl MailApp {
             },
             |this, result: anyhow::Result<usize>, cx| match result {
                 Ok(n) => {
-                    let plural = if n == 1 { "draft" } else { "drafts" };
-                    this.notice(format!("Started {n} {plural} in Drafts"), false, cx);
+                    this.notice(t!("organize-started-in-drafts", n = n), false, cx);
                     if this.folder == Folder::Drafts {
                         this.refresh(cx);
                     }
@@ -306,7 +305,7 @@ impl MailApp {
         let name = if to.name.is_empty() { to.email.clone() } else { to.name.clone() };
         let n: usize = groups.iter().map(|(_, l)| l.len()).sum();
         self.notice(
-            format!("Moving {n} {} to {name}…", if n == 1 { "message" } else { "messages" }),
+            t!("organize-moving-to", n = n, name = name),
             false,
             cx,
         );
@@ -328,7 +327,7 @@ impl MailApp {
             },
             move |this, result: anyhow::Result<(crate::manage::backend::archive::Moved, Vec<String>)>, cx| match result {
                 Ok((moved, gone)) => {
-                    this.notice(format!("{} to {name}", moved.notice("Moved")), false, cx);
+                    this.notice(moved.notice(crate::manage::backend::archive::Done::MovedTo(&name)), false, cx);
                     this.selection.retain(|s| !gone.contains(s));
                     this.messages.retain(|m| !gone.contains(&m.id));
                     if this.selected.as_ref().is_some_and(|s| gone.contains(s)) {
@@ -385,31 +384,31 @@ impl MailApp {
         let mut entries = vec![
             Entry::Separator,
             entry(
-                if self.org.is_pinned(m) { "Unpin" } else { "Pin to Top" },
+                if self.org.is_pinned(m) { t!("organize-unpin") } else { t!("organize-pin-to-top") },
                 "pin",
                 Action::Organize(OrgAction::TogglePin(m.id.clone())),
             ),
             entry(
                 if self.org.is_muted(m) {
-                    "Unmute Conversation"
+                    t!("organize-unmute-conversation")
                 } else {
-                    "Mute Conversation"
+                    t!("organize-mute-conversation")
                 },
                 "bell-off",
                 Action::Organize(OrgAction::ToggleMute(m.id.clone())),
             ),
-            entry("Print…", "print", Action::Tools(super::tools::ToolAction::Print(m.id.clone()))),
+            entry(t!("organize-print"), "print", Action::Tools(super::tools::ToolAction::Print(m.id.clone()))),
         ];
         if !m.from.is_empty() {
             entries.push(if self.org.is_blocked(&m.from) {
                 entry(
-                    format!("Unblock {}", m.from),
+                    t!("organize-unblock", from = m.from),
                     "ban",
                     Action::Organize(OrgAction::BlockSender(m.id.clone())),
                 )
             } else {
                 danger(
-                    format!("Block {}", m.from),
+                    t!("organize-block", from = m.from),
                     "ban",
                     Action::Organize(OrgAction::BlockSender(m.id.clone())),
                 )
@@ -423,27 +422,27 @@ impl MailApp {
         vec![
             Entry::Separator,
             checked(
-                "Group by Conversation",
+                t!("organize-group-by-conversation"),
                 self.org.threaded,
                 Action::Organize(OrgAction::ToggleThreaded),
             ),
             checked(
-                "Comfortable Rows",
+                t!("organize-comfortable-rows"),
                 self.org.density == Density::Comfortable,
                 Action::Organize(OrgAction::SetDensity(Density::Comfortable)),
             ),
             checked(
-                "Compact Rows",
+                t!("organize-compact-rows"),
                 self.org.density == Density::Compact,
                 Action::Organize(OrgAction::SetDensity(Density::Compact)),
             ),
             checked(
-                "Reader Beside List",
+                t!("organize-reader-beside-list"),
                 self.org.layout == ReaderLayout::Beside,
                 Action::Organize(OrgAction::SetLayout(ReaderLayout::Beside)),
             ),
             checked(
-                "Reader Below List",
+                t!("organize-reader-below-list"),
                 self.org.layout == ReaderLayout::Below,
                 Action::Organize(OrgAction::SetLayout(ReaderLayout::Below)),
             ),
@@ -480,7 +479,7 @@ impl MailApp {
                         let r = format!("m:{}", r.trim_matches(|c| c == '<' || c == '>'));
                         self.org.muted.remove(&r);
                     }
-                    self.notice("Conversation unmuted", false, cx);
+                    self.notice(t!("organize-conversation-unmuted"), false, cx);
                 } else {
                     self.org.muted.insert(conversation_key(&m));
                     // What's there now is read too.
@@ -493,7 +492,7 @@ impl MailApp {
                         self.apply(ids, Change::Read(true), cx);
                     }
                     self.notice(
-                        "Conversation muted: new messages in it are marked read and not announced",
+                        t!("organize-conversation-muted-new-messages-in-it"),
                         false,
                         cx,
                     );
@@ -516,7 +515,7 @@ impl MailApp {
                         .collect();
                     self.save_org(cx);
                     self.notice(
-                        format!("Blocked {}: their mail goes to Trash", m.from),
+                        t!("organize-blocked-their-mail-goes-to-trash", from = m.from),
                         false,
                         cx,
                     );
@@ -525,7 +524,7 @@ impl MailApp {
                     }
                 } else {
                     self.save_org(cx);
-                    self.notice(format!("Unblocked {}", m.from), false, cx);
+                    self.notice(t!("organize-unblocked", from = m.from), false, cx);
                 }
             }
             OrgAction::Unblock(address) => {
@@ -535,7 +534,7 @@ impl MailApp {
             OrgAction::AddBlocked => {
                 let text = Self::value(&self.org_ui.block, cx).trim().to_lowercase();
                 if text.is_empty() || (!text.contains('@')) {
-                    self.notice("Type an address, or @ and a domain", true, cx);
+                    self.notice(t!("organize-type-an-address-or-and-a"), true, cx);
                     return;
                 }
                 if !self.org.is_blocked(&text) || text.starts_with('@') {
@@ -557,7 +556,7 @@ impl MailApp {
                         query,
                     });
                     self.save_org(cx);
-                    self.notice("Saved: it's in the sidebar under Saved Searches", false, cx);
+                    self.notice(t!("organize-saved-its-in-the-sidebar-under"), false, cx);
                 }
             }
             OrgAction::SearchEverywhere => {
@@ -637,11 +636,11 @@ impl MailApp {
                 let text = Self::value(&self.org_ui.rule_text, cx).trim().to_owned();
                 let name = Self::value(&self.org_ui.rule_name, cx).trim().to_owned();
                 if text.is_empty() {
-                    self.notice("Type the text the rule looks for", true, cx);
+                    self.notice(t!("organize-type-the-text-the-rule-looks"), true, cx);
                     return;
                 }
                 let Some(action) = self.org_ui.kind.action(&name) else {
-                    self.notice("Type the folder or label's name", true, cx);
+                    self.notice(t!("organize-type-the-folder-or-labels-name"), true, cx);
                     return;
                 };
                 self.org.rules.push(Rule {
@@ -686,7 +685,7 @@ impl MailApp {
             move |b| crate::manage::organize::apply_to_arrivals(&b, &a, &fresh),
             move |this, result: anyhow::Result<()>, cx| {
                 if let Err(e) = result {
-                    this.notice(format!("A rule couldn't be applied: {e:#}"), true, cx);
+                    this.notice(t!("organize-a-rule-couldnt-be-applied", e = format!("{:#}", e)), true, cx);
                 }
                 this.reload_cached(cx);
                 this.refresh_counts(cx);
@@ -700,7 +699,7 @@ impl MailApp {
             return;
         }
         if self.org.blocked.is_empty() && !self.org.rules.iter().any(|r| r.enabled) {
-            self.notice("Add a rule or block a sender first", true, cx);
+            self.notice(t!("organize-add-a-rule-or-block-a"), true, cx);
             return;
         }
         self.applying_rules = true;
@@ -713,10 +712,10 @@ impl MailApp {
             |this, result: anyhow::Result<usize>, cx| {
                 this.applying_rules = false;
                 match result {
-                    Ok(0) => this.notice("No mail in your inboxes matches the rules", false, cx),
-                    Ok(1) => this.notice("Rules applied to 1 message", false, cx),
-                    Ok(n) => this.notice(format!("Rules applied to {} messages", fmt_count(n)), false, cx),
-                    Err(e) => this.notice(format!("Rules couldn't be applied everywhere: {e:#}"), true, cx),
+                    Ok(0) => this.notice(t!("organize-no-mail-in-your-inboxes-matches"), false, cx),
+                    Ok(1) => this.notice(t!("organize-rules-applied-to-1-message"), false, cx),
+                    Ok(n) => this.notice(t!("organize-rules-applied-to-messages", shown = fmt_count(n), count = n), false, cx),
+                    Err(e) => this.notice(t!("organize-rules-couldnt-be-applied-everywhere", e = format!("{:#}", e)), true, cx),
                 }
                 this.reload_cached(cx);
                 this.refresh_counts(cx);
@@ -751,16 +750,16 @@ impl MailApp {
                 .text_size(px(12.))
                 .text_color(rgb(c.muted))
                 .when(searching_text, |d| {
-                    d.child(spinner(11., c.muted)).child("Searching message text…")
+                    d.child(spinner(11., c.muted)).child(t!("organize-searching-message-text"))
                 })
                 .when(!searching_text && asking_servers, |d| {
                     d.child(spinner(11., c.muted))
-                        .child("Asking the server about mail not downloaded yet…")
+                        .child(t!("organize-asking-the-server-about-mail-not"))
                 })
                 .when(!saved, |d| {
                     d.child(self.link(
                         "save-search",
-                        "Save Search",
+                        t!("organize-save-search"),
                         Action::Organize(OrgAction::SaveSearch),
                         cx,
                     ))
@@ -768,7 +767,7 @@ impl MailApp {
                 .when(!everywhere, |d| {
                     d.child(self.link(
                         "search-everywhere",
-                        "Search All Mail on This Computer",
+                        t!("organize-search-all-mail-on-this-computer"),
                         Action::Organize(OrgAction::SearchEverywhere),
                         cx,
                     ))
@@ -792,7 +791,7 @@ impl MailApp {
                 .child(
                     self.button(
                         "local-results-done",
-                        "@Back to where you were",
+                        t!("organize-back-to-where-you-were"),
                         "chevron-left",
                         Action::Organize(OrgAction::CloseLocalResults),
                         false,
@@ -812,7 +811,7 @@ impl MailApp {
                                 .truncate()
                                 .text_size(px(15.))
                                 .font_weight(FontWeight::SEMIBOLD)
-                                .child("Results on This Computer"),
+                                .child(t!("organize-results-on-this-computer")),
                         )
                         .child(
                             div()
@@ -820,9 +819,9 @@ impl MailApp {
                                 .text_size(px(11.))
                                 .text_color(rgb(c.muted))
                                 .child(match count {
-                                    0 => "No messages found in every account's mail".to_owned(),
-                                    1 => "1 message, from every account's mail".to_owned(),
-                                    n => format!("{} messages, from every account's mail", fmt_count(n)),
+                                    0 => t!("organize-no-messages-found-in-every-accounts").to_owned(),
+                                    1 => t!("organize-1-message-from-every-accounts-mail").to_owned(),
+                                    n => t!("organize-messages-from-every-accounts-mail", shown = fmt_count(n), count = n),
                                 }),
                         ),
                 )
@@ -1042,7 +1041,7 @@ impl MailApp {
                 .text_size(px(11.))
                 .font_weight(FontWeight::SEMIBOLD)
                 .text_color(rgb(c.muted))
-                .child("SAVED SEARCHES"),
+                .child(t!("organize-saved-searches")),
         );
         for (i, s) in self.org.saved_searches.iter().enumerate() {
             let name = s.name.clone();
@@ -1072,12 +1071,12 @@ impl MailApp {
                                 e.position,
                                 vec![
                                     entry(
-                                        "Open",
+                                        t!("organize-open"),
                                         "search",
                                         Action::Organize(OrgAction::OpenSavedSearch(i)),
                                     ),
                                     danger(
-                                        "Remove Saved Search",
+                                        t!("organize-remove-saved-search"),
                                         "trash",
                                         Action::Organize(OrgAction::RemoveSavedSearch(i)),
                                     ),
@@ -1101,12 +1100,12 @@ impl MailApp {
                 "density",
                 vec![
                     (
-                        "Comfortable".into(),
+                        t!("organize-comfortable").into(),
                         act(OrgAction::SetDensity(Density::Comfortable)),
                         org.density == Density::Comfortable,
                     ),
                     (
-                        "Compact".into(),
+                        t!("organize-compact").into(),
                         act(OrgAction::SetDensity(Density::Compact)),
                         org.density == Density::Compact,
                     ),
@@ -1119,12 +1118,12 @@ impl MailApp {
                 "reader-layout",
                 vec![
                     (
-                        "Beside the list".into(),
+                        t!("organize-beside-the-list").into(),
                         act(OrgAction::SetLayout(ReaderLayout::Beside)),
                         org.layout == ReaderLayout::Beside,
                     ),
                     (
-                        "Below the list".into(),
+                        t!("organize-below-the-list").into(),
                         act(OrgAction::SetLayout(ReaderLayout::Below)),
                         org.layout == ReaderLayout::Below,
                     ),
@@ -1154,24 +1153,24 @@ impl MailApp {
             .flex()
             .flex_col()
             .gap_5()
-            .child(self.section("Layout"))
-            .child(self.setting("Rows", "How much of each message the list shows.", density))
+            .child(self.section(t!("organize-layout")))
+            .child(self.setting(t!("organize-rows"), t!("organize-how-much-of-each-message-the"), density))
             .child(self.setting(
-                "Reader",
-                "Where an open message shows on a wide window.",
+                t!("organize-reader"),
+                t!("organize-where-an-open-message-shows-on"),
                 layout,
             ))
             .child(self.switch_setting(
-                "Group by conversation",
-                "Show each conversation as one row, its newest message, with how many it holds.",
+                t!("organize-group-by-conversation-2"),
+                t!("organize-show-each-conversation-as-one-row"),
                 "threaded".into(),
                 org.threaded,
                 act(OrgAction::ToggleThreaded),
                 cx,
             ))
-            .child(self.section("Saved searches"))
+            .child(self.section(t!("organize-saved-searches-2")))
             .child(small(
-                "Search, then choose Save Search beside the search field. Saved searches list in the sidebar and search every account's mail.".into(),
+                t!("organize-search-then-choose-save-search-beside").into(),
             ));
         for (i, s) in org.saved_searches.iter().enumerate() {
             page = page.child(row(
@@ -1189,9 +1188,9 @@ impl MailApp {
             ));
         }
         page = page
-            .child(self.section("Blocked senders"))
+            .child(self.section(t!("organize-blocked-senders")))
             .child(small(
-                "New mail from these addresses goes straight to Trash, on every account, without a notification, also while Picacho runs in the background. Block a sender from a message's menu, or here.".into(),
+                t!("organize-new-mail-from-these-addresses-goes").into(),
             ));
         for (i, b) in org.blocked.iter().enumerate() {
             page = page.child(row(
@@ -1199,7 +1198,7 @@ impl MailApp {
                 b.clone(),
                 self.button(
                     format!("unblock-{i}"),
-                    "Unblock",
+                    t!("organize-unblock-2"),
                     "",
                     act(OrgAction::Unblock(b.clone())),
                     false,
@@ -1214,18 +1213,13 @@ impl MailApp {
                 .gap_2()
                 .items_center()
                 .child(div().flex_1().child(field(Input::new(&self.org_ui.block), c, false)))
-                .child(self.button("add-blocked", "Block", "", act(OrgAction::AddBlocked), true, cx)),
+                .child(self.button("add-blocked", t!("organize-block-2"), "", act(OrgAction::AddBlocked), true, cx)),
         );
-        page = page.child(self.section("Rules")).child(small(
-            "Picacho applies these to new inbox mail as it arrives, while its window is open and while it runs in the background, for any mail service, including those without server filters (Gmail, Outlook, iCloud, Proton, POP3). Apply Rules Now applies them, and blocked senders, to the mail in your inboxes already. Server filters, where the service has them, are on each mailbox's page.".into(),
+        page = page.child(self.section(t!("organize-rules"))).child(small(
+            t!("organize-picacho-applies-these-to-new-inbox").into(),
         ));
         for (i, r) in org.rules.iter().enumerate() {
-            let text = format!(
-                "{} contains “{}” → {}",
-                r.field.label(),
-                r.contains,
-                r.action.label()
-            );
+            let text = t!("organize-contains", label = r.field.label(), contains = r.contains, label2 = r.action.label());
             page = page.child(row(
                 format!("rule-row-{i}"),
                 text,
@@ -1241,7 +1235,7 @@ impl MailApp {
                     ))
                     .child(self.button(
                         format!("remove-rule-{i}"),
-                        "@Remove rule",
+                        t!("organize-remove-rule"),
                         "trash",
                         act(OrgAction::RemoveRule(i)),
                         false,
@@ -1284,7 +1278,7 @@ impl MailApp {
                 .flex()
                 .flex_col()
                 .gap_2()
-                .child(small("When".into()))
+                .child(small(t!("organize-when").into()))
                 .child(fields)
                 .child(small("contains".into()))
                 .child(field(Input::new(&self.org_ui.rule_text), c, false))
@@ -1304,12 +1298,12 @@ impl MailApp {
                                 .text_size(px(12.))
                                 .text_color(rgb(c.muted))
                                 .child(spinner(12., c.muted))
-                                .child("Applying…")
+                                .child(t!("organize-applying"))
                                 .into_any_element()
                         } else {
                             self.button(
                                 "apply-rules",
-                                "Apply Rules Now",
+                                t!("organize-apply-rules-now"),
                                 "",
                                 act(OrgAction::ApplyRulesNow),
                                 false,
@@ -1319,7 +1313,7 @@ impl MailApp {
                         })
                         .child(self.button(
                             "add-rule",
-                            "Add Rule",
+                            t!("organize-add-rule"),
                             "plus",
                             act(OrgAction::AddRule),
                             true,

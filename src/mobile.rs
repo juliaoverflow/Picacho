@@ -4,6 +4,9 @@
 //! and this library is empty there.
 #![cfg(any(target_os = "android", target_os = "ios"))]
 
+// First: `t!` (the interface's text) is for every module after it.
+#[macro_use]
+mod i18n;
 mod display;
 mod manage;
 mod sync;

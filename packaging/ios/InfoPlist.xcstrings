@@ -1,0 +1,42 @@
+{
+  "sourceLanguage" : "en",
+  "strings" : {
+    "NFCReaderUsageDescription" : {
+      "comment" : "Why Picacho asks to use NFC (security keys held to the iPhone)",
+      "extractionState" : "extracted_with_value",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "Picacho reads your security key when you hold it to your iPhone to sign in."
+          }
+        }
+      }
+    },
+    "NSBluetoothAlwaysUsageDescription" : {
+      "comment" : "Why Picacho asks to use Bluetooth (a passkey on another device, by QR code)",
+      "extractionState" : "extracted_with_value",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "Picacho uses Bluetooth to check that the phone or tablet with your passkey is nearby when you sign in with it."
+          }
+        }
+      }
+    },
+    "NSFaceIDUsageDescription" : {
+      "comment" : "Why Picacho asks to use Face ID (the app lock)",
+      "extractionState" : "extracted_with_value",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "Picacho uses Face ID to unlock your mail when the app lock is on."
+          }
+        }
+      }
+    }
+  },
+  "version" : "1.0"
+}

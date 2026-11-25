@@ -62,8 +62,10 @@ modules:
       - $CARGO_HOME/bin/cargo build --release --locked
       - install -Dm755 target/release/picacho /app/bin/picacho
       - install -Dm644 packaging/linux/tech.pinal.picacho.svg /app/share/icons/hicolor/scalable/apps/tech.pinal.picacho.svg
-      - install -Dm644 packaging/flatpak/tech.pinal.picacho.desktop /app/share/applications/tech.pinal.picacho.desktop
-      - python3 scripts/release/changelog.py metainfo packaging/flatpak/tech.pinal.picacho.metainfo.xml /app/share/metainfo/tech.pinal.picacho.metainfo.xml
+      # The desktop entry and listing with their translations (locales/).
+      - python3 scripts/release/l10n.py desktop packaging/flatpak/tech.pinal.picacho.desktop /app/share/applications/tech.pinal.picacho.desktop
+      - python3 scripts/release/l10n.py metainfo packaging/flatpak/tech.pinal.picacho.metainfo.xml metainfo.xml
+      - python3 scripts/release/changelog.py metainfo metainfo.xml /app/share/metainfo/tech.pinal.picacho.metainfo.xml
     sources:
       - type: dir
         path: ../..

@@ -153,9 +153,9 @@ impl Render for Recovery {
         );
         let bar = window::detached_titlebar(bar, c, |_, _, cx| cx.quit(), window, cx);
         let explanation = if start_over {
-            "Start Over moves the unreadable database aside, next to where it was (nothing is deleted), and opens Picacho with a new, empty one: add your accounts again, and mail on their servers downloads again. Drafts saved only on this device, and mail only this device kept (POP accounts that remove it from the server), stay in the old file."
+            t!("recovery-start-over-moves-the-unreadable-database")
         } else {
-            "Nothing was changed. If the system keychain is locked, unlock it, or allow Picacho to use it, then try again."
+            t!("recovery-nothing-was-changed-if-the-system")
         };
         let mut buttons = div()
             .flex()
@@ -163,7 +163,7 @@ impl Render for Recovery {
             .justify_end()
             .gap_2()
             .child(
-                self.button("recovery-quit", "Quit", Tone::Plain, c, cx, |_, _, cx| {
+                self.button("recovery-quit", t!("recovery-quit"), Tone::Plain, c, cx, |_, _, cx| {
                     cx.quit()
                 }),
             );
@@ -171,9 +171,9 @@ impl Render for Recovery {
             buttons = buttons.child(self.button(
                 "recovery-start-over",
                 if self.confirming {
-                    "Move Aside and Start Over"
+                    t!("recovery-move-aside-and-start-over")
                 } else {
-                    "Start Over…"
+                    t!("recovery-start-over")
                 },
                 if self.confirming {
                     Tone::Danger
@@ -188,9 +188,9 @@ impl Render for Recovery {
         buttons = buttons.child(self.button(
             "recovery-try-again",
             if self.trying {
-                "Trying…"
+                t!("recovery-trying")
             } else {
-                "Try Again"
+                t!("recovery-try-again")
             },
             Tone::Primary,
             c,
@@ -233,7 +233,7 @@ impl Render for Recovery {
                                 div()
                                     .text_size(px(18.))
                                     .font_weight(FontWeight::SEMIBOLD)
-                                    .child("Picacho couldn't open its local database"),
+                                    .child(t!("recovery-picacho-couldnt-open-its-local-database")),
                             ),
                     )
                     .child(
@@ -254,7 +254,7 @@ impl Render for Recovery {
                         div()
                             .text_size(px(12.))
                             .text_color(rgb(c.muted))
-                            .child(format!("Folder: {}", self.path.display())),
+                            .child(t!("recovery-folder", path = self.path.display())),
                     )
                     .child(buttons),
             )

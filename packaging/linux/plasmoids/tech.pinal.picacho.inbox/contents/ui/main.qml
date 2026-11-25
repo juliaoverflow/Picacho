@@ -9,8 +9,17 @@ PlasmoidItem {
     id: root
 
     property var snapshot: null
+
+    // The widget's words in the language Picacho shows (the snapshot's
+    // labels, which Picacho writes in it), else in English. %1 and %2
+    // stand for a and b.
+    function word(name, english, a, b) {
+        var labels = root.snapshot && root.snapshot.labels;
+        var text = (labels && labels[name]) || english;
+        return text.replace("%1", function () { return a; }).replace("%2", function () { return b; });
+    }
     property int unreadCount: 0
-    property string headerTitle: "Inbox"
+    property string headerTitle: word("inbox", "Inbox")
     property var filteredMessages: []
     property color accentColor: Kirigami.Theme.highlightColor
     property var execSource: null
@@ -49,7 +58,7 @@ PlasmoidItem {
         var d = new Date(epochSec * 1000);
         var now = new Date();
         if (d.toDateString() === now.toDateString()) {
-            return Qt.formatTime(d, "HH:mm");
+            return Qt.formatTime(d, Qt.locale().timeFormat(Locale.ShortFormat));
         }
         var diffDays = (now.getTime() - d.getTime()) / 86400000;
         if (diffDays >= 0 && diffDays < 6) {
@@ -113,23 +122,23 @@ PlasmoidItem {
         accentColor = rgb24ToColor(isDarkTheme() ? (snapshot.accent_dark || 0x86cfaa) : (snapshot.accent_light || 0x246846));
 
         var count = snapshot.total_unread || 0;
-        var title = "All Inboxes";
+        var title = word("all-inboxes", "All Inboxes");
         var accs = snapshot.accounts || [];
         if (accId) {
             count = 0;
-            title = "Inbox";
+            title = word("inbox", "Inbox");
             for (var i = 0; i < accs.length; i++) {
                 if (accs[i].id === accId) {
                     count = accs[i].unread || 0;
-                    title = accs[i].name || accs[i].email || "Inbox";
+                    title = accs[i].name || accs[i].email || word("inbox", "Inbox");
                     break;
                 }
             }
         } else if (accs.length === 1) {
-            title = accs[0].name || accs[0].email || "Inbox";
+            title = accs[0].name || accs[0].email || word("inbox", "Inbox");
         }
         if (unreadOnly) {
-            title = title + " · Unread";
+            title = word("title-unread", "%1 · Unread", title);
         }
         unreadCount = count;
         headerTitle = title;
@@ -249,7 +258,7 @@ PlasmoidItem {
                     icon.name: "view-refresh"
                     display: PlasmaComponents.AbstractButton.IconOnly
                     onClicked: root.refreshSnapshot()
-                    PlasmaComponents.ToolTip.text: "Refresh"
+                    PlasmaComponents.ToolTip.text: word("refresh", "Refresh")
                     PlasmaComponents.ToolTip.visible: hovered
                 }
 
@@ -257,7 +266,7 @@ PlasmoidItem {
                     icon.name: "mail-message-new"
                     display: PlasmaComponents.AbstractButton.IconOnly
                     onClicked: root.openUri(root.composeUri())
-                    PlasmaComponents.ToolTip.text: "Compose"
+                    PlasmaComponents.ToolTip.text: word("compose", "Compose")
                     PlasmaComponents.ToolTip.visible: hovered
                 }
             }
@@ -318,7 +327,7 @@ PlasmoidItem {
                                 spacing: 4
                                 PlasmaComponents.Label {
                                     Layout.fillWidth: true
-                                    text: modelData.sender || "(Unknown sender)"
+                                    text: modelData.sender || word("unknown-sender", "(Unknown sender)")
                                     font.bold: !!modelData.unread
                                     opacity: modelData.unread ? 1.0 : 0.78
                                     elide: Text.ElideRight
@@ -332,7 +341,7 @@ PlasmoidItem {
 
                             PlasmaComponents.Label {
                                 Layout.fillWidth: true
-                                text: modelData.subject || "(No subject)"
+                                text: modelData.subject || word("no-subject", "(No subject)")
                                 font.bold: !!modelData.unread
                                 opacity: modelData.unread ? 0.95 : 0.78
                                 elide: Text.ElideRight
@@ -355,8 +364,8 @@ PlasmoidItem {
                     visible: msgList.count === 0
                     opacity: 0.65
                     text: (!root.snapshot || !root.snapshot.accounts || root.snapshot.accounts.length === 0)
-                        ? "Open Picacho to add an account"
-                        : (Plasmoid.configuration.unreadOnly ? "All caught up" : "No messages in Inbox")
+                        ? word("open-to-add-account", "Open Picacho to add an account")
+                        : (Plasmoid.configuration.unreadOnly ? word("all-caught-up", "All caught up") : word("no-messages-in-inbox", "No messages in Inbox"))
                 }
             }
         }

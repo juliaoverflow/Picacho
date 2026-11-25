@@ -25,7 +25,7 @@ impl Backend {
     pub fn undo_move(&self, a: &Account, moved: &[Moved]) -> Result<usize> {
         ensure!(
             moved.iter().all(|m| m.before.account == a.id && m.change.moves()),
-            "Only moves of this account's mail can be undone."
+            t!("manage-undo-only-moves-of-this-accounts-mail")
         );
         if moved.is_empty() {
             return Ok(0);
@@ -82,7 +82,7 @@ impl Backend {
                 }
                 // COPY alone (above) leaves the mailbox as it is; moving
                 // out of it changes it.
-                c.require_writable("move messages back")?;
+                c.require_writable(t!("manage-undo-move-messages-back"))?;
                 if c.extensions()?.moves {
                     c.session
                         .run_command_and_check_ok(format!("UID MOVE {set} {wire}"))?;

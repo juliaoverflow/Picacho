@@ -39,7 +39,7 @@ impl MailApp {
             .map(|m| m.id.clone())
             .collect();
         if snoozable.is_empty() {
-            self.notice("Snoozing needs mail kept on the server (IMAP).", true, cx);
+            self.notice(t!("later-snoozing-needs-mail-kept-on-the"), true, cx);
             return;
         }
         let presets = crate::manage::composing::snooze_choices(chrono::Local::now());
@@ -47,7 +47,7 @@ impl MailApp {
         let parser = self.when.clone();
         let mobile = self.mobile.on;
         let picker = cx.new(|cx| {
-            DateTimePicker::new("snooze", "Snooze until", presets, colors)
+            DateTimePicker::new("snooze", t!("later-snooze-until"), presets, colors)
                 .phone(mobile)
                 .typed(parser, w, cx)
         });
@@ -119,11 +119,7 @@ impl MailApp {
                         Ok(list) => {
                             this.snoozed.insert(account_id.clone(), list);
                             this.notice_undo(
-                                if count == 1 {
-                                    format!("Snoozed until {when}")
-                                } else {
-                                    format!("Snoozed {count} messages until {when}")
-                                },
+                                t!("later-snoozed-messages-until", count = count, when = when),
                                 Undo::Snooze(account_id.clone(), message_ids),
                                 cx,
                             );
@@ -133,7 +129,7 @@ impl MailApp {
                             }
                             this.views_changed(cx);
                         }
-                        Err(e) => this.notice(format!("Couldn't snooze: {e:#}"), true, cx),
+                        Err(e) => this.notice(t!("later-couldnt-snooze", e = format!("{:#}", e)), true, cx),
                     }
                     this.reload_cached(cx);
                     this.refresh_counts(cx);
@@ -205,9 +201,9 @@ impl MailApp {
                         this.snoozed.insert(account_id.clone(), list);
                         if !woken.is_empty() {
                             let text = match woken.as_slice() {
-                                [one] => format!("Back from snooze: {}", one.subject),
+                                [one] => t!("later-back-from-snooze", subject = one.subject),
                                 many => {
-                                    format!("{} snoozed messages are back in the inbox", many.len())
+                                    t!("later-snoozed-messages-are-back-in-the", count = many.len())
                                 }
                             };
                             this.notice(text, false, cx);
@@ -224,7 +220,7 @@ impl MailApp {
                     Err(e) => {
                         if !crate::sync::retry::later(&e) {
                             this.notice(
-                                format!("Couldn't bring back snoozed mail: {e:#}"),
+                                t!("later-couldnt-bring-back-snoozed-mail", e = format!("{:#}", e)),
                                 true,
                                 cx,
                             );
@@ -251,7 +247,7 @@ impl MailApp {
         let unsnooze = self
             .button(
                 "unsnooze",
-                "Unsnooze",
+                t!("later-unsnooze"),
                 "inbox",
                 Action::Unsnooze(m.account.clone(), m.message_id.clone()),
                 false,
@@ -261,7 +257,7 @@ impl MailApp {
             .border_color(rgb(c.border));
         let resnooze = self.button(
             "resnooze",
-            "@Snooze until another time",
+            t!("later-snooze-until-another-time"),
             "clock",
             Action::SnoozeMenu(vec![m.id.clone()]),
             false,
@@ -272,7 +268,7 @@ impl MailApp {
                 "snooze-banner",
                 "snooze",
                 BannerStyle::Filled,
-                format!("Snoozed until {when}. It comes back to the inbox, unread."),
+                t!("later-snoozed-until-it-comes-back-to", when = when),
                 [unsnooze.into_any_element(), resnooze.into_any_element()],
             )
             .into_any_element(),
@@ -392,7 +388,7 @@ impl MailApp {
         Some(match self.current_server_search(&query) {
             Some(s) if s.running => line
                 .child(spinner(12., c.accent))
-                .child(text(format!("Searching {} on the server…", self.mailbox_label())))
+                .child(text(t!("later-searching-on-the-server", mailbox_label = self.mailbox_label())))
                 .into_any_element(),
             Some(s) if s.error.is_some() => line
                 .child(icon_el("warning", 13., c.danger))
@@ -403,37 +399,33 @@ impl MailApp {
                         .truncate()
                         .child(s.error.clone().unwrap_or_default()),
                 )
-                .child(self.link("server-search-retry", "Try Again", Action::SearchServer, cx))
+                .child(self.link("server-search-retry", t!("later-try-again"), Action::SearchServer, cx))
                 .into_any_element(),
             Some(s) => line
                 .child(icon_el("cloud", 13., c.accent))
                 .child(text(if s.total > s.ids.len() {
-                    format!(
-                        "The newest {} of {} matches on the server",
-                        fmt_count(s.ids.len()),
-                        fmt_count(s.total)
-                    )
+                    t!("later-the-newest-of-matches-on-the", newest = fmt_count(s.ids.len()), total = fmt_count(s.total), count = s.total)
                 } else if s.total == 0 {
-                    "No matches on the server".to_owned()
+                    t!("later-no-matches-on-the-server").to_owned()
                 } else {
-                    format!("{} matches on the server", fmt_count(s.total))
+                    t!("later-matches-on-the-server", shown = fmt_count(s.total), count = s.total)
                 }))
                 .child(action(self.link(
                     "server-search-clear",
-                    "Show Local Matches",
+                    t!("later-show-local-matches"),
                     Action::ClearServerSearch,
                     cx,
                 )))
                 .into_any_element(),
             None => line
                 .child(icon_el("cloud", 13., c.muted))
-                .child(text("Only mail on this computer is searched.".to_owned()))
+                .child(text(t!("later-only-mail-on-this-computer-is").to_owned()))
                 .child(action(self.link(
                     "server-search-start",
                     if gmail {
-                        "Search Gmail · ↩"
+                        t!("later-search-gmail")
                     } else {
-                        "Search the Server · ↩"
+                        t!("later-search-the-server")
                     },
                     Action::SearchServer,
                     cx,
@@ -462,7 +454,7 @@ impl MailApp {
         let decline = self
             .button(
                 "receipt-decline",
-                "Don't Send",
+                t!("later-dont-send"),
                 "",
                 Action::Receipt(m.id.clone(), false),
                 false,
@@ -472,7 +464,7 @@ impl MailApp {
             .border_color(rgb(c.border));
         let send = self.button(
             "receipt-send",
-            "Send Receipt",
+            t!("later-send-receipt"),
             "",
             Action::Receipt(m.id.clone(), true),
             true,
@@ -486,13 +478,9 @@ impl MailApp {
                 // Who is told: the receipt goes where the message asked,
                 // which may not be its sender (a tracking service).
                 if m.receipt_to().eq_ignore_ascii_case(&m.from) {
-                    format!("{} asks to be told when you've read this message.", m.sender)
+                    t!("later-asks-to-be-told-when-youve", sender = m.sender)
                 } else {
-                    format!(
-                        "{} asks that {} be told when you've read this message.",
-                        m.sender,
-                        m.receipt_to()
-                    )
+                    t!("later-asks-that-be-told-when-youve", sender = m.sender, receipt_to = m.receipt_to())
                 },
                 [decline.into_any_element(), send.into_any_element()],
             )
@@ -520,14 +508,14 @@ impl MailApp {
                 }
             },
             move |this, result, cx| match result {
-                Ok(()) if send => this.notice("Read receipt sent", false, cx),
+                Ok(()) if send => this.notice(t!("later-read-receipt-sent"), false, cx),
                 Ok(()) => {}
                 Err(e) => {
                     let _ = &account_id;
                     for x in this.messages.iter_mut().filter(|x| x.id == id) {
                         x.mdn_sent = false;
                     }
-                    this.notice(format!("The read receipt wasn't sent: {e:#}"), true, cx);
+                    this.notice(t!("later-the-read-receipt-wasnt-sent", e = format!("{:#}", e)), true, cx);
                 }
             },
         );
@@ -565,7 +553,7 @@ impl MailApp {
                 }
                 Ok(_) => {}
                 Err(e) => this.notice(
-                    format!("The original's attachments couldn't be added: {e:#}"),
+                    t!("later-the-originals-attachments-couldnt-be-added", e = format!("{:#}", e)),
                     true,
                     cx,
                 ),

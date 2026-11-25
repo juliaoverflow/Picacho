@@ -1,0 +1,218 @@
+# src/display/forwarding.rs and nearby views.
+
+forwarding-description = Description
+
+forwarding-display-name = Display name
+
+forwarding-the-name-recipients-see-like-jane = The name recipients see, like Jane Doe
+
+forwarding-unknown-contact = Unknown contact
+
+forwarding-last-written = Last written { $date }
+
+forwarding-received = Received
+
+forwarding-sent = Sent
+
+forwarding-d-total = { $what } { $recent } ({ $contact_recent_days }d) · { $total }{ $partial ->
+        [yes] +
+       *[no] {""}
+    } total
+
+forwarding-cancel = Cancel
+
+forwarding-forwarding = Forwarding
+
+forwarding-manage-your-simplelogin-addy-io-and = Manage your SimpleLogin, addy.io and Firefox Relay aliases. Their mail can stay in its mailbox or appear as an account of its own.
+
+forwarding-add-service = Add Service
+
+forwarding-add-a-service = Add a Service
+
+forwarding-api-key = API key
+
+forwarding-open = Open
+
+forwarding-server = Server
+
+forwarding-only-for-a-self-hosted-server = Only for a self-hosted server; blank uses { $default_server }. The key is kept in the system keychain.
+
+forwarding-connecting = Connecting…
+
+forwarding-connect = Connect
+
+forwarding-alias = { $count ->
+        [one] { $count } alias
+       *[other] { $count } aliases
+    }
+
+forwarding-to = to { $email }
+
+forwarding-to-any-mailbox = to any mailbox
+
+forwarding-more = More
+
+forwarding-remove-its-aliases-keep-working-picacho = Remove { $label }? Its aliases keep working; Picacho stops managing them.
+
+forwarding-remove = Remove
+
+forwarding-a-removed-mailbox = a removed mailbox
+
+forwarding-any-mailbox = Any mailbox
+
+forwarding-where-the-aliases-mail-arrives-any = Where the aliases' mail arrives. Any mailbox looks in every account.
+
+forwarding-send-as-an-alias-by-choosing = Send as an alias by choosing it in From. It goes out from { $mailbox }, which must be a verified mailbox at { $label }.
+
+forwarding-only-relays-replies-to-mail-it = { $label } only relays replies to mail it forwarded; new messages can't be sent as an alias.
+
+forwarding-forwards-to = Forwards to
+
+forwarding-new-alias = New Alias
+
+forwarding-no-mailbox-here-receives-its-aliases = No mailbox here receives its aliases yet; choose one in Forwards to.
+
+forwarding-cant-write-as-new-mail-and = { $aliases } can't write as { $count ->
+        [one] itself
+       *[other] themselves
+    }: new mail and replies go out as an alias, and the alias used is shown wherever its address was, in received and sent mail.
+
+forwarding-send-only-as-aliases = Send only as aliases
+
+forwarding-no-aliases-yet = No aliases yet.
+
+forwarding-no-alias-matches = No alias matches.
+
+forwarding-of-aliases = { $count ->
+        [one] { $first }–{ $end } of { $count } alias
+       *[other] { $first }–{ $end } of { $count } aliases
+    }
+
+forwarding-first = « First
+
+forwarding-previous = ‹ Previous
+
+forwarding-page-of = Page { $page } of { $pages } · { $label }
+
+forwarding-next = Next ›
+
+forwarding-last = Last »
+
+forwarding-a-prefix = a { $to_lowercase } prefix
+
+forwarding-a-random-prefix = a random prefix
+
+forwarding-creates = Creates { $prefix }{ $suffix }
+
+forwarding-creates-with = Creates { $random } with { $suffix }
+
+forwarding-creates-with-this-domain-only-takes = Creates { $random } with { $suffix }. This domain only takes random aliases.
+
+forwarding-loading-domains = Loading domains…
+
+forwarding-default-domain = Default domain
+
+forwarding-wont-make-more-aliases-on-this = { $label } won't make more aliases on this plan.
+
+forwarding-couldnt-list-domains-new-aliases-use = Couldn't list domains: { $e }. New aliases use the default domain.
+
+forwarding-try-again = Try Again
+
+forwarding-new-alias-2 = New alias
+
+forwarding-forwards-to-2 = Forwards to { $email }
+
+forwarding-random-prefix = Random prefix
+
+forwarding-creating = Creating…
+
+forwarding-create = Create
+
+forwarding-forward-mail-sent-to-this-alias = Forward mail sent to this alias
+
+forwarding-off = Off
+
+forwarding-own-account = Own account
+
+forwarding-save = Save
+
+forwarding-delete-mail-sent-to-it-will = Delete { $email }? Mail sent to it will be refused.
+
+forwarding-delete = Delete
+
+forwarding-reverse-aliases = Reverse Aliases
+
+forwarding-refresh = Refresh
+
+forwarding-writing-to-one-of-these-from = Writing to one of these from your mailbox sends as the alias. They're partly hidden here; copy one to use it.
+
+forwarding-loading = Loading…
+
+forwarding-adding = Adding…
+
+forwarding-add = Add
+
+forwarding-delete-the-contact-its-reverse-alias = Delete the contact { $title }? Its reverse alias stops working.
+
+forwarding-none-yet-simplelogin-makes-one-for = None yet. SimpleLogin makes one for each person who writes to this alias, or whom you write to from it; add one above to write to someone new.
+
+forwarding-no-contact-matches = No contact matches.
+
+forwarding-of-contacts = { $total_shown ->
+        [one] { $first }–{ $end } of { $total_shown } contact
+       *[other] { $first }–{ $end } of { $total_shown } contacts
+    }
+
+forwarding-blocked = Blocked
+
+forwarding-copy-reverse-alias = Copy reverse alias
+
+forwarding-copy-reverse-alias-2 = Copy Reverse Alias
+
+forwarding-unblock-contact = Unblock Contact
+
+forwarding-block-contact = Block Contact
+
+forwarding-delete-contact = Delete Contact…
+
+forwarding-contact-deleted = Contact deleted
+
+forwarding-enter-the-address-you-want-to = Enter the address you want to write to.
+
+forwarding-reverse-alias-for-ready-copied = Reverse alias for { $contact } ready · copied
+
+forwarding-default-recipient = Default recipient
+
+forwarding-an-alias-needs-at-least-one = An alias needs at least one mailbox.
+
+forwarding-refresh-aliases = Refresh Aliases
+
+forwarding-remove-service = Remove Service…
+
+forwarding-copy-address = Copy Address
+
+forwarding-add-description = Add Description…
+
+forwarding-edit-description = Edit Description…
+
+forwarding-set-display-name = Set Display Name…
+
+forwarding-edit-display-name = Edit Display Name…
+
+forwarding-unpin = Unpin
+
+forwarding-pin = Pin
+
+forwarding-encrypt-with-pgp = Encrypt with PGP
+
+forwarding-hide-reverse-aliases = Hide Reverse Aliases
+
+forwarding-show-reverse-aliases = Show Reverse Aliases
+
+forwarding-show-in-its-mailbox = Show in Its Mailbox
+
+forwarding-show-as-its-own-account = Show as Its Own Account
+
+forwarding-delete-alias = Delete Alias…
+
+forwarding-the-mailbox-you-write-from = the mailbox you write from

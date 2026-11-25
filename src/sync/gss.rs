@@ -40,7 +40,7 @@ pub(crate) fn start_bound(target: &str, application_data: Vec<u8>) -> Result<Box
 #[allow(dead_code)]
 fn explain(detail: &str) -> anyhow::Error {
     anyhow::anyhow!(
-        "Kerberos sign-in failed: {detail}. Get a ticket for your realm first (kinit, or sign in to your domain), then try again."
+        t!("sync-gss-kerberos-sign-in-failed-get-a", detail = detail)
     )
 }
 
@@ -221,8 +221,7 @@ pub(crate) mod imp {
             }
         }
         bail!(
-            "This computer has no Kerberos (GSS-API) library{}. Install your system's Kerberos package (krb5 or heimdal).",
-            last.map(|e| format!(" ({e})")).unwrap_or_default()
+            t!("sync-gss-this-computer-has-no-kerberos-gss", detail = last.map(|e| format!(" ({e})")).unwrap_or_default())
         )
     }
 
@@ -233,10 +232,7 @@ pub(crate) mod imp {
             macro_rules! function {
                 ($name:literal) => {
                     *library.get($name).with_context(|| {
-                        format!(
-                            "The Kerberos library lacks {}",
-                            String::from_utf8_lossy(&$name[..$name.len() - 1])
-                        )
+                        t!("sync-gss-the-kerberos-library-lacks", function = String::from_utf8_lossy(&$name[..$name.len() - 1]))
                     })?
                 };
             }
@@ -249,11 +245,11 @@ pub(crate) mod imp {
             } else {
                 *library
                     .get::<*mut c_void>(b"__gss_c_nt_hostbased_service_oid_desc\0")
-                    .context("The Kerberos library doesn't name host-based services")?
+                    .with_context(|| t!("sync-gss-the-kerberos-library-doesnt-name-host"))?
             };
             ensure!(
                 !hostbased_service.is_null(),
-                "The Kerberos library has no host-based service name type."
+                t!("sync-gss-the-kerberos-library-has-no-host")
             );
             Ok(Library {
                 init_sec_context: function!(b"gss_init_sec_context\0"),
@@ -378,7 +374,7 @@ pub(crate) mod imp {
         fn step(&mut self, input: &[u8]) -> Result<(Vec<u8>, bool)> {
             ensure!(
                 !self.established,
-                "The Kerberos sign-in was already complete."
+                t!("sync-gss-the-kerberos-sign-in-was-already")
             );
             let mut minor = 0;
             let mut token = Buffer::of(input);
@@ -428,26 +424,26 @@ pub(crate) mod imp {
             // mean "continue".
             ensure!(
                 major & 0xffff & !CONTINUE_NEEDED == 0,
-                "The server's Kerberos answer was replayed or out of order; not signed in."
+                t!("sync-gss-the-servers-kerberos-answer-was-replayed")
             );
             let done = major & 0xffff == COMPLETE && major & CONTINUE_NEEDED == 0;
             if done {
                 ensure!(
                     flags & MUTUAL != 0,
-                    "The server didn't prove it is the service it claims to be (no Kerberos mutual authentication); not signed in."
+                    t!("sync-gss-the-server-didnt-prove-it-is")
                 );
                 // The security-layer exchange is wrapped (RFC 4752 §3.1):
                 // integrity must be on.
                 ensure!(
                     flags & INTEG != 0,
-                    "The Kerberos sign-in has no integrity protection; not signed in."
+                    t!("sync-gss-the-kerberos-sign-in-has-no")
                 );
                 self.established = true;
             }
             Ok((out, done))
         }
         fn unwrap(&mut self, message: &[u8]) -> Result<Vec<u8>> {
-            ensure!(self.established, "The Kerberos sign-in isn't complete.");
+            ensure!(self.established, t!("sync-gss-the-kerberos-sign-in-isnt-complete"));
             let mut minor = 0;
             let mut input = Buffer::of(message);
             let mut output = Buffer::empty();
@@ -467,14 +463,13 @@ pub(crate) mod imp {
             let out = unsafe { take(self.library, &mut output) };
             if major & ERROR_MASK != 0 {
                 bail!(
-                    "The server's Kerberos message couldn't be read: {}",
-                    self.library.describe(major, minor)
+                    t!("sync-gss-the-servers-kerberos-message-couldnt-be", error = self.library.describe(major, minor))
                 );
             }
             Ok(out)
         }
         fn wrap(&mut self, message: &[u8]) -> Result<Vec<u8>> {
-            ensure!(self.established, "The Kerberos sign-in isn't complete.");
+            ensure!(self.established, t!("sync-gss-the-kerberos-sign-in-isnt-complete"));
             let mut minor = 0;
             let mut input = Buffer::of(message);
             let mut output = Buffer::empty();
@@ -495,8 +490,7 @@ pub(crate) mod imp {
             let out = unsafe { take(self.library, &mut output) };
             if major & ERROR_MASK != 0 {
                 bail!(
-                    "Picacho couldn't sign its Kerberos answer: {}",
-                    self.library.describe(major, minor)
+                    t!("sync-gss-picacho-couldnt-sign-its-kerberos-answer", error = self.library.describe(major, minor))
                 );
             }
             Ok(out)
@@ -745,9 +739,7 @@ mod imp {
             )
         };
         if status != SEC_E_OK {
-            bail!(explain(&format!(
-                "Windows has no Kerberos credentials for you (SSPI {status:#x})"
-            )));
+            bail!(explain(&t!("sync-gss-windows-has-no-kerberos-credentials-for", status = format!("{:#x}", status))));
         }
         Ok(Box::new(Sspi {
             credentials,
@@ -762,7 +754,7 @@ mod imp {
         fn step(&mut self, input: &[u8]) -> Result<(Vec<u8>, bool)> {
             ensure!(
                 !self.established,
-                "The Kerberos sign-in was already complete."
+                t!("sync-gss-the-kerberos-sign-in-was-already")
             );
             let mut bindings = self.bindings.clone().unwrap_or_default();
             let mut in_buffers = [
@@ -842,18 +834,18 @@ mod imp {
                 bytes
             };
             if status != SEC_E_OK && status != SEC_I_CONTINUE_NEEDED {
-                bail!(explain(&format!("SSPI refused ({status:#x})")));
+                bail!(explain(&t!("sync-gss-sspi-refused", status = format!("{status:#x}"))));
             }
             self.context = Some(next);
             let done = status == SEC_E_OK;
             if done {
                 ensure!(
                     attributes & ISC_RET_MUTUAL_AUTH != 0,
-                    "The server didn't prove it is the service it claims to be (no Kerberos mutual authentication); not signed in."
+                    t!("sync-gss-the-server-didnt-prove-it-is")
                 );
                 ensure!(
                     attributes & ISC_RET_INTEGRITY != 0,
-                    "The Kerberos sign-in has no integrity protection; not signed in."
+                    t!("sync-gss-the-kerberos-sign-in-has-no")
                 );
                 self.established = true;
             }
@@ -862,7 +854,7 @@ mod imp {
         fn unwrap(&mut self, message: &[u8]) -> Result<Vec<u8>> {
             let context = self.context.filter(|_| self.established);
             let Some(context) = context else {
-                bail!("The Kerberos sign-in isn't complete.");
+                bail!(t!("sync-gss-the-kerberos-sign-in-isnt-complete"));
             };
             let mut data = message.to_vec();
             let mut buffers = [
@@ -887,19 +879,19 @@ mod imp {
             let status = unsafe { DecryptMessage(&context, &desc, 0, &mut qop) };
             ensure!(
                 status == SEC_E_OK,
-                "The server's Kerberos message couldn't be read (SSPI {status:#x})."
+                t!("sync-gss-the-servers-kerberos-message-couldnt-be-2", status = format!("{:#x}", status))
             );
             let start = (buffers[1].pvBuffer as usize).checked_sub(data.as_ptr() as usize);
             let end = start.and_then(|s| s.checked_add(buffers[1].cbBuffer as usize));
             match (start, end) {
                 (Some(s), Some(e)) if e <= data.len() => Ok(data[s..e].to_vec()),
-                _ => bail!("The server's Kerberos message couldn't be read."),
+                _ => bail!(t!("sync-gss-the-servers-kerberos-message-couldnt-be-3")),
             }
         }
         fn wrap(&mut self, message: &[u8]) -> Result<Vec<u8>> {
             let context = self.context.filter(|_| self.established);
             let Some(context) = context else {
-                bail!("The Kerberos sign-in isn't complete.");
+                bail!(t!("sync-gss-the-kerberos-sign-in-isnt-complete"));
             };
             let mut sizes = SecPkgContext_Sizes::default();
             // SAFETY: SECPKG_ATTR_SIZES fills a SecPkgContext_Sizes.
@@ -908,7 +900,7 @@ mod imp {
             };
             ensure!(
                 status == SEC_E_OK,
-                "Picacho couldn't sign its Kerberos answer (SSPI {status:#x})."
+                t!("sync-gss-picacho-couldnt-sign-its-kerberos-answer-2", status = format!("{:#x}", status))
             );
             let mut trailer = vec![0u8; sizes.cbSecurityTrailer as usize];
             let mut data = message.to_vec();
@@ -939,7 +931,7 @@ mod imp {
             let status = unsafe { EncryptMessage(&context, SECQOP_WRAP_NO_ENCRYPT, &desc, 0) };
             ensure!(
                 status == SEC_E_OK,
-                "Picacho couldn't sign its Kerberos answer (SSPI {status:#x})."
+                t!("sync-gss-picacho-couldnt-sign-its-kerberos-answer-2", status = format!("{:#x}", status))
             );
             let mut out = trailer[..buffers[0].cbBuffer as usize].to_vec();
             out.extend_from_slice(&data[..buffers[1].cbBuffer as usize]);
@@ -965,7 +957,7 @@ mod imp {
     use super::Context;
     use anyhow::{Result, bail};
     pub(super) fn start(_target: &str, _bindings: Option<Vec<u8>>) -> Result<Box<dyn Context>> {
-        bail!("Kerberos sign-in isn't available on phones and tablets.")
+        bail!(t!("sync-gss-kerberos-sign-in-isnt-available-on"))
     }
 }
 

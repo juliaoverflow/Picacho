@@ -83,7 +83,10 @@ impl Backend {
             .map(|t| t.trim().to_owned())
             .filter(|t| !t.is_empty())
             .collect();
-        ensure!(!to.is_empty(), "The sender didn't ask for a read receipt.");
+        ensure!(
+            !to.is_empty(),
+            t!("manage-extras-the-sender-didnt-ask-for-a")
+        );
         // The addresses are the sender's to write: checked for every
         // provider, not only for SMTP's envelope (`deliver_raw`).
         // Plain addresses: list separators, quotes or a second `@` could
@@ -95,10 +98,16 @@ impl Backend {
                 }) && to.matches('@').count() == 1
                     && !to.starts_with('@')
                     && !to.ends_with('@'),
-                "The read receipt's address “{to}” isn't valid."
+                t!(
+                    "manage-extras-the-read-receipts-address-isnt-valid",
+                    to = to
+                )
             );
         }
-        ensure!(m.account == a.id, "Message belongs to another account");
+        ensure!(
+            m.account == a.id,
+            t!("manage-extras-message-belongs-to-another-account")
+        );
         // Original-Recipient, where the receiving server noted it (RFC
         // 8098 §3.2.3: copied into the report when present).
         let original_recipient = self
@@ -135,10 +144,13 @@ impl Backend {
                 };
                 // RFC 9007 §2 with RFC 8098 §3.2.3: the Original-Recipient
                 // the receiving server noted goes in the report too.
-                let mut receipt = crate::sync::jmap::Receipt::displayed(
-                    format!("Read: {}", m.subject),
-                    format!("Your message “{}” was displayed.", m.subject),
-                );
+                let (subject, text) = crate::i18n::in_outgoing(|| {
+                    (
+                        t!("outgoing-read", subject = m.subject),
+                        t!("outgoing-your-message-was-displayed", subject = m.subject),
+                    )
+                });
+                let mut receipt = crate::sync::jmap::Receipt::displayed(subject, text);
                 receipt.original_recipient = original_recipient.clone();
                 s.send_receipt(id, &identity.id, &receipt)?;
                 Ok(true)
@@ -181,7 +193,7 @@ impl Backend {
     fn readable_source(&self, a: &Account, m: &Mail) -> Result<Vec<u8>> {
         ensure!(
             !(m.partial || m.size as usize > large::MAX_DOWNLOAD),
-            "This message is too large to forward whole. Forward it inline, with its attachments."
+            t!("manage-extras-this-message-is-too-large-to")
         );
         let raw = self.original(a, m)?;
         let lock = self.account_lock(&a.id);
@@ -304,7 +316,7 @@ impl Backend {
     pub fn filters(&self, a: &Account) -> Result<sieve::State> {
         ensure!(
             Self::may_filter(a),
-            "This mail service doesn't offer server filters (ManageSieve)."
+            t!("manage-extras-this-mail-service-doesnt-offer-server")
         );
         let lock = self.account_lock(&a.id);
         let _operation = lock.lock().unwrap();
@@ -320,7 +332,7 @@ impl Backend {
     pub fn save_filters(&self, a: &Account, filters: &sieve::Filters) -> Result<sieve::State> {
         ensure!(
             Self::may_filter(a),
-            "This mail service doesn't offer server filters (ManageSieve)."
+            t!("manage-extras-this-mail-service-doesnt-offer-server")
         );
         let lock = self.account_lock(&a.id);
         let _operation = lock.lock().unwrap();
@@ -400,11 +412,17 @@ impl Backend {
         mailbox: &str,
         work: impl FnOnce(&mut Connection, &str) -> Result<T>,
     ) -> Result<T> {
-        ensure!(a.provider.imap(), "Only IMAP mailboxes have access lists here.");
+        ensure!(
+            a.provider.imap(),
+            t!("manage-extras-only-imap-mailboxes-have-access-lists")
+        );
         let lock = self.account_lock(&a.id);
         let _operation = lock.lock().unwrap();
         self.with_imap(a, |c| {
-            ensure!(c.extensions()?.acl, "This server doesn't share mailboxes (no ACL).");
+            ensure!(
+                c.extensions()?.acl,
+                t!("manage-extras-this-server-doesnt-share-mailboxes-no")
+            );
             let wire = c.wire(mailbox);
             work(c, &wire)
         })

@@ -43,17 +43,18 @@ final class Notifier {
 
     private static NotificationManager manager(Context context) {
         NotificationManager manager = context.getSystemService(NotificationManager.class);
-        // Creating channels that exist changes nothing.
-        NotificationChannel mail = new NotificationChannel(
-                MAIL_CHANNEL, "New mail", NotificationManager.IMPORTANCE_HIGH);
-        mail.setDescription("New messages in your inboxes, and notices from your mail provider.");
-        NotificationChannel background = new NotificationChannel(
-                BACKGROUND_CHANNEL, "Checking for mail", NotificationManager.IMPORTANCE_MIN);
-        background.setDescription("Shown while Picacho checks for new mail in the background.");
+        // Creating channels that exist only renews their names and
+        // descriptions (so they follow the phone's language).
+        NotificationChannel mail = new NotificationChannel(MAIL_CHANNEL,
+                Lang.of(context).getString(R.string.channel_mail), NotificationManager.IMPORTANCE_HIGH);
+        mail.setDescription(Lang.of(context).getString(R.string.channel_mail_description));
+        NotificationChannel background = new NotificationChannel(BACKGROUND_CHANNEL,
+                Lang.of(context).getString(R.string.channel_background), NotificationManager.IMPORTANCE_MIN);
+        background.setDescription(Lang.of(context).getString(R.string.channel_background_description));
         background.setShowBadge(false);
-        NotificationChannel signIn = new NotificationChannel(
-                SIGN_IN_CHANNEL, "Signing in", NotificationManager.IMPORTANCE_LOW);
-        signIn.setDescription("Shown while you sign in to an account in the browser.");
+        NotificationChannel signIn = new NotificationChannel(SIGN_IN_CHANNEL,
+                Lang.of(context).getString(R.string.channel_sign_in), NotificationManager.IMPORTANCE_LOW);
+        signIn.setDescription(Lang.of(context).getString(R.string.channel_sign_in_description));
         signIn.setShowBadge(false);
         manager.createNotificationChannels(Arrays.asList(mail, background, signIn));
         return manager;
@@ -111,6 +112,11 @@ final class Notifier {
         }
     }
 
+    /** Names the channels anew, in Picacho's language ({@link Lang#set}). */
+    static void renameChannels(Context context) {
+        manager(context);
+    }
+
     static Notification ongoing(Context context) {
         PendingIntent stop = PendingIntent.getService(
                 context,
@@ -118,13 +124,14 @@ final class Notifier {
                 new Intent(context, MailService.class).setAction(MailService.ACTION_STOP),
                 PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT);
         Notification.Action stopAction = new Notification.Action.Builder(
-                        Icon.createWithResource(context, R.drawable.ic_notification), "Stop", stop)
+                        Icon.createWithResource(context, R.drawable.ic_notification),
+                        Lang.of(context).getString(R.string.notification_stop), stop)
                 .build();
         manager(context);
         return new Notification.Builder(context, BACKGROUND_CHANNEL)
                 .setSmallIcon(R.drawable.ic_notification)
-                .setContentTitle("Checking for new mail")
-                .setContentText("Picacho lets you know when new mail arrives.")
+                .setContentTitle(Lang.of(context).getString(R.string.notification_checking))
+                .setContentText(Lang.of(context).getString(R.string.notification_checking_text))
                 .setCategory(Notification.CATEGORY_SERVICE)
                 .setContentIntent(openApp(context))
                 .setOngoing(true)
@@ -137,8 +144,8 @@ final class Notifier {
         manager(context);
         return new Notification.Builder(context, SIGN_IN_CHANNEL)
                 .setSmallIcon(R.drawable.ic_notification)
-                .setContentTitle("Signing in")
-                .setContentText("Finish signing in in the browser, then come back to Picacho.")
+                .setContentTitle(Lang.of(context).getString(R.string.notification_signing_in))
+                .setContentText(Lang.of(context).getString(R.string.notification_signing_in_text))
                 .setCategory(Notification.CATEGORY_PROGRESS)
                 .setContentIntent(openApp(context))
                 .setOngoing(true)

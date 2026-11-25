@@ -9,10 +9,19 @@ PlasmoidItem {
     id: root
 
     property var snapshot: null
+
+    // The widget's words in the language Picacho shows (the snapshot's
+    // labels, which Picacho writes in it), else in English. %1 and %2
+    // stand for a and b.
+    function word(name, english, a, b) {
+        var labels = root.snapshot && root.snapshot.labels;
+        var text = (labels && labels[name]) || english;
+        return text.replace("%1", function () { return a; }).replace("%2", function () { return b; });
+    }
     property var receipts: []
     // How many the Summary lists (for "View all"), most of them in the snapshot.
     property int totalCount: 0
-    property string headerTitle: "Receipts"
+    property string headerTitle: word("receipts", "Receipts")
     property bool showAccountLabel: false
     property color accentColor: Kirigami.Theme.highlightColor
     property var execSource: null
@@ -58,7 +67,7 @@ PlasmoidItem {
 
     function detailText(r) {
         var parts = [];
-        if (r.order) parts.push("Order " + r.order);
+        if (r.order) parts.push(word("order", "Order %1", r.order));
         var d = formatShortDate(r.updated || r.date);
         if (d) parts.push(d);
         if (root.showAccountLabel && r.account_label) parts.push(r.account_label);
@@ -71,12 +80,12 @@ PlasmoidItem {
         var accs = snapshot.accounts || [];
         root.accentColor = rgb24ToColor(isDarkTheme() ? (snapshot.accent_dark || 0x86cfaa) : (snapshot.accent_light || 0x246846));
 
-        var title = "Receipts";
+        var title = word("receipts", "Receipts");
         if (accId) {
             for (var i = 0; i < accs.length; i++) {
                 if (accs[i].id === accId) {
                     var label = accs[i].name || accs[i].email || "";
-                    if (label) title = "Receipts · " + label;
+                    if (label) title = word("receipts-of", "Receipts · %1", label);
                     break;
                 }
             }
@@ -198,10 +207,10 @@ PlasmoidItem {
 
                 PlasmaComponents.ToolButton {
                     visible: root.totalCount > 0
-                    text: "View all " + root.totalCount
+                    text: word("view-all:" + root.totalCount, "View all %1", root.totalCount)
                     flat: true
                     onClicked: Qt.openUrlExternally(root.receiptsUri())
-                    PlasmaComponents.ToolTip.text: "Open them in Picacho's Summary"
+                    PlasmaComponents.ToolTip.text: word("open-in-summary", "Open them in Picacho's Summary")
                     PlasmaComponents.ToolTip.visible: hovered
                 }
 
@@ -209,7 +218,7 @@ PlasmoidItem {
                     icon.name: "view-refresh"
                     display: PlasmaComponents.AbstractButton.IconOnly
                     onClicked: root.refreshSnapshot()
-                    PlasmaComponents.ToolTip.text: "Refresh"
+                    PlasmaComponents.ToolTip.text: word("refresh", "Refresh")
                     PlasmaComponents.ToolTip.visible: hovered
                 }
             }
@@ -279,13 +288,13 @@ PlasmoidItem {
                                 spacing: 5
                                 PlasmaComponents.Label {
                                     Layout.fillWidth: true
-                                    text: modelData.merchant || "Receipt"
+                                    text: modelData.merchant || word("receipt", "Receipt")
                                     font.bold: true
                                     elide: Text.ElideRight
                                 }
                                 PlasmaComponents.Label {
                                     visible: !!modelData.refund
-                                    text: "Refund"
+                                    text: word("refund", "Refund")
                                     font.pixelSize: 10
                                     font.bold: true
                                     color: root.accentColor
@@ -312,7 +321,7 @@ PlasmoidItem {
                     anchors.centerIn: parent
                     visible: root.receipts.length === 0
                     opacity: 0.65
-                    text: "No recent receipts"
+                    text: word("no-recent-receipts", "No recent receipts")
                 }
             }
         }

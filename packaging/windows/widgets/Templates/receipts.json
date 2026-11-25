@@ -16,7 +16,7 @@
           "items": [
             {
               "type": "TextBlock",
-              "text": "Receipts",
+              "text": "${heading}",
               "weight": "Bolder",
               "size": "Medium"
             }
@@ -126,7 +126,7 @@
     },
     {
       "type": "TextBlock",
-      "text": "No recent receipts",
+      "text": "${emptyText}",
       "isSubtle": true,
       "horizontalAlignment": "Center",
       "spacing": "Large",
@@ -136,12 +136,12 @@
   "actions": [
     {
       "type": "Action.OpenUrl",
-      "title": "All Receipts",
+      "title": "${openText}",
       "url": "${receiptsUrl}"
     },
     {
       "type": "Action.Execute",
-      "title": "Refresh",
+      "title": "${refreshText}",
       "verb": "refresh"
     }
   ]

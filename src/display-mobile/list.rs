@@ -50,11 +50,11 @@ enum SwipeAct {
 impl SwipeAct {
     fn label(self, unread: bool) -> &'static str {
         match self {
-            Self::ToggleRead if unread => "Read",
-            Self::ToggleRead => "Unread",
-            Self::Archive => "Archive",
-            Self::Trash => "Trash",
-            Self::DeleteForever | Self::DeleteDraft => "Delete",
+            Self::ToggleRead if unread => t!("mobile-list-read"),
+            Self::ToggleRead => t!("mobile-list-unread"),
+            Self::Archive => t!("mobile-list-archive"),
+            Self::Trash => t!("mobile-list-trash"),
+            Self::DeleteForever | Self::DeleteDraft => t!("mobile-list-delete"),
         }
     }
     fn icon(self, unread: bool) -> &'static str {
@@ -101,7 +101,7 @@ impl MailApp {
             vec![
                 self.touch_text(
                     "mobile-select-all",
-                    if all { "None" } else { "All" },
+                    if all { t!("mobile-list-none") } else { t!("mobile-list-all") },
                     false,
                     act(Action::SelectAll),
                     cx,
@@ -109,7 +109,7 @@ impl MailApp {
                 .into_any_element(),
                 self.touch_text(
                     "mobile-select-done",
-                    "Done",
+                    t!("mobile-list-done"),
                     true,
                     act(Action::StopSelecting),
                     cx,
@@ -122,7 +122,7 @@ impl MailApp {
             vec![
                 self.touch_text(
                     "mobile-select",
-                    "Select",
+                    t!("mobile-list-select"),
                     false,
                     act(Action::ToggleSelectMode),
                     cx,
@@ -132,8 +132,8 @@ impl MailApp {
         };
         let title = if self.selecting {
             match self.selection.len() {
-                0 => "Select Messages".to_owned(),
-                n => format!("{} Selected", fmt_count(n)),
+                0 => t!("mobile-list-select-messages").to_owned(),
+                n => t!("mobile-list-selected", shown = fmt_count(n), count = n),
             }
         } else {
             self.mailbox_label()
@@ -220,13 +220,9 @@ impl MailApp {
                         .text_color(rgb(c.muted))
                         .child(spinner(12., c.muted))
                         .child(if progress.total == 0 {
-                            "Listing mail…".to_owned()
+                            t!("mobile-list-listing-mail").to_owned()
                         } else {
-                            format!(
-                                "Listing mail · {} of {}",
-                                fmt_count(progress.cataloged),
-                                fmt_count(progress.total)
-                            )
+                            t!("mobile-list-listing-mail-of", listed = fmt_count(progress.cataloged), total = fmt_count(progress.total))
                         }),
                 )
             })
@@ -241,7 +237,7 @@ impl MailApp {
                     vec![self.bar_icon(
                         "mobile-settings",
                         "settings",
-                        "Settings",
+                        t!("mobile-list-settings"),
                         Rc::new(
                             |this: &mut MailApp, w: &mut Window, cx: &mut Context<MailApp>| {
                                 this.mobile_open_settings(w, cx)
@@ -287,16 +283,16 @@ impl MailApp {
             .flex()
             .items_center()
             .gap_2()
-            .child(chip("mobile-filter-unread", Filter::Unread, "Unread"))
-            .child(chip("mobile-filter-starred", Filter::Starred, "Starred"))
+            .child(chip("mobile-filter-unread", Filter::Unread, t!("mobile-list-unread")))
+            .child(chip("mobile-filter-starred", Filter::Starred, t!("mobile-list-starred")))
             .child(chip(
                 "mobile-filter-attachments",
                 Filter::Attachments,
-                "Attachments",
+                t!("mobile-list-attachments"),
             ))
             .child(self.chip(
                 "mobile-filter-oldest",
-                "Oldest First",
+                t!("mobile-list-oldest-first"),
                 self.oldest_first,
                 act(Action::OldestFirst(!self.oldest_first)),
                 cx,
@@ -819,9 +815,9 @@ impl MailApp {
                         .flex_shrink_0()
                         .child(ring(progress, c.border, c.accent).size_full()),
                 )
-                .child("Pull down to refresh")
+                .child(t!("mobile-list-pull-down-to-refresh"))
         };
-        let busy = || layer().child(spinner(14., c.accent)).child("Refreshing…");
+        let busy = || layer().child(spinner(14., c.accent)).child(t!("mobile-list-refreshing"));
         let settle = self.mobile.pull_settle.filter(|_| refreshing);
         let card = div()
             .relative()
@@ -913,7 +909,7 @@ impl MailApp {
                     .flex_shrink_0()
                     .text_size(px(16.))
                     .text_color(rgb(c.muted))
-                    .child("Search"),
+                    .child(t!("mobile-list-search")),
             )
             .child(div().flex_1())
             .child(
@@ -943,7 +939,7 @@ impl MailApp {
         let button = if typing {
             self.touch_text(
                 "mobile-search-done",
-                "Done",
+                t!("mobile-list-done"),
                 true,
                 Rc::new(
                     |this: &mut MailApp, w: &mut Window, cx: &mut Context<MailApp>| {
@@ -955,7 +951,7 @@ impl MailApp {
         } else {
             self.touch_text(
                 "mobile-search-cancel",
-                "Cancel",
+                t!("mobile-list-cancel"),
                 false,
                 act(Action::CloseSearch),
                 cx,
@@ -1006,40 +1002,40 @@ impl MailApp {
                     "mobile-bulk-read",
                     if all_read { "mail" } else { "mail-open" },
                     if all_read {
-                        "Mark as unread"
+                        t!("mobile-list-mark-as-unread")
                     } else {
-                        "Mark as read"
+                        t!("mobile-list-mark-as-read")
                     },
                     act(Action::ApplySelection(Change::Read(!all_read))),
                 ),
                 tool(
                     "mobile-bulk-star",
                     if all_starred { "star-filled" } else { "star" },
-                    if all_starred { "Unstar" } else { "Star" },
+                    if all_starred { t!("mobile-list-unstar") } else { t!("mobile-list-star") },
                     act(Action::ApplySelection(Change::Star(!all_starred))),
                 ),
                 tool(
                     "mobile-bulk-move",
                     "folder",
-                    "Move to folder",
+                    t!("mobile-list-move-to-folder"),
                     act(Action::MoveMenu(MoveTarget::Selection)),
                 ),
                 tool(
                     "mobile-bulk-archive",
                     "archive",
-                    "Archive",
+                    t!("mobile-list-archive"),
                     act(Action::ApplySelection(Change::Move(Folder::Archive))),
                 ),
                 tool(
                     "mobile-bulk-trash",
                     "trash",
-                    "Move to trash",
+                    t!("mobile-list-move-to-trash"),
                     act(Action::ApplySelection(Change::Move(Folder::Trash))),
                 ),
                 tool(
                     "mobile-bulk-more",
                     "ellipsis",
-                    "More",
+                    t!("mobile-list-more"),
                     Rc::new(
                         move |this: &mut MailApp, w: &mut Window, cx: &mut Context<MailApp>| {
                             if let Some(id) = &first {

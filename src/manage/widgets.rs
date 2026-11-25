@@ -22,7 +22,7 @@ use chrono::{Datelike, Local, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
@@ -76,6 +76,14 @@ pub struct Snapshot {
     pub packages: Vec<WidgetPackage>,
     #[serde(default)]
     pub receipts: Vec<WidgetReceipt>,
+    /// The language Picacho shows (BCP 47): widgets write their own text in
+    /// it, even where it isn't the system's.
+    #[serde(default)]
+    pub language: String,
+    /// The widgets' own words in that language, for widget hosts without
+    /// translations of their own (KDE Plasma's), by name (`labels`).
+    #[serde(default)]
+    pub labels: BTreeMap<String, String>,
 }
 
 impl Snapshot {
@@ -100,7 +108,17 @@ impl Snapshot {
             events: Vec::new(),
             packages: Vec::new(),
             receipts: Vec::new(),
+            language: String::new(),
+            labels: BTreeMap::new(),
         }
+        .worded()
+    }
+
+    /// With the language Picacho shows, and the widgets' words in it.
+    fn worded(mut self) -> Self {
+        self.language = crate::i18n::language().to_owned();
+        self.labels = labels(&self);
+        self
     }
 
     /// How many packages the Summary lists for one account, or for All
@@ -425,11 +443,112 @@ pub fn snapshot(store: &Store, now: i64) -> Snapshot {
         events,
         packages,
         receipts,
-    };
+        language: String::new(),
+        labels: BTreeMap::new(),
+    }
+    .worded();
     if crate::manage::applock::hides_contents(store) {
         redact(&mut snap);
     }
     snap
+}
+
+/// The widgets' own words, in the language shown, for widget hosts with
+/// no translations of their own (KDE Plasma's). `%1` and `%2` stand for
+/// what the widget fills in. Words that depend on a number are given for
+/// each number the widgets may show, as `name:number`.
+fn labels(snap: &Snapshot) -> BTreeMap<String, String> {
+    let mut labels: BTreeMap<String, String> = [
+        ("inbox", t!("widgets-inbox").to_owned()),
+        ("all-inboxes", t!("widgets-all-inboxes").to_owned()),
+        ("all-accounts", t!("widgets-all-accounts").to_owned()),
+        ("account", t!("widgets-account").to_owned()),
+        (
+            "account-name",
+            t!("widgets-account-name", name = "%1", address = "%2"),
+        ),
+        (
+            "show-unread-only",
+            t!("widgets-show-unread-messages-only").to_owned(),
+        ),
+        ("title-unread", t!("widgets-title-unread", title = "%1")),
+        ("refresh", t!("widgets-refresh").to_owned()),
+        ("compose", t!("widgets-compose").to_owned()),
+        ("unknown-sender", t!("widgets-unknown-sender").to_owned()),
+        ("no-subject", t!("manage-widgets-no-subject").to_owned()),
+        ("no-title", t!("manage-widgets-no-title").to_owned()),
+        (
+            "open-to-add-account",
+            t!("widgets-open-picacho-to-add-an-account").to_owned(),
+        ),
+        ("all-caught-up", t!("widgets-all-caught-up").to_owned()),
+        (
+            "no-messages-in-inbox",
+            t!("widgets-no-messages-in-inbox").to_owned(),
+        ),
+        ("today", t!("widgets-today").to_owned()),
+        ("tomorrow", t!("widgets-tomorrow").to_owned()),
+        ("all-day", t!("widgets-all-day").to_owned()),
+        ("calendar", t!("widgets-calendar").to_owned()),
+        (
+            "no-upcoming-events",
+            t!("widgets-no-upcoming-events").to_owned(),
+        ),
+        (
+            "connect-calendar",
+            t!("widgets-connect-a-calendar-in-settings").to_owned(),
+        ),
+        ("packages", t!("widgets-packages").to_owned()),
+        ("packages-of", t!("widgets-packages-of", account = "%1")),
+        ("package", t!("manage-widgets-package").to_owned()),
+        ("expected", t!("widgets-expected", date = "%1")),
+        (
+            "no-recent-packages",
+            t!("widgets-no-recent-packages").to_owned(),
+        ),
+        (
+            "open-in-summary",
+            t!("widgets-open-them-in-the-summary").to_owned(),
+        ),
+        ("receipts", t!("widgets-receipts").to_owned()),
+        ("receipts-of", t!("widgets-receipts-of", account = "%1")),
+        ("receipt", t!("widgets-receipt").to_owned()),
+        ("order", t!("widgets-order", number = "%1")),
+        ("refund", t!("manage-widgets-refund").to_owned()),
+        (
+            "no-recent-receipts",
+            t!("widgets-no-recent-receipts").to_owned(),
+        ),
+    ]
+    .into_iter()
+    .map(|(name, text)| (name.to_owned(), text))
+    .collect();
+    let choices = snap
+        .accounts
+        .iter()
+        .map(|a| Some(a.id.as_str()))
+        .chain([None]);
+    for account in choices {
+        for count in [snap.package_total(account), snap.receipt_total(account)] {
+            labels.insert(
+                format!("view-all:{count}"),
+                t!("widgets-view-all", count = count),
+            );
+        }
+        let unread = match account {
+            Some(id) => snap
+                .accounts
+                .iter()
+                .find(|a| a.id == id)
+                .map_or(0, |a| a.unread),
+            None => snap.total_unread,
+        };
+        labels.insert(
+            format!("unread:{unread}"),
+            t!("widgets-unread", count = unread),
+        );
+    }
+    labels
 }
 
 /// Settings → Privacy → Hide mail outside Picacho: the snapshot keeps its
@@ -440,19 +559,24 @@ pub fn snapshot(store: &Store, now: i64) -> Snapshot {
 pub fn redact(snap: &mut Snapshot) {
     for m in &mut snap.messages {
         m.sender = m.account_label.clone();
-        m.subject = "Details hidden".to_owned();
+        m.subject = t!("manage-widgets-details-hidden").to_owned();
         m.snippet.clear();
     }
     for e in &mut snap.events {
-        e.title = "Event".to_owned();
+        e.title = t!("manage-widgets-event").to_owned();
         e.location.clear();
     }
     for p in &mut snap.packages {
-        p.title = "Package".to_owned();
+        p.title = t!("manage-widgets-package").to_owned();
         p.number.clear();
     }
     for r in &mut snap.receipts {
-        r.merchant = if r.refund { "Refund" } else { "Purchase" }.to_owned();
+        r.merchant = if r.refund {
+            t!("manage-widgets-refund")
+        } else {
+            t!("manage-widgets-purchase")
+        }
+        .to_owned();
         r.amount.clear();
         r.order.clear();
     }
@@ -633,11 +757,12 @@ fn clean_sender_name(sender: &str) -> Option<String> {
     (!name.is_empty()).then(|| name.to_owned())
 }
 
-/// Formats an ISO-8601 expected arrival date (e.g. "2026-11-26..." -> "Nov 26").
+/// Formats an ISO-8601 expected arrival date (e.g. "2026-11-26..." -> "Nov 26",
+/// in the language shown).
 fn format_expected_date(raw: &str) -> Option<String> {
     let date_part = raw.trim().get(..10)?;
     let d = chrono::NaiveDate::parse_from_str(date_part, "%Y-%m-%d").ok()?;
-    Some(d.format("%b %-d").to_string())
+    Some(crate::i18n::dates::format(&d, t!("dates-month-day")))
 }
 
 /// Filters `snapshot`'s messages by optional account and unread-only toggle.
@@ -743,7 +868,7 @@ fn sanitize_preview(
         }
         // Without the model a code cannot be distinguished; stay safe rather than
         // leaking a sign-in code onto the home screen.
-        None => ("New message".to_owned(), String::new()),
+        None => (t!("manage-widgets-new-message").to_owned(), String::new()),
     }
 }
 
@@ -851,7 +976,7 @@ fn calendar_agenda(store: &Store, now: i64) -> (bool, Vec<WidgetEvent>) {
             out.push(WidgetEvent {
                 uid: occ.uid,
                 title: if title.is_empty() {
-                    "(No title)".to_owned()
+                    t!("manage-widgets-no-title").to_owned()
                 } else {
                     truncate_chars(&title, MAX_SUBJECT_CHARS)
                 },
@@ -922,13 +1047,14 @@ pub fn waybar_json(snap: &Snapshot) -> String {
     };
     let mut lines = Vec::new();
     if snap.accounts.is_empty() {
-        lines.push("Picacho — open to sign in".to_owned());
+        lines.push(t!("manage-widgets-picacho-open-to-sign-in").to_owned());
     } else if snap.total_unread == 0 {
-        lines.push("Picacho — All caught up".to_owned());
-    } else if snap.total_unread == 1 {
-        lines.push("Picacho — 1 unread message".to_owned());
+        lines.push(t!("manage-widgets-picacho-all-caught-up").to_owned());
     } else {
-        lines.push(format!("Picacho — {} unread messages", snap.total_unread));
+        lines.push(t!(
+            "manage-widgets-picacho-unread-messages",
+            count = snap.total_unread
+        ));
     }
     let unread_msgs: Vec<&WidgetMessage> = snap.messages.iter().filter(|m| m.unread).take(5).collect();
     let shown = if unread_msgs.is_empty() {
@@ -937,14 +1063,22 @@ pub fn waybar_json(snap: &Snapshot) -> String {
         unread_msgs
     };
     for m in shown {
-        let sender = if m.sender.is_empty() { "(Unknown)" } else { &m.sender };
-        let subject = if m.subject.is_empty() { "(No subject)" } else { &m.subject };
+        let sender = if m.sender.is_empty() {
+            t!("manage-widgets-unknown")
+        } else {
+            &m.sender
+        };
+        let subject = if m.subject.is_empty() {
+            t!("manage-widgets-no-subject")
+        } else {
+            &m.subject
+        };
         let mark = if m.unread { "• " } else { "  " };
         lines.push(format!("{mark}{sender}: {subject}"));
     }
     if !snap.events.is_empty() {
         lines.push(String::new());
-        lines.push("Upcoming:".to_owned());
+        lines.push(t!("manage-widgets-upcoming").to_owned());
         for ev in snap.events.iter().take(3) {
             lines.push(format!("• {}", ev.title));
         }
@@ -1450,6 +1584,8 @@ mod tests {
                 packages: 0,
                 receipts: 0,
             }],
+            language: String::new(),
+            labels: BTreeMap::new(),
             messages: vec![WidgetMessage {
                 id: "m1".into(),
                 account_id: "a1".into(),

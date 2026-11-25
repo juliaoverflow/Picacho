@@ -61,15 +61,14 @@ fn install() -> std::io::Result<()> {
         "[Desktop Entry]\n\
          Type=Application\n\
          Name=Picacho\n\
-         GenericName=Email Client\n\
-         Comment=Read and send email\n\
+         {}\
          Exec={} %U\n\
          Icon={APP_ID}\n\
          StartupWMClass={APP_ID}\n\
          Terminal=false\n\
          Categories=Network;Email;\n\
-         Keywords=mail;email;inbox;imap;\n\
          MimeType=x-scheme-handler/mailto;x-scheme-handler/picacho;message/rfc822;application/vnd.ms-outlook;\n",
+        localized_keys(),
         exec_quote(&exe.to_string_lossy()),
     );
     write_if_changed(
@@ -79,9 +78,46 @@ fn install() -> std::io::Result<()> {
     write_if_changed(&data.join(entry), desktop.as_bytes())
 }
 
+/// The desktop entry's GenericName, Comment and Keywords lines: in English,
+/// then in each language Picacho has that words them otherwise (`Key[ll_CC]`),
+/// for app menus to show in their reader's language.
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+fn localized_keys() -> String {
+    use std::fmt::Write;
+    let words = || {
+        [
+            ("GenericName", t!("desktop-generic-name")),
+            ("Comment", t!("desktop-comment")),
+            ("Keywords", t!("desktop-keywords")),
+        ]
+    };
+    // A line break would end the key and start keys of its own.
+    let one_line = |text: &str| text.replace(['\n', '\r'], " ");
+    let english = crate::i18n::in_source(words);
+    let mut lines = String::new();
+    for (key, text) in english {
+        let _ = writeln!(lines, "{key}={}", one_line(text));
+    }
+    for &(code, _) in crate::i18n::languages() {
+        // Desktop entries name locales as POSIX does: pt_BR, not pt-BR.
+        let locale = code.replace('-', "_");
+        for ((key, text), (_, source)) in crate::i18n::in_language(code, words)
+            .into_iter()
+            .zip(english)
+        {
+            if text != source {
+                let _ = writeln!(lines, "{key}[{locale}]={}", one_line(text));
+            }
+        }
+    }
+    lines
+}
+
 /// Installs Picacho's KDE Plasma 6 desktop & panel widgets into
 /// `$XDG_DATA_HOME/plasma/plasmoids/` so Plasma users can add them directly
-/// from "Add Widgets…".
+/// from "Add Widgets…". Their words come with the snapshot they show
+/// (`widgets::labels`), in the language Picacho shows; their names and
+/// descriptions get each language's in `metadata.json` (`named`).
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
 fn install_plasmoids(data: &std::path::Path) -> std::io::Result<()> {
     let files: &[(&str, &[u8])] = &[
@@ -155,9 +191,51 @@ fn install_plasmoids(data: &std::path::Path) -> std::io::Result<()> {
         ),
     ];
     for (rel, bytes) in files {
-        write_if_changed(&data.join(rel), bytes)?;
+        if rel.ends_with("/metadata.json") {
+            write_if_changed(&data.join(rel), &named(bytes))?;
+        } else {
+            write_if_changed(&data.join(rel), bytes)?;
+        }
     }
     Ok(())
+}
+
+/// A widget's metadata.json with its name and description in each language
+/// Picacho has (`Name[de]`), for Plasma's widget list.
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+fn named(metadata: &[u8]) -> Vec<u8> {
+    let Ok(mut json) = serde_json::from_slice::<serde_json::Value>(metadata) else {
+        return metadata.to_vec();
+    };
+    let id = json["KPlugin"]["Id"].as_str().unwrap_or_default().to_owned();
+    let Some(words) = plasmoid_words(&id) else {
+        return metadata.to_vec();
+    };
+    let english = crate::i18n::in_source(words);
+    let plugin = &mut json["KPlugin"];
+    for &(code, _) in crate::i18n::languages() {
+        let locale = code.replace('-', "_");
+        let (name, description) = crate::i18n::in_language(code, words);
+        if name != english.0 {
+            plugin[format!("Name[{locale}]")] = name.into();
+        }
+        if description != english.1 {
+            plugin[format!("Description[{locale}]")] = description.into();
+        }
+    }
+    serde_json::to_vec_pretty(&json).unwrap_or_else(|_| metadata.to_vec())
+}
+
+/// A widget's name and description, by its id.
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+fn plasmoid_words(id: &str) -> Option<fn() -> (&'static str, &'static str)> {
+    Some(match id {
+        "tech.pinal.picacho.inbox" => || (t!("widgets-plasmoid-inbox"), t!("widgets-plasmoid-inbox-about")),
+        "tech.pinal.picacho.calendar" => || (t!("widgets-plasmoid-calendar"), t!("widgets-plasmoid-calendar-about")),
+        "tech.pinal.picacho.packages" => || (t!("widgets-plasmoid-packages"), t!("widgets-plasmoid-packages-about")),
+        "tech.pinal.picacho.receipts" => || (t!("widgets-plasmoid-receipts"), t!("widgets-plasmoid-receipts-about")),
+        _ => return None,
+    })
 }
 
 /// Writes `bytes` to `path` unless it already holds them, so launchers do
@@ -205,5 +283,35 @@ mod tests {
             "\"/opt/Pi cacho/picacho\""
         );
         assert_eq!(super::exec_quote("/a$b%c"), "\"/a\\\\$b%%c\"");
+    }
+
+    #[test]
+    fn plasmoids_are_named_as_their_metadata_names_them() {
+        for widget in ["inbox", "calendar", "packages", "receipts"] {
+            let path = format!("packaging/linux/plasmoids/tech.pinal.picacho.{widget}/metadata.json");
+            let file = std::fs::read(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(&path)).unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&super::named(&file)).unwrap();
+            let id = json["KPlugin"]["Id"].as_str().unwrap();
+            let (name, about) = crate::i18n::in_source(super::plasmoid_words(id).unwrap());
+            assert_eq!(json["KPlugin"]["Name"], name, "{path}");
+            assert_eq!(json["KPlugin"]["Description"], about, "{path}");
+        }
+    }
+
+    #[test]
+    fn localized_keys_are_one_line_each() {
+        let keys = super::localized_keys();
+        assert!(
+            keys.starts_with("GenericName=Email Client\nComment=Fast, native email for every inbox you have\n"),
+            "{keys}"
+        );
+        assert!(
+            keys.contains("\nKeywords=mail;email;inbox;imap;\n"),
+            "{keys}"
+        );
+        assert!(
+            keys.lines()
+                .all(|line| line.split_once('=').is_some_and(|(key, _)| !key.is_empty()))
+        );
     }
 }

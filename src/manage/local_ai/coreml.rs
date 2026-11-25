@@ -31,7 +31,7 @@ pub fn compile(source: &Path, target: &Path) -> Result<()> {
         compiled
             .path()
             .map(|p| p.to_string())
-            .context("Core ML gave no compiled model")
+            .with_context(|| t!("manage-local-ai-coreml-core-ml-gave-no-compiled-model"))
     })?;
     if target.exists() {
         std::fs::remove_dir_all(target)?;
@@ -95,7 +95,7 @@ impl CoreMlModel {
             .map_err(error)?;
             ensure!(
                 input.count() as usize == self.dim,
-                "Core ML input has the wrong size"
+                t!("manage-local-ai-coreml-core-ml-input-has-the-wrong")
             );
             // A fresh array is uninitialized: zero it, then set the features.
             #[allow(deprecated)]
@@ -128,10 +128,10 @@ impl CoreMlModel {
             let probability = output
                 .featureValueForName(&NSString::from_str("probability"))
                 .and_then(|v| v.multiArrayValue())
-                .context("Core ML gave no probability")?;
+                .with_context(|| t!("manage-local-ai-coreml-core-ml-gave-no-probability"))?;
             // Indexing an empty array raises an Objective-C exception, which
             // can't be caught here: it would end the app.
-            ensure!(probability.count() > 0, "Core ML gave no probability");
+            ensure!(probability.count() > 0, t!("manage-local-ai-coreml-core-ml-gave-no-probability"));
             Ok(probability.objectAtIndexedSubscript(0).floatValue())
         }
     }

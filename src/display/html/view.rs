@@ -706,7 +706,7 @@ fn accessible_links(
         .size_0()
         .overflow_hidden()
         .role(gpui::accesskit::Role::List)
-        .aria_label("Links in this message")
+        .aria_label(t!("html-view-links-in-this-message"))
         .children(links.map(move |(i, (label, href))| {
             let opener = opener.clone();
             // AccessKit's Click, handled here: GPUI's own presses the middle
@@ -756,7 +756,7 @@ impl Render for HtmlView {
                 .py_6()
                 .text_size(px(13.))
                 .text_color(rgb(0x9aa0a6))
-                .child("This email's formatting couldn't be shown. Choose plain text above to read it.")
+                .child(t!("html-view-this-emails-formatting-couldnt-be-shown"))
                 .into_any_element();
         }
         let view = cx.entity();
@@ -877,7 +877,7 @@ impl Render for HtmlView {
             // 2.1.1). Both are drawn nowhere: the painted strips are what
             // sighted readers see.
             .role(gpui::accesskit::Role::Document)
-            .aria_label("Message")
+            .aria_label(t!("html-view-message"))
             .when_some(self.accessible.clone(), |d, (text, links)| {
                 let opener = cx.entity().downgrade();
                 d.child(accessible_text(text))

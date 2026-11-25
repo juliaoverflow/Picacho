@@ -44,12 +44,18 @@ public final class CalendarWidgetProvider extends AppWidgetProvider {
         int accent = WidgetStore.accentColor(context, snap);
 
         RemoteViews views = new RemoteViews(context.getPackageName(), R.layout.widget_calendar);
+        // The layout's own text, in Picacho's language (the launcher would
+        // read the layout in the phone's).
+        Context text = Lang.of(context);
+        views.setTextViewText(R.id.widget_cal_title, text.getString(R.string.widget_calendar_label));
+        views.setContentDescription(R.id.widget_cal_refresh, text.getString(R.string.widget_refresh));
+        views.setTextViewText(R.id.widget_cal_empty, text.getString(R.string.widget_empty_calendar));
         views.setInt(R.id.widget_cal_icon, "setColorFilter", accent);
         views.setInt(
                 R.id.widget_cal_refresh,
                 "setColorFilter",
                 context.getColor(R.color.widget_text_muted));
-        views.setTextViewText(R.id.widget_cal_date, WidgetStore.formatTodayHeader());
+        views.setTextViewText(R.id.widget_cal_date, WidgetStore.formatTodayHeader(context));
         views.setTextViewText(
                 R.id.widget_cal_empty,
                 context.getString(
