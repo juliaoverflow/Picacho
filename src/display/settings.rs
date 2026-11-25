@@ -19,6 +19,26 @@ pub(super) struct IdentityEdit {
     pub(super) error: Option<String>,
 }
 
+/// The rows of a settings group, in order.
+#[derive(Default)]
+pub(super) struct Rows(Vec<AnyElement>);
+
+impl Rows {
+    pub(super) fn new() -> Self {
+        Self::default()
+    }
+    pub(super) fn row(mut self, row: impl IntoElement) -> Self {
+        self.0.push(row.into_any_element());
+        self
+    }
+    pub(super) fn rows<E: IntoElement>(mut self, rows: impl IntoIterator<Item = E>) -> Self {
+        self.0.extend(rows.into_iter().map(IntoElement::into_any_element));
+        self
+    }
+}
+
+impl FluentBuilder for Rows {}
+
 impl MailApp {
     pub(super) fn segmented(
         &self,
@@ -125,33 +145,91 @@ impl MailApp {
             )
             .on_click(cx.listener(move |this, _, w, cx| this.handle(action.clone(), w, cx)))
     }
-    pub(super) fn setting(&self, title: &str, caption: &str, control: impl IntoElement) -> Div {
+    /// A setting's name, with a short caption under it when there is one.
+    fn setting_label(&self, title: &str, caption: &str) -> Div {
         let c = self.colors();
         div()
             .flex()
             .flex_col()
-            .gap_2()
+            .gap(px(2.))
             .child(
                 div()
+                    .text_size(px(13.))
+                    .font_weight(FontWeight::MEDIUM)
+                    .child(title.to_owned()),
+            )
+            .when(!caption.is_empty(), |d| {
+                d.child(
+                    div()
+                        .text_size(px(12.))
+                        .text_color(rgb(c.muted))
+                        .child(caption.to_owned()),
+                )
+            })
+    }
+    /// A setting with its control below its name: for wide controls.
+    pub(super) fn setting(&self, title: &str, caption: &str, control: impl IntoElement) -> Div {
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(self.setting_label(title, caption))
+            .child(control)
+    }
+    /// A setting with its control beside its name, dropping below it when
+    /// the page is too narrow.
+    pub(super) fn setting_row(&self, title: &str, caption: &str, control: impl IntoElement) -> Div {
+        div()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap_x_4()
+            .gap_y_2()
+            .child(
+                self.setting_label(title, caption)
+                    .flex_1()
+                    .min_w(px(180.)),
+            )
+            .child(div().flex_shrink_0().max_w_full().child(control))
+    }
+    /// A titled card of settings, a line between one and the next. Empty
+    /// without any.
+    pub(super) fn settings_group(&self, title: &str, rows: Rows) -> Div {
+        let c = self.colors();
+        if rows.0.is_empty() {
+            return div();
+        }
+        div()
+            .w_full()
+            .min_w_0()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .when(!title.is_empty(), |d| d.child(self.section(title)))
+            .child(
+                div()
+                    .w_full()
+                    .min_w_0()
                     .flex()
                     .flex_col()
-                    .gap(px(2.))
-                    .child(
+                    .rounded(px(12.))
+                    .border_1()
+                    .border_color(rgb(c.border))
+                    .bg(rgb(c.raised))
+                    .children(rows.0.into_iter().enumerate().map(|(i, row)| {
                         div()
-                            .text_size(px(13.))
-                            .font_weight(FontWeight::MEDIUM)
-                            .child(title.to_owned()),
-                    )
-                    .when(!caption.is_empty(), |d| {
-                        d.child(
-                            div()
-                                .text_size(px(12.))
-                                .text_color(rgb(c.muted))
-                                .child(caption.to_owned()),
-                        )
-                    }),
+                            .min_w_0()
+                            .px_4()
+                            .py_3()
+                            .when(i > 0, |d| d.border_t_1().border_color(rgb(c.border)))
+                            .child(row)
+                    })),
             )
-            .child(control)
+    }
+    /// A settings page: its groups one below the other, kept to a
+    /// readable width.
+    pub(super) fn settings_column(&self) -> Div {
+        div().w_full().max_w(px(720.)).flex().flex_col().gap_6()
     }
     /// A setting turned on and off with a switch beside its description.
     pub(super) fn switch_setting(
@@ -163,37 +241,17 @@ impl MailApp {
         action: Action,
         cx: &Context<Self>,
     ) -> Div {
-        let c = self.colors();
         div()
             .flex()
             .items_center()
             .gap_4()
-            .child(
-                div()
-                    .flex_1()
-                    // Wraps the caption instead of pushing the switch out.
-                    .min_w_0()
-                    .flex()
-                    .flex_col()
-                    .gap(px(2.))
-                    .child(
-                        div()
-                            .text_size(px(13.))
-                            .font_weight(FontWeight::MEDIUM)
-                            .child(title.to_owned()),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(12.))
-                            .text_color(rgb(c.muted))
-                            .child(caption.to_owned()),
-                    ),
-            )
+            // Wraps the caption instead of pushing the switch out.
+            .child(self.setting_label(title, caption).flex_1().min_w_0())
             .child({
                 let selector = id.clone();
                 self.switch(id, on, action, cx)
                     .aria_label(title.to_owned())
-                    .aria_description(caption.to_owned())
+                    .when(!caption.is_empty(), |s| s.aria_description(caption.to_owned()))
                     .debug_selector(move || selector)
             })
     }
@@ -257,10 +315,7 @@ impl MailApp {
     pub(super) fn section(&self, title: &str) -> Div {
         let c = self.colors();
         div()
-            .pt_2()
-            .pb_1()
-            .border_b_1()
-            .border_color(rgb(c.border))
+            .px_1()
             .text_size(px(11.))
             .font_weight(FontWeight::SEMIBOLD)
             .text_color(rgb(c.muted))
@@ -531,7 +586,7 @@ impl MailApp {
                     .rounded_full()
                     .p(px(3.))
                     .border_2()
-                    .border_color(rgb(if active { color } else { c.surface }))
+                    .border_color(rgb(if active { color } else { c.raised }))
                     .cursor_pointer()
                     .child(
                         div()
@@ -550,136 +605,114 @@ impl MailApp {
                         this.handle(Action::SetAccent(accent), w, cx)
                     }))
             }));
-        div()
-            .flex()
-            .flex_col()
-            .gap_5()
-            .child(self.section(t!("settings-appearance")))
-            // Offered once Picacho has more than one language.
-            .when(crate::i18n::languages().len() > 1, |d| {
-                let chosen = self
-                    .backend
-                    .store
-                    .preference(crate::i18n::PREFERENCE)
-                    .unwrap_or_default();
-                let choices = std::iter::once((
-                    t!("settings-language-automatic").to_owned(),
-                    Action::SetLanguage(String::new()),
-                    chosen.is_empty(),
-                ))
-                .chain(crate::i18n::languages().iter().map(|(code, name)| {
-                    (
-                        (*name).to_owned(),
-                        Action::SetLanguage((*code).to_owned()),
-                        chosen == *code,
-                    )
-                }))
-                .collect();
-                let outgoing = self
-                    .backend
-                    .store
-                    .preference(crate::i18n::OUTGOING_PREFERENCE)
-                    .unwrap_or_default();
-                let outgoing_choices = std::iter::once((
-                    t!("settings-outgoing-language-same").to_owned(),
-                    Action::SetOutgoingLanguage(String::new()),
-                    outgoing.is_empty(),
-                ))
-                .chain(crate::i18n::languages().iter().map(|(code, name)| {
-                    (
-                        (*name).to_owned(),
-                        Action::SetOutgoingLanguage((*code).to_owned()),
-                        outgoing == *code,
-                    )
-                }))
-                .collect();
-                d.child(self.setting(
+        let motion = self
+            .segmented(
+                "reduce-motion",
+                [
+                    super::motion::Motion::System,
+                    super::motion::Motion::Reduced,
+                    super::motion::Motion::Full,
+                ]
+                .into_iter()
+                .map(|m| (m.label().to_owned(), Action::SetMotion(m), self.motion == m))
+                .collect(),
+                cx,
+            )
+            .max_w(px(320.));
+        let contrast = self
+            .segmented(
+                "email-contrast",
+                [
+                    super::motion::Contrast::System,
+                    super::motion::Contrast::More,
+                    super::motion::Contrast::Standard,
+                ]
+                .into_iter()
+                .map(|c| (c.label().to_owned(), Action::SetContrast(c), self.contrast == c))
+                .collect(),
+                cx,
+            )
+            .max_w(px(320.));
+        // Offered once Picacho has more than one language.
+        let language = (crate::i18n::languages().len() > 1).then(|| {
+            let chosen = self
+                .backend
+                .store
+                .preference(crate::i18n::PREFERENCE)
+                .unwrap_or_default();
+            let choices = std::iter::once((
+                t!("settings-language-automatic").to_owned(),
+                Action::SetLanguage(String::new()),
+                chosen.is_empty(),
+            ))
+            .chain(crate::i18n::languages().iter().map(|(code, name)| {
+                (
+                    (*name).to_owned(),
+                    Action::SetLanguage((*code).to_owned()),
+                    chosen == *code,
+                )
+            }))
+            .collect();
+            let outgoing = self
+                .backend
+                .store
+                .preference(crate::i18n::OUTGOING_PREFERENCE)
+                .unwrap_or_default();
+            let outgoing_choices = std::iter::once((
+                t!("settings-outgoing-language-same").to_owned(),
+                Action::SetOutgoingLanguage(String::new()),
+                outgoing.is_empty(),
+            ))
+            .chain(crate::i18n::languages().iter().map(|(code, name)| {
+                (
+                    (*name).to_owned(),
+                    Action::SetOutgoingLanguage((*code).to_owned()),
+                    outgoing == *code,
+                )
+            }))
+            .collect();
+            Rows::new()
+                .row(self.setting(
                     t!("settings-language"),
-                    t!("settings-language-caption"),
+                    "",
                     self.segmented("language", choices, cx),
                 ))
-                .child(self.setting(
+                .row(self.setting(
                     t!("settings-outgoing-language"),
                     t!("settings-outgoing-language-caption"),
                     self.segmented("outgoing-language", outgoing_choices, cx),
                 ))
-            })
-            .child(self.setting(
-                t!("settings-theme"),
-                t!("settings-automatic-follows-your-systems-light-and"),
-                appearance,
-            ))
-            .child(self.setting(
-                t!("settings-theme-color"),
-                &t!(
-                    "settings-used-for-buttons-selection-and-highlights",
-                    label = self.accent.label()
-                ),
-                swatches,
-            ))
-            .child(
-                self.setting(
-                    t!("settings-reduce-motion"),
-                    t!("settings-panes-menus-and-messages-appear-without"),
-                    self.segmented(
-                        "reduce-motion",
-                        [
-                            super::motion::Motion::System,
-                            super::motion::Motion::Reduced,
-                            super::motion::Motion::Full,
-                        ]
-                        .into_iter()
-                        .map(|m| (m.label().to_owned(), Action::SetMotion(m), self.motion == m))
-                        .collect(),
-                        cx,
-                    )
-                    .max_w(px(320.)),
-                ),
+        });
+        let all_mail = self
+            .switch(
+                "all-mail".into(),
+                self.all_mail,
+                Action::SetAllMail(!self.all_mail),
+                cx,
             )
-            .child(
-                self.setting(
-                    t!("settings-contrast-in-emails"),
-                    t!("settings-emails-that-style-themselves-for-more"),
-                    self.segmented(
-                        "email-contrast",
-                        [
-                            super::motion::Contrast::System,
-                            super::motion::Contrast::More,
-                            super::motion::Contrast::Standard,
-                        ]
-                        .into_iter()
-                        .map(|c| (c.label().to_owned(), Action::SetContrast(c), self.contrast == c))
-                        .collect(),
-                    cx,
-                )
-                .max_w(px(320.)),
+            .debug_selector(|| "all-mail".into());
+        self.settings_column()
+            .child(self.settings_group(
+                t!("settings-appearance"),
+                Rows::new()
+                    .row(self.setting_row(t!("settings-theme"), "", appearance.max_w(px(320.))))
+                    .row(self.setting(t!("settings-theme-color"), "", swatches))
+                    .row(self.setting_row(t!("settings-reduce-motion"), "", motion))
+                    .row(self.setting_row(t!("settings-contrast-in-emails"), "", contrast)),
             ))
-            .child(self.section(t!("settings-mailboxes")))
-            .child(
-                self.toggle_row(
+            .when_some(language, |d, rows| d.child(self.settings_group(t!("settings-language"), rows)))
+            .child(self.settings_group(
+                t!("settings-mailboxes"),
+                Rows::new().row(self.toggle_row(
                     t!("settings-all-accounts"),
                     t!("settings-with-more-than-one-account-list"),
-                    self.switch(
-                        "all-mail".into(),
-                        self.all_mail,
-                        Action::SetAllMail(!self.all_mail),
-                        cx,
-                    )
-                    .debug_selector(|| "all-mail".into()),
+                    all_mail,
+                )),
             ))
-            .map(|d| self.background_settings(d, cx))
+            .child(self.settings_group(t!("settings-background"), self.background_settings(cx)))
             // A phone lists About in Settings' own list instead.
             .when(!self.mobile.on, |d| {
                 let is_default = self.find.default_mail_app == Some(true);
-                let default_desc = if is_default {
-                    t!("settings-picacho-is-currently-your-default-email")
-                } else if cfg!(windows) {
-                    t!("settings-picacho-is-registered-in-windows-default")
-                } else if cfg!(target_os = "macos") {
-                    t!("settings-use-picacho-for-mailto-links-eml")
-                } else {
-                    t!("settings-use-picacho-as-your-default-app")
-                };
                 let default_label = if cfg!(windows) {
                     if is_default {
                         t!("settings-manage-in-default-apps")
@@ -693,35 +726,50 @@ impl MailApp {
                 } else {
                     t!("settings-set-as-default-email-app")
                 };
-                d.child(self.section("Picacho"))
-                    .child(self.setting(
-                        t!("settings-default-email-app"),
-                        default_desc,
-                        div().flex().items_center().gap_2().child(
-                            self.button(
-                                "set-default-app",
-                                default_label,
-                                if is_default { "check" } else { "external" },
-                                Action::Tools(super::tools::ToolAction::SetDefaultApp),
-                                !is_default,
-                                cx,
+                d.child(
+                    self.settings_group(
+                        "Picacho",
+                        Rows::new()
+                            .row(self.setting_row(
+                                t!("settings-default-email-app"),
+                                if is_default {
+                                    t!("settings-picacho-is-currently-your-default-email")
+                                } else {
+                                    ""
+                                },
+                                self.button(
+                                    "set-default-app",
+                                    default_label,
+                                    if is_default { "check" } else { "external" },
+                                    Action::Tools(super::tools::ToolAction::SetDefaultApp),
+                                    !is_default,
+                                    cx,
+                                ),
+                            ))
+                            .row(
+                                div()
+                                    .id("open-about")
+                                    .debug_selector(|| "open-about".into())
+                                    .role(Role::Button)
+                                    .flex()
+                                    .items_center()
+                                    .gap_3()
+                                    .cursor_pointer()
+                                    .hover(|s| s.opacity(0.8))
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .text_size(px(13.))
+                                            .font_weight(FontWeight::MEDIUM)
+                                            .child(t!("settings-about-picacho")),
+                                    )
+                                    .child(icon_el("chevron-right", 14., c.muted))
+                                    .on_click(cx.listener(|this, _, w, cx| {
+                                        this.handle(Action::About, w, cx)
+                                    })),
                             ),
-                        ),
-                    ))
-                    .child(
-                        div().flex().flex_wrap().gap_2().child(
-                            self.button(
-                                "open-about",
-                                t!("settings-about-picacho"),
-                                "",
-                                Action::About,
-                                false,
-                                cx,
-                            )
-                            .border_1()
-                            .border_color(rgb(c.border)),
-                        ),
-                    )
+                    ),
+                )
             })
             .into_any_element()
     }
@@ -912,41 +960,32 @@ impl MailApp {
                 cx,
             )
             .debug_selector(|| "clean-links".into());
-        div().flex().flex_col().gap_5()
-            .child(self.section(t!("settings-reading")))
-            .child(
-                div()
-                    .text_size(px(12.))
-                    .text_color(rgb(self.colors().muted))
-                    .child(t!("settings-defaults-for-all-accounts-each-email")),
-            )
-            .child(self.setting(
-                t!("settings-render-html"),
-                t!("settings-show-the-emails-original-formatting-and"),
-                html,
-            ))
-            .child(self.setting(
-                t!("settings-email-colors"),
-                t!("settings-show-email-bodies-light-or-dark"),
-                theme,
-            ))
-            .child(self.setting(
-                t!("settings-block-remote-content"),
-                t!("settings-prevent-images-stylesheets-and-fonts-from"),
-                remote,
-            ))
-            .child(self.setting(
-                t!("settings-remove-tracking-from-links"),
-                t!("settings-take-campaign-and-click-identifiers-such"),
-                clean,
+        self.settings_column()
+            .child(self.settings_group(
+                t!("settings-reading"),
+                Rows::new()
+                    .row(self.toggle_row(t!("settings-render-html"), "", html))
+                    .row(self.setting_row(t!("settings-email-colors"), "", theme))
+                    .row(self.toggle_row(
+                        t!("settings-block-remote-content"),
+                        t!("settings-prevent-images-stylesheets-and-fonts-from"),
+                        remote,
+                    ))
+                    .row(self.toggle_row(
+                        t!("settings-remove-tracking-from-links"),
+                        t!("settings-take-campaign-and-click-identifiers-such"),
+                        clean,
+                    )),
             ))
             // Phones warn before opening a link; desktops show its address
             // on hover instead.
-            .when(self.mobile.on, |d| d.child(self.link_warning_settings(cx)))
+            .when(self.mobile.on, |d| {
+                d.child(self.settings_group(t!("settings-links"), self.link_warning_settings(cx)))
+            })
             .into_any_element()
     }
     /// Warn before opening links, and the sites trusted not to (phones).
-    fn link_warning_settings(&self, cx: &Context<Self>) -> Div {
+    fn link_warning_settings(&self, cx: &Context<Self>) -> Rows {
         let c = self.colors();
         let warn = self
             .switch(
@@ -957,22 +996,15 @@ impl MailApp {
             )
             .debug_selector(|| "link-warnings".into());
         let trusted = &self.links.trusted;
-        div()
-            .flex()
-            .flex_col()
-            .gap_5()
-            .child(self.setting(
-                t!("settings-warn-before-opening-links"),
-                t!("settings-show-where-a-link-in-an"),
-                warn,
-            ))
+        Rows::new()
+            .row(self.toggle_row(t!("settings-warn-before-opening-links"), "", warn))
             .when(self.links.warn, |d| {
-                d.child(self.setting(
+                d.row(self.setting(
                     t!("settings-trusted-sites"),
                     if trusted.is_empty() {
                         t!("settings-links-to-sites-you-trust-open")
                     } else {
-                        t!("settings-links-to-these-sites-and-the")
+                        ""
                     },
                     div().flex().flex_col().gap_2().children(trusted.iter().enumerate().map(
                         |(i, site)| {
@@ -1085,121 +1117,84 @@ impl MailApp {
             self.switch(id, on, set(change), cx)
                 .debug_selector(move || selector)
         };
-        let row = |title: &str, caption: &str, control: Stateful<Div>| {
-            div()
-                .flex()
-                .items_center()
-                .gap_4()
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .flex()
-                        .flex_col()
-                        .gap(px(2.))
-                        .child(
-                            div()
-                                .text_size(px(13.))
-                                .font_weight(FontWeight::MEDIUM)
-                                .child(title.to_owned()),
-                        )
-                        .child(
-                            div()
-                                .text_size(px(12.))
-                                .text_color(rgb(c.muted))
-                                .child(caption.to_owned()),
-                        ),
-                )
-                .child(control)
-        };
-        div()
-            .flex()
-            .flex_col()
-            .gap_5()
-            .child(self.section(t!("settings-composing")))
-            .child(self.setting(
-                t!("settings-replies"),
-                t!("settings-write-replies-right-below-the-message"),
-                replies,
+        let row = |title: &str, control: Stateful<Div>| self.toggle_row(title, "", control);
+        self.settings_column()
+            .child(self.settings_group(
+                t!("settings-composing"),
+                Rows::new()
+                    .row(self.setting_row(t!("settings-replies"), "", replies))
+                    .row(self.setting_row(t!("settings-new-messages-open"), "", open_in))
+                    .row(self.setting_row(t!("settings-message-format"), "", format))
+                    .row(row(
+                        t!("settings-reply-to-everyone-by-default"),
+                        toggle("default-reply-all", o.default_reply_all, &|o| {
+                            o.default_reply_all = !o.default_reply_all
+                        }),
+                    ))
+                    .row(row(
+                        t!("settings-include-the-original-message"),
+                        toggle("quote-original", o.quote_original, &|o| {
+                            o.quote_original = !o.quote_original
+                        }),
+                    ))
+                    .row(row(
+                        t!("settings-paste-with-formatting"),
+                        toggle("paste-formatted", o.paste_formatted, &|o| {
+                            o.paste_formatted = !o.paste_formatted
+                        }),
+                    )),
             ))
-            .child(self.setting(
-                t!("settings-new-messages-open"),
-                t!("settings-a-panel-you-can-move-minimize"),
-                open_in,
+            .child(self.settings_group(
+                t!("settings-sending"),
+                Rows::new()
+                    .row(self.setting_row(t!("settings-undo-send"), "", undo))
+                    .row(row(
+                        t!("settings-attachment-reminder"),
+                        toggle("attachment-reminder", o.attachment_reminder, &|o| {
+                            o.attachment_reminder = !o.attachment_reminder
+                        }),
+                    ))
+                    .row(row(
+                        t!("settings-missing-subject-warning"),
+                        toggle("empty-subject", o.warn_empty_subject, &|o| {
+                            o.warn_empty_subject = !o.warn_empty_subject
+                        }),
+                    )),
             ))
-            .child(self.setting(
-                t!("settings-message-format"),
-                t!("settings-formatted-messages-can-use-bold-lists"),
-                format,
+            .child(self.settings_group(
+                t!("settings-signature"),
+                Rows::new()
+                    .row(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .children(self.signature_chooser(cx))
+                            .child(
+                                div()
+                                    .id("signature")
+                                    .debug_selector(|| "signature".into())
+                                    .h(px(110.))
+                                    .child(
+                                        textarea_field(Textarea::new(&self.signature_input), c, false)
+                                            .h_full(),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(12.))
+                                    .text_color(rgb(c.muted))
+                                    .child(t!("settings-markdown-bold-links-https-pictures-https")),
+                            ),
+                    )
+                    .row(row(
+                        t!("settings-sign-replies-and-forwards"),
+                        toggle("signature-replies", o.signature_on_replies, &|o| {
+                            o.signature_on_replies = !o.signature_on_replies
+                        }),
+                    )),
             ))
-            .child(row(
-                t!("settings-reply-to-everyone-by-default"),
-                t!("settings-reply-answers-all-recipients-reply-all"),
-                toggle("default-reply-all", o.default_reply_all, &|o| {
-                    o.default_reply_all = !o.default_reply_all
-                }),
-            ))
-            .child(row(
-                t!("settings-include-the-original-message"),
-                t!("settings-replies-quote-the-message-they-answer"),
-                toggle("quote-original", o.quote_original, &|o| {
-                    o.quote_original = !o.quote_original
-                }),
-            ))
-            .child(row(
-                t!("settings-paste-with-formatting"),
-                t!("settings-text-copied-with-bold-links-or"),
-                toggle("paste-formatted", o.paste_formatted, &|o| {
-                    o.paste_formatted = !o.paste_formatted
-                }),
-            ))
-            .child(self.section(t!("settings-sending")))
-            .child(self.setting(
-                t!("settings-undo-send"),
-                t!("settings-wait-a-moment-before-a-message"),
-                undo,
-            ))
-            .child(row(
-                t!("settings-attachment-reminder"),
-                t!("settings-ask-before-sending-a-message-that"),
-                toggle("attachment-reminder", o.attachment_reminder, &|o| {
-                    o.attachment_reminder = !o.attachment_reminder
-                }),
-            ))
-            .child(row(
-                t!("settings-missing-subject-warning"),
-                t!("settings-ask-before-sending-a-message-without"),
-                toggle("empty-subject", o.warn_empty_subject, &|o| {
-                    o.warn_empty_subject = !o.warn_empty_subject
-                }),
-            ))
-            .child(self.section(t!("settings-signature")))
-            .children(self.signature_chooser(cx))
-            .child(
-                div()
-                    .id("signature")
-                    .debug_selector(|| "signature".into())
-                    .h(px(110.))
-                    .child(textarea_field(Textarea::new(&self.signature_input), c, false).h_full()),
-            )
-            .child(
-                div()
-                    .text_size(px(12.))
-                    .text_color(rgb(c.muted))
-                    .child(if crate::manage::composing::is_html(&self.signature_input.read(cx).value()) {
-                        "HTML: formatted messages show it as written, plain-text ones its text. Changing From in a message changes its signature too."
-                    } else {
-                        t!("settings-markdown-bold-links-https-pictures-https")
-                    }),
-            )
-            .child(row(
-                t!("settings-sign-replies-and-forwards"),
-                t!("settings-without-this-only-new-messages-get"),
-                toggle("signature-replies", o.signature_on_replies, &|o| {
-                    o.signature_on_replies = !o.signature_on_replies
-                }),
-            ))
-            .child(self.templates_settings(cx))
+            .child(self.settings_group(t!("templates-templates"), self.templates_settings(cx)))
             .into_any_element()
     }
     pub(super) fn account_page(&self, index: usize, cx: &Context<Self>) -> AnyElement {
@@ -1214,184 +1209,107 @@ impl MailApp {
         } else {
             a.service.password_label()
         };
-        let mut page = div()
+        let text_field = |id: &'static str, input: &Entity<InputState>| {
+            div()
+                .id(id)
+                .debug_selector(move || id.into())
+                .w(px(260.))
+                .max_w_full()
+                .child(field(Input::new(input), c, false))
+        };
+        let choices = |id: String, options: Vec<(String, Action, bool)>| self.segmented(&id, options, cx);
+
+        // Its picture, name and address, with the picture changed from here.
+        let header = div()
             .flex()
-            .flex_col()
-            .gap_5()
+            .flex_wrap()
+            .items_center()
+            .gap_4()
             .child(
                 div()
+                    .id(SharedString::from(format!("avatar-picker-{}", a.id)))
+                    .debug_selector(|| "avatar-picker".into())
+                    .flex_shrink_0()
+                    .rounded_full()
+                    .cursor_pointer()
+                    .hover(|s| s.opacity(0.85))
+                    .child(self.account_avatar(a, index, 56.))
+                    .tooltip(|w, cx| Tooltip::new(t!("settings-change-picture")).build(w, cx))
+                    .on_click({
+                        let id = a.id.clone();
+                        cx.listener(move |this, _, w, cx| {
+                            this.handle(Action::AvatarMenu(id.clone()), w, cx)
+                        })
+                    }),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(160.))
                     .flex()
-                    .items_center()
-                    .gap_3()
-                    .child(if self.avatars.contains_key(&a.id) {
-                        self.account_avatar(a, index, 44.)
-                    } else {
-                        self.service_tile(a.service, 44.)
-                            .when(a.service == Service::Other, |_| {
-                                avatar(&initials(&a.name), 44., index, c)
-                            })
-                            .into_any_element()
-                    })
+                    .flex_col()
+                    .gap(px(2.))
                     .child(
                         div()
-                            .flex_1()
-                            .min_w_0()
-                            .flex()
-                            .flex_col()
-                            .gap(px(2.))
-                            .child(
-                                div()
-                                    .text_size(px(16.))
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .truncate()
-                                    .child(a.label().to_owned()),
-                            )
-                            .child(
-                                div()
-                                    .text_size(px(12.))
-                                    .text_color(rgb(c.muted))
-                                    .truncate()
-                                    .child(format!("{} · {} · {auth}", a.email, a.service_label())),
-                            ),
-                    ),
-            )
-            .when(self.settings_page_has_errors(), |page| {
-                page.child(self.account_error_details(a, cx))
-            })
-            .child(self.section(t!("settings-nickname")))
-            .child(
-                self.setting(
-                    t!("settings-nickname"),
-                    &t!("settings-shown-for-this-mailbox-in-the", name = a.name),
-                    div()
-                        .id("account-nickname")
-                        .debug_selector(|| "account-nickname".into())
-                        .max_w(px(320.))
-                        .child(field(Input::new(&self.nickname_input), c, false)),
-                ),
-            )
-            .when(!a.oauth && a.service != Service::Pinal, |page| {
-                page.child(self.section(t!("settings-sign-in"))).child(
-                    self.setting(
-                        t!("settings-sign-in-name"),
-                        &t!("settings-the-user-name-your-mail-servers", email = a.email),
+                            .text_size(px(17.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .truncate()
+                            .child(a.label().to_owned()),
+                    )
+                    .child(
                         div()
-                            .id("account-login")
-                            .debug_selector(|| "account-login".into())
-                            .max_w(px(320.))
-                            .child(field(Input::new(&self.login_input), c, false)),
+                            .text_size(px(12.))
+                            .text_color(rgb(c.muted))
+                            .truncate()
+                            .child(format!("{} · {} · {auth}", a.email, a.service_label())),
                     ),
-                )
-            })
-            .child(self.section(t!("settings-sending")))
-            .child(
-                self.setting(
-                    t!("settings-reply-to"),
-                    if crate::sync::smtp::recipients(&a.reply_to).is_err() {
-                        t!("settings-this-isnt-a-valid-address-messages")
-                    } else {
-                        t!("settings-where-replies-to-your-messages-go")
-                    },
-                    div()
-                        .id("account-reply-to")
-                        .debug_selector(|| "account-reply-to".into())
-                        .max_w(px(320.))
-                        .child(field(Input::new(&self.reply_to_input), c, false)),
-                ),
             )
-            .child(self.switch_setting(
-                t!("settings-ask-for-read-receipts"),
-                t!("settings-recipients-mail-apps-may-offer-to"),
-                format!("read-receipts-{}", a.id),
-                a.read_receipts,
-                Action::ToggleReadReceipts(a.id.clone()),
-                cx,
+            .child(
+                self.button(
+                    format!("choose-avatar-{}", a.id),
+                    t!("settings-change-picture-2"),
+                    "chevron-down",
+                    Action::AvatarMenu(a.id.clone()),
+                    false,
+                    cx,
+                )
+                .flex_row_reverse()
+                .border_1()
+                .border_color(rgb(c.border)),
+            );
+
+        // Its name here, how it signs in and what it's encrypted with.
+        let account = Rows::new()
+            .row(self.setting_row(
+                t!("settings-nickname"),
+                "",
+                text_field("account-nickname", &self.nickname_input),
             ))
-            .child(self.switch_setting(
-                t!("settings-ask-for-delivery-receipts"),
-                t!("settings-the-receiving-mail-servers-report-when"),
-                format!("delivery-receipts-{}", a.id),
-                a.delivery_receipts,
-                Action::ToggleDeliveryReceipts(a.id.clone()),
-                cx,
-            ))
-            // RFC 3461 §4.1, §4.3: which reports, and how much of the
-            // message a failure report returns.
-            .when(a.delivery_receipts, |page| {
-                let dsn = a.dsn;
-                let toggle =
-                    |title: &str, caption: &str, key: &str, on: bool, change: DsnChange| {
-                        self.switch_setting(
-                            title,
-                            caption,
-                            format!("dsn-{key}-{}", a.id),
-                            on,
-                            Action::SetDsn(a.id.clone(), change),
-                            cx,
-                        )
-                    };
-                page.child(toggle(
-                    t!("settings-report-delivery"),
-                    t!("settings-when-it-arrives"),
-                    "success",
-                    dsn.success,
-                    DsnChange::Success,
-                ))
-                .child(toggle(
-                    t!("settings-report-failure"),
-                    t!("settings-when-it-cant-be-delivered"),
-                    "failure",
-                    dsn.failure,
-                    DsnChange::Failure,
-                ))
-                .child(toggle(
-                    t!("settings-report-delays"),
-                    t!("settings-when-delivery-is-taking-longer-than"),
-                    "delay",
-                    dsn.delay,
-                    DsnChange::Delay,
-                ))
-                .child(toggle(
-                    t!("settings-return-the-full-message"),
-                    t!("settings-a-failure-report-includes-the-whole"),
-                    "full",
-                    dsn.return_full,
-                    DsnChange::ReturnFull,
+            .when(!a.oauth && a.service != Service::Pinal, |rows| {
+                rows.row(self.setting_row(
+                    t!("settings-sign-in-name"),
+                    "",
+                    text_field("account-login", &self.login_input),
                 ))
             })
-            .when_some(a.sso.as_ref(), |page, sso| {
-                let c = self.colors();
-                page.child(
-                    div()
-                        .id(SharedString::from(format!("sso-{}", a.id)))
-                        .debug_selector(|| "account-sso".into())
-                        .flex()
-                        .flex_col()
-                        .gap(px(2.))
-                        .child(
-                            div()
-                                .text_size(px(13.))
-                                .font_weight(FontWeight::MEDIUM)
-                                .child(t!("settings-single-sign-on")),
-                        )
-                        .child(div().text_size(px(12.)).text_color(rgb(c.muted)).child(t!(
-                            "settings-signed-in-through-in-the-browser",
-                            issuer = sso.issuer
-                        ))),
+            .when_some(a.sso.as_ref(), |rows, sso| {
+                rows.row(
+                    self.setting_label(
+                        t!("settings-single-sign-on"),
+                        &t!("settings-signed-in-through-in-the-browser", issuer = sso.issuer),
+                    )
+                    .id(SharedString::from(format!("sso-{}", a.id)))
+                    .debug_selector(|| "account-sso".into()),
                 )
             })
             .when(
                 matches!(a.provider, Provider::Imap | Provider::Pop3)
                     && !a.oauth
                     && !cfg!(any(target_os = "android", target_os = "ios")),
-                |page| {
-                    page.child(self.switch_setting(
+                |rows| {
+                    rows.row(self.switch_setting(
                         t!("settings-sign-in-with-kerberos"),
-                        if a.kerberos {
-                            t!("settings-picacho-signs-in-to-this-accounts")
-                        } else {
-                            t!("settings-use-this-computers-kerberos-ticket-kinit")
-                        },
+                        "",
                         format!("kerberos-{}", a.id),
                         a.kerberos,
                         Action::ToggleKerberos(a.id.clone()),
@@ -1399,239 +1317,45 @@ impl MailApp {
                     ))
                 },
             )
-            .child(self.switch_setting(
-                t!("settings-require-encryption-in-transit"),
-                t!("settings-messages-only-go-if-every-server"),
-                format!("require-tls-{}", a.id),
-                a.require_tls,
-                Action::ToggleRequireTls(a.id.clone()),
-                cx,
-            ))
-            // A JMAP server takes it as its submissions' BY parameter
-            // (RFC 8621 §7); Proton has no such option.
-            .when(a.provider != Provider::Proton, |page| {
-                page.child(
-                    self.setting(
-                        t!("settings-give-up-on-delivery-after"),
-                        t!("settings-where-your-outgoing-server-supports-it"),
-                        self.segmented(
-                            &format!("deliver-within-{}", a.id),
-                            [
-                                (0, t!("settings-days-as-usual")),
-                                (4, t!("settings-4-hours")),
-                                (24, t!("settings-1-day")),
-                            ]
-                            .into_iter()
-                            .map(|(hours, label)| {
-                                (
-                                    label.to_owned(),
-                                    Action::SetDeliverWithin(a.id.clone(), hours),
-                                    a.deliver_within_hours == hours,
-                                )
-                            })
-                            .collect(),
-                        cx,
-                    ),
-                ))
-            })
-            // RFC 2852 §4: what a late message does, and a trace of its
-            // way; only with a time limit.
-            .when(
-                a.provider != Provider::Proton && a.deliver_within_hours > 0,
-                |page| {
-                    page.child(
-                        self.setting(
-                            t!("settings-if-its-late"),
-                            t!("settings-return-it-to-you-or-deliver"),
-                            self.segmented(
-                                &format!("deliver-late-{}", a.id),
-                                [
-                                    (false, t!("settings-return-it")),
-                                    (true, t!("settings-deliver-and-tell-me")),
-                                ]
-                                .into_iter()
-                                .map(|(notify, label)| {
-                                    (
-                                        label.to_owned(),
-                                        Action::SetDeliverLateNotify(a.id.clone(), notify),
-                                        a.deliver_late_notify == notify,
-                                    )
-                                })
-                                .collect(),
-                            cx,
-                        ),
-                    ))
-                    .child(self.switch_setting(
-                        t!("settings-trace-its-delivery"),
-                        t!("settings-each-server-on-the-way-reports"),
-                        format!("deliver-by-trace-{}", a.id),
-                        a.deliver_by_trace,
-                        Action::ToggleDeliverByTrace(a.id.clone()),
-                        cx,
-                    ))
-                },
-            )
-            .when(a.provider != Provider::Proton, |page| {
-                page.child(self.switch_setting(
-                    t!("settings-let-the-server-send-scheduled-messages"),
-                    t!("settings-a-message-sent-later-goes-to"),
-                    format!("server-send-later-{}", a.id),
-                    a.server_send_later,
-                    Action::ToggleServerSendLater(a.id.clone()),
-                    cx,
-                ))
-            })
-            .child(self.identities_setting(a, cx))
-            .children(self.server_identities_setting(a, cx))
-            .when(a.provider != Provider::Pop3, |page| {
-                page.child(self.section(t!("settings-storage")))
-                    .child(self.storage(a))
-                    .children(self.server_notes_view(a))
-                    .children(self.jmap_access_note(a))
-                    .children(self.offline_note(a))
-            })
-            .when(Backend::may_filter(a), |page| {
-                page.child(self.section(t!("settings-filters-vacation")))
-                    .child(self.filters_setting(a, cx))
-            })
-            .child(self.section(t!("settings-profile-picture")))
-            .child(
-                self.setting(
-                    t!("settings-picture"),
-                    if a.provider == Provider::Gmail && a.oauth {
-                        t!("settings-shown-beside-this-mailbox-your-google")
-                    } else {
-                        t!("settings-shown-beside-this-mailbox-load-one")
-                    },
-                    div()
-                        .flex()
-                        .flex_wrap()
-                        .items_center()
-                        .gap_3()
-                        .child(
-                            div()
-                                .id(SharedString::from(format!("avatar-picker-{}", a.id)))
-                                .debug_selector(|| "avatar-picker".into())
-                                .rounded_full()
-                                .cursor_pointer()
-                                .hover(|s| s.opacity(0.85))
-                                .child(self.account_avatar(a, index, 48.))
-                                .tooltip(|w, cx| {
-                                    Tooltip::new(t!("settings-change-picture")).build(w, cx)
-                                })
-                                .on_click({
-                                    let id = a.id.clone();
-                                    cx.listener(move |this, _, w, cx| {
-                                        this.handle(Action::AvatarMenu(id.clone()), w, cx)
-                                    })
-                                }),
-                        )
-                        .child(
-                            self.button(
-                                format!("choose-avatar-{}", a.id),
-                                t!("settings-change-picture-2"),
-                                "chevron-down",
-                                Action::AvatarMenu(a.id.clone()),
-                                false,
-                                cx,
-                            )
-                            .flex_row_reverse()
-                            .border_1()
-                            .border_color(rgb(c.border)),
-                        ),
-                ),
-            )
-            .when(self.encrypted.contains(&a.id), |page| {
+            .when(self.encrypted.contains(&a.id), |rows| {
                 let locked = self.locked.contains(&a.id);
-                page.child(self.section(t!("settings-encryption")))
-                    .child(self.setting(
-                        t!("settings-zero-access-encryption"),
-                        if locked {
-                            t!("settings-your-mail-is-stored-encrypted-open")
-                        } else {
-                            t!("settings-your-mail-is-stored-encrypted-and")
-                        },
-                        if locked {
-                            div().into_any_element()
-                        } else {
-                            self.button(
-                                format!("lock-{}", a.id),
-                                t!("settings-forget-key"),
-                                "lock",
-                                Action::LockMail(a.id.clone()),
-                                false,
-                                cx,
-                            )
-                            .border_1()
-                            .border_color(rgb(c.border))
-                            .into_any_element()
-                        },
-                    ))
-            })
-            .child(self.section(t!("settings-sync")));
-        if a.provider != Provider::Pop3 {
-            page = page.child(
-                self.setting(
-                    t!("settings-keep-mail-from"),
-                    t!("settings-older-mail-stays-on-the-server"),
-                    self.segmented(
-                        &format!("days-{}", a.id),
-                        [
-                            (14, t!("settings-2-weeks")),
-                            (30, t!("settings-1-month")),
-                            (90, t!("settings-3-months")),
-                            (365, t!("settings-1-year")),
-                            (0, t!("settings-all")),
-                        ]
-                        .into_iter()
-                        .map(|(days, label)| {
-                            (
-                                label.to_owned(),
-                                set(SyncSettings { days, ..sync }),
-                                sync.days == days,
-                            )
-                        })
-                        .collect(),
-                        cx,
-                    ),
-                ),
-            );
-        }
-        if a.provider != Provider::Pop3 {
-            page = page.child(self.setting(
-                t!("settings-download-for-offline-reading"),
-                t!("settings-message-contents-in-this-range-download"),
-                self.segmented(
-                    &format!("offline-{}", a.id),
-                    [
-                        (30, t!("settings-1-month")),
-                        (365, t!("settings-1-year")),
-                        (0, t!("settings-all")),
-                        (OFFLINE_WHEN_OPENED, t!("settings-when-opened")),
-                    ]
-                    .into_iter()
-                    .map(|(days, label)| {
-                        (
-                            label.to_owned(),
-                            set(SyncSettings {
-                                offline_days: days,
-                                ..sync
-                            }),
-                            sync.offline_days == days,
+                rows.row(self.setting_row(
+                    t!("settings-zero-access-encryption"),
+                    if locked {
+                        t!("settings-your-mail-is-stored-encrypted-open")
+                    } else {
+                        ""
+                    },
+                    if locked {
+                        div().into_any_element()
+                    } else {
+                        self.button(
+                            format!("lock-{}", a.id),
+                            t!("settings-forget-key"),
+                            "lock",
+                            Action::LockMail(a.id.clone()),
+                            false,
+                            cx,
                         )
-                    })
-                    .collect(),
-                    cx,
-                ),
-            ));
-        }
+                        .border_1()
+                        .border_color(rgb(c.border))
+                        .into_any_element()
+                    },
+                ))
+            })
+            .when(a.provider == Provider::Jmap && a.credentials_of.is_empty(), |rows| {
+                rows.row(self.jmap_shared_setting(a, cx))
+            });
+
+        // How much mail it keeps, and how often it checks.
+        let mut sync_rows = Rows::new();
         if a.provider == Provider::Pop3 {
-            page = page
-                .child(self.setting(
+            sync_rows = sync_rows
+                .row(self.setting(
                     t!("settings-remove-from-the-server"),
-                    t!("settings-downloaded-mail-stays-on-this-computer"),
-                    self.segmented(
-                        &format!("pop-delete-{}", a.id),
+                    "",
+                    choices(
+                        format!("pop-delete-{}", a.id),
                         [
                             (None, t!("settings-never")),
                             (Some(0), t!("settings-after-download")),
@@ -1642,38 +1366,71 @@ impl MailApp {
                         .map(|(days, label)| {
                             (
                                 label.to_owned(),
-                                set(SyncSettings {
-                                    pop_delete_after_days: days,
-                                    ..sync
-                                }),
+                                set(SyncSettings { pop_delete_after_days: days, ..sync }),
                                 sync.pop_delete_after_days == days,
                             )
                         })
                         .collect(),
-                        cx,
                     ),
                 ))
-                .child(self.switch_setting(
+                .row(self.switch_setting(
                     t!("settings-delete-on-the-server-too"),
-                    t!("settings-deleting-a-message-for-good-here"),
+                    "",
                     format!("pop-delete-local-{}", a.id),
                     sync.pop_delete_with_local,
-                    Action::SetSync(
-                        a.id.clone(),
-                        SyncSettings {
-                            pop_delete_with_local: !sync.pop_delete_with_local,
-                            ..sync
-                        },
-                    ),
+                    set(SyncSettings { pop_delete_with_local: !sync.pop_delete_with_local, ..sync }),
                     cx,
                 ));
+        } else {
+            sync_rows = sync_rows
+                .row(self.setting(
+                    t!("settings-keep-mail-from"),
+                    "",
+                    choices(
+                        format!("days-{}", a.id),
+                        [
+                            (14, t!("settings-2-weeks")),
+                            (30, t!("settings-1-month")),
+                            (90, t!("settings-3-months")),
+                            (365, t!("settings-1-year")),
+                            (0, t!("settings-all")),
+                        ]
+                        .into_iter()
+                        .map(|(days, label)| {
+                            (label.to_owned(), set(SyncSettings { days, ..sync }), sync.days == days)
+                        })
+                        .collect(),
+                    ),
+                ))
+                .row(self.setting(
+                    t!("settings-download-for-offline-reading"),
+                    "",
+                    choices(
+                        format!("offline-{}", a.id),
+                        [
+                            (30, t!("settings-1-month")),
+                            (365, t!("settings-1-year")),
+                            (0, t!("settings-all")),
+                            (OFFLINE_WHEN_OPENED, t!("settings-when-opened")),
+                        ]
+                        .into_iter()
+                        .map(|(days, label)| {
+                            (
+                                label.to_owned(),
+                                set(SyncSettings { offline_days: days, ..sync }),
+                                sync.offline_days == days,
+                            )
+                        })
+                        .collect(),
+                    ),
+                ));
         }
-        page = page
-            .child(self.setting(
+        sync_rows = sync_rows
+            .row(self.setting(
                 t!("settings-check-for-new-mail"),
                 "",
-                self.segmented(
-                    &format!("refresh-{}", a.id),
+                choices(
+                    format!("refresh-{}", a.id),
                     [
                         (1, t!("settings-1-min")),
                         (5, t!("settings-5-min")),
@@ -1686,28 +1443,19 @@ impl MailApp {
                     .map(|(minutes, label)| {
                         (
                             label.to_owned(),
-                            set(SyncSettings {
-                                refresh_minutes: minutes,
-                                ..sync
-                            }),
+                            set(SyncSettings { refresh_minutes: minutes, ..sync }),
                             sync.refresh_minutes == minutes,
                         )
                     })
                     .collect(),
-                    cx,
                 ),
-            ));
-        if a.provider == Provider::Proton {
-            page = page.child(
-                self.setting(
+            ))
+            .when(a.provider == Provider::Proton, |rows| {
+                rows.row(self.setting(
                     t!("settings-check-proton-for-changes"),
-                    if sync.proton_events_seconds == 0 {
-                        t!("settings-new-mail-moves-and-notices-from")
-                    } else {
-                        t!("settings-how-often-picacho-asks-proton-about")
-                    },
-                    self.segmented(
-                        &format!("proton-events-{}", a.id),
+                    "",
+                    choices(
+                        format!("proton-events-{}", a.id),
                         [
                             (15, t!("settings-15-sec")),
                             (30, t!("settings-30-sec")),
@@ -1725,102 +1473,247 @@ impl MailApp {
                             )
                         })
                         .collect(),
+                    ),
+                ))
+            })
+            .row(self.toggle_row(
+                t!("settings-notifications"),
+                if sync.refresh_minutes == 0 && !a.pushes_new_mail() {
+                    t!("settings-announce-new-inbox-mail-only-works")
+                } else {
+                    ""
+                },
+                self.switch(
+                    format!("notify-{}", a.id),
+                    sync.notify,
+                    // Push needs Notifications: turning them off turns it off too.
+                    set(SyncSettings {
+                        notify: !sync.notify,
+                        proton_push: sync.proton_push && !sync.notify,
+                        ..sync
+                    }),
                     cx,
                 ),
-            ));
-        }
-        page = page
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_4()
-                    .child(
-                        div()
-                            .flex_1()
-                            .flex()
-                            .flex_col()
-                            .gap(px(2.))
-                            .child(
-                                div()
-                                    .text_size(px(13.))
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .child(t!("settings-notifications")),
-                            )
-                            .child(div().text_size(px(12.)).text_color(rgb(c.muted)).child(
-                                if a.pushes_new_mail() {
-                                    t!("settings-announce-new-inbox-mail-protons-push")
-                                } else if sync.refresh_minutes == 0 {
-                                    t!("settings-announce-new-inbox-mail-only-works")
-                                } else {
-                                    t!("settings-announce-new-inbox-mail-while-picacho")
-                                },
-                            )),
-                    )
-                    .child(self.switch(
-                        format!("notify-{}", a.id),
-                        sync.notify,
-                        // Push needs Notifications: turning them off turns it off too.
-                        set(SyncSettings {
-                            notify: !sync.notify,
-                            proton_push: sync.proton_push && !sync.notify,
-                            ..sync
-                        }),
-                        cx,
-                    )),
-            )
-            .when(a.provider == Provider::Proton, |page| {
-                page.child(self.proton_push_setting(a, cx))
+            ))
+            .when(a.provider == Provider::Proton, |rows| {
+                rows.row(self.proton_push_setting(a, cx))
             })
-            .when(a.provider.imap(), |page| {
-                page.child(self.switch_setting(
+            .when(a.provider.imap(), |rows| {
+                rows.row(self.switch_setting(
                     t!("settings-only-subscribed-folders"),
-                    t!("settings-show-only-the-folders-subscribed-to"),
+                    "",
                     format!("subscribed-only-{}", a.id),
                     sync.subscribed_only,
-                    Action::SetSync(
-                        a.id.clone(),
-                        SyncSettings {
-                            subscribed_only: !sync.subscribed_only,
-                            ..sync
-                        },
+                    set(SyncSettings { subscribed_only: !sync.subscribed_only, ..sync }),
+                    cx,
+                ))
+            });
+
+        // What its messages say about you, and what they ask for.
+        let sending = Rows::new()
+            .row(self.setting_row(
+                t!("settings-reply-to"),
+                if crate::sync::smtp::recipients(&a.reply_to).is_err() {
+                    t!("settings-this-isnt-a-valid-address-messages")
+                } else {
+                    ""
+                },
+                text_field("account-reply-to", &self.reply_to_input),
+            ))
+            .row(self.identities_setting(a, cx))
+            .rows(self.server_identities_setting(a, cx))
+            .row(self.switch_setting(
+                t!("settings-ask-for-read-receipts"),
+                "",
+                format!("read-receipts-{}", a.id),
+                a.read_receipts,
+                Action::ToggleReadReceipts(a.id.clone()),
+                cx,
+            ))
+            .row(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .child(self.switch_setting(
+                        t!("settings-ask-for-delivery-receipts"),
+                        "",
+                        format!("delivery-receipts-{}", a.id),
+                        a.delivery_receipts,
+                        Action::ToggleDeliveryReceipts(a.id.clone()),
+                        cx,
+                    ))
+                    // RFC 3461 §4.1, §4.3: which reports, and how much of
+                    // the message a failure report returns.
+                    .when(a.delivery_receipts, |d| {
+                        let dsn = a.dsn;
+                        let toggle = |title: &str, key: &str, on: bool, change: DsnChange| {
+                            self.switch_setting(
+                                title,
+                                "",
+                                format!("dsn-{key}-{}", a.id),
+                                on,
+                                Action::SetDsn(a.id.clone(), change),
+                                cx,
+                            )
+                        };
+                        d.child(
+                            div()
+                                .pl_4()
+                                .flex()
+                                .flex_col()
+                                .gap_3()
+                                .border_l_2()
+                                .border_color(rgb(c.border))
+                                .child(toggle(
+                                    t!("settings-report-delivery"),
+                                    "success",
+                                    dsn.success,
+                                    DsnChange::Success,
+                                ))
+                                .child(toggle(
+                                    t!("settings-report-failure"),
+                                    "failure",
+                                    dsn.failure,
+                                    DsnChange::Failure,
+                                ))
+                                .child(toggle(
+                                    t!("settings-report-delays"),
+                                    "delay",
+                                    dsn.delay,
+                                    DsnChange::Delay,
+                                ))
+                                .child(toggle(
+                                    t!("settings-return-the-full-message"),
+                                    "full",
+                                    dsn.return_full,
+                                    DsnChange::ReturnFull,
+                                )),
+                        )
+                    }),
+            );
+
+        // How the outgoing server handles its messages.
+        let delivery = Rows::new()
+            .row(self.switch_setting(
+                t!("settings-require-encryption-in-transit"),
+                "",
+                format!("require-tls-{}", a.id),
+                a.require_tls,
+                Action::ToggleRequireTls(a.id.clone()),
+                cx,
+            ))
+            // A JMAP server takes it as its submissions' BY parameter
+            // (RFC 8621 §7); Proton has no such option.
+            .when(a.provider != Provider::Proton, |rows| {
+                rows.row(self.setting_row(
+                    t!("settings-give-up-on-delivery-after"),
+                    "",
+                    choices(
+                        format!("deliver-within-{}", a.id),
+                        [
+                            (0, t!("settings-days-as-usual")),
+                            (4, t!("settings-4-hours")),
+                            (24, t!("settings-1-day")),
+                        ]
+                        .into_iter()
+                        .map(|(hours, label)| {
+                            (
+                                label.to_owned(),
+                                Action::SetDeliverWithin(a.id.clone(), hours),
+                                a.deliver_within_hours == hours,
+                            )
+                        })
+                        .collect(),
                     ),
+                ))
+            })
+            // RFC 2852 §4: what a late message does, and a trace of its
+            // way; only with a time limit.
+            .when(a.provider != Provider::Proton && a.deliver_within_hours > 0, |rows| {
+                rows.row(self.setting_row(
+                    t!("settings-if-its-late"),
+                    "",
+                    choices(
+                        format!("deliver-late-{}", a.id),
+                        [
+                            (false, t!("settings-return-it")),
+                            (true, t!("settings-deliver-and-tell-me")),
+                        ]
+                        .into_iter()
+                        .map(|(notify, label)| {
+                            (
+                                label.to_owned(),
+                                Action::SetDeliverLateNotify(a.id.clone(), notify),
+                                a.deliver_late_notify == notify,
+                            )
+                        })
+                        .collect(),
+                    ),
+                ))
+                .row(self.switch_setting(
+                    t!("settings-trace-its-delivery"),
+                    "",
+                    format!("deliver-by-trace-{}", a.id),
+                    a.deliver_by_trace,
+                    Action::ToggleDeliverByTrace(a.id.clone()),
                     cx,
                 ))
             })
-            .when(a.provider == Provider::Jmap && a.credentials_of.is_empty(), |page| {
-                page.child(self.jmap_shared_setting(a, cx))
-            })
-            .child(self.section(t!("settings-account")))
-            .child(
+            .when(a.provider != Provider::Proton, |rows| {
+                rows.row(self.switch_setting(
+                    t!("settings-let-the-server-send-scheduled-messages"),
+                    "",
+                    format!("server-send-later-{}", a.id),
+                    a.server_send_later,
+                    Action::ToggleServerSendLater(a.id.clone()),
+                    cx,
+                ))
+            });
+
+        let storage = Rows::new().when(a.provider != Provider::Pop3, |rows| {
+            rows.row(
                 div()
                     .flex()
-                    .items_center()
-                    .flex_wrap()
-                    .gap_3()
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w(px(160.))
-                            .text_size(px(12.))
-                            .text_color(rgb(c.muted))
-                            .child(t!("settings-removing-this-account-deletes-its-mail")),
-                    )
-                    .child(
-                        self.button(
-                            format!("remove-{}", a.id),
-                            t!("settings-remove-account"),
-                            "trash",
-                            Action::ConfirmRemove(a.id.clone()),
-                            false,
-                            cx,
-                        )
-                        .border_1()
-                        .border_color(rgb(c.border))
-                        .text_color(rgb(c.danger)),
-                    ),
-            );
-        page.into_any_element()
+                    .flex_col()
+                    .gap_2()
+                    .child(self.storage(a))
+                    .children(self.server_notes_view(a))
+                    .children(self.jmap_access_note(a))
+                    .children(self.offline_note(a)),
+            )
+        });
+        let filters = Rows::new()
+            .when(Backend::may_filter(a), |rows| rows.row(self.filters_setting(a, cx)));
+        let remove = Rows::new().row(self.setting_row(
+            t!("settings-remove-account"),
+            t!("settings-removing-this-account-deletes-its-mail"),
+            self.button(
+                format!("remove-{}", a.id),
+                t!("settings-remove-account"),
+                "trash",
+                Action::ConfirmRemove(a.id.clone()),
+                false,
+                cx,
+            )
+            .border_1()
+            .border_color(rgb(c.border))
+            .text_color(rgb(c.danger)),
+        ));
+
+        self.settings_column()
+            .child(header)
+            .when(self.settings_page_has_errors(), |page| {
+                page.child(self.account_error_details(a, cx))
+            })
+            .child(self.settings_group(t!("settings-account"), account))
+            .child(self.settings_group(t!("settings-sync"), sync_rows))
+            .child(self.settings_group(t!("settings-sending"), sending))
+            .child(self.settings_group(t!("settings-delivery"), delivery))
+            .child(self.settings_group(t!("settings-storage"), storage))
+            .child(self.settings_group(t!("settings-filters-vacation"), filters))
+            .child(self.settings_group("", remove))
+            .into_any_element()
     }
 }
 
@@ -1899,9 +1792,9 @@ impl MailApp {
             .flex()
             .flex_col()
             .gap_2()
-            .child(self.setting(
+            .child(self.setting_row(
                 t!("settings-shared-with-you"),
-                t!("settings-mail-accounts-others-share-with-this"),
+                "",
                 find,
             ))
             .child(list)
@@ -1924,7 +1817,7 @@ impl MailApp {
         }
         self.switch_setting(
             title,
-            t!("settings-proton-sends-new-mail-and-its"),
+            "",
             format!("proton-push-{}", a.id),
             sync.proton_push,
             Action::SetSync(a.id.clone(), SyncSettings { proton_push: !sync.proton_push, ..sync }),
@@ -2016,9 +1909,9 @@ impl MailApp {
             .flex()
             .flex_col()
             .gap_3()
-            .child(self.setting(
+            .child(self.setting_row(
                 t!("settings-other-addresses"),
-                &t!("settings-addresses-also-sends-as-chosen-in", email = a.email),
+                "",
                 if adding {
                     div().into_any_element()
                 } else {
@@ -2088,7 +1981,7 @@ impl MailApp {
             )))
             .child(self.switch_setting(
                 t!("settings-use-its-own-outgoing-server"),
-                t!("settings-send-through-another-providers-smtp-server"),
+                "",
                 "identity-own-server".into(),
                 edit.own_server,
                 Action::ToggleIdentityServer,
@@ -2173,7 +2066,7 @@ impl MailApp {
     /// Running in the background once Picacho's windows close, and its tray
     /// icon (desktop); its mail service (Android); background app refresh
     /// (iOS).
-    fn background_settings(&self, page: Div, cx: &Context<Self>) -> Div {
+    fn background_settings(&self, cx: &Context<Self>) -> Rows {
         let background = self
             .switch(
                 "background".into(),
@@ -2182,23 +2075,12 @@ impl MailApp {
                 cx,
             )
             .debug_selector(|| "background".into());
-        if cfg!(target_os = "ios") {
-            return page
-                .child(self.section(t!("settings-background")))
-                .child(self.toggle_row(
-                    t!("settings-check-for-mail-in-the-background"),
-                    t!("settings-while-picacho-isnt-open-check-for"),
-                    background,
-                ));
-        }
-        if cfg!(target_os = "android") {
-            return page
-                .child(self.section(t!("settings-background")))
-                .child(self.toggle_row(
-                    t!("settings-check-for-mail-in-the-background"),
-                    t!("settings-after-picacho-is-closed-keep-checking"),
-                    background,
-                ));
+        if cfg!(any(target_os = "ios", target_os = "android")) {
+            return Rows::new().row(self.toggle_row(
+                t!("settings-check-for-mail-in-the-background"),
+                t!("settings-new-mail-scheduled-mail-and-snoozes"),
+                background,
+            ));
         }
         let tray = self
             .switch(
@@ -2208,17 +2090,13 @@ impl MailApp {
                 cx,
             )
             .debug_selector(|| "tray-icon".into());
-        page.child(self.section(t!("settings-background")))
-            .child(self.toggle_row(
+        Rows::new()
+            .row(self.toggle_row(
                 t!("settings-keep-running-in-the-background"),
-                t!("settings-when-you-close-picachos-window-keep"),
+                t!("settings-new-mail-scheduled-mail-and-snoozes"),
                 background,
             ))
-            .child(self.toggle_row(
-                t!("settings-show-tray-icon-while-open"),
-                t!("settings-also-show-picachos-tray-icon-while"),
-                tray,
-            ))
+            .row(self.toggle_row(t!("settings-show-tray-icon-while-open"), "", tray))
     }
     /// Moves Settings between a dialog, the full main window and a window
     /// of its own, keeping the page and everything on it.

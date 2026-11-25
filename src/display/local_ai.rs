@@ -683,137 +683,138 @@ impl MailApp {
 
     pub(super) fn local_ai_page(&self, cx: &Context<Self>) -> AnyElement {
         let c = self.colors();
-        let model = &local_ai::OTP;
-        let error = self.model_error.clone();
-        div()
-            .flex()
-            .flex_col()
-            .gap_5()
-            .child(self.section(t!("local-ai-local-ai")))
-            .child(div().text_size(px(12.)).text_color(rgb(c.muted)).child(
-                t!("local-ai-small-models-that-run-on-this"),
+        // A feature's switch, and what went wrong getting its model.
+        let feature = |title: &str,
+                       caption: &str,
+                       id: &str,
+                       on: bool,
+                       toggle: Action,
+                       status: &'static str,
+                       error: Option<String>,
+                       retry: Action| {
+            div()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .when(!self.local_ai, |d| d.opacity(0.5))
+                .child(self.switch_setting(title, caption, id.into(), on, toggle, cx))
+                .children(self.feature_error(status, error, retry, cx))
+        };
+        let features = Rows::new()
+            .row(feature(
+                t!("local-ai-hide-sign-in-codes"),
+                &t!(
+                    "local-ai-find-two-factor-verification-and-sign",
+                    b = otp::BULLET,
+                    size = mb(local_ai::OTP.size)
+                ),
+                "local-ai-otp",
+                self.hide_codes,
+                // Needs Local AI on first.
+                Action::SetHideCodes(self.local_ai && !self.hide_codes),
+                "local-ai-status",
+                self.model_error.clone(),
+                Action::SetHideCodes(true),
             ))
-            .child(self.switch_setting(
+            .row(feature(
+                t!("local-ai-understand-typed-dates"),
+                &t!("local-ai-type-when-to-snooze-a-message", size = mb(local_ai::WHEN.size)),
+                "local-ai-when",
+                self.understand_dates,
+                Action::SetUnderstandDates(self.local_ai && !self.understand_dates),
+                "local-ai-when-status",
+                self.when_error.clone(),
+                Action::SetUnderstandDates(true),
+            ))
+            .row(feature(
+                t!("local-ai-find-tracking-numbers"),
+                &t!("local-ai-confirm-the-tracking-numbers-found-in", size = mb(local_ai::PARCEL.size)),
+                "local-ai-parcel",
+                self.find_parcels,
+                Action::SetFindParcels(self.local_ai && !self.find_parcels),
+                "local-ai-parcel-status",
+                self.parcel_error.clone(),
+                Action::SetFindParcels(true),
+            ))
+            .row(feature(
+                t!("local-ai-suggest-replies"),
+                &t!("local-ai-offer-a-few-short-replies-under", size = mb(local_ai::REPLIES.size)),
+                "local-ai-replies",
+                self.suggest_replies,
+                Action::SetSuggestReplies(self.local_ai && !self.suggest_replies),
+                "local-ai-replies-status",
+                self.replies_error.clone(),
+                Action::SetSuggestReplies(true),
+            ))
+            .when(!self.reply_history.is_empty(), |rows| {
+                let hidden = self.reply_history.dismissed().len();
+                rows.row(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .text_size(px(12.))
+                        .text_color(rgb(c.muted))
+                        .child(div().flex_1().min_w_0().child(if hidden == 0 {
+                            t!("local-ai-picacho-remembers-which-suggested-replies-you").to_owned()
+                        } else {
+                            t!("local-ai-picacho-remembers-which-suggested-replies-you-2", hidden = hidden)
+                        }))
+                        .child(self.link(
+                            "local-ai-replies-forget",
+                            t!("local-ai-forget"),
+                            Action::ForgetReplyHistory,
+                            cx,
+                        )),
+                )
+            });
+        let total = local_ai::installed_size(&self.backend.store);
+        self.settings_column()
+            .child(self.settings_group(
                 t!("local-ai-local-ai"),
-                t!("local-ai-turning-this-off-deletes-every-model"),
-                "local-ai".into(),
-                self.local_ai,
-                Action::SetLocalAi(!self.local_ai),
-                cx,
+                Rows::new().row(self.switch_setting(
+                    t!("local-ai-local-ai"),
+                    t!("local-ai-turning-this-off-deletes-every-model"),
+                    "local-ai".into(),
+                    self.local_ai,
+                    Action::SetLocalAi(!self.local_ai),
+                    cx,
+                )),
             ))
-            .child(self.section(t!("local-ai-features")))
+            .child(self.settings_group(t!("local-ai-features"), features))
             .child(
                 div()
                     .flex()
                     .flex_col()
                     .gap_2()
-                    .when(!self.local_ai, |d| d.opacity(0.5))
-                    .child(self.switch_setting(
-                        t!("local-ai-hide-sign-in-codes"),
-                        &t!("local-ai-find-two-factor-verification-and-sign", b = otp::BULLET, model = model.label.to_lowercase(), size = mb(model.size)),
-                        "local-ai-otp".into(),
-                        self.hide_codes,
-                        // Needs Local AI on first.
-                        Action::SetHideCodes(self.local_ai && !self.hide_codes),
-                        cx,
-                    ))
-                    .children(self.feature_error(
-                        "local-ai-status",
-                        error,
-                        Action::SetHideCodes(true),
-                        cx,
-                    ))
-                    .child(self.switch_setting(
-                        t!("local-ai-understand-typed-dates"),
-                        &t!("local-ai-type-when-to-snooze-a-message", model = local_ai::WHEN.label.to_lowercase(), size = mb(local_ai::WHEN.size)),
-                        "local-ai-when".into(),
-                        self.understand_dates,
-                        Action::SetUnderstandDates(self.local_ai && !self.understand_dates),
-                        cx,
-                    ))
-                    .children(self.feature_error(
-                        "local-ai-when-status",
-                        self.when_error.clone(),
-                        Action::SetUnderstandDates(true),
-                        cx,
-                    ))
-                    .child(self.switch_setting(
-                        t!("local-ai-find-tracking-numbers"),
-                        &t!("local-ai-confirm-the-tracking-numbers-found-in", model = local_ai::PARCEL.label.to_lowercase(), size = mb(local_ai::PARCEL.size)),
-                        "local-ai-parcel".into(),
-                        self.find_parcels,
-                        Action::SetFindParcels(self.local_ai && !self.find_parcels),
-                        cx,
-                    ))
-                    .children(self.feature_error(
-                        "local-ai-parcel-status",
-                        self.parcel_error.clone(),
-                        Action::SetFindParcels(true),
-                        cx,
-                    ))
-                    .child(self.switch_setting(
-                        t!("local-ai-suggest-replies"),
-                        &t!("local-ai-offer-a-few-short-replies-under", model = local_ai::REPLIES.label.to_lowercase(), size = mb(local_ai::REPLIES.size)),
-                        "local-ai-replies".into(),
-                        self.suggest_replies,
-                        Action::SetSuggestReplies(self.local_ai && !self.suggest_replies),
-                        cx,
-                    ))
-                    .children(self.feature_error(
-                        "local-ai-replies-status",
-                        self.replies_error.clone(),
-                        Action::SetSuggestReplies(true),
-                        cx,
-                    ))
-                    .when(!self.reply_history.is_empty(), |d| {
-                        let hidden = self.reply_history.dismissed().len();
+                    .child(self.section(t!("local-ai-models")))
+                    .child(
+                        div()
+                            .id("local-ai-models")
+                            .debug_selector(|| "local-ai-models".into())
+                            .flex()
+                            .flex_col()
+                            .rounded(px(12.))
+                            .border_1()
+                            .border_color(rgb(c.border))
+                            .bg(rgb(c.raised))
+                            .children(
+                                local_ai::MODELS
+                                    .into_iter()
+                                    .enumerate()
+                                    .map(|(i, m)| self.model_row(m, i > 0, cx)),
+                            ),
+                    )
+                    .when(total > 0, |d| {
                         d.child(
                             div()
-                                .flex()
-                                .items_center()
-                                .gap_2()
+                                .px_1()
                                 .text_size(px(12.))
                                 .text_color(rgb(c.muted))
-                                .child(div().flex_1().min_w_0().child(if hidden == 0 {
-                                    t!("local-ai-picacho-remembers-which-suggested-replies-you").to_owned()
-                                } else {
-                                    t!("local-ai-picacho-remembers-which-suggested-replies-you-2", hidden = hidden)
-                                }))
-                                .child(self.link(
-                                    "local-ai-replies-forget",
-                                    t!("local-ai-forget"),
-                                    Action::ForgetReplyHistory,
-                                    cx,
-                                )),
+                                .child(t!("local-ai-on-this-computer", size = mb(total))),
                         )
                     }),
             )
-            .child(self.section(t!("local-ai-models")))
-            .child(
-                div()
-                    .id("local-ai-models")
-                    .debug_selector(|| "local-ai-models".into())
-                    .flex()
-                    .flex_col()
-                    .rounded(px(10.))
-                    .border_1()
-                    .border_color(rgb(c.border))
-                    .children(
-                        local_ai::MODELS
-                            .into_iter()
-                            .enumerate()
-                            .map(|(i, m)| self.model_row(m, i > 0, cx)),
-                    ),
-            )
-            .child(div().text_size(px(12.)).text_color(rgb(c.muted)).child({
-                let total = local_ai::installed_size(&self.backend.store);
-                let about = t!("local-ai-models-download-when-a-feature-that");
-                if total > 0 {
-                    crate::i18n::sentences(&t!("local-ai-on-this-computer", size = mb(total)), about)
-                } else {
-                    about.to_owned()
-                }
-            }))
             .into_any_element()
     }
 

@@ -348,6 +348,15 @@ same version in `Cargo.toml`.
   screen as it goes), and from the first screen home, keeping Picacho where
   it was.
 
+### Changed
+
+- Settings is reorganized: every page groups its settings into titled
+  cards, with controls beside their names where they fit and long
+  explanations trimmed to a few words. A mailbox's page starts with its
+  picture (Change Picture is beside it), then Account, Sync, Sending,
+  Delivery, Storage and Filters; Contacts and Calendar show your contacts,
+  events and tasks before their server settings.
+
 ### Fixed
 
 - Tasks no longer show as events in calendars that hold both, tasks

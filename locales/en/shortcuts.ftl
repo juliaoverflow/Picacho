@@ -154,7 +154,7 @@ shortcuts-add-ctrl-or-alt-to-that = Add Ctrl or Alt to that key
 
 shortcuts-no-longer-has = { $actions } no longer has { $keys }
 
-shortcuts-click-a-shortcut-and-press-the = Click a shortcut and press the keys you'd like for it. For a sequence, press the next key within a second. Keys another action had are taken from it.
+shortcuts-click-a-shortcut-and-press-the = Click a shortcut, then press the keys you want.
 
 shortcuts-change-the-shortcut-for = Change the shortcut for { $label }
 
@@ -169,8 +169,6 @@ shortcuts-use-the-default-shortcut = Use the default shortcut
 shortcuts-no-shortcut = No shortcut
 
 shortcuts-shortcuts-file = Shortcuts File
-
-shortcuts-shortcuts-are-kept-in-a-line = Shortcuts are kept in { $file }, a line per action such as “reply = secondary-shift-r”. Edits to it apply as soon as it's saved.
 
 shortcuts-edit-as-text = Edit as Text
 

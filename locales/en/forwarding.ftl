@@ -23,8 +23,6 @@ forwarding-cancel = Cancel
 
 forwarding-forwarding = Forwarding
 
-forwarding-manage-your-simplelogin-addy-io-and = Manage your SimpleLogin, addy.io and Firefox Relay aliases. Their mail can stay in its mailbox or appear as an account of its own.
-
 forwarding-add-service = Add Service
 
 forwarding-add-a-service = Add a Service
@@ -35,7 +33,7 @@ forwarding-open = Open
 
 forwarding-server = Server
 
-forwarding-only-for-a-self-hosted-server = Only for a self-hosted server; blank uses { $default_server }. The key is kept in the system keychain.
+forwarding-only-for-a-self-hosted-server = Only for a self-hosted server. Blank uses { $default_server }.
 
 forwarding-connecting = Connecting…
 

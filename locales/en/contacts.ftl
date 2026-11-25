@@ -3,16 +3,16 @@
 contacts-contacts = Contacts
 
 contacts-in-your-address-book-the-composer = { $count ->
-        [0] No addresses in your address book. The composer suggests them first, then people from your mail.
-        [one] { $count } address in your address book. The composer suggests them first, then people from your mail.
-       *[other] { $count } addresses in your address book. The composer suggests them first, then people from your mail.
+        [0] No addresses saved.
+        [one] { $count } address saved.
+       *[other] { $count } addresses saved.
     }
 
 contacts-contacts-server-carddav = Contacts server (CardDAV)
 
 contacts-signed-in-as-read-read-again = { $how ->
-        [account] Signed in as { $user }, with your { $email } account's sign-in. Read { $synced }; read again each time Picacho starts.
-       *[password] Signed in as { $user }. Read { $synced }; read again each time Picacho starts.
+        [account] { $user }, through your { $email } account · Read { $synced }
+       *[password] { $user } · Read { $synced }
     }
 
 contacts-reading = Reading…
@@ -23,19 +23,15 @@ contacts-disconnect = Disconnect
 
 contacts-new-address-book = New address book
 
-contacts-made-on-the-server-new-contacts = Made on the server; new contacts then go to it.
-
 contacts-make-address-book = Make Address Book
 
-contacts-read-and-edit-your-address-books = Read and edit your address books on Fastmail, iCloud, Nextcloud, Radicale or another CardDAV server. iCloud and Fastmail need an app password.
+contacts-read-and-edit-your-address-books = Fastmail, iCloud, Nextcloud, Radicale or another CardDAV server.
 
 contacts-server = Server
 
 contacts-user-name = User name
 
 contacts-password = Password
-
-contacts-kept-in-the-system-keychain = Kept in the system keychain.
 
 contacts-connecting = Connecting…
 
@@ -44,8 +40,6 @@ contacts-connect = Connect
 contacts-files = Files
 
 contacts-vcard-files = vCard files
-
-contacts-import-contacts-exported-from-another-address = Import contacts exported from another address book (.vcf), or save yours as one.
 
 contacts-import = Import…
 
@@ -105,9 +99,9 @@ contacts-rename = Rename
 
 contacts-delete = Delete
 
-contacts-the-server-keeps-mb-of-yours = The server keeps { $used } MB of yours, with { $left } MB left.
+contacts-the-server-keeps-mb-of-yours = { $used } MB used, { $left } MB left.
 
-contacts-rename-uses-the-name-written-in = Rename uses the name written in the field above. Deleting removes the book and its contacts from the server.
+contacts-rename-uses-the-name-written-in = Rename uses the name in the field above.
 
 contacts-new-contact = New contact
 

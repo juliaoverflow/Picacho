@@ -1451,12 +1451,14 @@ impl MailApp {
                             .font_weight(FontWeight::MEDIUM)
                             .child(title.to_owned()),
                     )
-                    .child(
-                        div()
-                            .text_size(px(12.))
-                            .text_color(rgb(c.muted))
-                            .child(caption.to_owned()),
-                    ),
+                    .when(!caption.is_empty(), |d| {
+                        d.child(
+                            div()
+                                .text_size(px(12.))
+                                .text_color(rgb(c.muted))
+                                .child(caption.to_owned()),
+                        )
+                    }),
             )
             .child(control)
     }

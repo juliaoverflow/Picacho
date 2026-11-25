@@ -54,11 +54,7 @@ encryption-no-keys-yet = No keys yet.
 
 encryption-openpgp-keys = OpenPGP keys
 
-encryption-with-your-key-picacho-opens-mail = With your key, Picacho opens mail encrypted to you and signs what you send; with others' public keys, it checks their signatures and encrypts to them. Choose Sign or Encrypt in the composer's menu. Pinal Mail's own encryption needs nothing here.
-
-encryption-import-keys = Import keys
-
-encryption-choose-armored-key-files-asc-a = Choose armored key files (.asc). A secret key with a passphrase needs it once: it's then kept, without the passphrase, in the system keychain.
+encryption-import-keys = Add keys
 
 encryption-new-and-renewed-keys-expire = New and renewed keys expire:
 
@@ -67,8 +63,6 @@ encryption-import-keys-2 = Import Keys…
 encryption-create-a-key = Create a Key
 
 encryption-share-your-public-key = Share your public key
-
-encryption-save-it-to-send-to-people = Save it to send to people who'll write to you encrypted, publish it on keys.openpgp.org (which lists an address only once its owner confirms it by email) or on an HKP keyserver (which lists every address on it at once, for good), or export Web Key Directory (WKD) files to host on your own domain.
 
 encryption-save-public-keys = Save Public Keys…
 
@@ -80,21 +74,15 @@ encryption-publish-on-keyserver = Publish on Keyserver…
 
 encryption-ask-for-encrypted-replies = Ask for encrypted replies ({ $email })
 
-encryption-tells-peoples-mail-apps-in-the = Tells people's mail apps (in the Autocrypt header of mail you send) that you'd like them to encrypt to you by default. Their app decides; apps that don't use Autocrypt ignore it.
-
 encryption-find-keys = Find keys
-
-encryption-look-up-the-keys-of-people = Look up the keys of people you've written to or heard from, on their domain (WKD) and keys.openpgp.org. Picacho also looks when you send encrypted mail to someone without a key, and keeps the keys people's mail apps send along (Autocrypt). Keys you imported yourself are never replaced.
 
 encryption-looking = Looking…
 
 encryption-find-key = Find Key
 
-encryption-certificates-many-companies-and-authorities-issue = Certificates many companies and authorities issue. Import yours as a .p12 or .pfx file (with its password); others' certificates are kept from the signed mail they send you, or imported as .pem, .crt or .cer. In the composer, choose S/MIME in place of OpenPGP.
-
 encryption-import-certificates = Import certificates
 
-encryption-your-own-p12-pfx-with-the = Your own (.p12, .pfx) with the password above, or someone else's (.pem, .crt, .cer).
+encryption-your-own-p12-pfx-with-the = .p12 or .pfx (with the passphrase above), .pem, .crt or .cer.
 
 encryption-import-certificates-2 = Import Certificates…
 
@@ -113,7 +101,7 @@ encryption-import-certificates-3 = Import Certificates
 
 encryption-revocation-lists-crl = Revocation lists (CRL)
 
-encryption-lists-of-withdrawn-certificates-as-your = Lists of withdrawn certificates, as your organization or a certificate authority publishes them (.crl or .pem). Signatures are then checked against them; a copy of each is kept here, so update it by adding the new one.
+encryption-lists-of-withdrawn-certificates-as-your = Withdrawn certificates to check signatures against (.crl or .pem).
 
 encryption-revocation-lists = Revocation lists
 
@@ -232,7 +220,7 @@ encryption-modern-v6 = Modern (v6)
 
 encryption-key-type = Key type:
 
-encryption-modern-keys-arent-yet-readable-by = Modern keys aren't yet readable by many mail apps. Choose Standard unless your correspondents use OpenPGP v6.
+encryption-modern-keys-arent-yet-readable-by = Many mail apps can't read Modern keys yet.
 
 encryption-out-of-date-since-add-a = out of date since { $d }: add a newer one
 

@@ -770,27 +770,22 @@ impl MailApp {
             Some(b) => t!("applock-your-passcode-or", label = b.label()),
             None => t!("applock-your-passcode").into(),
         };
-        let mut page = div()
-            .flex()
-            .flex_col()
-            .gap_5()
-            .child(self.section(t!("applock-app-lock")))
-            .child(self.switch_setting(
-                t!("applock-lock-picacho"),
-                &t!("applock-ask-for-when-picacho-opens-and", unlocks = unlocks),
-                "app-lock".into(),
-                on,
-                Action::Lock(LockAction::Form(Some(if on { LockForm::Disable } else { LockForm::Enable }))),
-                cx,
-            ));
+        let mut app_lock = Rows::new().row(self.switch_setting(
+            t!("applock-lock-picacho"),
+            &t!("applock-ask-for-when-picacho-opens-and", unlocks = unlocks),
+            "app-lock".into(),
+            on,
+            Action::Lock(LockAction::Form(Some(if on { LockForm::Disable } else { LockForm::Enable }))),
+            cx,
+        ));
         if matches!(lock.form, Some(LockForm::Enable | LockForm::Disable)) {
-            page = page.child(self.lock_form(cx));
+            app_lock = app_lock.row(self.lock_form(cx));
         }
         if on {
             if let Some(b) = lock.biometry {
-                page = page.child(self.switch_setting(
+                app_lock = app_lock.row(self.switch_setting(
                     &t!("applock-unlock-with", title = b.title()),
-                    &t!("applock-unlocks-picacho-as-well-as-its", title = b.title()),
+                    "",
                     "app-lock-biometrics".into(),
                     lock.settings.biometrics,
                     Action::Lock(LockAction::SetBiometrics(!lock.settings.biometrics)),
@@ -801,14 +796,12 @@ impl MailApp {
                 target_os = "ios",
                 target_os = "android"
             )) {
-                page = page.child(caption(
-                    t!("applock-set-up-touch-id-face-id"),
-                ));
+                app_lock = app_lock.row(caption(t!("applock-set-up-touch-id-face-id")));
             }
-            page = page
-                .child(self.setting(
+            app_lock = app_lock
+                .row(self.setting(
                     t!("applock-require-the-passcode"),
-                    t!("applock-how-long-picacho-can-be-in"),
+                    "",
                     self.segmented(
                         "app-lock-after",
                         applock::AFTER_CHOICES
@@ -824,7 +817,7 @@ impl MailApp {
                         cx,
                     ),
                 ))
-                .child(
+                .row(
                     div()
                         .flex()
                         .flex_wrap()
@@ -855,10 +848,10 @@ impl MailApp {
                         ),
                 );
             if lock.form == Some(LockForm::Change) {
-                page = page.child(self.lock_form(cx));
+                app_lock = app_lock.row(self.lock_form(cx));
             }
         }
-        page = page.child(self.switch_setting(
+        let outside = Rows::new().row(self.switch_setting(
             t!("applock-hide-mail-outside-picacho"),
             t!("applock-notifications-and-widgets-say-how-much"),
             "hide-contents".into(),
@@ -867,7 +860,7 @@ impl MailApp {
             cx,
         ));
         let encrypted = lock.encrypted;
-        page = page.child(self.section(t!("applock-local-database"))).child(self.switch_setting(
+        let mut database = Rows::new().row(self.switch_setting(
             t!("applock-encrypt-the-local-database"),
             t!("applock-mail-drafts-contacts-calendars-and-settings"),
             "encrypt-database".into(),
@@ -876,7 +869,7 @@ impl MailApp {
             cx,
         ));
         if lock.encrypting {
-            page = page.child(div().text_size(px(12.)).text_color(rgb(c.accent)).child(
+            database = database.row(div().text_size(px(12.)).text_color(rgb(c.accent)).child(
                 if encrypted {
                     t!("applock-decrypting-the-local-database")
                 } else {
@@ -896,7 +889,7 @@ impl MailApp {
                     t!("applock-decrypt"),
                 )
             };
-            page = page.child(
+            database = database.row(
                 div()
                     .id("encrypt-database-confirm")
                     .debug_selector(|| "encrypt-database-confirm".into())
@@ -933,14 +926,18 @@ impl MailApp {
             );
         }
         if let Some(error) = &lock.encryption_error {
-            page = page.child(
+            database = database.row(
                 div()
                     .text_size(px(12.))
                     .text_color(rgb(c.danger))
                     .child(error.clone()),
             );
         }
-        page.into_any_element()
+        self.settings_column()
+            .child(self.settings_group(t!("applock-app-lock"), app_lock))
+            .child(self.settings_group(t!("applock-notifications-widgets"), outside))
+            .child(self.settings_group(t!("applock-local-database"), database))
+            .into_any_element()
     }
 
     /// The form that turns the lock on or off, or changes its passcode.

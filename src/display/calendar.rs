@@ -1663,21 +1663,9 @@ impl MailApp {
                 )),
             )
         };
-        let mut page = div()
-            .flex()
-            .flex_col()
-            .gap_5()
-            .child(self.section(t!("calendar-calendar")))
-            .child(
-                div()
-                    .text_size(px(12.))
-                    .text_color(rgb(c.muted))
-                    .child(t!("calendar-invitations-in-mail-show-what-when")),
-            );
         let Some(server) = self.backend.calendar_server() else {
-            return page
-                .child(self.section(t!("calendar-calendar-server-caldav")))
-                .child(
+            let form = Rows::new()
+                .row(
                     div()
                         .flex()
                         .flex_col()
@@ -1705,9 +1693,12 @@ impl MailApp {
                             .when(busy, |d| d.opacity(0.6)),
                         )),
                 )
-                .children(self.calendar_error.clone().map(|e| {
+                .rows(self.calendar_error.clone().map(|e| {
                     div().id("calendar-error").text_size(px(12.)).text_color(rgb(c.danger)).child(e)
-                }))
+                }));
+            return self
+                .settings_column()
+                .child(self.settings_group(t!("calendar-calendar-server-caldav"), form))
                 .into_any_element();
         };
         let synced = self
@@ -1720,14 +1711,13 @@ impl MailApp {
             })
             .unwrap_or_else(|| t!("calendar-never-read").to_owned());
         let over_jmap = !server.jmap_account.is_empty();
-        page = page
-            .child(self.section(if over_jmap {
-                t!("calendar-calendar-server-jmap")
-            } else {
-                t!("calendar-calendar-server-caldav")
-            }))
-            .child(
-            self.setting(
+        let server_title = if over_jmap {
+            t!("calendar-calendar-server-jmap")
+        } else {
+            t!("calendar-calendar-server-caldav")
+        };
+        let mut server_rows = Rows::new().row(
+            self.setting_row(
                 &server.url,
                 &{
                     let account = self
@@ -1745,6 +1735,7 @@ impl MailApp {
                 },
                 div()
                     .flex()
+                    .flex_wrap()
                     .gap_2()
                     .child(
                         self.button(
@@ -1770,7 +1761,7 @@ impl MailApp {
         // What the server said about shared calendars (JMAP).
         let notices = self.backend.calendar_notices();
         if !notices.is_empty() {
-            page = page.child(
+            server_rows = server_rows.row(
                 self.setting(
                     t!("calendar-shared-calendars"),
                     &notices.join("\n"),
@@ -1793,10 +1784,10 @@ impl MailApp {
             .collect();
         let default = self.backend.default_calendar().map(|c| c.href);
         if calendars.len() > 1 {
-            page = page.child(
+            server_rows = server_rows.row(
                 self.setting(
                     t!("calendar-new-events-go-to"),
-                    t!("calendar-also-where-invitations-you-accept-are"),
+                    "",
                     self.segmented(
                         "calendar-default",
                         calendars
@@ -1816,20 +1807,16 @@ impl MailApp {
             );
         }
         if !over_jmap {
-            page = page.child(self.switch_setting(
+            server_rows = server_rows.row(self.switch_setting(
                 t!("calendar-let-the-server-send-invitations"),
-                if server.server_schedules {
-                    t!("calendar-the-calendar-server-invites-guests-to")
-                } else {
-                    t!("calendar-picacho-emails-invitations-updates-and-cancellations")
-                },
+                "",
                 "calendar-server-scheduling".into(),
                 server.server_schedules,
                 Action::ServerScheduling(!server.server_schedules),
                 cx,
             ));
         }
-        page = page.children(self.calendar_error.clone().map(|e| {
+        server_rows = server_rows.rows(self.calendar_error.clone().map(|e| {
             div()
                 .id("calendar-error")
                 .text_size(px(12.))
@@ -1837,10 +1824,10 @@ impl MailApp {
                 .child(e)
         }));
         // A new calendar, or a task, named in one field.
-        page = page.child(
+        server_rows = server_rows.row(
             self.setting(
                 t!("calendar-new-calendar-or-task"),
-                t!("calendar-a-calendar-is-made-on-the"),
+                "",
                 div()
                     .flex()
                     .flex_wrap()
@@ -1900,7 +1887,7 @@ impl MailApp {
                 let mb = |b: u64| b as f64 / 1_048_576.0;
                 t!("calendar-the-server-keeps-mb-of-yours", used = format!("{:.0}", mb(used)), left = format!("{:.0}", mb(left)))
             });
-            page = page.child(self.setting(
+            server_rows = server_rows.row(self.setting(
                 t!("calendar-calendars"),
                 &{
                     let rename = t!("calendar-rename-uses-the-name-written-in");
@@ -1914,9 +1901,10 @@ impl MailApp {
         }
         // Open tasks.
         let tasks = self.backend.calendar_tasks();
+        let mut task_section = None;
         if !tasks.is_empty() {
             let count = tasks.len();
-            page = page.child(self.section(t!("calendar-tasks"))).child(
+            task_section = Some(
                 div()
                     .id("calendar-tasks")
                     .role(Role::List)
@@ -1994,8 +1982,9 @@ impl MailApp {
             );
         }
         // The task being edited.
+        let mut task_editor = None;
         if let Some(uid) = &self.task_editing {
-            page = page.child(
+            task_editor = Some(
                 div()
                     .id("task-editor")
                     .debug_selector(|| "task-editor".into())
@@ -2031,8 +2020,9 @@ impl MailApp {
             .iter()
             .filter(|a| a.provider == crate::manage::model::Provider::Jmap)
             .collect();
+        let mut held_rows = Rows::new();
         if !jmap_accounts.is_empty() {
-            page = page.child(self.section(t!("calendar-held-to-send-later")));
+
             for a in jmap_accounts {
                 let listed = self.held.as_ref().filter(|(id, _)| *id == a.id);
                 let detail = match listed {
@@ -2040,7 +2030,7 @@ impl MailApp {
                     Some((_, held)) if held.is_empty() => t!("calendar-nothing-is-waiting").to_owned(),
                     Some((_, held)) => t!("calendar-waiting", count = held.len()),
                 };
-                page = page.child(self.setting(
+                held_rows = held_rows.row(self.setting_row(
                     &a.email,
                     &detail,
                     self.button(
@@ -2056,7 +2046,7 @@ impl MailApp {
                     let when = chrono::DateTime::from_timestamp(h.send_at, 0)
                         .map(|d| d.with_timezone(&chrono::Local).local(t!("dates-weekday-month-day-time")))
                         .unwrap_or_default();
-                    page = page.child(self.setting(
+                    held_rows = held_rows.row(self.setting_row(
                         if h.subject.is_empty() { t!("calendar-no-subject") } else { &h.subject },
                         &t!("calendar-goes", when = when),
                         self.button(
@@ -2072,8 +2062,9 @@ impl MailApp {
             }
         }
         // The event being added or edited.
+        let mut event_editor = None;
         if let Some(uid) = &self.event_editing {
-            page = page.child(
+            event_editor = Some(
                 div()
                     .id("event-editor")
                     .role(Role::Form)
@@ -2253,9 +2244,9 @@ impl MailApp {
             );
         }
         // Day, Week and Month grids, in place of the agenda.
-        page = page.children(self.calendar_grid(cx));
+        let mut body = div().flex().flex_col().gap_3().children(self.calendar_grid(cx));
         if self.cal.view != super::calendar_views::CalendarView::Agenda {
-            return page
+            body = body
                 .when(default.is_some() && self.event_editing.is_none(), |d| {
                     d.child(div().flex().child(self.button(
                         "event-new",
@@ -2265,9 +2256,8 @@ impl MailApp {
                         false,
                         cx,
                     )))
-                })
-                .into_any_element();
-        }
+                });
+        } else {
         // Coming events.
         let now = chrono::Utc::now().timestamp();
         let coming: Vec<Event> = self
@@ -2276,7 +2266,7 @@ impl MailApp {
             .into_iter()
             .take(60)
             .collect();
-        page = page.child(
+        body = body.child(
             div()
                 .flex()
                 .items_center()
@@ -2370,7 +2360,25 @@ impl MailApp {
                     })
             }))
         };
-        page.child(list).into_any_element()
+        body = body.child(list);
+        }
+        self.settings_column()
+            .children(event_editor)
+            .child(body)
+            .when(task_section.is_some() || task_editor.is_some(), |d| {
+                d.child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .child(self.section(t!("calendar-tasks")))
+                        .children(task_section)
+                        .children(task_editor),
+                )
+            })
+            .child(self.settings_group(server_title, server_rows))
+            .child(self.settings_group(t!("calendar-held-to-send-later"), held_rows))
+            .into_any_element()
     }
 }
 

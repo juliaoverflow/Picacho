@@ -233,155 +233,138 @@ impl MailApp {
                 .children(keys.iter().map(row))
                 .into_any_element()
         };
-        div()
-            .flex()
-            .flex_col()
-            .gap_5()
-            .child(self.section("OpenPGP"))
-            .child(
-                div()
-                    .text_size(px(12.))
-                    .text_color(rgb(c.muted))
-                    .child(t!("encryption-with-your-key-picacho-opens-mail")),
-            )
-            .child(
-                div()
-                    .rounded(px(12.))
-                    .border_1()
-                    .border_color(rgb(c.border))
-                    .bg(rgb(c.raised))
-                    .overflow_hidden()
-                    .child(list),
-            )
-            .child(self.setting(
-                t!("encryption-import-keys"),
-                t!("encryption-choose-armored-key-files-asc-a"),
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .max_w(px(420.))
-                    .child(
-                        div()
-                            .id("openpgp-passphrase")
-                            .child(field(Input::new(&self.key_passphrase), c, false)),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .text_size(px(12.))
-                                    .text_color(rgb(c.muted))
-                                    .flex_shrink_0()
-                                    .child(t!("encryption-new-and-renewed-keys-expire")),
-                            )
-                            .child(self.segmented(
-                                "openpgp-expiry",
-                                KeyExpiry::CHOICES
-                                    .into_iter()
-                                    .map(|e| (e.label(), Action::SetKeyExpiry(e), self.key_expiry == e))
-                                    .collect(),
-                                cx,
-                            )),
-                    )
-                    .child(self.key_version_choice(cx))
-                    .child(div().flex().gap_2().child(self.button(
-                        "openpgp-import",
-                        t!("encryption-import-keys-2"),
-                        "upload",
-                        Action::ImportKeys,
-                        true,
-                        cx,
-                    )).child(self.button(
-                        "openpgp-create",
-                        t!("encryption-create-a-key"),
-                        "lock",
-                        Action::CreateKey,
-                        false,
-                        cx,
-                    ))),
-            ))
-            .when(ring.secret.iter().len() > 0, |page| {
-                page.child(self.setting(
-                    t!("encryption-share-your-public-key"),
-                    t!("encryption-save-it-to-send-to-people"),
+        let add_keys = self.setting(
+            t!("encryption-import-keys"),
+            "",
+            div()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .max_w(px(420.))
+                .child(
+                    div()
+                        .id("openpgp-passphrase")
+                        .child(field(Input::new(&self.key_passphrase), c, false)),
+                )
+                .child(
                     div()
                         .flex()
-                        .flex_col()
+                        .flex_wrap()
+                        .items_center()
                         .gap_2()
                         .child(
                             div()
-                                .flex()
-                                .flex_wrap()
-                                .gap_2()
-                                .child(self.button(
-                                    "openpgp-export",
-                                    t!("encryption-save-public-keys"),
-                                    "download",
-                                    Action::ExportPublicKeys,
-                                    false,
-                                    cx,
-                                ))
-                                .child(self.button(
-                                    "openpgp-publish",
-                                    t!("encryption-publish-on-keys-openpgp-org"),
-                                    "upload",
-                                    Action::Tools(super::tools::ToolAction::PublishKeys),
-                                    false,
-                                    cx,
-                                ))
-                                .child(self.button(
-                                    "openpgp-export-wkd",
-                                    t!("encryption-export-for-wkd"),
-                                    "download",
-                                    Action::Tools(super::tools::ToolAction::ExportWkd),
-                                    false,
-                                    cx,
-                                )),
+                                .text_size(px(12.))
+                                .text_color(rgb(c.muted))
+                                .flex_shrink_0()
+                                .child(t!("encryption-new-and-renewed-keys-expire")),
                         )
+                        .child(self.segmented(
+                            "openpgp-expiry",
+                            KeyExpiry::CHOICES
+                                .into_iter()
+                                .map(|e| (e.label(), Action::SetKeyExpiry(e), self.key_expiry == e))
+                                .collect(),
+                            cx,
+                        )),
+                )
+                .child(self.key_version_choice(cx))
+                .child(
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .gap_2()
+                        .child(self.button(
+                            "openpgp-import",
+                            t!("encryption-import-keys-2"),
+                            "upload",
+                            Action::ImportKeys,
+                            true,
+                            cx,
+                        ))
+                        .child(self.button(
+                            "openpgp-create",
+                            t!("encryption-create-a-key"),
+                            "lock",
+                            Action::CreateKey,
+                            false,
+                            cx,
+                        )),
+                ),
+        );
+        let share = self.setting(
+            t!("encryption-share-your-public-key"),
+            "",
+            div()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .child(
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .gap_2()
+                        .child(self.button(
+                            "openpgp-export",
+                            t!("encryption-save-public-keys"),
+                            "download",
+                            Action::ExportPublicKeys,
+                            false,
+                            cx,
+                        ))
+                        .child(self.button(
+                            "openpgp-publish",
+                            t!("encryption-publish-on-keys-openpgp-org"),
+                            "upload",
+                            Action::Tools(super::tools::ToolAction::PublishKeys),
+                            false,
+                            cx,
+                        ))
+                        .child(self.button(
+                            "openpgp-export-wkd",
+                            t!("encryption-export-for-wkd"),
+                            "download",
+                            Action::Tools(super::tools::ToolAction::ExportWkd),
+                            false,
+                            cx,
+                        )),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .items_center()
+                        .gap_2()
                         .child(
                             div()
-                                .flex()
-                                .flex_wrap()
-                                .items_center()
-                                .gap_2()
-                                .child(
-                                    div()
-                                        .w(px(260.))
-                                        .child(field(Input::new(&self.find.hkp_server), c, false)),
-                                )
-                                .child(self.button(
-                                    "openpgp-publish-custom-hkp",
-                                    t!("encryption-publish-on-keyserver"),
-                                    "upload",
-                                    Action::Tools(super::tools::ToolAction::PublishKeysCustomHkp),
-                                    false,
-                                    cx,
-                                )),
-                        ),
-                ))
-            })
-            // Autocrypt 1.1 §2.2: prefer-encrypt per account, off by default.
-            .children(self.accounts.iter().filter(|a| ring.own_key(&a.email).is_some()).map(|a| {
-                self.switch_setting(
-                    &t!("encryption-ask-for-encrypted-replies", email = a.email),
-                    t!("encryption-tells-peoples-mail-apps-in-the"),
-                    format!("autocrypt-mutual-{}", a.id),
-                    ring.prefers_mutual(&a.email),
-                    Action::ToggleAutocryptMutual(a.email.clone()),
-                    cx,
+                                .w(px(260.))
+                                .max_w_full()
+                                .child(field(Input::new(&self.find.hkp_server), c, false)),
+                        )
+                        .child(self.button(
+                            "openpgp-publish-custom-hkp",
+                            t!("encryption-publish-on-keyserver"),
+                            "upload",
+                            Action::Tools(super::tools::ToolAction::PublishKeysCustomHkp),
+                            false,
+                            cx,
+                        )),
+                ),
+        );
+        let find = self.setting_row(
+            t!("encryption-find-keys"),
+            "",
+            div()
+                .flex()
+                .flex_wrap()
+                .gap_2()
+                .child(
+                    div()
+                        .w(px(220.))
+                        .max_w_full()
+                        .child(field(Input::new(&self.key_lookup), c, self.key_busy)),
                 )
-            }))
-            .children(checking.map(|k| self.key_check_panel(k, cx)))
-            .child(self.setting(
-                t!("encryption-find-keys"),
-                t!("encryption-look-up-the-keys-of-people"),
-                div().flex().gap_2().child(
-                    div().w(px(260.)).child(field(Input::new(&self.key_lookup), c, self.key_busy)),
-                ).child(
+                .child(
                     self.button(
                         "openpgp-find",
                         if self.key_busy { t!("encryption-looking") } else { t!("encryption-find-key") },
@@ -392,28 +375,65 @@ impl MailApp {
                     )
                     .when(self.key_busy, |d| d.opacity(0.6)),
                 ),
-            ))
-            .child(self.section("S/MIME"))
-            .child(
-                div()
-                    .text_size(px(12.))
-                    .text_color(rgb(c.muted))
-                    .child(t!("encryption-certificates-many-companies-and-authorities-issue")),
-            )
-            .child(self.certificate_list(cx))
-            .child(self.setting(
+        );
+        let openpgp = Rows::new()
+            .row(add_keys)
+            .when(ring.secret.iter().len() > 0, |rows| rows.row(share))
+            // Autocrypt 1.1 §2.2: prefer-encrypt per account, off by default.
+            .rows(self.accounts.iter().filter(|a| ring.own_key(&a.email).is_some()).map(|a| {
+                self.switch_setting(
+                    &t!("encryption-ask-for-encrypted-replies", email = a.email),
+                    "",
+                    format!("autocrypt-mutual-{}", a.id),
+                    ring.prefers_mutual(&a.email),
+                    Action::ToggleAutocryptMutual(a.email.clone()),
+                    cx,
+                )
+            }))
+            .row(find);
+        let smime = Rows::new()
+            .row(self.setting_row(
                 t!("encryption-import-certificates"),
                 t!("encryption-your-own-p12-pfx-with-the"),
-                div().flex().child(self.button(
+                self.button(
                     "smime-import",
                     t!("encryption-import-certificates-2"),
                     "upload",
                     Action::ImportCertificates,
                     false,
                     cx,
-                )),
+                ),
             ))
-            .child(self.crl_setting(cx))
+            .row(self.crl_setting(cx));
+        let card = |list: AnyElement| {
+            div()
+                .rounded(px(12.))
+                .border_1()
+                .border_color(rgb(c.border))
+                .bg(rgb(c.raised))
+                .overflow_hidden()
+                .child(list)
+        };
+        self.settings_column()
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(self.section("OpenPGP"))
+                    .child(card(list))
+                    .children(checking.map(|k| self.key_check_panel(k, cx)))
+                    .child(self.settings_group("", openpgp)),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(self.section("S/MIME"))
+                    .child(self.certificate_list(cx))
+                    .child(self.settings_group("", smime)),
+            )
             .when_some(self.key_error.clone(), |page, e| {
                 page.child(
                     div()

@@ -875,19 +875,23 @@ impl MailApp {
                     this.handle(Action::Keys(action.clone()), w, cx)
                 }))
         };
-        let mut page = div()
-            .flex()
-            .flex_col()
-            .gap_3()
-            .child(
-                div()
-                    .text_size(px(12.))
-                    .text_color(rgb(c.muted))
-                    .child(t!("shortcuts-click-a-shortcut-and-press-the")),
-            );
+        let mut page = self.settings_column().child(
+            div()
+                .px_1()
+                .text_size(px(12.))
+                .text_color(rgb(c.muted))
+                .child(t!("shortcuts-click-a-shortcut-and-press-the")),
+        );
         for group in Group::ALL {
-            page = page.child(self.section(group.title()));
-            let mut rows = div().flex().flex_col();
+            let mut rows = div()
+                .flex()
+                .flex_col()
+                .px_4()
+                .py_2()
+                .rounded(px(12.))
+                .border_1()
+                .border_color(rgb(c.border))
+                .bg(rgb(c.raised));
             for b in all.iter().filter(|b| b.group == group) {
                 let keys = effective(b, &custom);
                 let recording = self.keys_ui.recording == Some(b.name);
@@ -1023,17 +1027,33 @@ impl MailApp {
                     );
                 }
             }
-            page = page.child(rows);
+            page = page.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(self.section(group.title()))
+                    .child(rows),
+            );
         }
-        page.child(self.section(t!("shortcuts-shortcuts-file")))
-            .child(
+        page.child(self.settings_group(
+            t!("shortcuts-shortcuts-file"),
+            Rows::new().row(
                 div()
-                    .text_size(px(12.))
-                    .text_color(rgb(c.muted))
-                    .child(t!("shortcuts-shortcuts-are-kept-in-a-line", file = file_path().display())),
-            )
-            .child(
-                div()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap_3()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(160.))
+                            .truncate()
+                            .text_size(px(12.))
+                            .text_color(rgb(c.muted))
+                            .child(file_path().display().to_string()),
+                    )
+                    .child(div()
                     .flex()
                     .flex_wrap()
                     .gap_2()
@@ -1054,9 +1074,10 @@ impl MailApp {
                             false,
                             cx,
                         ))
-                    }),
-            )
-            .into_any_element()
+                    })),
+            ),
+        ))
+        .into_any_element()
     }
 }
 

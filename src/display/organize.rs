@@ -1143,37 +1143,25 @@ impl MailApp {
                 .flex()
                 .items_center()
                 .gap_3()
-                .py(px(6.))
-                .border_b_1()
-                .border_color(rgb(c.border))
                 .child(div().flex_1().min_w_0().text_size(px(13.)).child(text))
                 .child(trailing)
         };
-        let mut page = div()
-            .flex()
-            .flex_col()
-            .gap_5()
-            .child(self.section(t!("organize-layout")))
-            .child(self.setting(t!("organize-rows"), t!("organize-how-much-of-each-message-the"), density))
-            .child(self.setting(
-                t!("organize-reader"),
-                t!("organize-where-an-open-message-shows-on"),
-                layout,
-            ))
-            .child(self.switch_setting(
+        let layout_rows = Rows::new()
+            .row(self.setting_row(t!("organize-rows"), "", density))
+            .row(self.setting_row(t!("organize-reader"), "", layout))
+            .row(self.switch_setting(
                 t!("organize-group-by-conversation-2"),
-                t!("organize-show-each-conversation-as-one-row"),
+                "",
                 "threaded".into(),
                 org.threaded,
                 act(OrgAction::ToggleThreaded),
                 cx,
-            ))
-            .child(self.section(t!("organize-saved-searches-2")))
-            .child(small(
-                t!("organize-search-then-choose-save-search-beside").into(),
             ));
+        let mut saved = Rows::new().when(org.saved_searches.is_empty(), |rows| {
+            rows.row(small(t!("organize-search-then-choose-save-search-beside").into()))
+        });
         for (i, s) in org.saved_searches.iter().enumerate() {
-            page = page.child(row(
+            saved = saved.row(row(
                 format!("saved-row-{i}"),
                 s.query.clone(),
                 self.button(
@@ -1187,13 +1175,9 @@ impl MailApp {
                 .into_any_element(),
             ));
         }
-        page = page
-            .child(self.section(t!("organize-blocked-senders")))
-            .child(small(
-                t!("organize-new-mail-from-these-addresses-goes").into(),
-            ));
+        let mut blocked = Rows::new();
         for (i, b) in org.blocked.iter().enumerate() {
-            page = page.child(row(
+            blocked = blocked.row(row(
                 format!("blocked-row-{i}"),
                 b.clone(),
                 self.button(
@@ -1207,7 +1191,7 @@ impl MailApp {
                 .into_any_element(),
             ));
         }
-        page = page.child(
+        blocked = blocked.row(
             div()
                 .flex()
                 .gap_2()
@@ -1215,12 +1199,10 @@ impl MailApp {
                 .child(div().flex_1().child(field(Input::new(&self.org_ui.block), c, false)))
                 .child(self.button("add-blocked", t!("organize-block-2"), "", act(OrgAction::AddBlocked), true, cx)),
         );
-        page = page.child(self.section(t!("organize-rules"))).child(small(
-            t!("organize-picacho-applies-these-to-new-inbox").into(),
-        ));
+        let mut rules = Rows::new();
         for (i, r) in org.rules.iter().enumerate() {
             let text = t!("organize-contains", label = r.field.label(), contains = r.contains, label2 = r.action.label());
-            page = page.child(row(
+            rules = rules.row(row(
                 format!("rule-row-{i}"),
                 text,
                 div()
@@ -1273,7 +1255,7 @@ impl MailApp {
             cx,
         );
         let named = matches!(self.org_ui.kind, RuleKind::MoveTo | RuleKind::Label);
-        page = page.child(
+        rules = rules.row(
             div()
                 .flex()
                 .flex_col()
@@ -1321,7 +1303,12 @@ impl MailApp {
                         )),
                 ),
         );
-        page.into_any_element()
+        self.settings_column()
+            .child(self.settings_group(t!("organize-layout"), layout_rows))
+            .child(self.settings_group(t!("organize-saved-searches-2"), saved))
+            .child(self.settings_group(t!("organize-blocked-senders"), blocked))
+            .child(self.settings_group(t!("organize-rules"), rules))
+            .into_any_element()
     }
 }
 

@@ -126,31 +126,21 @@ organize-layout = Layout
 
 organize-rows = Rows
 
-organize-how-much-of-each-message-the = How much of each message the list shows.
-
 organize-reader = Reader
-
-organize-where-an-open-message-shows-on = Where an open message shows on a wide window.
 
 organize-group-by-conversation-2 = Group by conversation
 
-organize-show-each-conversation-as-one-row = Show each conversation as one row, its newest message, with how many it holds.
-
 organize-saved-searches-2 = Saved searches
 
-organize-search-then-choose-save-search-beside = Search, then choose Save Search beside the search field. Saved searches list in the sidebar and search every account's mail.
+organize-search-then-choose-save-search-beside = Search, then choose Save Search beside the search field.
 
 organize-blocked-senders = Blocked senders
-
-organize-new-mail-from-these-addresses-goes = New mail from these addresses goes straight to Trash, on every account, without a notification, also while Picacho runs in the background. Block a sender from a message's menu, or here.
 
 organize-unblock-2 = Unblock
 
 organize-block-2 = Block
 
 organize-rules = Rules
-
-organize-picacho-applies-these-to-new-inbox = Picacho applies these to new inbox mail as it arrives, while its window is open and while it runs in the background, for any mail service, including those without server filters (Gmail, Outlook, iCloud, Proton, POP3). Apply Rules Now applies them, and blocked senders, to the mail in your inboxes already. Server filters, where the service has them, are on each mailbox's page.
 
 organize-contains = { $label } contains “{ $contains }” → { $label2 }
 

@@ -9,28 +9,22 @@ impl MailApp {
         let cards = self.backend.contacts();
         let server = self.backend.contacts_server();
         let busy = self.contacts_busy;
-        let label = |text: &'static str| {
+        let labelled = |text: &'static str, id: &'static str, input: &Entity<InputState>| {
             div()
-                .text_size(px(12.))
-                .font_weight(FontWeight::MEDIUM)
-                .text_color(rgb(c.muted))
-                .child(text)
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(
+                    div()
+                        .text_size(px(12.))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(rgb(c.muted))
+                        .child(text),
+                )
+                .child(div().id(id).child(field(Input::new(input), c, busy)))
         };
         let count = crate::manage::backend::contacts::people(&cards).len();
-        let mut page = div()
-            .flex()
-            .flex_col()
-            .gap_5()
-            .child(self.section(t!("contacts-contacts")))
-            .child(
-                div()
-                    .id("contacts-summary")
-                    .text_size(px(12.))
-                    .text_color(rgb(c.muted))
-                    .child(t!("contacts-in-your-address-book-the-composer", count = count)),
-            )
-            .child(self.section(t!("contacts-contacts-server-carddav")));
-        page = if let Some(server) = server {
+        let server_rows = if let Some(server) = server {
             let synced = self
                 .backend
                 .contacts_synced()
@@ -40,25 +34,24 @@ impl MailApp {
                         .local(t!("dates-month-day-time"))
                 })
                 .unwrap_or_else(|| t!("contacts-never").to_owned());
-            page.child(
-                self.setting(
+            let account = self
+                .backend
+                .contacts_mail_account()
+                .filter(|_| server.jmap_account.is_empty())
+                .and_then(|id| self.accounts.iter().find(|a| a.id == id));
+            Rows::new()
+                .row(self.setting_row(
                     &server.url,
-                    &{
-                        let account = self
-                            .backend
-                            .contacts_mail_account()
-                            .filter(|_| server.jmap_account.is_empty())
-                            .and_then(|id| self.accounts.iter().find(|a| a.id == id));
-                        t!(
-                            "contacts-signed-in-as-read-read-again",
-                            how = if account.is_some() { "account" } else { "password" },
-                            user = server.user,
-                            email = account.map(|a| a.email.as_str()).unwrap_or_default(),
-                            synced = synced
-                        )
-                    },
+                    &t!(
+                        "contacts-signed-in-as-read-read-again",
+                        how = if account.is_some() { "account" } else { "password" },
+                        user = server.user,
+                        email = account.map(|a| a.email.as_str()).unwrap_or_default(),
+                        synced = synced
+                    ),
                     div()
                         .flex()
+                        .flex_wrap()
                         .gap_2()
                         .child(
                             self.button(
@@ -79,33 +72,34 @@ impl MailApp {
                             false,
                             cx,
                         )),
-                ),
-            )
-            .child(self.setting(
-                t!("contacts-new-address-book"),
-                t!("contacts-made-on-the-server-new-contacts"),
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(
-                        div()
-                            .id("address-book-name")
-                            .w(px(200.))
-                            .child(field(Input::new(&self.collection_name), c, busy)),
-                    )
-                    .child(self.button(
-                        "address-book-create",
-                        t!("contacts-make-address-book"),
-                        "plus",
-                        Action::CreateAddressBook,
-                        false,
-                        cx,
-                    )),
-            ))
-            .child(self.address_books_list(&server, cx))
+                ))
+                .row(self.setting_row(
+                    t!("contacts-new-address-book"),
+                    "",
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            div()
+                                .id("address-book-name")
+                                .w(px(200.))
+                                .max_w_full()
+                                .child(field(Input::new(&self.collection_name), c, busy)),
+                        )
+                        .child(self.button(
+                            "address-book-create",
+                            t!("contacts-make-address-book"),
+                            "plus",
+                            Action::CreateAddressBook,
+                            false,
+                            cx,
+                        )),
+                ))
+                .row(self.address_books_list(&server, cx))
         } else {
-            page.child(
+            Rows::new().row(
                 div()
                     .flex()
                     .flex_col()
@@ -118,48 +112,9 @@ impl MailApp {
                             .child(t!("contacts-read-and-edit-your-address-books")),
                     )
                     .children(self.jmap_sources("contacts-jmap", Action::ConnectJmapContacts, cx))
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .child(label(t!("contacts-server")))
-                            .child(
-                                div()
-                                    .id("contacts-url")
-                                    .child(field(Input::new(&self.contacts_url), c, busy)),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .child(label(t!("contacts-user-name")))
-                            .child(
-                                div()
-                                    .id("contacts-user")
-                                    .child(field(Input::new(&self.contacts_user), c, busy)),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .child(label(t!("contacts-password")))
-                            .child(
-                                div()
-                                    .id("contacts-password")
-                                    .child(field(Input::new(&self.contacts_password), c, busy)),
-                            )
-                            .child(
-                                div()
-                                    .text_size(px(11.))
-                                    .text_color(rgb(c.muted))
-                                    .child(t!("contacts-kept-in-the-system-keychain")),
-                            ),
-                    )
+                    .child(labelled(t!("contacts-server"), "contacts-url", &self.contacts_url))
+                    .child(labelled(t!("contacts-user-name"), "contacts-user", &self.contacts_user))
+                    .child(labelled(t!("contacts-password"), "contacts-password", &self.contacts_password))
                     .child(
                         div().flex().child(
                             self.button(
@@ -175,8 +130,8 @@ impl MailApp {
                     ),
             )
         };
-        page = page.when_some(self.contacts_error.clone(), |d, e| {
-            d.child(
+        let server_rows = server_rows.when_some(self.contacts_error.clone(), |rows, e| {
+            rows.row(
                 div()
                     .id("contacts-error")
                     .text_size(px(12.))
@@ -184,42 +139,58 @@ impl MailApp {
                     .child(e),
             )
         });
-        page.child(self.people_section(&cards, cx))
-            .child(self.section(t!("contacts-files")))
-            .child(self.setting(
-                t!("contacts-vcard-files"),
-                t!("contacts-import-contacts-exported-from-another-address"),
+        let files = Rows::new().row(self.setting_row(
+            t!("contacts-vcard-files"),
+            "",
+            div()
+                .flex()
+                .flex_wrap()
+                .gap_2()
+                .child(self.button(
+                    "contacts-import",
+                    t!("contacts-import"),
+                    "upload",
+                    Action::ImportContacts,
+                    false,
+                    cx,
+                ))
+                .child(self.button(
+                    "contacts-export",
+                    t!("contacts-export"),
+                    "download",
+                    Action::ExportContacts,
+                    false,
+                    cx,
+                ))
+                .when(cards.iter().any(|c| !crate::manage::backend::contacts::from_server(c)), |d| {
+                    d.child(self.button(
+                        "contacts-clear",
+                        t!("contacts-remove-those-on-this-computer"),
+                        "trash",
+                        Action::ClearImportedContacts,
+                        false,
+                        cx,
+                    ))
+                }),
+        ));
+        self.settings_column()
+            .child(
                 div()
                     .flex()
-                    .flex_wrap()
+                    .flex_col()
                     .gap_2()
-                    .child(self.button(
-                        "contacts-import",
-                        t!("contacts-import"),
-                        "upload",
-                        Action::ImportContacts,
-                        false,
-                        cx,
-                    ))
-                    .child(self.button(
-                        "contacts-export",
-                        t!("contacts-export"),
-                        "download",
-                        Action::ExportContacts,
-                        false,
-                        cx,
-                    ))
-                    .when(cards.iter().any(|c| !crate::manage::backend::contacts::from_server(c)), |d| {
-                        d.child(self.button(
-                            "contacts-clear",
-                            t!("contacts-remove-those-on-this-computer"),
-                            "trash",
-                            Action::ClearImportedContacts,
-                            false,
-                            cx,
-                        ))
-                    }),
-            ))
+                    .child(self.people_section(&cards, cx))
+                    .child(
+                        div()
+                            .id("contacts-summary")
+                            .px_1()
+                            .text_size(px(12.))
+                            .text_color(rgb(c.muted))
+                            .child(t!("contacts-in-your-address-book-the-composer", count = count)),
+                    ),
+            )
+            .child(self.settings_group(t!("contacts-contacts-server-carddav"), server_rows))
+            .child(self.settings_group(t!("contacts-files"), files))
             .into_any_element()
     }
 

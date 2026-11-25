@@ -54,17 +54,13 @@ applock-app-lock = App Lock
 
 applock-lock-picacho = Lock Picacho
 
-applock-ask-for-when-picacho-opens-and = Ask for { $unlocks } when Picacho opens and when you come back to it. Mail is still checked, and new mail announced, while it's locked.
+applock-ask-for-when-picacho-opens-and = Ask for { $unlocks } when Picacho opens.
 
 applock-unlock-with = Unlock with { $title }
 
-applock-unlocks-picacho-as-well-as-its = { $title } unlocks Picacho as well as its passcode.
-
-applock-set-up-touch-id-face-id = Set up Touch ID, Face ID or fingerprint or face unlock in your device's settings to unlock Picacho with it.
+applock-set-up-touch-id-face-id = Set up biometric unlock in your device's settings to use it here.
 
 applock-require-the-passcode = Require the passcode
-
-applock-how-long-picacho-can-be-in = How long Picacho can be in the background, or behind other apps, before it asks again.
 
 applock-change-passcode = Change Passcode…
 
@@ -72,23 +68,23 @@ applock-lock-now = Lock Now
 
 applock-hide-mail-outside-picacho = Hide mail outside Picacho
 
-applock-notifications-and-widgets-say-how-much = Notifications and widgets say how much new mail there is, but not who it's from, what it's about, or what your events, packages and receipts are. Turned on with the app lock or encryption.
+applock-notifications-and-widgets-say-how-much = Show only how much new mail there is.
 
 applock-local-database = Local Database
 
 applock-encrypt-the-local-database = Encrypt the local database
 
-applock-mail-drafts-contacts-calendars-and-settings = Mail, drafts, contacts, calendars and settings saved on this device are encrypted, with a key kept in the system keychain. Picacho opens it without asking, so mail is still checked in the background; use the app lock to keep others out of the app itself.
+applock-mail-drafts-contacts-calendars-and-settings = Mail, contacts and settings on this device, with a key in the system keychain.
 
 applock-decrypting-the-local-database = Decrypting the local database…
 
 applock-encrypting-the-local-database = Encrypting the local database…
 
-applock-encrypting-copies-the-whole-database-which = Encrypting copies the whole database, which can take a minute for a large one. If the system keychain ever loses the key, the local copy can't be read: mail on your servers is downloaded again, but drafts saved only here, and mail that only this device kept (POP accounts that remove it from the server), would be lost. Widgets keep their own short list of recent mail outside the database; Hide mail outside Picacho (turned on with encryption) keeps what it says out of it.
+applock-encrypting-copies-the-whole-database-which = This can take a minute. If the system keychain loses the key, drafts and mail kept only on this device are lost.
 
 applock-encrypt = Encrypt
 
-applock-the-database-will-be-stored-without = The database will be stored without encryption, and its key removed from the system keychain.
+applock-the-database-will-be-stored-without = The database will be stored unencrypted and its key removed from the keychain.
 
 applock-decrypt = Decrypt
 
@@ -120,3 +116,5 @@ applock-too-many-wrong-passcodes-try-again = Too many wrong passcodes. Try again
 applock-that-isnt-the-current-passcode = That isn't the current passcode.
 
 applock-encrypting-stopped-part-way = Encrypting stopped part way.
+
+applock-notifications-widgets = Notifications & Widgets

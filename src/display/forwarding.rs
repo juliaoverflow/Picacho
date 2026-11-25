@@ -269,7 +269,6 @@ impl MailApp {
 
     /// Forwarding services as cards, then a way to add another.
     pub(super) fn forwarding_page(&self, cx: &Context<Self>) -> AnyElement {
-        let c = self.colors();
         let adding = self.fwd_adding || self.forwarding.is_empty();
         let list = div()
             .id("forwarding-list")
@@ -286,18 +285,15 @@ impl MailApp {
             } else {
                 self.add_service_button(cx)
             });
-        div()
-            .flex()
-            .flex_col()
-            .gap_4()
-            .child(self.section(t!("forwarding-forwarding")))
+        self.settings_column()
             .child(
                 div()
-                    .text_size(px(12.))
-                    .text_color(rgb(c.muted))
-                    .child(t!("forwarding-manage-your-simplelogin-addy-io-and")),
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(self.section(t!("forwarding-forwarding")))
+                    .child(list),
             )
-            .child(list)
             .into_any_element()
     }
     /// The quiet "Add Service" line below the services.

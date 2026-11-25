@@ -201,13 +201,9 @@ calendar-cancel = Cancel
 
 calendar-or-use-your-email-providers-signed = Or use your email provider's, signed in as the account already is (Google asks once for access):
 
-calendar-calendar = Calendar
-
-calendar-invitations-in-mail-show-what-when = Invitations in mail show what, when and where, with Accept, Maybe and Decline; the organizer is told. With a calendar server, answered invitations go in your calendar, and you can add and change events here.
-
 calendar-calendar-server-caldav = Calendar server (CalDAV)
 
-calendar-fastmail-icloud-nextcloud-radicale-mailbox-org = Fastmail, iCloud, Nextcloud, Radicale, mailbox.org or another CalDAV server. iCloud and Fastmail need an app password.
+calendar-fastmail-icloud-nextcloud-radicale-mailbox-org = Fastmail, iCloud, Nextcloud, Radicale, mailbox.org or another CalDAV server.
 
 calendar-server = Server
 
@@ -222,9 +218,9 @@ calendar-connect = Connect
 calendar-calendar-server-jmap = Calendar server (JMAP)
 
 calendar-read-read-again-each-time-picacho = { $how ->
-        [jmap] The calendars of { $user }. Read { $synced }; read again each time Picacho starts.
-        [account] Signed in as { $user }, with your { $email } account's sign-in. Read { $synced }; read again each time Picacho starts.
-       *[password] Signed in as { $user }. Read { $synced }; read again each time Picacho starts.
+        [jmap] { $user } · Read { $synced }
+        [account] { $user }, through your { $email } account · Read { $synced }
+       *[password] { $user } · Read { $synced }
     }
 
 calendar-reading = Reading…
@@ -239,17 +235,9 @@ calendar-dismiss = Dismiss
 
 calendar-new-events-go-to = New events go to
 
-calendar-also-where-invitations-you-accept-are = Also where invitations you accept are put.
-
 calendar-let-the-server-send-invitations = Let the server send invitations
 
-calendar-the-calendar-server-invites-guests-to = The calendar server invites guests to events you organize, and tells them about changes and cancellations. Invitations you receive are still answered by mail.
-
-calendar-picacho-emails-invitations-updates-and-cancellations = Picacho emails invitations, updates and cancellations for events you organize. Turn on to have the calendar server send them, where it can.
-
 calendar-new-calendar-or-task = New calendar or task
-
-calendar-a-calendar-is-made-on-the = A calendar is made on the server. A task goes to the calendar new events go to (or the first that keeps tasks), due when written in Due, else with no due date.
 
 calendar-make-calendar = Make Calendar
 
@@ -259,11 +247,11 @@ calendar-rename = Rename
 
 calendar-delete = Delete
 
-calendar-the-server-keeps-mb-of-yours = The server keeps { $used } MB of yours, with { $left } MB left.
+calendar-the-server-keeps-mb-of-yours = { $used } MB used, { $left } MB left.
 
 calendar-calendars = Calendars
 
-calendar-rename-uses-the-name-written-in = Rename uses the name written in the field above. Deleting removes the calendar and its events from the server.
+calendar-rename-uses-the-name-written-in = Rename uses the name in the field above.
 
 calendar-tasks = Tasks
 
@@ -295,7 +283,7 @@ calendar-save = Save
 
 calendar-held-to-send-later = Held to send later
 
-calendar-messages-handed-to-the-server-to = Messages handed to the server to send later can be taken back until they go.
+calendar-messages-handed-to-the-server-to = Messages the server holds to send later.
 
 calendar-nothing-is-waiting = Nothing is waiting.
 

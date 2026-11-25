@@ -22,13 +22,12 @@ app-sentences = { $first } { $second }
 ## Settings → General
 
 settings-language = Language
-settings-language-caption = Automatic follows your system's language.
 settings-language-automatic = Automatic
 
 # The language of what Picacho writes into mail others receive
 settings-outgoing-language = Outgoing mail
 
-settings-outgoing-language-caption = The language of reply and forward introductions, invitations and read receipts.
+settings-outgoing-language-caption = For reply headers, invitations and receipts.
 
 # Outgoing mail in the same language as Picacho's
 settings-outgoing-language-same = Same as Picacho

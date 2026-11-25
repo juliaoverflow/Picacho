@@ -76,6 +76,7 @@ use panes::{LIST_MIN, Pane, Resize};
 #[path = "reader.rs"]
 mod reader;
 use reader::BannerStyle;
+use settings::Rows;
 #[cfg(test)]
 #[path = "reading_tests.rs"]
 mod reading_tests;

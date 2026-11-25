@@ -14,10 +14,10 @@ templates-every-mailbox = Every mailbox
 
 templates-templates = Templates
 
-templates-messages-you-send-often-insert-one = Messages you send often. Insert one from the composer's Templates button, which also saves the message you're writing as a template.
-
-templates-placeholders-fill-in-as-a-template = Placeholders fill in as a template is inserted: { $placeholders }.
+templates-placeholders-fill-in-as-a-template = { $placeholders }
 
 templates-remove-template = @Remove template
 
 templates-add-template = Add Template
+
+templates-placeholders = Placeholders

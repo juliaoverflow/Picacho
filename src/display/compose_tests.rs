@@ -205,11 +205,12 @@ fn settings_expands_pops_out_and_comes_back(cx: &mut TestAppContext) {
         assert_eq!(this.settings_place, SettingsPlace::Maximized);
     });
     assert!(cx.debug_bounds("forwarding-add").is_some());
-    // The list spans the page (inside its padding).
+    // The list spans the page (inside its padding), up to the settings
+    // column's readable width.
     let page = cx.debug_bounds("settings-page").unwrap();
     let list = cx.debug_bounds("forwarding-list").unwrap();
     assert!(
-        list.size.width > page.size.width - px(60.),
+        list.size.width > (page.size.width - px(60.)).min(px(700.)),
         "{list:?} in {page:?}"
     );
     act(&view, Action::PlaceSettings(SettingsPlace::Window), cx);

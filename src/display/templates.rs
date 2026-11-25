@@ -138,34 +138,17 @@ impl MailApp {
         Some(self.segmented("signature-for", options, cx))
     }
 
-    /// The templates section of Settings → Composing.
-    pub(super) fn templates_settings(&self, cx: &Context<Self>) -> Div {
+    /// The templates group of Settings → Composing: each saved one, then
+    /// the fields for a new one.
+    pub(super) fn templates_settings(&self, cx: &Context<Self>) -> Rows {
         let c = self.colors();
-        let mut section = div().flex().flex_col().gap_3().child(self.section(t!("templates-templates"))).child(
-            div()
-                .text_size(px(12.))
-                .text_color(rgb(c.muted))
-                .child(t!("templates-messages-you-send-often-insert-one")),
-        ).child(
-            div()
-                .text_size(px(12.))
-                .text_color(rgb(c.muted))
-                .child(t!("templates-placeholders-fill-in-as-a-template", placeholders = crate::manage::composing::PLACEHOLDERS
-                        .iter()
-                        .map(|(p, what)| format!("{p} {what}"))
-                        .collect::<Vec<_>>()
-                        .join(", "))),
-        );
-        for (i, t) in self.compose_options.templates.iter().enumerate() {
-            section = section.child(
+        Rows::new()
+            .rows(self.compose_options.templates.iter().enumerate().map(|(i, t)| {
                 div()
                     .id(SharedString::from(format!("template-row-{i}")))
                     .flex()
                     .items_center()
                     .gap_3()
-                    .py(px(6.))
-                    .border_b_1()
-                    .border_color(rgb(c.border))
                     .child(
                         div()
                             .flex_1()
@@ -188,24 +171,50 @@ impl MailApp {
                         Action::Templates(TemplateAction::Remove(i)),
                         false,
                         cx,
-                    )),
-            );
-        }
-        section
-            .child(field(Input::new(&self.templates.name), c, false))
-            .child(field(Input::new(&self.templates.subject), c, false))
-            .child(
+                    ))
+            }))
+            .row(
                 div()
-                    .h(px(110.))
-                    .child(textarea_field(Textarea::new(&self.templates.body), c, false).h_full()),
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(field(Input::new(&self.templates.name), c, false))
+                    .child(field(Input::new(&self.templates.subject), c, false))
+                    .child(
+                        div()
+                            .h(px(110.))
+                            .child(textarea_field(Textarea::new(&self.templates.body), c, false).h_full()),
+                    )
+                    .child(div().flex().items_center().justify_between().child(
+                        // The placeholders a template can use, on hover.
+                        div()
+                            .id("template-placeholders")
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .text_size(px(12.))
+                            .text_color(rgb(c.muted))
+                            .child(icon_el("info", 13., c.muted))
+                            .child(t!("templates-placeholders"))
+                            .tooltip(|w, cx| {
+                                Tooltip::new(t!(
+                                    "templates-placeholders-fill-in-as-a-template",
+                                    placeholders = crate::manage::composing::PLACEHOLDERS
+                                        .iter()
+                                        .map(|(p, what)| format!("{p} {what}"))
+                                        .collect::<Vec<_>>()
+                                        .join(", ")
+                                ))
+                                .build(w, cx)
+                            }),
+                    ).child(self.button(
+                        "add-template",
+                        t!("templates-add-template"),
+                        "plus",
+                        Action::Templates(TemplateAction::Add),
+                        true,
+                        cx,
+                    ))),
             )
-            .child(div().flex().justify_end().child(self.button(
-                "add-template",
-                t!("templates-add-template"),
-                "plus",
-                Action::Templates(TemplateAction::Add),
-                true,
-                cx,
-            )))
     }
 }
