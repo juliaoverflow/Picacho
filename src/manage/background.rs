@@ -334,6 +334,7 @@ fn run(shared: &Shared, wake: mpsc::Sender<Wake>, woken: mpsc::Receiver<Wake>, a
         // A check parses and stores mail, then frees it all again; give that
         // back to the system before waiting.
         if checked {
+            super::widgets::publish(store);
             super::memory::release_unused();
         }
         match woken.recv_timeout(TICK) {

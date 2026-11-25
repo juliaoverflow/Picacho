@@ -1327,20 +1327,6 @@ impl MailApp {
                         )),
                 ),
         );
-        page = page
-            .child(self.section("Keyboard shortcuts"))
-            .child(small(format!(
-                "Change shortcuts in {}: each line is an action and its keys, as “reply = ctrl-shift-r”. The file lists every action; changes apply when Picacho starts again.",
-                super::shortcuts::file_path().display()
-            )))
-            .child(div().flex().child(self.button(
-                "open-shortcuts",
-                "Open Shortcuts File",
-                "",
-                Action::Tools(super::tools::ToolAction::OpenShortcuts),
-                false,
-                cx,
-            )));
         page.into_any_element()
     }
 }

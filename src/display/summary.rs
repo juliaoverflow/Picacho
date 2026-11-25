@@ -157,6 +157,7 @@ impl MailApp {
                         this.download_shipping(waiting, cx);
                         // New emails are searched too.
                         this.load_parcel_texts(cx);
+                        crate::manage::widgets::publish_soon(this.backend.store.clone());
                     }
                     Err(e) => this.notice(format!("{e:#}"), true, cx),
                 }
@@ -242,6 +243,7 @@ impl MailApp {
             self.summary_read = None;
             self.load_summary(cx);
         }
+        crate::manage::widgets::publish_soon(self.backend.store.clone());
     }
 
     /// The statuses set by hand on parcels, as saved.
@@ -302,6 +304,7 @@ impl MailApp {
         }
         if let Ok(json) = serde_json::to_string(&overrides) {
             self.backend.store.set_preference_soon(OVERRIDES, &json);
+            crate::manage::widgets::publish_soon(self.backend.store.clone());
         }
         parcels::apply_overrides(&mut self.summary, &overrides);
         cx.notify();

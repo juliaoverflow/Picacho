@@ -557,6 +557,13 @@ impl Backend {
                     continue;
                 }
                 let raw = std::fs::read(path)?;
+                let raw = if crate::sync::msg::is_msg(&raw)
+                    || path.extension().is_some_and(|e| e.eq_ignore_ascii_case("msg"))
+                {
+                    crate::sync::msg::to_eml(&raw)?
+                } else {
+                    raw
+                };
                 // Mail travels with CRLF; files saved elsewhere may use LF.
                 add(Some(MboxMessage {
                     raw: crlf(&raw),

@@ -29,6 +29,11 @@ public final class RestartActivity extends Activity {
             // Checked before the restart (PicachoActivity.restartProcess).
             open.putExtra(Notifier.EXTRA_OPEN, target).putExtra(Notifier.EXTRA_KEY, Notifier.key(this));
         }
+        String widgetUri = getIntent().getStringExtra(WidgetStore.EXTRA_WIDGET);
+        if (widgetUri != null) {
+            open.putExtra(WidgetStore.EXTRA_WIDGET, widgetUri)
+                    .putExtra(WidgetStore.EXTRA_KEY, WidgetStore.key(this));
+        }
         startActivity(open);
         finish();
         Process.killProcess(Process.myPid());

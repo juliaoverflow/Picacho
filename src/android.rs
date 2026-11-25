@@ -62,24 +62,23 @@ fn android_main(app: android_activity::AndroidApp) {
         log::error!("no internal data directory");
         return;
     };
-    let backend = {
+    let opened = {
         let mut process = process();
         process.ui = true;
         // The window checks mail from here on; the monitor's watches end
         // before the window's begin.
         process.monitor = None;
-        match process.backend(&path) {
-            Ok(backend) => backend,
-            Err(e) => {
-                log::error!("could not open the mail store at {}: {e:#}", path.display());
-                process.ui = false;
-                return;
-            }
-        }
+        process.backend(&path)
     };
     // Starts (or stops) the service that keeps checking once the activity
     // is gone.
-    set_background(background::enabled(&backend.store));
+    let started = |backend: &Arc<Backend>| {
+        set_background(background::enabled(&backend.store));
+        crate::manage::widgets::publish_soon(backend.store.clone());
+    };
+    if let Ok(backend) = &opened {
+        started(backend);
+    }
 
     platform::init_platform(&app);
     let Some(gpui_platform) = platform::shared_platform() else {
@@ -87,14 +86,24 @@ fn android_main(app: android_activity::AndroidApp) {
         process().ui = false;
         return;
     };
+    let gpui_app = gpui::Application::with_platform(gpui_platform.into_rc());
     // Blocks on the activity's event loop; the app's window opens once the
     // system has given the activity its surface. Returns once the activity
     // is destroyed.
-    display::run_on(
-        gpui::Application::with_platform(gpui_platform.into_rc()),
-        backend.clone(),
-    );
-    drop(backend);
+    match opened {
+        Ok(backend) => display::run_on(gpui_app, backend),
+        // A window says why (an encrypted database whose key is gone, say)
+        // and offers to try again or start over.
+        Err(e) => {
+            log::error!("could not open the mail store at {}: {e:#}", path.display());
+            let dir = path.clone();
+            display::run_recovery_on(gpui_app, path, e, move || {
+                let backend = process().backend(&dir)?;
+                started(&backend);
+                Ok(backend)
+            });
+        }
+    }
 
     let mut process = process();
     process.ui = false;
@@ -202,6 +211,53 @@ pub fn set_background(on: bool) {
             &[JValue::Object(java.context.as_obj()), JValue::Bool(on)],
         )
         .map(drop)
+    });
+}
+
+/// Tells Android's home-screen widgets (`WidgetStore.refreshAll`) that
+/// `widget-snapshot.json` was updated.
+pub fn publish_widgets(_json: &str) {
+    with_java("WidgetStore.refreshAll", |env, java| {
+        env.call_static_method(
+            &java.widgets,
+            jni_str!("refreshAll"),
+            jni_sig!("(Landroid/content/Context;)V"),
+            &[JValue::Object(java.context.as_obj())],
+        )
+        .map(drop)
+    });
+}
+
+/// `Native.refreshWidgets(String dataDir)`: rebuilds `widget-snapshot.json`
+/// from the local store and refreshes all home-screen widgets. Called on a
+/// background thread when a widget's Refresh button is tapped or when no
+/// snapshot exists yet.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_tech_pinal_picacho_Native_refreshWidgets<'caller>(
+    env: EnvUnowned<'caller>,
+    _class: JClass<'caller>,
+    data_dir: JString<'caller>,
+) {
+    native(env, |_| {
+        if data_dir.is_null() {
+            return Ok(());
+        }
+        let path = std::path::PathBuf::from(data_dir.to_string());
+        let existing = process().backend.as_ref().map(|b| b.store.clone());
+        match existing {
+            Some(store) => {
+                crate::manage::widgets::publish_force(&store);
+            }
+            None => match Store::open(&path) {
+                Ok(store) => {
+                    crate::manage::widgets::publish_force(&store);
+                }
+                Err(e) => {
+                    log::warn!("refreshWidgets: could not open store at {}: {e:#}", path.display());
+                }
+            },
+        }
+        Ok(())
     });
 }
 
@@ -769,6 +825,10 @@ struct Java {
     browser: Global<JClass<'static>>,
     /// "Save as", with the system's document picker.
     save_file: Global<JClass<'static>>,
+    /// Home-screen widgets (`WidgetStore`).
+    widgets: Global<JClass<'static>>,
+    /// The app lock's fingerprint or face prompt (`AppLock`).
+    app_lock: Global<JClass<'static>>,
     /// The app's package name (`tech.pinal.picacho`, or the beta's).
     package: String,
 }
@@ -860,6 +920,8 @@ pub extern "system" fn Java_tech_pinal_picacho_Native_attach<'caller>(
         let passkeys = env.find_class(jni_str!("tech/pinal/picacho/Passkeys"))?;
         let browser = env.find_class(jni_str!("tech/pinal/picacho/Browser"))?;
         let save_file = env.find_class(jni_str!("tech/pinal/picacho/SaveFile"))?;
+        let widgets = env.find_class(jni_str!("tech/pinal/picacho/WidgetStore"))?;
+        let app_lock = env.find_class(jni_str!("tech/pinal/picacho/AppLock"))?;
         let package = env
             .call_method(
                 &context,
@@ -882,6 +944,8 @@ pub extern "system" fn Java_tech_pinal_picacho_Native_attach<'caller>(
             passkeys: env.new_global_ref(&passkeys)?,
             browser: env.new_global_ref(&browser)?,
             save_file: env.new_global_ref(&save_file)?,
+            widgets: env.new_global_ref(&widgets)?,
+            app_lock: env.new_global_ref(&app_lock)?,
             package,
         };
         let _ = JAVA.set(java);
@@ -1107,4 +1171,71 @@ pub fn verify(url: &str, cancel: &AtomicBool) -> anyhow::Result<Option<(String, 
         .map(drop)
     });
     outcome
+}
+
+/// Whether the phone can unlock the app lock with a fingerprint or the face
+/// (`AppLock.available`): Android 10 or later, with one enrolled.
+pub fn biometrics_available() -> bool {
+    call_java("AppLock.available", |env, java| {
+        env.call_static_method(
+            &java.app_lock,
+            jni_str!("available"),
+            jni_sig!("(Landroid/content/Context;)Z"),
+            &[JValue::Object(java.context.as_obj())],
+        )?
+        .z()
+    }) == Some(true)
+}
+
+/// Shows Android's fingerprint or face prompt for the app lock
+/// (`AppLock.authenticate`) and waits for how it ended.
+pub fn authenticate_biometrics(reason: &str) -> crate::display::biometric::Answer {
+    use crate::display::biometric::Failure;
+    use requests::{Request, Waited};
+    let request = Request::new();
+    let id = request.id();
+    let asked = call_java("AppLock.authenticate", |env, java| {
+        let title = env.new_string("Unlock Picacho")?;
+        let reason = env.new_string(reason)?;
+        let cancel = env.new_string("Use Passcode")?;
+        env.call_static_method(
+            &java.app_lock,
+            jni_str!("authenticate"),
+            jni_sig!("(ILjava/lang/String;Ljava/lang/String;Ljava/lang/String;)V"),
+            &[
+                JValue::Int(id),
+                JValue::Object(&title),
+                JValue::Object(&reason),
+                JValue::Object(&cancel),
+            ],
+        )
+        .map(drop)
+    });
+    if asked.is_none() {
+        return Err(Failure::Failed("The fingerprint or face prompt couldn't be shown.".into()));
+    }
+    let never = AtomicBool::new(false);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10 * 60);
+    match request.next(&never, deadline) {
+        Waited::Answer(Some(answer)) if answer == "ok" => Ok(()),
+        Waited::Answer(Some(answer)) => match answer.strip_prefix("error:") {
+            Some(why) => Err(Failure::Failed(why.to_owned())),
+            None => Err(Failure::Cancelled),
+        },
+        Waited::Answer(None) | Waited::TimedOut | Waited::Cancelled => Err(Failure::Cancelled),
+    }
+}
+
+/// Keeps Picacho's picture out of Recents (Android 13 and later), while
+/// the app lock is on (`AppLock.setRecentsPrivate`). Screenshots still work.
+pub fn set_recents_private(on: bool) {
+    with_java("AppLock.setRecentsPrivate", |env, java| {
+        env.call_static_method(
+            &java.app_lock,
+            jni_str!("setRecentsPrivate"),
+            jni_sig!("(Z)V"),
+            &[JValue::Bool(on)],
+        )
+        .map(drop)
+    });
 }

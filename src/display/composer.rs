@@ -24,26 +24,6 @@ actions!(
     ]
 );
 
-/// Key bindings while a composer has focus. The "Composer" context is
-/// deeper than "Mail", so these win over the main window's shortcuts.
-pub(super) fn bindings(cx: &App) -> Vec<KeyBinding> {
-    let ctx = Some("Composer");
-    vec![
-        key(cx, "secondary-b", Bold, ctx),
-        key(cx, "secondary-i", Italic, ctx),
-        key(cx, "secondary-shift-x", Strike, ctx),
-        key(cx, "secondary-e", InlineCode, ctx),
-        key(cx, "secondary-k", InsertLink, ctx),
-        key(cx, "secondary-shift-8", Bullets, ctx),
-        key(cx, "secondary-shift-7", Numbers, ctx),
-        key(cx, "secondary-shift-9", QuoteLines, ctx),
-        key(cx, "secondary-alt-1", Heading, ctx),
-        key(cx, "secondary-s", SaveDraft, ctx),
-        key(cx, "secondary-enter", SendDraft, ctx),
-        key(cx, "secondary-shift-p", TogglePreview, ctx),
-    ]
-}
-
 /// Where a composer is shown.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Placement {
@@ -1540,18 +1520,20 @@ impl Composer {
         &self,
         id: &'static str,
         icon: &'static str,
-        tip: &'static str,
+        tip: impl Into<SharedString>,
         on: bool,
         cx: &Context<Self>,
         click: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
     ) -> Stateful<Div> {
         let c = self.colors;
+        let tip: SharedString = tip.into();
+        let shown = keys(&tip);
         div()
             .id(id)
             .debug_selector(move || format!("compose-{id}"))
             .role(Role::Button)
-            .aria_label(super::spoken(tip))
-            .when_some(super::spoken_keys(tip), |d, k| d.aria_keyshortcuts(k))
+            .aria_label(super::spoken(&tip))
+            .when_some(super::spoken_keys(&tip), |d, k| d.aria_keyshortcuts(k))
             .when(on, |d| d.aria_toggled(Toggled::True))
             .focusable()
             .tab_stop(true)
@@ -1568,7 +1550,7 @@ impl Composer {
             .hover(move |s| s.bg(rgb(c.border)))
             .active(|s| s.opacity(0.7))
             .child(icon_el(icon, if self.mobile { 20. } else { 15. }, if on { c.accent } else { c.muted }))
-            .tooltip(move |w, cx| Tooltip::new(keys(tip)).build(w, cx))
+            .tooltip(move |w, cx| Tooltip::new(shown.clone()).build(w, cx))
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_click(cx.listener(move |this, _, w, cx| {
                 cx.stop_propagation();
@@ -1594,7 +1576,7 @@ impl Composer {
             .child(self.icon_button(
                 "save",
                 "save",
-                "Save draft · ⌘S",
+                super::shortcuts::tip("Save draft", "save-draft", cx),
                 false,
                 cx,
                 |this, _, cx| this.save(cx),
@@ -1667,7 +1649,7 @@ impl Composer {
         let save = self.icon_button(
             "save",
             "save",
-            "Save draft · ⌘S",
+            super::shortcuts::tip("Save draft", "save-draft", cx),
             false,
             cx,
             |this, _, cx| {
@@ -1928,6 +1910,7 @@ impl Composer {
 
     /// The address the draft goes from: its alias, the account's other
     /// address it is sent as, or the account's own.
+    #[allow(clippy::wrong_self_convention)]
     fn from_address(&self) -> String {
         if !self.draft.send_as.trim().is_empty() {
             return self.draft.send_as.trim().to_owned();
@@ -2412,14 +2395,14 @@ impl Composer {
             .border_b_1()
             .border_color(rgb(c.border))
             .child(
-                self.icon_button("bold", "bold", "Bold · ⌘B", false, cx, |t, w, cx| {
+                self.icon_button("bold", "bold", super::shortcuts::tip("Bold", "bold", cx), false, cx, |t, w, cx| {
                     t.wrap("**", w, cx)
                 }),
             )
             .child(self.icon_button(
                 "italic",
                 "italic",
-                "Italic · ⌘I",
+                super::shortcuts::tip("Italic", "italic", cx),
                 false,
                 cx,
                 |t, w, cx| t.wrap("_", w, cx),
@@ -2427,13 +2410,13 @@ impl Composer {
             .child(self.icon_button(
                 "strike",
                 "strike",
-                "Strikethrough · ⌘⇧X",
+                super::shortcuts::tip("Strikethrough", "strikethrough", cx),
                 false,
                 cx,
                 |t, w, cx| t.wrap("~~", w, cx),
             ))
             .child(
-                self.icon_button("code", "code", "Code · ⌘E", false, cx, |t, w, cx| {
+                self.icon_button("code", "code", super::shortcuts::tip("Code", "code", cx), false, cx, |t, w, cx| {
                     t.wrap("`", w, cx)
                 }),
             )
@@ -2441,7 +2424,7 @@ impl Composer {
             .child(self.icon_button(
                 "heading",
                 "heading",
-                "Heading · ⌘⌥1",
+                super::shortcuts::tip("Heading", "heading", cx),
                 false,
                 cx,
                 |t, w, cx| t.prefix_lines(Lines::Heading, w, cx),
@@ -2449,7 +2432,7 @@ impl Composer {
             .child(self.icon_button(
                 "bullets",
                 "list",
-                "Bulleted list · ⌘⇧8",
+                super::shortcuts::tip("Bulleted list", "bulleted-list", cx),
                 false,
                 cx,
                 |t, w, cx| t.prefix_lines(Lines::Bullets, w, cx),
@@ -2457,7 +2440,7 @@ impl Composer {
             .child(self.icon_button(
                 "numbers",
                 "list-ordered",
-                "Numbered list · ⌘⇧7",
+                super::shortcuts::tip("Numbered list", "numbered-list", cx),
                 false,
                 cx,
                 |t, w, cx| t.prefix_lines(Lines::Numbers, w, cx),
@@ -2465,13 +2448,13 @@ impl Composer {
             .child(self.icon_button(
                 "quote",
                 "quote",
-                "Quote · ⌘⇧9",
+                super::shortcuts::tip("Quote", "quote", cx),
                 false,
                 cx,
                 |t, w, cx| t.prefix_lines(Lines::Quote, w, cx),
             ))
             .child(
-                self.icon_button("link", "link", "Link · ⌘K", false, cx, |t, w, cx| {
+                self.icon_button("link", "link", super::shortcuts::tip("Link", "link", cx), false, cx, |t, w, cx| {
                     t.insert_link(w, cx)
                 }),
             )
@@ -2479,7 +2462,7 @@ impl Composer {
             .child(self.icon_button(
                 "preview",
                 "preview",
-                "Preview · ⌘⇧P",
+                super::shortcuts::tip("Preview", "preview-formatting", cx),
                 self.preview,
                 cx,
                 |t, _, cx| {
@@ -2629,7 +2612,7 @@ impl Composer {
             .when(self.sending, |d| d.opacity(0.6))
             .child(icon_el("send", 14., c.on_accent))
             .child(if self.sending { "Sending…" } else { "Send" })
-            .tooltip(|w, cx| Tooltip::new(keys("Send · ⌘Enter")).build(w, cx))
+            .tooltip(|w, cx| Tooltip::new(keys(&super::shortcuts::tip("Send", "send", cx))).build(w, cx))
             .on_click(cx.listener(|this, _, w, cx| this.request_send(w, cx)));
         let status = if let Some(error) = &self.error {
             div()
@@ -2911,6 +2894,9 @@ impl Render for ComposeWindow {
         let c = self.composer.read(cx).colors;
         let title = self.composer.read(cx).title(cx);
         super::window::set_title(window, &title);
+        if super::applock::covered(cx) {
+            return super::applock::cover(c, window);
+        }
         let composer = self.composer.clone();
         div()
             .key_context("Detached")
@@ -2925,6 +2911,7 @@ impl Render for ComposeWindow {
             .font_family(".SystemUIFont")
             .text_size(px(14.))
             .child(self.composer.clone())
+            .into_any_element()
     }
 }
 

@@ -100,7 +100,13 @@ fn message(raw: &[u8], depth: usize, whole: bool, out: &mut String) {
             ),
             Kind::Email if depth < MAX_DEPTH => {
                 let mut inner = String::new();
-                message(&bytes, depth + 1, true, &mut inner);
+                if crate::sync::msg::is_msg(&bytes) {
+                    if let Ok(eml) = crate::sync::msg::to_eml(&bytes) {
+                        message(&eml, depth + 1, true, &mut inner);
+                    }
+                } else {
+                    message(&bytes, depth + 1, true, &mut inner);
+                }
                 inner
             }
             Kind::Pdf => pdf_text(&bytes),
@@ -136,7 +142,7 @@ fn kind(mime: &str, name: &str) -> Kind {
         .unwrap_or_default();
     match (mime, ext.as_str()) {
         (_, "html" | "htm") | ("text/html", _) => Kind::Html,
-        ("message/rfc822", _) | (_, "eml") => Kind::Email,
+        ("message/rfc822" | "application/vnd.ms-outlook", _) | (_, "eml" | "msg") => Kind::Email,
         ("application/pdf", _) | (_, "pdf") => Kind::Pdf,
         (_, "docx" | "docm" | "dotx") => Kind::Office(WORD),
         (_, "xlsx" | "xlsm") => Kind::Office(EXCEL),

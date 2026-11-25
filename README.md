@@ -124,6 +124,12 @@ The Android app has what the desktop has, including:
   checking, and starts again at boot. Settings → General turns it off.
 - Attachments and account pictures from the system file picker
   (`GpuiPathPicker`).
+- Home-screen widgets: a resizable **Inbox** widget (scrollable recent
+  messages, unread count, account and unread-only filter, quick compose and
+  refresh), a compact **Unread Mail** widget, an upcoming **Calendar**
+  agenda widget, and **Packages** and **Receipts** widgets showing as many
+  of your recent deliveries and receipts as fit, with **View all** for the
+  rest.
 - Proton: second factors with a security key (USB or NFC) or a passkey
   (Android 14 and later, through Credential Manager), and Proton's human
   verification (CAPTCHA) in a WebView (`VerifyActivity`).
@@ -237,6 +243,23 @@ Beyond reading, writing and organizing mail, Picacho has:
     S/MIME, sync with the server's Drafts sealed to your own key or
     certificate, so other devices with it can open them.
   - Pinal Mail's zero-access encryption works without any of this.
+- **App lock and an encrypted database** (Settings → Privacy).
+  - *App lock:* Picacho asks for a passcode, or Touch ID, Face ID or the
+    phone's fingerprint or face unlock, when it opens and when you come back
+    to it after a while (immediately, or after 1, 5, 15 or 60 minutes away).
+    **Lock Picacho** in the Picacho menu (⌥⌘L, Ctrl+Alt+L) locks it at
+    once. Its other windows are covered meanwhile, and on phones so is the
+    app switcher's picture. Mail is still checked, and new mail announced,
+    while it's locked; **Hide mail outside Picacho** (on with the lock)
+    keeps who and what out of notifications and widgets. Tries slow down
+    after five wrong passcodes.
+  - *Encrypted database:* the local copy of your mail, drafts, contacts,
+    calendars and settings is encrypted with SQLCipher (AES-256), with a
+    random key kept in the system keychain, so background checks still
+    run without asking. Turning it on or off rewrites the database in
+    place. If the keychain loses the key, the local copy can't be read:
+    Picacho says so at launch and can move it aside to start over (mail
+    kept only on this device stays in the old file).
 - **Contacts** (Settings → Contacts). Picacho reads your address books from
   a CardDAV server (Fastmail, iCloud, Nextcloud, Radicale and others; RFC
   6352), and adds, edits and deletes contacts there. It keeps what other

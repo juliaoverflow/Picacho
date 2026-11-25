@@ -54,13 +54,14 @@ impl MailApp {
     }
     /// The sidebar toggle, beside Compose (or above it in the rail).
     pub(super) fn sidebar_toggle(&self, collapsed: bool, cx: &Context<Self>) -> Stateful<Div> {
+        let tip = shortcuts::tip(
+            if collapsed { "@Show sidebar" } else { "@Hide sidebar" },
+            "toggle-sidebar",
+            cx,
+        );
         self.button(
             "toggle-sidebar",
-            if collapsed {
-                "@Show sidebar · ⌃⌘S"
-            } else {
-                "@Hide sidebar · ⌃⌘S"
-            },
+            &tip,
             if collapsed {
                 "panel-left-open"
             } else {

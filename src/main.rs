@@ -29,16 +29,42 @@ fn main() -> anyhow::Result<()> {
         }
         return Ok(());
     }
+    // Widget snapshot helpers for external Linux bars/scripts (Waybar, Polybar,
+    // Eww, Conky, etc.): print JSON and exit without touching the running app.
+    let widget_json_flag = first.as_deref() == Some(std::ffi::OsStr::new("--widget-json"));
+    let widget_waybar_flag = first.as_deref() == Some(std::ffi::OsStr::new("--widget-waybar"));
+    if widget_json_flag || widget_waybar_flag {
+        let project = directories::ProjectDirs::from("tech", "pinal", "picacho")
+            .ok_or_else(|| anyhow::anyhow!("Cannot find the application data directory"))?;
+        let path = std::env::var_os("PICACHO_DATA_DIR")
+            .or_else(|| std::env::var_os("PINAL_MAIL_DATA_DIR"))
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| project.data_dir().to_owned());
+        // The snapshot the app (or its background process) keeps up to date.
+        // The mail store isn't opened here: Picacho may be running, and only
+        // one process opens it (see `display::instance`). Before the first
+        // snapshot is written, an empty one is printed.
+        let snap = manage::widgets::read_cached(&path).unwrap_or_else(|| {
+            manage::widgets::Snapshot::empty("green", chrono::Utc::now().timestamp())
+        });
+        if widget_waybar_flag {
+            println!("{}", manage::widgets::waybar_json(&snap));
+        } else {
+            println!("{}", serde_json::to_string(&snap)?);
+        }
+        return Ok(());
+    }
     let project = directories::ProjectDirs::from("tech", "pinal", "picacho")
         .ok_or_else(|| anyhow::anyhow!("Cannot find the application data directory"))?;
-    // The background process opens the window on the directory it used.
-    let chosen = (first.as_deref() == Some(std::ffi::OsStr::new(display::resident::DATA_DIR_FLAG)))
-        .then(|| args.next())
-        .flatten();
+    // The background process opens the window on the directory it used, and
+    // direct launches may pass `mailto:` links or `.eml`/`.msg` files.
+    let (chosen, requests) = display::launch::parse_args(std::env::args_os().skip(1));
     let path = chosen
-        .or_else(|| std::env::var_os("PICACHO_DATA_DIR"))
-        .or_else(|| std::env::var_os("PINAL_MAIL_DATA_DIR"))
-        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("PICACHO_DATA_DIR")
+                .or_else(|| std::env::var_os("PINAL_MAIL_DATA_DIR"))
+                .map(std::path::PathBuf::from)
+        })
         .unwrap_or_else(|| {
             let path = project.data_dir().to_owned();
             // Keep accounts and mail from earlier identifiers: com.pinal.Picacho,
@@ -55,12 +81,6 @@ fn main() -> anyhow::Result<()> {
         });
     // Picacho may be running already, perhaps with no window (in the
     // background): show that one rather than open the cache twice.
-    // A `mailto:` address or an email file to open (Picacho as the default
-    // email app, or opened from the file manager).
-    let requests: Vec<String> = std::env::args()
-        .skip(1)
-        .filter_map(|a| display::launch::request(&a))
-        .collect();
     let listener = match display::instance::claim(&path, &requests) {
         Some(display::instance::Claim::Forwarded) => return Ok(()),
         // Running already but not answering: opening the cache too would
@@ -71,10 +91,21 @@ fn main() -> anyhow::Result<()> {
         Some(display::instance::Claim::Primary(listener)) => Some(listener),
         None => None,
     };
+    for r in display::launch::load_pending(&path) {
+        display::launch::push(r);
+    }
     for r in requests {
         display::launch::push(r);
     }
-    let store = std::sync::Arc::new(manage::store::Store::open(&path)?);
-    display::run(store, listener);
+    match manage::store::Store::open(&path) {
+        Ok(store) => display::run(std::sync::Arc::new(store), listener),
+        // An encrypted database whose key is gone, a keychain that refused:
+        // a window says so and offers what can be done, rather than the
+        // app quitting with a message nobody sees.
+        Err(e) => {
+            eprintln!("Picacho: {e:#}");
+            display::run_recovery(path, e, listener);
+        }
+    }
     Ok(())
 }

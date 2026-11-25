@@ -179,7 +179,11 @@ pub fn act(backend: &Backend, target: &Target, change: Change) -> anyhow::Result
     if mails.is_empty() {
         return Ok(());
     }
-    backend.change_many(&a, &mails, change)
+    let result = backend.change_many(&a, &mails, change);
+    if result.is_ok() {
+        crate::manage::widgets::publish_soon(backend.store.clone());
+    }
+    result
 }
 
 /// The notification tapped last, until the window takes it.
@@ -275,7 +279,14 @@ pub fn new_mail(
     latest: (&str, &str),
     count: usize,
 ) {
-    let (title, body) = if count == 1 {
+    // Settings → Privacy → Hide mail outside Picacho: how many, not who or what.
+    let (title, body) = if crate::manage::applock::hiding() {
+        if count == 1 {
+            ("New message".to_owned(), String::new())
+        } else {
+            (format!("{count} new messages"), String::new())
+        }
+    } else if count == 1 {
         (latest.0.to_owned(), latest.1.to_owned())
     } else {
         (
@@ -325,7 +336,10 @@ pub fn announce(announcement: crate::manage::background::Announcement<'_>) {
             subject,
             count,
         } => {
-            let body = if count == 1 {
+            let hiding = crate::manage::applock::hiding();
+            let body = if count == 1 && hiding {
+                "A snoozed message is back in the inbox".to_owned()
+            } else if count == 1 {
                 format!("{sender} — {}", or_untitled(subject))
             } else {
                 format!("{count} snoozed messages are back in the inbox")
@@ -352,7 +366,11 @@ pub fn announce(announcement: crate::manage::background::Announcement<'_>) {
             format!("sent:{account}"),
             "Scheduled message sent".to_owned(),
             account.to_owned(),
-            format!("{} — to {to}", or_untitled(subject)),
+            if crate::manage::applock::hiding() {
+                String::new()
+            } else {
+                format!("{} — to {to}", or_untitled(subject))
+            },
             Some(Target::new(account_id, Folder::Sent, None)),
         ),
         ScheduledFailed {
@@ -365,7 +383,11 @@ pub fn announce(announcement: crate::manage::background::Announcement<'_>) {
             format!("unsent:{draft}"),
             "A scheduled message wasn't sent".to_owned(),
             account.to_owned(),
-            format!("{}: {error} It's in Drafts.", or_untitled(subject)),
+            if crate::manage::applock::hiding() {
+                "It's in Drafts.".to_owned()
+            } else {
+                format!("{}: {error} It's in Drafts.", or_untitled(subject))
+            },
             account_id.map(|id| Target::new(id, Folder::Drafts, None)),
         ),
     }
@@ -394,11 +416,12 @@ pub fn account_notice(account: &str, account_id: &str, title: &str, body: &str) 
 
 /// A calendar reminder: the event's title, and when and where.
 pub fn reminder(uid: &str, title: &str, body: &str) {
+    let hiding = crate::manage::applock::hiding();
     show(
         format!("reminder:{uid}"),
-        title.to_owned(),
+        if hiding { "Upcoming event".to_owned() } else { title.to_owned() },
         "Calendar".to_owned(),
-        body.to_owned(),
+        if hiding { String::new() } else { body.to_owned() },
         None,
     );
 }
@@ -586,4 +609,5 @@ mod tests {
         assert_eq!(quick_change("reply"), None);
         assert!(is_quick("trash") && !is_quick("default"));
     }
+
 }

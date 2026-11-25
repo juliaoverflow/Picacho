@@ -389,6 +389,13 @@ impl MailApp {
                 cx,
             ))
             .child(self.settings_nav(
+                "settings-privacy".into(),
+                "Privacy".into(),
+                icon_el("shield", 15., c.muted).into_any_element(),
+                Page::Privacy,
+                cx,
+            ))
+            .child(self.settings_nav(
                 "settings-local-ai".into(),
                 "Local AI".into(),
                 icon_el("sparkle", 15., c.muted).into_any_element(),
@@ -402,6 +409,15 @@ impl MailApp {
                 Page::Organizing,
                 cx,
             ))
+            .when(!self.mobile.on, |nav| {
+                nav.child(self.settings_nav(
+                    "settings-shortcuts".into(),
+                    "Keyboard Shortcuts".into(),
+                    icon_el("keyboard", 15., c.muted).into_any_element(),
+                    Page::Shortcuts,
+                    cx,
+                ))
+            })
             .when(!narrow, |nav| {
                 nav.child(
                     div()
@@ -587,29 +603,49 @@ impl MailApp {
             ))
             .map(|d| self.background_settings(d, cx))
             // A phone lists About in Settings' own list instead.
-            .when(!self.mobile.on, |d| d.child(self.section("Picacho")).child(
-                div()
-                    .flex()
-                    .flex_wrap()
-                    .gap_2()
+            .when(!self.mobile.on, |d| {
+                let is_default = self.find.default_mail_app == Some(true);
+                let default_desc = if is_default {
+                    "Picacho is currently your default email app for mailto: links, .eml and .msg files."
+                } else if cfg!(windows) {
+                    "Picacho is registered in Windows Default apps for mailto: links, .eml and .msg files. Click below to jump straight to Picacho's page in Default apps."
+                } else if cfg!(target_os = "macos") {
+                    "Use Picacho for mailto: links, .eml and .msg files (chosen in Apple Mail → Settings → General)."
+                } else {
+                    "Use Picacho as your default app for mailto: links, .eml and .msg files."
+                };
+                let default_label = if cfg!(windows) {
+                    if is_default { "Manage in Default Apps…" } else { "Open Default Apps…" }
+                } else if cfg!(target_os = "macos") {
+                    "Choose Default Email Reader…"
+                } else if is_default {
+                    "Reapply as Default Email App"
+                } else {
+                    "Set as Default Email App"
+                };
+                d.child(self.section("Picacho"))
+                    .child(self.setting(
+                        "Default email app",
+                        default_desc,
+                        div().flex().items_center().gap_2().child(
+                            self.button(
+                                "set-default-app",
+                                default_label,
+                                if is_default { "check" } else { "external" },
+                                Action::Tools(super::tools::ToolAction::SetDefaultApp),
+                                !is_default,
+                                cx,
+                            ),
+                        ),
+                    ))
                     .child(
-                        self.button(
-                            "open-shortcuts",
-                            "Keyboard Shortcuts",
-                            "info",
-                            Action::Help,
-                            false,
-                            cx,
-                        )
-                        .border_1()
-                        .border_color(rgb(c.border)),
+                        div().flex().flex_wrap().gap_2().child(
+                            self.button("open-about", "About Picacho", "", Action::About, false, cx)
+                                .border_1()
+                                .border_color(rgb(c.border)),
+                        ),
                     )
-                    .child(
-                        self.button("open-about", "About Picacho", "", Action::About, false, cx)
-                            .border_1()
-                            .border_color(rgb(c.border)),
-                    ),
-            ))
+            })
             .into_any_element()
     }
     /// Whether the open settings page lists an account's mail errors: only
@@ -2300,6 +2336,9 @@ impl Render for SettingsWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let c = self.colors;
         super::window::set_title(window, "Settings");
+        if super::applock::covered(cx) {
+            return super::applock::cover(c, window);
+        }
         let id = window.window_handle().window_id();
         let (content, menu, status, error) = self.app.update(cx, |app, cx| {
             app.sync_nickname_input(window, cx);
@@ -2392,6 +2431,7 @@ impl Render for SettingsWindow {
                 )
             })
             .children(menu)
+            .into_any_element()
     }
 }
 
@@ -2410,8 +2450,10 @@ impl MailApp {
             Page::Contacts => self.contacts_page(cx),
             Page::Calendar => self.calendar_page(cx),
             Page::Encryption => self.encryption_page(cx),
+            Page::Privacy => self.privacy_page(cx),
             Page::LocalAi => self.local_ai_page(cx),
             Page::Organizing => self.organizing_page(cx),
+            Page::Shortcuts => self.shortcuts_page(cx),
             Page::About if self.mobile.on => self.mobile_about_page(cx),
             Page::About => self.general_page(cx),
         }

@@ -17,8 +17,10 @@ pub(crate) struct OpenWithApp {
     pub path: PathBuf,
 }
 
-/// The apps that open `file` (of type `mime`), the default first.
+/// The apps that open `file` (of type `mime`), the default first. Windows
+/// shows its own Open With dialog instead.
 #[allow(unused_variables)]
+#[cfg_attr(any(windows, target_os = "android", target_os = "ios"), allow(dead_code))]
 pub(crate) fn apps_for(file: &Path, mime: &str) -> Vec<OpenWithApp> {
     #[cfg(target_os = "macos")]
     {

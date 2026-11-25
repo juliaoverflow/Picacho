@@ -129,6 +129,9 @@ impl MessageWindow {
 impl Render for MessageWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let c = self.colors;
+        if super::applock::covered(cx) {
+            return super::applock::cover(c, window);
+        }
         let m = &self.mail;
         // Sign-in codes found by Local AI are hidden here too.
         let codes = self
@@ -410,6 +413,7 @@ impl Render for MessageWindow {
                     .as_deref()
                     .map(|url| super::links::link_status_pill(url, c)),
             ))
+            .into_any_element()
     }
 }
 
@@ -455,12 +459,19 @@ impl MailApp {
         self.show_mail_window(mail, w, cx);
     }
 
-    /// Opens an email file (.eml) in a message window of its own, as when
-    /// one is opened from the system's file manager.
+    /// Opens an email file (.eml or Outlook .msg) in a message window of its
+    /// own, as when one is opened from the system's file manager.
     pub(super) fn open_eml_file(&mut self, path: &std::path::Path, w: &mut Window, cx: &mut Context<Self>) {
         let parsed = std::fs::read(path)
             .map_err(anyhow::Error::from)
             .and_then(|raw| {
+                let raw = if crate::sync::msg::is_msg(&raw)
+                    || path.extension().is_some_and(|e| e.eq_ignore_ascii_case("msg"))
+                {
+                    crate::sync::msg::to_eml(&raw)?
+                } else {
+                    raw
+                };
                 let mut account = Account::new(Provider::Imap);
                 account.id = String::new();
                 let id = format!("file:{}", path.display());

@@ -75,7 +75,7 @@ xcodebuild \
     -allowProvisioningUpdates \
     -quiet \
     DEVELOPMENT_TEAM="$team" \
-    PRODUCT_BUNDLE_IDENTIFIER="$bundle_id" \
+    PICACHO_BUNDLE_ID="$bundle_id" \
     RUST_PROFILE="$profile" \
     build
 app="target/ios-build/Build/Products/$configuration-$sdk/Picacho.app"

@@ -1633,6 +1633,7 @@ pub struct Rule {
     pub by_day: Vec<(i32, chrono::Weekday)>,
     pub by_month_day: Vec<i32>,
     pub by_month: Vec<u32>,
+    pub by_set_pos: Vec<i32>,
 }
 
 impl Rule {
@@ -1667,6 +1668,9 @@ impl Rule {
                 }
                 "BYMONTH" => {
                     rule.by_month = v.split(',').filter_map(|d| d.trim().parse().ok()).collect()
+                }
+                "BYSETPOS" => {
+                    rule.by_set_pos = v.split(',').filter_map(|d| d.trim().parse().ok()).collect()
                 }
                 // WKST and the rest change nothing Picacho expands.
                 _ => {}
@@ -1714,7 +1718,52 @@ impl Rule {
         } else {
             format!("Every {} {unit}s", self.interval)
         };
-        if !self.by_day.is_empty() {
+        let ordinal = |n: i32| match n {
+            -1 => "the last".to_owned(),
+            1 => "the first".to_owned(),
+            2 => "the second".to_owned(),
+            3 => "the third".to_owned(),
+            4 => "the fourth".to_owned(),
+            n if n < 0 => format!("#{n}"),
+            n => format!("the {n}th"),
+        };
+        if !self.by_month.is_empty() {
+            const MONTHS: [&str; 12] = [
+                "January", "February", "March", "April", "May", "June", "July", "August",
+                "September", "October", "November", "December",
+            ];
+            let months: Vec<&str> = self
+                .by_month
+                .iter()
+                .filter_map(|&m| MONTHS.get(m.checked_sub(1)? as usize).copied())
+                .collect();
+            if !months.is_empty() {
+                text.push_str(&format!(" in {}", months.join(", ")));
+            }
+        }
+        let weekdays_only = self.by_day.len() == 5
+            && self.by_day.iter().all(|(n, d)| {
+                *n == 0
+                    && matches!(
+                        d,
+                        chrono::Weekday::Mon
+                            | chrono::Weekday::Tue
+                            | chrono::Weekday::Wed
+                            | chrono::Weekday::Thu
+                            | chrono::Weekday::Fri
+                    )
+            });
+        let weekend_only = self.by_day.len() == 2
+            && self
+                .by_day
+                .iter()
+                .all(|(n, d)| *n == 0 && matches!(d, chrono::Weekday::Sat | chrono::Weekday::Sun));
+        if let [pos] = self.by_set_pos.as_slice()
+            && (weekdays_only || weekend_only)
+        {
+            let kind = if weekdays_only { "weekday" } else { "weekend day" };
+            text.push_str(&format!(" on {} {kind}", ordinal(*pos)));
+        } else if !self.by_day.is_empty() {
             let days: Vec<String> = self
                 .by_day
                 .iter()
@@ -1736,6 +1785,21 @@ impl Rule {
                         3 => format!("the third {name}"),
                         4 => format!("the fourth {name}"),
                         n => format!("{name} #{n}"),
+                    }
+                })
+                .collect();
+            text.push_str(&format!(" on {}", days.join(", ")));
+        } else if !self.by_month_day.is_empty() {
+            let days: Vec<String> = self
+                .by_month_day
+                .iter()
+                .map(|&d| {
+                    if d == -1 {
+                        "the last day".to_owned()
+                    } else if d < 0 {
+                        format!("{} days before the end", -d)
+                    } else {
+                        format!("day {d}")
                     }
                 })
                 .collect();

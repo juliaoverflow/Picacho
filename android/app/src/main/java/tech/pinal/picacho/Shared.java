@@ -41,7 +41,11 @@ final class Shared {
             return out;
         }
         if (Intent.ACTION_VIEW.equals(action) && data != null) {
-            File file = copy(context, data, "message.eml");
+            String mime = intent.getType();
+            String fallback = "application/vnd.ms-outlook".equalsIgnoreCase(mime)
+                    ? "message.msg"
+                    : "message.eml";
+            File file = copy(context, data, fallback);
             if (file != null) {
                 out.add(file.getAbsolutePath());
             }
@@ -102,9 +106,11 @@ final class Shared {
             // Not every provider answers; the fallback name does.
         }
         name = name.replace('/', '_').replace('\\', '_').replace("\0", "_");
-        // An email file keeps its extension, which Rust goes by.
-        if (fallback.endsWith(".eml") && !name.toLowerCase(java.util.Locale.ROOT).endsWith(".eml")) {
-            name = name + ".eml";
+        // An email file keeps its extension (.eml or .msg), which Rust goes by.
+        String lower = name.toLowerCase(java.util.Locale.ROOT);
+        if ((fallback.endsWith(".eml") || fallback.endsWith(".msg"))
+                && !lower.endsWith(".eml") && !lower.endsWith(".msg")) {
+            name = name + (fallback.endsWith(".msg") ? ".msg" : ".eml");
         }
         File dir = new File(context.getCacheDir(), "shared/" + System.nanoTime());
         if (!dir.mkdirs()) {

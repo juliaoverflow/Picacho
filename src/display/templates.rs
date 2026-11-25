@@ -122,6 +122,18 @@ impl MailApp {
                 act(Some(a.id.clone())),
                 self.templates.signature_for.as_deref() == Some(a.id.as_str()),
             ));
+            for ident in &a.identities {
+                let key = ident.email.trim().to_lowercase();
+                if key.is_empty() || key == a.email.trim().to_lowercase() {
+                    continue;
+                }
+                let has_addr = self.compose_options.account_signatures.contains_key(&key);
+                options.push((
+                    format!("{}{}", ident.email, if has_addr { " ✓" } else { "" }),
+                    act(Some(key.clone())),
+                    self.templates.signature_for.as_deref() == Some(key.as_str()),
+                ));
+            }
         }
         Some(self.segmented("signature-for", options, cx))
     }

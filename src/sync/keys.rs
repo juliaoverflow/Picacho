@@ -165,9 +165,107 @@ pub fn lookup(email: &str, tls: native_tls::TlsConnector) -> Result<Option<(Vec<
         .context("keys.openpgp.org couldn't be reached.")?;
     match response.status().as_u16() {
         200 => Ok(Some((limited(response)?, Source::KeysOpenpgpOrg))),
+        // Not on keys.openpgp.org. HKP keyservers (keyserver.ubuntu.com and
+        // the like) aren't asked: they list a key under any address its
+        // uploader claims, without checking it, so a key found there could
+        // be anyone's, and encrypting to it would give them the mail.
         404 => Ok(None),
         status => bail!("keys.openpgp.org answered {status}."),
     }
+}
+
+/// Normalizes an HKP keyserver address (such as `keyserver.ubuntu.com`,
+/// `hkps://keys.mailvelope.com`, or `https://pgp.example.org`) to its
+/// HTTPS `/pks/add` endpoint. Plain HTTP is refused.
+pub fn hkp_add_url(server: &str) -> Result<String> {
+    let raw = server.trim();
+    anyhow::ensure!(!raw.is_empty(), "Enter a keyserver address.");
+    let with_scheme = if raw.contains("://") {
+        if let Some(rest) = raw
+            .strip_prefix("hkps://")
+            .or_else(|| raw.strip_prefix("HKPS://"))
+        {
+            format!("https://{rest}")
+        } else {
+            raw.to_owned()
+        }
+    } else {
+        format!("https://{raw}")
+    };
+    let mut url = url::Url::parse(&with_scheme).context("That isn't a valid keyserver address.")?;
+    anyhow::ensure!(
+        url.scheme() == "https",
+        "Keyservers must use HTTPS (or hkps://)."
+    );
+    anyhow::ensure!(url.host_str().is_some(), "Keyserver address has no host.");
+    url.set_path("/pks/add");
+    url.set_query(None);
+    url.set_fragment(None);
+    Ok(url.into())
+}
+
+/// Publishes an armored public key to an HKP keyserver (`POST /pks/add`,
+/// draft-gallagher-openpgp-hkp §4), such as `keyserver.ubuntu.com` or a
+/// custom server. Unlike keys.openpgp.org, standard HKP keyservers list the
+/// key and its email addresses immediately without a confirmation email.
+pub fn publish_hkp(server: &str, armored: &str, tls: native_tls::TlsConnector) -> Result<String> {
+    let url = hkp_add_url(server)?;
+    let host = url::Url::parse(&url)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_owned))
+        .unwrap_or_else(|| server.trim().to_owned());
+    let client = http(tls)?;
+    let response = client
+        .post(&url)
+        .form(&[("keytext", armored)])
+        .send()
+        .with_context(|| format!("{host} couldn't be reached."))?;
+    let status = response.status();
+    if !status.is_success() {
+        bail!("{host} answered {}.", status.as_u16());
+    }
+    Ok(host)
+}
+
+/// Exports public keys into Web Key Directory (WKD) trees under `dir`, one
+/// per domain, laid out for the direct method (draft-koch-openpgp-webkey-service
+/// §3.1): `<domain>/.well-known/openpgpkey/hu/<hash>` and an empty `policy`
+/// beside `hu`, so each `<domain>` folder's contents go in that domain's web
+/// root as they are (served at `https://<domain>/.well-known/openpgpkey/…`).
+/// Each key is the one for its address alone (`keys` pairs them). Returns the
+/// domain folders written.
+pub fn export_wkd(
+    keys: &[(String, Vec<u8>)],
+    dir: &std::path::Path,
+) -> Result<Vec<std::path::PathBuf>> {
+    let mut roots = Vec::new();
+    for (email, binary_key) in keys {
+        let Some((local, domain)) = email.trim().rsplit_once('@') else {
+            continue;
+        };
+        let domain = domain.to_ascii_lowercase();
+        if local.is_empty() || !super::mta_sts::is_domain(&domain) || binary_key.is_empty() {
+            continue;
+        }
+        let hash = zbase32(&Sha1::digest(local.to_ascii_lowercase().as_bytes()));
+        let root = dir.join(&domain);
+        let base = root.join(".well-known").join("openpgpkey");
+        let hu = base.join("hu");
+        std::fs::create_dir_all(&hu)?;
+        let policy = base.join("policy");
+        if !policy.exists() {
+            std::fs::write(&policy, b"")?;
+        }
+        std::fs::write(hu.join(&hash), binary_key)?;
+        if !roots.contains(&root) {
+            roots.push(root);
+        }
+    }
+    anyhow::ensure!(
+        !roots.is_empty(),
+        "No email addresses on your keys could be exported for WKD."
+    );
+    Ok(roots)
 }
 
 /// What publishing a key on keys.openpgp.org did, by address: those it
@@ -493,5 +591,47 @@ mod tests {
         assert_eq!(dane_found(dns_keys(vec![Vec::new()], Validation::Secure)), None);
         assert!(!Source::Wkd.domain_vouched());
         assert!(!Source::KeysOpenpgpOrg.domain_vouched());
+    }
+
+    #[test]
+    fn hkp_add_url_normalizes_and_requires_tls() {
+        assert_eq!(
+            hkp_add_url("keyserver.ubuntu.com").unwrap(),
+            "https://keyserver.ubuntu.com/pks/add"
+        );
+        assert_eq!(
+            hkp_add_url("hkps://keys.example.org:443/").unwrap(),
+            "https://keys.example.org/pks/add"
+        );
+        assert_eq!(
+            hkp_add_url("https://keys.example.org/pks/add").unwrap(),
+            "https://keys.example.org/pks/add"
+        );
+        assert!(hkp_add_url("http://insecure.example.org").is_err());
+        assert!(hkp_add_url("hkp://insecure.example.org").is_err());
+        assert!(hkp_add_url("   ").is_err());
+    }
+
+    #[test]
+    fn export_wkd_writes_hashed_keys_and_policy_per_domain() {
+        let dir = std::env::temp_dir().join(format!("picacho-wkd-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let written = export_wkd(
+            &[
+                ("Joe.Doe@Example.ORG".into(), vec![0x99, 0x01, 0x02]),
+                ("invalid-address".into(), vec![0x99]),
+            ],
+            &dir,
+        )
+        .unwrap();
+        // Direct method: the domain's folder holds its web root's
+        // `.well-known/openpgpkey/hu/<hash>` and `policy`.
+        assert_eq!(written, vec![dir.join("example.org")]);
+        let base = dir.join("example.org").join(".well-known").join("openpgpkey");
+        let expected_key = base.join("hu").join("iy9q119eutrkn8s1mk4r39qejnbu3n5q");
+        assert_eq!(std::fs::read(&expected_key).unwrap(), vec![0x99, 0x01, 0x02]);
+        assert!(base.join("policy").is_file());
+        assert!(export_wkd(&[("bad".into(), vec![1])], &dir).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

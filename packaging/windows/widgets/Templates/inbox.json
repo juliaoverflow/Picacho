@@ -1,0 +1,130 @@
+{
+  "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+  "type": "AdaptiveCard",
+  "version": "1.5",
+  "body": [
+    {
+      "type": "ColumnSet",
+      "columns": [
+        {
+          "type": "Column",
+          "width": "stretch",
+          "items": [
+            {
+              "type": "TextBlock",
+              "text": "${title}",
+              "weight": "Bolder",
+              "size": "Medium",
+              "wrap": false
+            }
+          ]
+        },
+        {
+          "type": "Column",
+          "width": "auto",
+          "items": [
+            {
+              "type": "TextBlock",
+              "text": "${badgeText}",
+              "weight": "Bolder",
+              "color": "Accent",
+              "isVisible": "${unreadCount > 0}"
+            }
+          ]
+        }
+      ],
+      "selectAction": {
+        "type": "Action.OpenUrl",
+        "url": "${inboxUrl}"
+      }
+    },
+    {
+      "type": "Container",
+      "separator": true,
+      "spacing": "Small",
+      "items": [
+        {
+          "type": "Container",
+          "$data": "${messages}",
+          "spacing": "Small",
+          "separator": true,
+          "selectAction": {
+            "type": "Action.OpenUrl",
+            "url": "${url}"
+          },
+          "items": [
+            {
+              "type": "ColumnSet",
+              "columns": [
+                {
+                  "type": "Column",
+                  "width": "stretch",
+                  "items": [
+                    {
+                      "type": "TextBlock",
+                      "text": "${sender}",
+                      "weight": "${if(unread, 'Bolder', 'Default')}",
+                      "size": "Small",
+                      "wrap": false
+                    }
+                  ]
+                },
+                {
+                  "type": "Column",
+                  "width": "auto",
+                  "items": [
+                    {
+                      "type": "TextBlock",
+                      "text": "${date}",
+                      "size": "Small",
+                      "isSubtle": true,
+                      "wrap": false
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "type": "TextBlock",
+              "text": "${subject}",
+              "weight": "${if(unread, 'Bolder', 'Default')}",
+              "size": "Small",
+              "spacing": "None",
+              "wrap": false
+            },
+            {
+              "type": "TextBlock",
+              "text": "${snippet}",
+              "size": "Small",
+              "isSubtle": true,
+              "spacing": "None",
+              "wrap": false,
+              "isVisible": "${snippet != ''}"
+            }
+          ]
+        }
+      ],
+      "isVisible": "${hasMessages}"
+    },
+    {
+      "type": "TextBlock",
+      "text": "${emptyText}",
+      "isSubtle": true,
+      "horizontalAlignment": "Center",
+      "spacing": "Large",
+      "isVisible": "${!hasMessages}"
+    }
+  ],
+  "actions": [
+    {
+      "type": "Action.OpenUrl",
+      "title": "Compose",
+      "url": "${composeUrl}"
+    },
+    {
+      "type": "Action.Execute",
+      "title": "Refresh",
+      "verb": "refresh"
+    }
+  ]
+}

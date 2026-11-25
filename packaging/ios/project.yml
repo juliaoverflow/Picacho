@@ -10,13 +10,26 @@ settings:
   base:
     # Which Cargo profile's libpicacho.a to link: release or debug.
     RUST_PROFILE: release
+    # Shared across Picacho and its PicachoWidgets extension so App Group IDs
+    # and the extension's bundle ID follow `PICACHO_IOS_BUNDLE_ID`.
+    PICACHO_BUNDLE_ID: tech.pinal.picacho
+    SWIFT_VERSION: "5.9"
 targets:
   Picacho:
     type: application
     platform: iOS
     sources:
       - main.m
+      - WidgetBridge.swift
       - Assets.xcassets
+    dependencies:
+      - target: PicachoWidgets
+        embed: true
+    entitlements:
+      path: Picacho.entitlements
+      properties:
+        com.apple.security.application-groups:
+          - group.$(PICACHO_BUNDLE_ID)
     info:
       path: Info.plist
       properties:
@@ -43,10 +56,12 @@ targets:
             CFBundleURLSchemes: [picacho, tech.pinal.picacho]
         NSAppTransportSecurity:
           NSAllowsLocalNetworking: true
+        # The app lock's Face ID unlock (src/display/biometric.rs).
+        NSFaceIDUsageDescription: Picacho uses Face ID to unlock your mail when the app lock is on.
     settings:
       base:
         PRODUCT_NAME: Picacho
-        PRODUCT_BUNDLE_IDENTIFIER: tech.pinal.picacho
+        PRODUCT_BUNDLE_IDENTIFIER: $(PICACHO_BUNDLE_ID)
         MARKETING_VERSION: 0.1.0
         CURRENT_PROJECT_VERSION: 1
         TARGETED_DEVICE_FAMILY: "1,2"
@@ -83,3 +98,48 @@ targets:
           # Haptics (gpui-mobile's `vibration`): AudioServicesPlaySystemSound.
           - -framework
           - AudioToolbox
+          # Home-screen widget timeline reloads (WidgetBridge.swift).
+          - -framework
+          - WidgetKit
+          # The app lock's Face ID and Touch ID (src/display/biometric.rs).
+          - -framework
+          - LocalAuthentication
+  PicachoWidgets:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: Widgets
+        excludes:
+          - "*.entitlements"
+    entitlements:
+      path: Widgets/PicachoWidgets.entitlements
+      properties:
+        com.apple.security.application-groups:
+          - group.$(PICACHO_BUNDLE_ID)
+    info:
+      path: Widgets/Info.plist
+      properties:
+        CFBundleDisplayName: Picacho Widgets
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.widgetkit-extension
+    settings:
+      base:
+        PRODUCT_NAME: PicachoWidgets
+        PRODUCT_BUNDLE_IDENTIFIER: $(PICACHO_BUNDLE_ID).widgets
+        MARKETING_VERSION: 0.1.0
+        CURRENT_PROJECT_VERSION: 1
+        TARGETED_DEVICE_FAMILY: "1,2"
+        SUPPORTED_PLATFORMS: iphoneos iphonesimulator
+        SUPPORTS_MACCATALYST: NO
+        CODE_SIGN_STYLE: Automatic
+        SKIP_INSTALL: YES
+        APPLICATION_EXTENSION_API_ONLY: YES
+        LD_RUNPATH_SEARCH_PATHS:
+          - "$(inherited)"
+          - "@executable_path/Frameworks"
+          - "@executable_path/../../Frameworks"
+    dependencies:
+      - sdk: WidgetKit.framework
+      - sdk: SwiftUI.framework

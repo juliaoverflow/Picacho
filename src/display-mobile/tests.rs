@@ -1303,3 +1303,150 @@ fn a_notification_opens_its_message_once_it_arrives(cx: &mut TestAppContext) {
     assert_eq!(view.read_with(cx, |this, _| this.selected.clone()), Some(new));
     assert_eq!(screen(&view, cx), Screen::Reader);
 }
+
+#[gpui::test]
+fn calendar_and_contacts_open_as_views_on_phones(cx: &mut TestAppContext) {
+    let (view, cx) = phone(PHONE, cx);
+    // Start at Mailboxes, where Calendar and Contacts live.
+    view.update(cx, |this, cx| {
+        this.mobile.mailboxes = true;
+        cx.notify();
+    });
+    frame(cx);
+    assert_eq!(screen(&view, cx), Screen::Mailboxes);
+    assert!(cx.debug_bounds("mobile-open-calendar").is_some());
+    assert!(cx.debug_bounds("mobile-open-contacts").is_some());
+
+    // Open Calendar as its own full-screen view.
+    act(
+        &view,
+        Action::Calendar(calendar_views::CalAction::Open(
+            calendar_views::AppView::Calendar,
+        )),
+        cx,
+    );
+    frame(cx);
+    assert_eq!(
+        screen(&view, cx),
+        Screen::AppView(calendar_views::AppView::Calendar)
+    );
+    assert!(cx.debug_bounds("mobile-calendar").is_some());
+
+    // Back returns to Mailboxes.
+    act(&view, Action::Close, cx);
+    frame(cx);
+    assert_eq!(screen(&view, cx), Screen::Mailboxes);
+
+    // Open Contacts as its own full-screen view.
+    act(
+        &view,
+        Action::Calendar(calendar_views::CalAction::Open(
+            calendar_views::AppView::Contacts,
+        )),
+        cx,
+    );
+    frame(cx);
+    assert_eq!(
+        screen(&view, cx),
+        Screen::AppView(calendar_views::AppView::Contacts)
+    );
+    assert!(cx.debug_bounds("mobile-contacts").is_some());
+
+    // Back returns to Mailboxes.
+    act(&view, Action::Close, cx);
+    frame(cx);
+    assert_eq!(screen(&view, cx), Screen::Mailboxes);
+}
+
+#[gpui::test]
+fn home_screen_widget_links_open_inbox_message_compose_and_calendar(cx: &mut TestAppContext) {
+    let (view, cx, _store) = two_accounts(cx);
+    view.update(cx, |this, cx| {
+        this.mobile.on = true;
+        this.mobile.fake_insets = Some(NOTCH);
+        this.mobile.mailboxes = true;
+        cx.notify();
+    });
+    cx.simulate_resize(size(px(PHONE.0), px(PHONE.1)));
+    frame(cx);
+    assert_eq!(screen(&view, cx), Screen::Mailboxes);
+
+    let accounts: Vec<String> =
+        view.read_with(cx, |this, _| this.accounts.iter().map(|a| a.id.clone()).collect());
+    assert_eq!(accounts.len(), 2);
+
+    // 1. Open a specific account's Inbox from a widget.
+    let inbox_uri = crate::manage::widgets::WidgetAction::Inbox {
+        account: Some(accounts[1].clone()),
+    }
+    .to_uri();
+    crate::display::launch::push(inbox_uri);
+    view.update_in(cx, |this, w, cx| this.take_launch_requests(w, cx));
+    cx.run_until_parked();
+    frame(cx);
+    assert_eq!(screen(&view, cx), Screen::List);
+    assert_eq!(
+        view.read_with(cx, |this, _| this.account.clone()),
+        Some(accounts[1].clone())
+    );
+
+    // 2. Open a specific message directly from the Inbox widget.
+    let msg_id = first_message(&view, cx);
+    let msg_uri = crate::manage::widgets::WidgetAction::Message {
+        account: accounts[1].clone(),
+        id: msg_id.clone(),
+    }
+    .to_uri();
+    crate::display::launch::push(msg_uri);
+    view.update_in(cx, |this, w, cx| this.take_launch_requests(w, cx));
+    cx.run_until_parked();
+    frame(cx);
+    assert_eq!(screen(&view, cx), Screen::Reader);
+    assert_eq!(
+        view.read_with(cx, |this, _| this.selected.clone()),
+        Some(msg_id)
+    );
+
+    // 3. Open the Calendar view from the Calendar widget.
+    crate::display::launch::push(crate::manage::widgets::WidgetAction::Calendar.to_uri());
+    view.update_in(cx, |this, w, cx| this.take_launch_requests(w, cx));
+    cx.run_until_parked();
+    frame(cx);
+    assert_eq!(
+        screen(&view, cx),
+        Screen::AppView(calendar_views::AppView::Calendar)
+    );
+
+    // 4. Open Summary → Packages and Summary → Receipts from their widgets.
+    crate::display::launch::push(
+        crate::manage::widgets::WidgetAction::Packages { account: None }.to_uri(),
+    );
+    view.update_in(cx, |this, w, cx| this.take_launch_requests(w, cx));
+    cx.run_until_parked();
+    frame(cx);
+    assert_eq!(screen(&view, cx), Screen::Summary);
+    assert!(view.read_with(cx, |this, _| this.summary_packages && !this.summary_receipts));
+
+    crate::display::launch::push(
+        crate::manage::widgets::WidgetAction::Receipts { account: None }.to_uri(),
+    );
+    view.update_in(cx, |this, w, cx| this.take_launch_requests(w, cx));
+    cx.run_until_parked();
+    frame(cx);
+    assert_eq!(screen(&view, cx), Screen::Summary);
+    assert!(view.read_with(cx, |this, _| this.summary_receipts && !this.summary_packages));
+
+    // 5. Start composing a new message from a widget's Compose button.
+    let compose_uri = crate::manage::widgets::WidgetAction::Compose {
+        account: Some(accounts[0].clone()),
+    }
+    .to_uri();
+    crate::display::launch::push(compose_uri);
+    view.update_in(cx, |this, w, cx| this.take_launch_requests(w, cx));
+    cx.run_until_parked();
+    frame(cx);
+    assert!(
+        view.read_with(cx, |this, _| !this.composers.is_empty()),
+        "widget compose action should open a composer"
+    );
+}

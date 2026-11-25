@@ -15,6 +15,8 @@
     <!-- Proton's passkeys: Credential Manager, asked as a browser asks for a
          site's passkeys (src/main/java/.../Passkeys.java). -->
     <uses-permission android:name="android.permission.CREDENTIAL_MANAGER_SET_ORIGIN" />
+    <!-- The app lock's fingerprint or face unlock (AppLock.java). -->
+    <uses-permission android:name="android.permission.USE_BIOMETRIC" />
 
     <!-- Browser sign-ins open in a Custom Tab where the browser has them. -->
     <queries>
@@ -84,13 +86,14 @@
                 <category android:name="android.intent.category.BROWSABLE" />
                 <data android:scheme="mailto" />
             </intent-filter>
-            <!-- Email files (.eml) opened from a file manager. -->
+            <!-- Email files (.eml, .msg) opened from a file manager. -->
             <intent-filter>
                 <action android:name="android.intent.action.VIEW" />
                 <category android:name="android.intent.category.DEFAULT" />
                 <data android:scheme="content" />
                 <data android:scheme="file" />
                 <data android:mimeType="message/rfc822" />
+                <data android:mimeType="application/vnd.ms-outlook" />
             </intent-filter>
             <!-- The Share sheet: text, links and files start a new message. -->
             <intent-filter>
@@ -164,5 +167,95 @@
                 <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
             </intent-filter>
         </receiver>
+
+        <!-- Home-screen widgets: Inbox, Unread Mail and Calendar agenda. -->
+        <receiver
+            android:name=".InboxWidgetProvider"
+            android:exported="true"
+            android:label="@string/widget_inbox_label">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+            </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/widget_inbox_info" />
+        </receiver>
+
+        <receiver
+            android:name=".UnreadWidgetProvider"
+            android:exported="true"
+            android:label="@string/widget_unread_label">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+            </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/widget_unread_info" />
+        </receiver>
+
+        <receiver
+            android:name=".CalendarWidgetProvider"
+            android:exported="true"
+            android:label="@string/widget_calendar_label">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+            </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/widget_calendar_info" />
+        </receiver>
+
+        <receiver
+            android:name=".PackagesWidgetProvider"
+            android:exported="true"
+            android:label="@string/widget_packages_label">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+            </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/widget_packages_info" />
+        </receiver>
+
+        <receiver
+            android:name=".ReceiptsWidgetProvider"
+            android:exported="true"
+            android:label="@string/widget_receipts_label">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+            </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/widget_receipts_info" />
+        </receiver>
+
+        <service
+            android:name=".InboxWidgetService"
+            android:exported="false"
+            android:permission="android.permission.BIND_REMOTEVIEWS" />
+
+        <service
+            android:name=".CalendarWidgetService"
+            android:exported="false"
+            android:permission="android.permission.BIND_REMOTEVIEWS" />
+
+        <service
+            android:name=".PackagesWidgetService"
+            android:exported="false"
+            android:permission="android.permission.BIND_REMOTEVIEWS" />
+
+        <service
+            android:name=".ReceiptsWidgetService"
+            android:exported="false"
+            android:permission="android.permission.BIND_REMOTEVIEWS" />
+
+        <activity
+            android:name=".InboxWidgetConfigActivity"
+            android:exported="true"
+            android:theme="@style/Theme.Picacho.Verify">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_CONFIGURE" />
+            </intent-filter>
+        </activity>
     </application>
 </manifest>

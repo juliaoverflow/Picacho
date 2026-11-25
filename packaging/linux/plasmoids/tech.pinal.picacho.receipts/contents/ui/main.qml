@@ -1,0 +1,320 @@
+import QtQuick
+import QtQuick.Layouts
+import QtCore
+import org.kde.plasma.plasmoid
+import org.kde.plasma.components as PlasmaComponents
+import org.kde.kirigami as Kirigami
+
+PlasmoidItem {
+    id: root
+
+    property var snapshot: null
+    property var receipts: []
+    // How many the Summary lists (for "View all"), most of them in the snapshot.
+    property int totalCount: 0
+    property string headerTitle: "Receipts"
+    property bool showAccountLabel: false
+    property color accentColor: Kirigami.Theme.highlightColor
+    property var execSource: null
+
+    preferredRepresentation: Plasmoid.formFactor === 2 || Plasmoid.formFactor === 3
+        ? compactRepresentation
+        : fullRepresentation
+
+    // Qt doesn't let QML's XMLHttpRequest read local files (unless
+    // QML_XHR_ALLOW_FILE_READ is set), so the snapshot is read through
+    // Plasma's executable engine instead.
+    function snapshotPath() {
+        var base = StandardPaths.writableLocation(StandardPaths.GenericDataLocation).toString();
+        if (base.startsWith("file://")) base = decodeURIComponent(base.substring(7));
+        return base + "/picacho/widget-snapshot.json";
+    }
+
+    function shellQuote(s) {
+        return "'" + s.replace(/'/g, "'\\''") + "'";
+    }
+
+    function receiptsUri() {
+        var acc = Plasmoid.configuration.accountId || "";
+        return acc ? ("picacho://widget/receipts?account=" + encodeURIComponent(acc)) : "picacho://widget/receipts";
+    }
+
+    function rgb24ToColor(n) {
+        return Qt.rgba(((n >> 16) & 255) / 255.0, ((n >> 8) & 255) / 255.0, (n & 255) / 255.0, 1.0);
+    }
+
+    function isDarkTheme() {
+        var bg = Kirigami.Theme.backgroundColor;
+        return (0.299 * bg.r + 0.587 * bg.g + 0.114 * bg.b) < 0.5;
+    }
+
+    function formatShortDate(epochSec) {
+        if (!epochSec) return "";
+        var d = new Date(epochSec * 1000);
+        var now = new Date();
+        if (d.getFullYear() === now.getFullYear()) return Qt.formatDate(d, "MMM d");
+        return Qt.formatDate(d, "MMM d, yyyy");
+    }
+
+    function detailText(r) {
+        var parts = [];
+        if (r.order) parts.push("Order " + r.order);
+        var d = formatShortDate(r.updated || r.date);
+        if (d) parts.push(d);
+        if (root.showAccountLabel && r.account_label) parts.push(r.account_label);
+        return parts.join(" · ");
+    }
+
+    function applySnapshot() {
+        if (!snapshot) return;
+        var accId = Plasmoid.configuration.accountId || "";
+        var accs = snapshot.accounts || [];
+        root.accentColor = rgb24ToColor(isDarkTheme() ? (snapshot.accent_dark || 0x86cfaa) : (snapshot.accent_light || 0x246846));
+
+        var title = "Receipts";
+        if (accId) {
+            for (var i = 0; i < accs.length; i++) {
+                if (accs[i].id === accId) {
+                    var label = accs[i].name || accs[i].email || "";
+                    if (label) title = "Receipts · " + label;
+                    break;
+                }
+            }
+        }
+        root.headerTitle = title;
+        root.showAccountLabel = !accId && accs.length > 1;
+
+        // All of them: the list shows as many as fit.
+        var all = snapshot.receipts || [];
+        var out = [];
+        for (var j = 0; j < all.length; j++) {
+            if (accId && all[j].account_id !== accId) continue;
+            out.push(all[j]);
+        }
+        root.receipts = out;
+        var total = 0;
+        for (var k = 0; k < accs.length; k++) {
+            if (!accId || accs[k].id === accId) total += accs[k].receipts || 0;
+        }
+        root.totalCount = Math.max(total, out.length);
+    }
+
+    function useSnapshot(snap) {
+        if (!snap) return;
+        if ((snap.version || 1) < 2) return;
+        root.snapshot = snap;
+        root.applySnapshot();
+    }
+
+    // Reads widget-snapshot.json (written by Picacho whenever its mail
+    // changes), or has Picacho build it when it isn't there yet.
+    function refreshSnapshot() {
+        try {
+            if (!execSource) {
+                execSource = Qt.createQmlObject(
+                    'import org.kde.plasma.plasma5support as P5; P5.DataSource { engine: "executable" }',
+                    root,
+                    "picachoReceiptsExec"
+                );
+                execSource.newData.connect(function(sourceName, data) {
+                    execSource.disconnectSource(sourceName);
+                    if (data && data.stdout) {
+                        try {
+                            root.useSnapshot(JSON.parse(data.stdout));
+                        } catch (e) {}
+                    }
+                });
+            }
+            execSource.connectSource(
+                "cat " + shellQuote(snapshotPath()) + " 2>/dev/null || picacho --widget-json 2>/dev/null"
+            );
+        } catch (e) {}
+    }
+
+    Connections {
+        target: Plasmoid.configuration
+        function onAccountIdChanged() { root.applySnapshot(); }
+    }
+
+    Timer {
+        interval: 30000
+        running: true
+        repeat: true
+        onTriggered: root.refreshSnapshot()
+    }
+
+    Component.onCompleted: refreshSnapshot()
+
+    compactRepresentation: MouseArea {
+        Layout.minimumWidth: Kirigami.Units.iconSizes.medium
+        Layout.minimumHeight: Kirigami.Units.iconSizes.medium
+        onClicked: root.expanded = !root.expanded
+        Kirigami.Icon {
+            anchors.centerIn: parent
+            source: "view-financial-list"
+            implicitWidth: Kirigami.Units.iconSizes.smallMedium
+            implicitHeight: Kirigami.Units.iconSizes.smallMedium
+        }
+    }
+
+    fullRepresentation: Item {
+        Layout.minimumWidth: Kirigami.Units.gridUnit * 15
+        Layout.minimumHeight: Kirigami.Units.gridUnit * 11
+        Layout.preferredWidth: Kirigami.Units.gridUnit * 20
+        Layout.preferredHeight: Kirigami.Units.gridUnit * 20
+
+        ColumnLayout {
+            anchors.fill: parent
+            anchors.margins: Kirigami.Units.smallSpacing * 2
+            spacing: Kirigami.Units.smallSpacing
+
+            RowLayout {
+                Layout.fillWidth: true
+                spacing: 6
+
+                MouseArea {
+                    Layout.fillWidth: true
+                    implicitHeight: headerRow.implicitHeight
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: Qt.openUrlExternally(root.receiptsUri())
+
+                    RowLayout {
+                        id: headerRow
+                        anchors.fill: parent
+                        spacing: 6
+                        Kirigami.Icon {
+                            source: "view-financial-list"
+                            implicitWidth: 18
+                            implicitHeight: 18
+                        }
+                        PlasmaComponents.Label {
+                            text: root.headerTitle
+                            font.bold: true
+                            elide: Text.ElideRight
+                            Layout.fillWidth: true
+                        }
+                    }
+                }
+
+                PlasmaComponents.ToolButton {
+                    visible: root.totalCount > 0
+                    text: "View all " + root.totalCount
+                    flat: true
+                    onClicked: Qt.openUrlExternally(root.receiptsUri())
+                    PlasmaComponents.ToolTip.text: "Open them in Picacho's Summary"
+                    PlasmaComponents.ToolTip.visible: hovered
+                }
+
+                PlasmaComponents.ToolButton {
+                    icon.name: "view-refresh"
+                    display: PlasmaComponents.AbstractButton.IconOnly
+                    onClicked: root.refreshSnapshot()
+                    PlasmaComponents.ToolTip.text: "Refresh"
+                    PlasmaComponents.ToolTip.visible: hovered
+                }
+            }
+
+            Kirigami.Separator { Layout.fillWidth: true }
+
+            // Measures a row (as the delegate lays one out), so the list
+            // shows as many whole rows as the widget's height fits: no
+            // scrolling, no scaling; "View all" has the rest.
+            ColumnLayout {
+                id: rowSizer
+                visible: false
+                spacing: 1
+                PlasmaComponents.Label { text: "Receipt"; font.bold: true }
+                PlasmaComponents.Label { text: "Order"; font.pixelSize: 11 }
+            }
+
+            ListView {
+                id: rcptList
+                Layout.fillWidth: true
+                Layout.fillHeight: true
+                clip: true
+                interactive: false
+                readonly property real rowHeight: rowSizer.implicitHeight + 12
+                readonly property int fitCount: Math.max(0, Math.floor((height + spacing) / (rowHeight + spacing)))
+                spacing: 3
+                model: root.receipts.slice(0, fitCount)
+
+                delegate: MouseArea {
+                    id: rcptArea
+                    width: rcptList.width
+                    height: rcptList.rowHeight
+                    hoverEnabled: true
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: {
+                        if (modelData.account_id && modelData.mail_id) {
+                            Qt.openUrlExternally(
+                                "picacho://widget/message?account="
+                                + encodeURIComponent(modelData.account_id)
+                                + "&id=" + encodeURIComponent(modelData.mail_id)
+                            );
+                        } else {
+                            Qt.openUrlExternally(root.receiptsUri());
+                        }
+                    }
+
+                    Rectangle {
+                        anchors.fill: parent
+                        radius: 6
+                        color: rcptArea.containsMouse ? Kirigami.Theme.hoverColor : "transparent"
+                        opacity: rcptArea.containsMouse ? 0.16 : 0
+                    }
+
+                    RowLayout {
+                        id: rcptContent
+                        anchors.left: parent.left
+                        anchors.right: parent.right
+                        anchors.verticalCenter: parent.verticalCenter
+                        anchors.margins: 6
+                        spacing: 8
+
+                        ColumnLayout {
+                            Layout.fillWidth: true
+                            spacing: 1
+                            RowLayout {
+                                Layout.fillWidth: true
+                                spacing: 5
+                                PlasmaComponents.Label {
+                                    Layout.fillWidth: true
+                                    text: modelData.merchant || "Receipt"
+                                    font.bold: true
+                                    elide: Text.ElideRight
+                                }
+                                PlasmaComponents.Label {
+                                    visible: !!modelData.refund
+                                    text: "Refund"
+                                    font.pixelSize: 10
+                                    font.bold: true
+                                    color: root.accentColor
+                                }
+                            }
+                            PlasmaComponents.Label {
+                                Layout.fillWidth: true
+                                text: root.detailText(modelData)
+                                font.pixelSize: 11
+                                opacity: 0.68
+                                elide: Text.ElideRight
+                            }
+                        }
+
+                        PlasmaComponents.Label {
+                            text: modelData.amount || "—"
+                            font.bold: true
+                            color: modelData.refund ? root.accentColor : Kirigami.Theme.textColor
+                        }
+                    }
+                }
+
+                PlasmaComponents.Label {
+                    anchors.centerIn: parent
+                    visible: root.receipts.length === 0
+                    opacity: 0.65
+                    text: "No recent receipts"
+                }
+            }
+        }
+    }
+}

@@ -93,7 +93,7 @@ fn pdf_image(image: &peniko::ImageData) -> Option<krilla::image::Image> {
         return None;
     }
     let mut rgba = bytes[..(w as usize) * (h as usize) * 4].to_vec();
-    for px in rgba.chunks_exact_mut(4) {
+    for px in rgba.as_chunks_mut::<4>().0 {
         if image.format == peniko::ImageFormat::Bgra8 {
             px.swap(0, 2);
         }
@@ -104,9 +104,14 @@ fn pdf_image(image: &peniko::ImageData) -> Option<krilla::image::Image> {
             }
         }
     }
-    let opaque = rgba.chunks_exact(4).all(|p| p[3] == 255);
+    let opaque = rgba.as_chunks::<4>().0.iter().all(|p| p[3] == 255);
     if opaque && w as u64 * h as u64 >= 128 * 128 {
-        let rgb: Vec<u8> = rgba.chunks_exact(4).flat_map(|p| [p[0], p[1], p[2]]).collect();
+        let rgb: Vec<u8> = rgba
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .flat_map(|p| [p[0], p[1], p[2]])
+            .collect();
         let mut jpeg = Vec::new();
         let encoded = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, 88)
             .encode(&rgb, w, h, image::ExtendedColorType::Rgb8);

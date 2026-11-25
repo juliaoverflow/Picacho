@@ -296,27 +296,61 @@ impl MailApp {
             .when(ring.secret.iter().len() > 0, |page| {
                 page.child(self.setting(
                     "Share your public key",
-                    "Save it to send to people who'll write to you encrypted, or check your signatures.",
+                    "Save it to send to people who'll write to you encrypted, publish it on keys.openpgp.org (which lists an address only once its owner confirms it by email) or on an HKP keyserver (which lists every address on it at once, for good), or export Web Key Directory (WKD) files to host on your own domain.",
                     div()
                         .flex()
-                        .flex_wrap()
+                        .flex_col()
                         .gap_2()
-                        .child(self.button(
-                            "openpgp-export",
-                            "Save Public Keys…",
-                            "download",
-                            Action::ExportPublicKeys,
-                            false,
-                            cx,
-                        ))
-                        .child(self.button(
-                            "openpgp-publish",
-                            "Publish on keys.openpgp.org",
-                            "upload",
-                            Action::Tools(super::tools::ToolAction::PublishKeys),
-                            false,
-                            cx,
-                        )),
+                        .child(
+                            div()
+                                .flex()
+                                .flex_wrap()
+                                .gap_2()
+                                .child(self.button(
+                                    "openpgp-export",
+                                    "Save Public Keys…",
+                                    "download",
+                                    Action::ExportPublicKeys,
+                                    false,
+                                    cx,
+                                ))
+                                .child(self.button(
+                                    "openpgp-publish",
+                                    "Publish on keys.openpgp.org",
+                                    "upload",
+                                    Action::Tools(super::tools::ToolAction::PublishKeys),
+                                    false,
+                                    cx,
+                                ))
+                                .child(self.button(
+                                    "openpgp-export-wkd",
+                                    "Export for WKD…",
+                                    "download",
+                                    Action::Tools(super::tools::ToolAction::ExportWkd),
+                                    false,
+                                    cx,
+                                )),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .flex_wrap()
+                                .items_center()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .w(px(260.))
+                                        .child(field(Input::new(&self.find.hkp_server), c, false)),
+                                )
+                                .child(self.button(
+                                    "openpgp-publish-custom-hkp",
+                                    "Publish on Keyserver…",
+                                    "upload",
+                                    Action::Tools(super::tools::ToolAction::PublishKeysCustomHkp),
+                                    false,
+                                    cx,
+                                )),
+                        ),
                 ))
             })
             // Autocrypt 1.1 §2.2: prefer-encrypt per account, off by default.

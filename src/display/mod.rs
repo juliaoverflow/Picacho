@@ -1,14 +1,16 @@
 //! Display: GPUI views, assets, and desktop notifications.
 mod assets;
+/// Touch ID, Face ID and Android's biometrics, for the app lock.
+pub(crate) mod biometric;
 mod desktop;
 pub mod notify;
 /// `mailto:` addresses and email files Picacho was opened with.
 pub mod launch;
 pub(crate) mod ui;
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
-pub use ui::run;
+pub use ui::{run, run_recovery};
 #[cfg(any(target_os = "android", target_os = "ios"))]
-pub use ui::{new_backend, run_on};
+pub use ui::{new_backend, run_on, run_recovery_on};
 /// One Picacho per data directory: later launches show its window.
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub mod instance;

@@ -96,6 +96,166 @@ fn register_app_id() {
     }
 }
 
+/// The registry key whose command says which picacho.exe the registration
+/// below is for.
+const MAILTO_COMMAND: &str = r"Software\Classes\Picacho.mailto\shell\open\command";
+
+/// The `shell\open\command` value for this executable.
+fn open_command() -> Option<String> {
+    let exe = std::env::current_exe().ok()?;
+    Some(format!("\"{}\" \"%1\"", exe.to_string_lossy()))
+}
+
+/// The executable an `"exe" "%1"` command runs.
+fn command_exe(command: &str) -> Option<std::path::PathBuf> {
+    let rest = command.trim().strip_prefix('"')?;
+    Some(std::path::PathBuf::from(&rest[..rest.find('"')?]))
+}
+
+/// Registers Picacho for Windows' Default apps (see `register_default_app`)
+/// when it starts, unless it is already registered for this executable, or
+/// another picacho.exe that still exists is (an installed copy keeps its
+/// registration when a portable or development build runs). Runs on a
+/// thread of its own: it only writes when something changed.
+pub fn register_default_app_if_unclaimed() {
+    std::thread::spawn(|| {
+        let Some(ours) = open_command() else { return };
+        let current = windows_registry::CURRENT_USER
+            .open(MAILTO_COMMAND)
+            .and_then(|key| key.get_string(""))
+            .ok();
+        let claimed_elsewhere = current.as_deref().is_some_and(|c| {
+            !c.eq_ignore_ascii_case(&ours) && command_exe(c).is_some_and(|exe| exe.is_file())
+        });
+        if current.as_deref().is_some_and(|c| c.eq_ignore_ascii_case(&ours)) || claimed_elsewhere {
+            return;
+        }
+        register_default_app();
+    });
+}
+
+/// Registers Picacho under HKCU for `mailto:` links, `picacho:` widget links,
+/// `.eml` and `.msg` files and Windows' Default apps list, so MSI installs and
+/// portable builds alike can be chosen there without administrator rights
+/// (Windows asks the person, never Picacho, to make it the default).
+pub fn register_default_app() {
+    let Some(command) = open_command() else {
+        return;
+    };
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let icon = format!("{},0", exe.to_string_lossy());
+
+    let set = |path: &str, name: &str, value: &str| {
+        if let Ok(key) = windows_registry::CURRENT_USER.create(path) {
+            let _ = key.set_string(name, value);
+        }
+    };
+
+    set(r"Software\Classes\Picacho.mailto", "", "URL:MailTo Protocol");
+    set(r"Software\Classes\Picacho.mailto", "URL Protocol", "");
+    set(r"Software\Classes\Picacho.mailto\DefaultIcon", "", &icon);
+    set(MAILTO_COMMAND, "", &command);
+
+    // picacho:// links (the Widgets Board's taps, OAuth's return).
+    set(r"Software\Classes\picacho", "", "URL:Picacho Protocol");
+    set(r"Software\Classes\picacho", "URL Protocol", "");
+    set(r"Software\Classes\picacho\DefaultIcon", "", &icon);
+    set(r"Software\Classes\picacho\shell\open\command", "", &command);
+
+    set(r"Software\Classes\Picacho.eml", "", "Email Message");
+    set(r"Software\Classes\Picacho.eml\DefaultIcon", "", &icon);
+    set(r"Software\Classes\Picacho.eml\shell\open\command", "", &command);
+    set(r"Software\Classes\.eml\OpenWithProgids", "Picacho.eml", "");
+
+    set(r"Software\Classes\Picacho.msg", "", "Outlook Email Message");
+    set(r"Software\Classes\Picacho.msg\DefaultIcon", "", &icon);
+    set(r"Software\Classes\Picacho.msg\shell\open\command", "", &command);
+    set(r"Software\Classes\.msg\OpenWithProgids", "Picacho.msg", "");
+
+    set(r"Software\Pinal Tech\Picacho\Capabilities", "ApplicationName", "Picacho");
+    set(
+        r"Software\Pinal Tech\Picacho\Capabilities",
+        "ApplicationDescription",
+        "Fast, native email for every inbox you have",
+    );
+    set(
+        r"Software\Pinal Tech\Picacho\Capabilities\URLAssociations",
+        "mailto",
+        "Picacho.mailto",
+    );
+    set(
+        r"Software\Pinal Tech\Picacho\Capabilities\FileAssociations",
+        ".eml",
+        "Picacho.eml",
+    );
+    set(
+        r"Software\Pinal Tech\Picacho\Capabilities\FileAssociations",
+        ".msg",
+        "Picacho.msg",
+    );
+    set(r"Software\Clients\Mail\Picacho", "", "Picacho");
+    set(r"Software\Clients\Mail\Picacho\Capabilities", "ApplicationName", "Picacho");
+    set(
+        r"Software\RegisteredApplications",
+        "Picacho",
+        r"Software\Pinal Tech\Picacho\Capabilities",
+    );
+
+    use windows_sys::Win32::UI::Shell::{SHCNE_ASSOCCHANGED, SHCNF_IDLIST, SHChangeNotify};
+    // SAFETY: notifying Explorer with SHCNF_IDLIST and null items is documented safe.
+    unsafe {
+        SHChangeNotify(
+            SHCNE_ASSOCCHANGED as i32,
+            SHCNF_IDLIST,
+            std::ptr::null(),
+            std::ptr::null(),
+        );
+    }
+}
+
+/// Whether Picacho is currently Windows' chosen handler for `mailto:` links.
+pub fn is_default_mail_app() -> bool {
+    windows_registry::CURRENT_USER
+        .open(r"Software\Microsoft\Windows\Shell\Associations\UrlAssociations\mailto\UserChoice")
+        .ok()
+        .and_then(|key| key.get_string("ProgId").ok())
+        .is_some_and(|id| id.eq_ignore_ascii_case("Picacho.mailto"))
+}
+
+/// Opens Windows Settings directly to Picacho's Default apps page (where
+/// Windows 11 offers a single "Set default" button for `mailto:`, `.eml` and
+/// `.msg`), falling back to the top-level Default apps page on older builds.
+pub fn open_default_apps() -> anyhow::Result<()> {
+    use windows_sys::Win32::UI::Shell::ShellExecuteW;
+    use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
+    register_default_app();
+    let verb = wide("open");
+    for uri in [
+        "ms-settings:defaultapps?registeredAppUser=Picacho",
+        "ms-settings:defaultapps",
+    ] {
+        let target = wide(uri);
+        // SAFETY: `verb` and `target` are NUL-terminated and outlive the call.
+        let result = unsafe {
+            ShellExecuteW(
+                std::ptr::null_mut(),
+                verb.as_ptr(),
+                target.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                SW_SHOWNORMAL,
+            )
+        };
+        if result as isize > 32 {
+            return Ok(());
+        }
+    }
+    anyhow::bail!("Could not open Windows Default apps settings.")
+}
+
 /// "Show animations in Windows" (Settings → Accessibility → Visual
 /// effects), asked of the system rather than read from the registry.
 pub fn animations_off() -> bool {

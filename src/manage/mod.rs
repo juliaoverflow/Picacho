@@ -1,5 +1,7 @@
 //! Manage: domain types, persistent cache, encryption, and account coordination.
 //! Display calls Backend and Store; protocol details live in Sync.
+/// The app lock's passcode, biometrics setting and wrong tries.
+pub mod applock;
 pub mod avatar;
 pub mod backend;
 /// Checking for new mail without a window (desktop background, Android's
@@ -23,8 +25,6 @@ pub mod model;
 pub mod openpgp;
 /// Pinned and muted mail, saved searches, blocked senders and rules kept here.
 pub mod organize;
-/// Saving a message as a PDF.
-pub mod pdf;
 pub mod protected_reply;
 pub mod smime;
 /// Tracking numbers in mail, for the reader and each account's Summary.
@@ -35,5 +35,9 @@ pub mod status;
 pub mod store;
 pub mod subscriptions;
 pub mod tracking;
+/// Home-screen widget snapshots and deep-link actions (Android and iOS).
+pub mod widgets;
+/// The optional encrypted database: its key and the keychain entry it's in.
+pub mod vault;
 
 pub mod reading;

@@ -361,4 +361,87 @@ mod tests {
         assert!(lock(&dir).unwrap().is_some());
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// Exercises the full background-process handover path:
+    /// 1. Background process claims the resident listener and serves it.
+    /// 2. A second launch forwards `mailto:`, `.eml`, `.msg`, and `notification:`
+    ///    requests to the background process over the real IPC socket.
+    /// 3. The background process wakes, saves pending requests to the private
+    ///    handover file, and releases the socket + lock.
+    /// 4. The newly started main window claims primary and consumes the handed-over
+    ///    requests cleanly without needing them on the command line.
+    #[test]
+    fn background_handover_passes_requests_to_main_window() {
+        let dir = std::env::temp_dir().join(format!("picacho-handover-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let eml = dir.join("note.eml");
+        let msg = dir.join("outlook.msg");
+        std::fs::write(&eml, "Subject: Hi\r\n\r\nHello").unwrap();
+        std::fs::write(&msg, b"\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1").unwrap();
+
+        // Drain any stale global requests from earlier tests.
+        let _ = super::super::launch::take();
+
+        let listener = claim_resident(&dir).expect("resident should claim fresh dir");
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let socket = listener.serve(move || {
+            let _ = tx.send(());
+            // Stop serving after waking to hand over (as resident does on exit).
+            false
+        });
+
+        let notif = format!(
+            "{}{}",
+            super::super::launch::NOTIFICATION,
+            serde_json::to_string(&super::super::notify::Target {
+                account: "acc1".into(),
+                mailbox: crate::manage::model::Folder::Inbox.into(),
+                message: Some("msg42".into()),
+                messages: vec!["msg42".into()],
+                action: Some("reply".into()),
+            })
+            .unwrap()
+        );
+        let forwarded_requests = vec![
+            "mailto:alice@example.com?subject=Hello".to_owned(),
+            super::super::launch::request(eml.to_str().unwrap()).unwrap(),
+            super::super::launch::request(msg.to_str().unwrap()).unwrap(),
+            notif.clone(),
+        ];
+
+        let outcome = claim(&dir, &forwarded_requests);
+        assert!(matches!(outcome, Some(Claim::Forwarded)));
+
+        // Resident received SHOW after all OPEN requests.
+        rx.recv_timeout(Duration::from_secs(2))
+            .expect("resident should wake on SHOW");
+
+        // Resident persists queued requests into the private handover file and releases.
+        let queued = super::super::launch::take();
+        assert_eq!(queued.len(), 4);
+        super::super::launch::save_pending(&dir, &queued).unwrap();
+        release(&socket);
+
+        // Give the listener thread a moment to exit and drop its lock file handle.
+        let main_claim = claim(&dir, &[]);
+        assert!(
+            matches!(main_claim, Some(Claim::Primary(_))),
+            "main window should claim primary after resident releases"
+        );
+        if let Some(Claim::Primary(l)) = main_claim {
+            l.abandon();
+        }
+
+        // Main window loads and clears the handover file.
+        let loaded = super::super::launch::load_pending(&dir);
+        assert_eq!(loaded.len(), 4);
+        assert_eq!(loaded[0], "mailto:alice@example.com?subject=Hello");
+        assert!(loaded[1].starts_with("file:") && loaded[1].ends_with("note.eml"));
+        assert!(loaded[2].starts_with("file:") && loaded[2].ends_with("outlook.msg"));
+        assert_eq!(loaded[3], notif);
+        // Second load must be empty (file removed on consume).
+        assert!(super::super::launch::load_pending(&dir).is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

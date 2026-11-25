@@ -101,6 +101,34 @@ impl MailApp {
             body = body.child(div().pt_4().child(self.group(rows)));
         }
         body = body.child(div().pt_6().child(self.group(vec![
+            self.cell(
+                "mobile-open-calendar",
+                icon_el("clock", 22., c.accent).into_any_element(),
+                "Calendar",
+                None,
+                true,
+                false,
+                super::chrome::push(Action::Calendar(calendar_views::CalAction::Open(
+                    calendar_views::AppView::Calendar,
+                ))),
+                cx,
+            )
+            .into_any_element(),
+            self.cell(
+                "mobile-open-contacts",
+                icon_el("contact", 22., c.accent).into_any_element(),
+                "Contacts",
+                None,
+                true,
+                false,
+                super::chrome::push(Action::Calendar(calendar_views::CalAction::Open(
+                    calendar_views::AppView::Contacts,
+                ))),
+                cx,
+            )
+            .into_any_element(),
+        ])));
+        body = body.child(div().pt_6().child(self.group(vec![
                     self.cell(
                         "mobile-add-account",
                         icon_el("plus", 20., c.accent).into_any_element(),

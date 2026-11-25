@@ -1,0 +1,142 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Sparse MSIX / External Location package manifest registering Picacho's
+  Windows 11 Widgets Board provider (Inbox, Unread Mail, Calendar).
+  Built and registered by scripts/bundle-windows-widgets.ps1.
+-->
+<Package
+  xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
+  xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
+  xmlns:uap3="http://schemas.microsoft.com/appx/manifest/uap/windows10/3"
+  xmlns:uap10="http://schemas.microsoft.com/appx/manifest/uap/windows10/10"
+  xmlns:com="http://schemas.microsoft.com/appx/manifest/com/windows10"
+  xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
+  IgnorableNamespaces="uap uap3 uap10 com rescap">
+
+  <Identity
+    Name="PinalTech.Picacho.Widgets"
+    Publisher="CN=Pinal Technologies"
+    Version="0.1.0.0"
+    ProcessorArchitecture="x64" />
+
+  <Properties>
+    <DisplayName>Picacho Widgets</DisplayName>
+    <PublisherDisplayName>Pinal Technologies</PublisherDisplayName>
+    <Logo>Assets\StoreLogo.png</Logo>
+    <uap10:AllowExternalContent>true</uap10:AllowExternalContent>
+  </Properties>
+
+  <Dependencies>
+    <TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.19041.0" MaxVersionTested="10.0.26100.0" />
+  </Dependencies>
+
+  <Capabilities>
+    <rescap:Capability Name="runFullTrust" />
+  </Capabilities>
+
+  <Applications>
+    <Application Id="PicachoWidgets" Executable="PicachoWidgets.exe" EntryPoint="Windows.FullTrustApplication">
+      <uap:VisualElements
+        DisplayName="Picacho Widgets"
+        Description="Inbox, unread count, and calendar agenda widgets for Picacho"
+        BackgroundColor="transparent"
+        Square150x150Logo="Assets\Square150x150Logo.png"
+        Square44x44Logo="Assets\Square44x44Logo.png"
+        AppListEntry="none" />
+
+      <Extensions>
+        <com:Extension Category="windows.comServer">
+          <com:ComServer>
+            <com:ExeServer Executable="PicachoWidgets.exe" Arguments="-RegisterProcessAsComServer" DisplayName="Picacho Widgets">
+              <com:Class Id="7F3E2D4A-8C19-4B5E-9A1D-2E6F4C8B3A50" DisplayName="Picacho Widget Provider" />
+            </com:ExeServer>
+          </com:ComServer>
+        </com:Extension>
+
+        <uap3:Extension Category="windows.appExtension">
+          <uap3:AppExtension Name="com.microsoft.windows.widgets"
+                             DisplayName="Picacho"
+                             Id="PicachoWidgets"
+                             PublicFolder="Public">
+            <uap3:Properties>
+              <WidgetProvider>
+                <ProviderIcons>
+                  <Icon Path="Assets\Square44x44Logo.png" />
+                </ProviderIcons>
+                <Activation>
+                  <CreateInstance ClassId="7F3E2D4A-8C19-4B5E-9A1D-2E6F4C8B3A50" />
+                </Activation>
+                <Definitions>
+                  <Definition Id="Picacho_Inbox" DisplayName="Picacho Inbox" Description="Recent inbox messages, unread count, and quick compose">
+                    <Capabilities>
+                      <Capability><Size Name="small" /></Capability>
+                      <Capability><Size Name="medium" /></Capability>
+                      <Capability><Size Name="large" /></Capability>
+                    </Capabilities>
+                    <ThemeResources>
+                      <Icons><Icon Path="Assets\Square44x44Logo.png" /></Icons>
+                      <Screenshots><Screenshot Path="Assets\Square150x150Logo.png" DisplayAltText="Picacho Inbox widget" /></Screenshots>
+                      <DarkMode />
+                      <LightMode />
+                    </ThemeResources>
+                  </Definition>
+                  <Definition Id="Picacho_Unread" DisplayName="Picacho Unread Mail" Description="Unread count, latest unread message, and quick compose">
+                    <Capabilities>
+                      <Capability><Size Name="small" /></Capability>
+                      <Capability><Size Name="medium" /></Capability>
+                    </Capabilities>
+                    <ThemeResources>
+                      <Icons><Icon Path="Assets\Square44x44Logo.png" /></Icons>
+                      <Screenshots><Screenshot Path="Assets\Square150x150Logo.png" DisplayAltText="Picacho Unread Mail widget" /></Screenshots>
+                      <DarkMode />
+                      <LightMode />
+                    </ThemeResources>
+                  </Definition>
+                  <Definition Id="Picacho_Calendar" DisplayName="Picacho Calendar" Description="Upcoming calendar events">
+                    <Capabilities>
+                      <Capability><Size Name="small" /></Capability>
+                      <Capability><Size Name="medium" /></Capability>
+                      <Capability><Size Name="large" /></Capability>
+                    </Capabilities>
+                    <ThemeResources>
+                      <Icons><Icon Path="Assets\Square44x44Logo.png" /></Icons>
+                      <Screenshots><Screenshot Path="Assets\Square150x150Logo.png" DisplayAltText="Picacho Calendar widget" /></Screenshots>
+                      <DarkMode />
+                      <LightMode />
+                    </ThemeResources>
+                  </Definition>
+                  <Definition Id="Picacho_Packages" DisplayName="Picacho Packages" Description="Your recent tracked packages and delivery progress">
+                    <Capabilities>
+                      <Capability><Size Name="small" /></Capability>
+                      <Capability><Size Name="medium" /></Capability>
+                      <Capability><Size Name="large" /></Capability>
+                    </Capabilities>
+                    <ThemeResources>
+                      <Icons><Icon Path="Assets\Square44x44Logo.png" /></Icons>
+                      <Screenshots><Screenshot Path="Assets\Square150x150Logo.png" DisplayAltText="Picacho Packages widget" /></Screenshots>
+                      <DarkMode />
+                      <LightMode />
+                    </ThemeResources>
+                  </Definition>
+                  <Definition Id="Picacho_Receipts" DisplayName="Picacho Receipts" Description="Your recent receipts and refunds">
+                    <Capabilities>
+                      <Capability><Size Name="small" /></Capability>
+                      <Capability><Size Name="medium" /></Capability>
+                      <Capability><Size Name="large" /></Capability>
+                    </Capabilities>
+                    <ThemeResources>
+                      <Icons><Icon Path="Assets\Square44x44Logo.png" /></Icons>
+                      <Screenshots><Screenshot Path="Assets\Square150x150Logo.png" DisplayAltText="Picacho Receipts widget" /></Screenshots>
+                      <DarkMode />
+                      <LightMode />
+                    </ThemeResources>
+                  </Definition>
+                </Definitions>
+              </WidgetProvider>
+            </uap3:Properties>
+          </uap3:AppExtension>
+        </uap3:Extension>
+      </Extensions>
+    </Application>
+  </Applications>
+</Package>

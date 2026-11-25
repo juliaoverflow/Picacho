@@ -326,7 +326,7 @@ impl MailApp {
             })
             .child(self.button(
                 "reply",
-                if compact { "@Reply" } else { "Reply" },
+                &if compact { shortcuts::tip("@Reply", "reply", cx) } else { "Reply".into() },
                 "reply",
                 Action::Reply(false),
                 false,
@@ -334,7 +334,7 @@ impl MailApp {
             ))
             .child(self.button(
                 "reply-all",
-                if compact { "@Reply all" } else { "Reply all" },
+                &if compact { shortcuts::tip("@Reply all", "reply-all", cx) } else { "Reply all".into() },
                 "reply-all",
                 Action::Reply(true),
                 false,
@@ -342,7 +342,7 @@ impl MailApp {
             ))
             .child(self.button(
                 "forward",
-                if compact { "@Forward" } else { "Forward" },
+                &if compact { shortcuts::tip("@Forward", "forward", cx) } else { "Forward".into() },
                 "forward",
                 Action::Forward,
                 false,
@@ -351,7 +351,7 @@ impl MailApp {
             .child(div().flex_1())
             .child(self.button(
                 "print",
-                "@Print · ⌘P",
+                &shortcuts::tip("@Print", "print", cx),
                 "print",
                 Action::Tools(super::tools::ToolAction::Print(m.id.clone())),
                 false,
@@ -359,7 +359,7 @@ impl MailApp {
             ))
             .child(self.button(
                 "open-window",
-                "@Open in new window · ⌘O",
+                &shortcuts::tip("@Open in new window", "open-in-window", cx),
                 "popout",
                 Action::OpenWindow(m.id.clone()),
                 false,
@@ -367,7 +367,7 @@ impl MailApp {
             ))
             .child(self.button(
                 "archive",
-                "@Archive message",
+                &shortcuts::tip("@Archive message", "archive", cx),
                 "archive",
                 Action::Move(Folder::Archive),
                 false,
@@ -389,7 +389,7 @@ impl MailApp {
             )
             .child(self.button(
                 "read",
-                "@Mark read / unread",
+                &shortcuts::tip("@Mark read / unread", "toggle-read", cx),
                 "mail",
                 Action::Read(m.id.clone()),
                 false,
@@ -397,7 +397,7 @@ impl MailApp {
             ))
             .child(self.button(
                 "trash",
-                "@Move to trash",
+                &shortcuts::tip("@Move to trash", "delete", cx),
                 "trash",
                 Action::Move(Folder::Trash),
                 false,
@@ -484,11 +484,11 @@ impl MailApp {
                     .child(
                         self.button(
                             "reader-star",
-                            if m.starred {
-                                "@Unstar · ⌘⇧S"
-                            } else {
-                                "@Star · ⌘⇧S"
-                            },
+                            &shortcuts::tip(
+                                if m.starred { "@Unstar" } else { "@Star" },
+                                "toggle-star",
+                                cx,
+                            ),
                             "",
                             Action::Star(m.id.clone()),
                             false,

@@ -14,11 +14,14 @@ use futures::channel::mpsc::UnboundedSender;
 pub(super) enum TrayCommand {
     /// Show Picacho's window, opening it if it is closed.
     Open,
+    /// Open or focus Picacho's compact Desktop Widget window.
+    Widget,
     Quit,
 }
 
 const TOOLTIP: &str = "Picacho";
 const OPEN_LABEL: &str = "Open Picacho";
+const WIDGET_LABEL: &str = "Desktop Widget";
 const QUIT_LABEL: &str = "Quit Picacho";
 
 /// The app icon as RGBA pixels, `size` pixels square.
@@ -89,6 +92,12 @@ mod platform {
                     ..Default::default()
                 }
                 .into(),
+                StandardItem {
+                    label: WIDGET_LABEL.into(),
+                    activate: Box::new(|this: &mut Self| this.send(TrayCommand::Widget)),
+                    ..Default::default()
+                }
+                .into(),
                 MenuItem::Separator,
                 StandardItem {
                     label: QUIT_LABEL.into(),
@@ -144,6 +153,7 @@ mod platform {
     };
 
     const OPEN_ID: &str = "picacho-open";
+    const WIDGET_ID: &str = "picacho-widget";
     const QUIT_ID: &str = "picacho-quit";
 
     /// Where the tray's events go. tray-icon takes its event handlers only
@@ -169,6 +179,8 @@ mod platform {
             MenuEvent::set_event_handler(Some(|event: MenuEvent| {
                 if event.id == OPEN_ID {
                     send(TrayCommand::Open);
+                } else if event.id == WIDGET_ID {
+                    send(TrayCommand::Widget);
                 } else if event.id == QUIT_ID {
                     send(TrayCommand::Quit);
                 }
@@ -189,9 +201,11 @@ mod platform {
         });
         let menu = Menu::new();
         let open = MenuItem::with_id(OPEN_ID, OPEN_LABEL, true, None);
+        let widget = MenuItem::with_id(WIDGET_ID, WIDGET_LABEL, true, None);
         let quit = MenuItem::with_id(QUIT_ID, QUIT_LABEL, true, None);
         let built = menu
             .append(&open)
+            .and_then(|_| menu.append(&widget))
             .and_then(|_| menu.append(&PredefinedMenuItem::separator()))
             .and_then(|_| menu.append(&quit));
         if let Err(e) = built {

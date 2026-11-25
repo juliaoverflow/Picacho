@@ -68,24 +68,33 @@
       <?endif?>
     </DirectoryRef>
 
-    <!-- Picacho in Windows' Default apps: the mailto: protocol and .eml
-         files (Capabilities registered under RegisteredApplications), so it
-         can be chosen as the email app; Windows asks the person, never the
-         installer, to make it the default. -->
+    <!-- Picacho in Windows' Default apps: the mailto: protocol, .eml and
+         Outlook .msg files (Capabilities registered under RegisteredApplications),
+         so it can be chosen as the email app directly from Picacho's Settings
+         or Windows Default apps. -->
     <DirectoryRef Id="INSTALLDIR">
       <Component Id="DefaultApp" Guid="B2E7C4A1-6D38-4F95-8C0B-1A9E3D5F7C26">
         <RegistryValue Root="HKCU" Key="Software\Classes\Picacho.mailto" Value="URL:MailTo Protocol" Type="string" KeyPath="yes" />
         <RegistryValue Root="HKCU" Key="Software\Classes\Picacho.mailto" Name="URL Protocol" Value="" Type="string" />
         <RegistryValue Root="HKCU" Key="Software\Classes\Picacho.mailto\DefaultIcon" Value="[INSTALLDIR]picacho.exe,0" Type="string" />
         <RegistryValue Root="HKCU" Key="Software\Classes\Picacho.mailto\shell\open\command" Value="&quot;[INSTALLDIR]picacho.exe&quot; &quot;%1&quot;" Type="string" />
+        <RegistryValue Root="HKCU" Key="Software\Classes\picacho" Value="URL:Picacho Protocol" Type="string" />
+        <RegistryValue Root="HKCU" Key="Software\Classes\picacho" Name="URL Protocol" Value="" Type="string" />
+        <RegistryValue Root="HKCU" Key="Software\Classes\picacho\DefaultIcon" Value="[INSTALLDIR]picacho.exe,0" Type="string" />
+        <RegistryValue Root="HKCU" Key="Software\Classes\picacho\shell\open\command" Value="&quot;[INSTALLDIR]picacho.exe&quot; &quot;%1&quot;" Type="string" />
         <RegistryValue Root="HKCU" Key="Software\Classes\Picacho.eml" Value="Email Message" Type="string" />
         <RegistryValue Root="HKCU" Key="Software\Classes\Picacho.eml\DefaultIcon" Value="[INSTALLDIR]picacho.exe,0" Type="string" />
         <RegistryValue Root="HKCU" Key="Software\Classes\Picacho.eml\shell\open\command" Value="&quot;[INSTALLDIR]picacho.exe&quot; &quot;%1&quot;" Type="string" />
         <RegistryValue Root="HKCU" Key="Software\Classes\.eml\OpenWithProgids" Name="Picacho.eml" Value="" Type="string" />
+        <RegistryValue Root="HKCU" Key="Software\Classes\Picacho.msg" Value="Outlook Email Message" Type="string" />
+        <RegistryValue Root="HKCU" Key="Software\Classes\Picacho.msg\DefaultIcon" Value="[INSTALLDIR]picacho.exe,0" Type="string" />
+        <RegistryValue Root="HKCU" Key="Software\Classes\Picacho.msg\shell\open\command" Value="&quot;[INSTALLDIR]picacho.exe&quot; &quot;%1&quot;" Type="string" />
+        <RegistryValue Root="HKCU" Key="Software\Classes\.msg\OpenWithProgids" Name="Picacho.msg" Value="" Type="string" />
         <RegistryValue Root="HKCU" Key="Software\Pinal Tech\Picacho\Capabilities" Name="ApplicationName" Value="Picacho" Type="string" />
         <RegistryValue Root="HKCU" Key="Software\Pinal Tech\Picacho\Capabilities" Name="ApplicationDescription" Value="Fast, native email for every inbox you have" Type="string" />
         <RegistryValue Root="HKCU" Key="Software\Pinal Tech\Picacho\Capabilities\URLAssociations" Name="mailto" Value="Picacho.mailto" Type="string" />
         <RegistryValue Root="HKCU" Key="Software\Pinal Tech\Picacho\Capabilities\FileAssociations" Name=".eml" Value="Picacho.eml" Type="string" />
+        <RegistryValue Root="HKCU" Key="Software\Pinal Tech\Picacho\Capabilities\FileAssociations" Name=".msg" Value="Picacho.msg" Type="string" />
         <RegistryValue Root="HKCU" Key="Software\Clients\Mail\Picacho" Value="Picacho" Type="string" />
         <RegistryValue Root="HKCU" Key="Software\Clients\Mail\Picacho\Capabilities" Name="ApplicationName" Value="Picacho" Type="string" />
         <RegistryValue Root="HKCU" Key="Software\RegisteredApplications" Name="Picacho" Value="Software\Pinal Tech\Picacho\Capabilities" Type="string" />

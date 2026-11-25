@@ -81,7 +81,9 @@ impl Backend {
     fn save_events(&self, mut events: Vec<Stored>) -> Result<()> {
         events.sort_by_key(|s| s.event.start);
         self.store
-            .set_preference(EVENTS, &serde_json::to_string(&events)?)
+            .set_preference(EVENTS, &serde_json::to_string(&events)?)?;
+        crate::manage::widgets::publish_soon(self.store.clone());
+        Ok(())
     }
     pub fn calendar_synced(&self) -> Option<i64> {
         self.store.preference(SYNCED)?.parse().ok()
@@ -858,6 +860,7 @@ impl Backend {
         }
         #[cfg(not(test))]
         store::delete_secret(PASSWORD)?;
+        crate::manage::widgets::publish_soon(self.store.clone());
         Ok(())
     }
     /// Adds an event, or saves changes to one (by UID), on the server.

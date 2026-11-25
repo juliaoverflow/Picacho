@@ -9,5 +9,5 @@ StartupWMClass=tech.pinal.picacho
 Terminal=false
 Categories=Network;Email;
 Keywords=mail;email;inbox;imap;
-# Picacho as the default email app (mailto: links), and email files.
-MimeType=x-scheme-handler/mailto;message/rfc822;
+# Picacho as the default email app (mailto: links), email files (.eml, .msg), and widget deep links (picacho:).
+MimeType=x-scheme-handler/mailto;x-scheme-handler/picacho;message/rfc822;application/vnd.ms-outlook;

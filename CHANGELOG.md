@@ -13,15 +13,36 @@ same version in `Cargo.toml`.
 
 ### Added
 
+- App lock (Settings → Privacy): a passcode, Touch ID, Face ID or Android's
+  fingerprint or face unlock when Picacho opens and after it has been away
+  for a chosen time, Lock Picacho (⌥⌘L / Ctrl+Alt+L), covers over its other
+  windows and, on phones, the app switcher's picture (Android 13 and later
+  also keep it out of Recents), and slower tries after wrong passcodes.
+- Hide mail outside Picacho (Settings → Privacy, on with the app lock or
+  encryption): notifications and widgets say how much new mail there is,
+  not who it's from or what it says.
+- An optional encrypted local database (SQLCipher, AES-256) with its key in
+  the system keychain, turned on and off in place (Settings → Privacy). A
+  database that can't be opened at launch (its key gone, the keychain
+  locked) gets a window offering Try Again or moving it aside to start over,
+  rather than Picacho quitting silently.
+
 - Group by Conversation in the message list (grouped as the reader gathers
-  a conversation), compact rows, and the reader
-  below the list; Pin to Top and Mute Conversation; dragging messages onto
-  sidebar folders.
+  a conversation), compact rows, and the reader below the list; Pin to Top
+  and Mute Conversation; dragging messages onto sidebar folders (within an
+  account, across accounts, onto All Mail to archive, or onto Drafts to
+  start new drafts).
 - Find in Message (⌘F / Ctrl+F) with highlighted matches; ⌥⌘F searches the
   mailbox.
-- Print (through the browser's print dialog) and Save as PDF.
-- Attachments open with the system's app, Quick Look (macOS), Open With…
-  (Windows) and Show in Folder; images preview in the reader.
+- Print without a browser (the system print dialog on Linux and macOS; on
+  Windows, and on Linux without a print portal, the message opens as a PDF to
+  print from the viewer) and vector Save as PDF with full formatting, images
+  and embedded Unicode fonts.
+- Attachments open from their saved file or a single cached copy beside the
+  mail store, with the system's app, Quick Look (macOS), Open With…
+  (Windows, macOS and Linux) and Show in Folder; PNG, JPEG, GIF, WebP, SVG,
+  BMP, ICO, TIFF, TGA, PNM, QOI and HDR images (plus HEIC/HEIF/AVIF on
+  macOS) preview in the reader.
 - A local full-text index of downloaded mail (SQLite FTS5) covering whole
   messages and their attachments' text (text files, HTML, attached emails,
   PDFs, Word, Excel, PowerPoint and OpenDocument files): words find
@@ -32,18 +53,47 @@ same version in `Cargo.toml`.
 - Blocked senders and rules applied by Picacho to new inbox mail, for every
   service, by the window and in the background; Apply Rules Now for mail
   already in the inboxes (Settings → Rules & Layout).
-- Signatures per mailbox, and templates in the composer.
-- Calendar and Contacts as views of their own, the calendar's Day, Week and
-  Month grids, and custom repeat rules.
-- Publishing your OpenPGP key on keys.openpgp.org.
-- Picacho as the default email app (`mailto:`) and for `.eml` files on
-  macOS, Linux and Windows; Android takes `mailto:` links, email files and
-  the Share sheet.
+- Signatures per mailbox and per sending address (Markdown or raw HTML,
+  swapped automatically when changing From in an open draft), and templates
+  with placeholders (`{name}`, `{first_name}`, `{date}`, `{subject}`…) in
+  the composer.
+- Calendar and Contacts as views of their own on desktops and phones, the
+  calendar's hour-by-hour Day and Week time grids and Month grid, and custom
+  repeat rules across daily, weekly, monthly and yearly schedules.
+- Publishing your OpenPGP key on keys.openpgp.org or, once confirmed, on an
+  HKP keyserver (`keyserver.ubuntu.com` or one typed in; these list every
+  address at once and for good), or exporting Web Key Directory (WKD) files
+  for your own domains. Keys are never looked up on HKP keyservers, which
+  don't check the addresses keys are listed under.
+- Picacho as the default email app (`mailto:`) and for `.eml` and Outlook
+  `.msg` files on macOS, Linux, Windows and Android; Settings → General
+  reports default-app status and jumps directly to Picacho's page in Windows
+  Default apps (or sets it directly via `xdg-mime`/`xdg-settings` on Linux);
+  requests forwarded through the background process hand over cleanly through
+  a private handover file inside the data directory.
 - Mark as Read, Archive, Delete and Reply buttons on new-mail notifications,
   and Mark All as Read, Archive All and Delete All on ones for several
   messages (Linux, Windows, macOS, Android), also while Picacho runs in the
   background.
-- Keyboard shortcuts changed in `shortcuts.txt`.
+- Home-screen and desktop widgets across Android, iOS, macOS, Linux and
+  Windows: a resizable **Inbox** widget (recent messages, unread badge,
+  optional per-account and unread-only filter, and quick Compose), a compact
+  **Unread Mail** widget (also on the iOS Lock Screen), an upcoming
+  **Calendar** agenda widget, and **Packages** and **Receipts** widgets
+  showing as many of your recent deliveries and receipts/refunds as their
+  size fits (whole rows, never scaled), with **View all N** at the top, following
+  Picacho's theme accent color and Local AI's sign-in code hiding — natively
+  via Android AppWidgets, iOS and macOS WidgetKit, KDE Plasma 6 Plasmoids,
+  Windows 11 Widgets Board Adaptive Cards, `--widget-json`/`--widget-waybar`
+  CLI output, and a built-in **Desktop Widget** window (Window menu, tray
+  menu, or `--widget`).
+- Keyboard shortcuts changed in Settings → **Keyboard Shortcuts**: click a
+  shortcut and press new keys, or keys one after another for a sequence (keys
+  another action had are taken from it), reset one or all, or take one away.
+  Tooltips name the shortcuts as they are now. Every shortcut is listed there, the
+  composer's formatting ones too, in place of the old Keyboard Shortcuts
+  dialog and Rules & Layout's shortcuts section. They're kept in
+  `shortcuts.txt`, whose edits apply live without restarting Picacho.
 
 - IMAP and POP3 servers that only offer STARTTLS (ports 143 and 110): the
   connection is upgraded before anything is sent, and never used plain.

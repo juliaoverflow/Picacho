@@ -1,0 +1,148 @@
+{
+  "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+  "type": "AdaptiveCard",
+  "version": "1.5",
+  "body": [
+    {
+      "type": "ColumnSet",
+      "columns": [
+        {
+          "type": "Column",
+          "width": "stretch",
+          "selectAction": {
+            "type": "Action.OpenUrl",
+            "url": "${receiptsUrl}"
+          },
+          "items": [
+            {
+              "type": "TextBlock",
+              "text": "Receipts",
+              "weight": "Bolder",
+              "size": "Medium"
+            }
+          ]
+        },
+        {
+          "type": "Column",
+          "width": "auto",
+          "verticalContentAlignment": "Center",
+          "isVisible": "${hasMultipleAccounts}",
+          "selectAction": {
+            "type": "Action.Execute",
+            "verb": "cycleAccount"
+          },
+          "items": [
+            {
+              "type": "TextBlock",
+              "text": "${accountLabel}",
+              "size": "Small",
+              "color": "Accent",
+              "wrap": false
+            }
+          ]
+        },
+        {
+          "type": "Column",
+          "width": "auto",
+          "verticalContentAlignment": "Center",
+          "isVisible": "${hasReceipts}",
+          "selectAction": {
+            "type": "Action.OpenUrl",
+            "url": "${receiptsUrl}"
+          },
+          "items": [
+            {
+              "type": "TextBlock",
+              "text": "${viewAllText}",
+              "size": "Small",
+              "weight": "Bolder",
+              "color": "Accent",
+              "wrap": false
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "type": "Container",
+      "separator": true,
+      "spacing": "Small",
+      "isVisible": "${hasReceipts}",
+      "items": [
+        {
+          "type": "Container",
+          "$data": "${receipts}",
+          "spacing": "Small",
+          "separator": true,
+          "selectAction": {
+            "type": "Action.OpenUrl",
+            "url": "${url}"
+          },
+          "items": [
+            {
+              "type": "ColumnSet",
+              "columns": [
+                {
+                  "type": "Column",
+                  "width": "stretch",
+                  "items": [
+                    {
+                      "type": "TextBlock",
+                      "text": "${merchant}",
+                      "weight": "Bolder",
+                      "size": "Small",
+                      "wrap": false
+                    },
+                    {
+                      "type": "TextBlock",
+                      "text": "${detail}",
+                      "size": "Small",
+                      "isSubtle": true,
+                      "spacing": "None",
+                      "wrap": false
+                    }
+                  ]
+                },
+                {
+                  "type": "Column",
+                  "width": "auto",
+                  "verticalContentAlignment": "Center",
+                  "items": [
+                    {
+                      "type": "TextBlock",
+                      "text": "${amount}",
+                      "weight": "Bolder",
+                      "size": "Small",
+                      "color": "${if(refund, 'Accent', 'Default')}",
+                      "wrap": false
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "type": "TextBlock",
+      "text": "No recent receipts",
+      "isSubtle": true,
+      "horizontalAlignment": "Center",
+      "spacing": "Large",
+      "isVisible": "${!hasReceipts}"
+    }
+  ],
+  "actions": [
+    {
+      "type": "Action.OpenUrl",
+      "title": "All Receipts",
+      "url": "${receiptsUrl}"
+    },
+    {
+      "type": "Action.Execute",
+      "title": "Refresh",
+      "verb": "refresh"
+    }
+  ]
+}

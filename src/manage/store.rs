@@ -1,4 +1,5 @@
 use crate::manage::model::*;
+use crate::manage::vault::{self, DatabaseKey, KeyStore};
 use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, params};
 use std::{
@@ -35,8 +36,15 @@ pub struct Store {
     readers: Vec<Mutex<Connection>>,
     next_reader: std::sync::atomic::AtomicUsize,
     prefs: Arc<PrefQueue>,
+    /// The preference writer's connection, its thread's own but for
+    /// `set_encrypted`, which opens it again on the new file.
+    pref_db: Arc<Mutex<Connection>>,
     pref_tx: Mutex<Option<mpsc::Sender<()>>>,
     pref_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
+    /// The database's key while it is encrypted (see `vault`).
+    key: Mutex<Option<DatabaseKey>>,
+    /// Where that key is kept: the system keychain, but in tests.
+    keys: Arc<dyn KeyStore>,
     pub path: PathBuf,
 }
 
@@ -110,8 +118,19 @@ impl Drop for Writer<'_> {
     }
 }
 
-fn connect(file: &Path) -> Result<Connection> {
+fn connect(file: &Path, key: Option<&DatabaseKey>) -> Result<Connection> {
     let db = Connection::open(file)?;
+    if let Some(key) = key {
+        // First, before anything reads the file. A raw key: no passphrase
+        // derivation, so opening each connection costs nothing.
+        db.execute_batch(&zeroize::Zeroizing::new(format!(
+            "PRAGMA key = \"{}\";",
+            key.sql_literal().as_str()
+        )))?;
+        // A wrong key only shows once a page is read.
+        db.query_row("SELECT count(*) FROM sqlite_schema", [], |r| r.get::<_, i64>(0))
+            .context(vault::KeyProblem::Wrong)?;
+    }
     db.busy_timeout(BUSY_TIMEOUT)?;
     // The write-ahead log is cut back to this after each checkpoint; left
     // alone it stayed as large as it had ever grown (24 MB here).
@@ -123,8 +142,58 @@ fn connect(file: &Path) -> Result<Connection> {
     Ok(db)
 }
 
+/// Makes `db` the writing connection: every write that changes the rows
+/// lists are built from marks the cache changed (`list_dirty`).
+fn prepare_writer(db: &mut Connection, list_dirty: &Arc<Mutex<HashSet<String>>>) -> Result<()> {
+    // Other connections write too (preferences); taking the write lock
+    // when a transaction begins means one that reads first can't find
+    // the database changed under it when it comes to write.
+    db.set_transaction_behavior(rusqlite::TransactionBehavior::Immediate);
+    // Every write that changes the rows lists are built from marks the
+    // cache changed; a write that changes nothing (a sync with no news)
+    // leaves the lists as they are, so they need not be built again.
+    // Only this connection writes messages; temporary triggers are its own.
+    // Changes are kept by account, so a view of every account rebuilds
+    // only the part of its list whose account changed.
+    let dirty = list_dirty.clone();
+    db.create_scalar_function(
+        "picacho_list_changed",
+        1,
+        rusqlite::functions::FunctionFlags::SQLITE_UTF8,
+        move |ctx| {
+            let account = ctx.get::<String>(0)?;
+            let mut dirty = dirty.lock().unwrap_or_else(|e| e.into_inner());
+            if !dirty.contains(&account) {
+                dirty.insert(account);
+            }
+            Ok(0i64)
+        },
+    )?;
+    db.execute_batch(
+        "CREATE TEMP TRIGGER list_inserted AFTER INSERT ON main.messages BEGIN SELECT picacho_list_changed(NEW.account); END;
+         CREATE TEMP TRIGGER list_deleted AFTER DELETE ON main.messages BEGIN SELECT picacho_list_changed(OLD.account); END;
+         CREATE TEMP TRIGGER list_updated AFTER UPDATE OF account, folder, date, data ON main.messages BEGIN SELECT picacho_list_changed(NEW.account); SELECT picacho_list_changed(OLD.account); END;",
+    )?;
+    Ok(())
+}
+
+/// A reading connection.
+fn connect_reader(file: &Path, key: Option<&DatabaseKey>) -> Result<Connection> {
+    let r = connect(file, key)?;
+    r.execute_batch("PRAGMA query_only=ON;")?;
+    Ok(r)
+}
+
 impl Store {
+    /// Opens the store in `path`, its database decrypted with the key in
+    /// the system keychain when it is encrypted.
     pub fn open(path: &Path) -> Result<Self> {
+        Self::open_with_keys(path, Arc::new(vault::Keychain))
+    }
+
+    /// Opens the store in `path`, keeping its database key (when it has
+    /// one, or is given one by `set_encrypted`) in `keys`.
+    pub fn open_with_keys(path: &Path, keys: Arc<dyn KeyStore>) -> Result<Self> {
         std::fs::create_dir_all(path)?;
         #[cfg(unix)]
         {
@@ -138,8 +207,16 @@ impl Store {
         if let Err(e) = crate::display::windows::restrict_to_user(path) {
             eprintln!("Picacho: couldn't limit the data directory to this user: {e}");
         }
-        let file = path.join("mail.sqlite3");
-        let mut db = connect(&file)?;
+        let file = path.join(vault::DATABASE_FILE);
+        // What a switch cut short by a crash left; the database it was
+        // made from is whole.
+        remove_database_files(&path.join(vault::CONVERTING_FILE));
+        let key = if vault::is_encrypted(&file)? {
+            Some(vault::load_key(path, &*keys)?)
+        } else {
+            None
+        };
+        let mut db = connect(&file, key.as_ref())?;
         // Free pages go back to the system on `incremental_vacuum` (see
         // `pack_saved_sources`). Takes effect for a new database; an older
         // one is switched by the VACUUM of `compact_on_quit`.
@@ -250,50 +327,19 @@ impl Store {
                INSERT INTO message_text_ids VALUES (NEW.id, last_insert_rowid());
              END;"
         ))?;
-        // Other connections write too (preferences); taking the write lock
-        // when a transaction begins means one that reads first can't find
-        // the database changed under it when it comes to write.
-        db.set_transaction_behavior(rusqlite::TransactionBehavior::Immediate);
-        // Every write that changes the rows lists are built from marks the
-        // cache changed; a write that changes nothing (a sync with no news)
-        // leaves the lists as they are, so they need not be built again.
-        // Only this connection writes messages; temporary triggers are its own.
-        // Changes are kept by account, so a view of every account rebuilds
-        // only the part of its list whose account changed.
-        let list_dirty: Arc<Mutex<std::collections::HashSet<String>>> = Arc::default();
-        let dirty = list_dirty.clone();
-        db.create_scalar_function(
-            "picacho_list_changed",
-            1,
-            rusqlite::functions::FunctionFlags::SQLITE_UTF8,
-            move |ctx| {
-                let account = ctx.get::<String>(0)?;
-                let mut dirty = dirty.lock().unwrap_or_else(|e| e.into_inner());
-                if !dirty.contains(&account) {
-                    dirty.insert(account);
-                }
-                Ok(0i64)
-            },
-        )?;
-        db.execute_batch(
-            "CREATE TEMP TRIGGER list_inserted AFTER INSERT ON main.messages BEGIN SELECT picacho_list_changed(NEW.account); END;
-             CREATE TEMP TRIGGER list_deleted AFTER DELETE ON main.messages BEGIN SELECT picacho_list_changed(OLD.account); END;
-             CREATE TEMP TRIGGER list_updated AFTER UPDATE OF account, folder, date, data ON main.messages BEGIN SELECT picacho_list_changed(NEW.account); SELECT picacho_list_changed(OLD.account); END;",
-        )?;
+        let list_dirty: Arc<Mutex<HashSet<String>>> = Arc::default();
+        prepare_writer(&mut db, &list_dirty)?;
         let readers = (0..READERS)
-            .map(|_| {
-                let r = connect(&file)?;
-                r.execute_batch("PRAGMA query_only=ON;")?;
-                Ok(Mutex::new(r))
-            })
+            .map(|_| Ok(Mutex::new(connect_reader(&file, key.as_ref())?)))
             .collect::<Result<Vec<_>>>()?;
         let prefs = Arc::new(PrefQueue::default());
         let (tx, rx) = mpsc::channel::<()>();
-        let writer = connect(&file)?;
+        let pref_db = Arc::new(Mutex::new(connect(&file, key.as_ref())?));
+        let writer = pref_db.clone();
         let queue = prefs.clone();
         let thread = std::thread::Builder::new()
             .name("preferences".into())
-            .spawn(move || write_preferences(writer, &queue, rx))?;
+            .spawn(move || write_preferences(&writer, &queue, rx))?;
         Ok(Self {
             db: Mutex::new(db),
             list_dirty,
@@ -302,10 +348,145 @@ impl Store {
             readers,
             next_reader: Default::default(),
             prefs,
+            pref_db,
             pref_tx: Mutex::new(Some(tx)),
             pref_thread: Mutex::new(Some(thread)),
+            key: Mutex::new(key),
+            keys,
             path: path.into(),
         })
+    }
+    /// Whether the database is encrypted (Settings → Privacy).
+    pub fn encrypted(&self) -> bool {
+        self.key.lock().unwrap_or_else(|e| e.into_inner()).is_some()
+    }
+    /// Encrypts the database with a new key kept in the keychain (`on`), or
+    /// decrypts it and forgets its key.
+    ///
+    /// The whole database is copied into a new file (`sqlcipher_export`),
+    /// which then replaces it; every connection is opened again on it. The
+    /// cache is held meanwhile, for as long as copying takes (some seconds
+    /// for a large one), and anything wanting it waits. All or nothing: on
+    /// a failure, or a crash, the database is as it was. The new key is in
+    /// the keychain before the new file replaces the old, and the old key
+    /// is forgotten only after.
+    pub fn set_encrypted(&self, on: bool) -> Result<()> {
+        if on == self.encrypted() {
+            return Ok(());
+        }
+        // Preferences waiting to be written go into the copy.
+        self.flush();
+        let mut held = self.hold_all();
+        let file = self.path.join(vault::DATABASE_FILE);
+        let converting = self.path.join(vault::CONVERTING_FILE);
+        remove_database_files(&converting);
+        let new_key = on.then(DatabaseKey::random);
+        if let Some(key) = &new_key {
+            vault::save_key(&self.path, &*self.keys, key)?;
+        }
+        let copied = (|| -> Result<()> {
+            // Everything in the log goes into the file first, so the copy
+            // is all of it.
+            held.writer.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+            let literal = match &new_key {
+                Some(key) => key.sql_literal(),
+                None => zeroize::Zeroizing::new(String::new()),
+            };
+            held.writer.execute(
+                "ATTACH DATABASE ?1 AS converted KEY ?2",
+                params![converting.to_string_lossy(), literal.as_str()],
+            )?;
+            let exported = held
+                .writer
+                .execute_batch(
+                    // Gives free pages back as it goes, as `open` sets up;
+                    // only takes effect before the copy makes a table.
+                    "PRAGMA converted.auto_vacuum=INCREMENTAL;
+                     SELECT sqlcipher_export('converted');",
+                )
+                .context("Couldn't copy the local database");
+            let detached = held.writer.execute_batch("DETACH DATABASE converted;");
+            exported?;
+            detached?;
+            Ok(())
+        })();
+        if let Err(e) = copied {
+            remove_database_files(&converting);
+            if new_key.is_some() {
+                let _ = vault::forget_key(&self.path, &*self.keys);
+            }
+            return Err(e);
+        }
+        // Every connection to the old file is closed before the new one
+        // takes its place (Windows can't replace an open file).
+        let closed = || Connection::open_in_memory();
+        drop(std::mem::replace(&mut *held.writer, closed()?));
+        for r in held.readers.iter_mut() {
+            drop(std::mem::replace(&mut **r, closed()?));
+        }
+        drop(std::mem::replace(&mut *held.prefs, closed()?));
+        let old_key = self.key.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let replaced = (|| -> Result<()> {
+            std::fs::rename(&converting, &file).context("Couldn't replace the local database")?;
+            // The old file's log and index, now empty, are not the new one's.
+            for suffix in ["-wal", "-shm"] {
+                let mut name = file.clone().into_os_string();
+                name.push(suffix);
+                let _ = std::fs::remove_file(PathBuf::from(name));
+            }
+            Ok(())
+        })();
+        let key = match &replaced {
+            Ok(()) => new_key.clone(),
+            Err(_) => old_key,
+        };
+        // Open again: the new file, or the old one if it couldn't be replaced.
+        let reopened = (|| -> Result<()> {
+            let mut db = connect(&file, key.as_ref())?;
+            db.execute_batch("PRAGMA journal_mode=WAL;")?;
+            prepare_writer(&mut db, &self.list_dirty)?;
+            *held.writer = db;
+            for r in held.readers.iter_mut() {
+                **r = connect_reader(&file, key.as_ref())?;
+            }
+            *held.prefs = connect(&file, key.as_ref())?;
+            Ok(())
+        })();
+        if let Err(e) = replaced {
+            remove_database_files(&converting);
+            if new_key.is_some() {
+                let _ = vault::forget_key(&self.path, &*self.keys);
+            }
+            reopened?;
+            return Err(e);
+        }
+        *self.key.lock().unwrap_or_else(|e| e.into_inner()) = key;
+        drop(held);
+        // The old key opens nothing now.
+        if !on && let Err(e) = vault::forget_key(&self.path, &*self.keys) {
+            eprintln!("Picacho: couldn't remove the old database key from the keychain: {e:#}");
+        }
+        reopened.context("Couldn't open the local database again")
+    }
+    /// Every connection, held: for replacing the file under them. Taken
+    /// all at once or not at all, so this never waits holding one that a
+    /// thread waiting for another holds (a write that reads, say).
+    fn hold_all(&self) -> HeldConnections<'_> {
+        loop {
+            if let Ok(writer) = self.db.try_lock() {
+                let readers: Vec<_> = self.readers.iter().map_while(|r| r.try_lock().ok()).collect();
+                if readers.len() == self.readers.len()
+                    && let Ok(prefs) = self.pref_db.try_lock()
+                {
+                    return HeldConnections {
+                        writer,
+                        readers,
+                        prefs,
+                    };
+                }
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
     /// The writing connection, held until the returned guard is dropped.
     fn write(&self) -> Writer<'_> {
@@ -475,11 +656,15 @@ impl Store {
             drop(db);
             rows.into_iter()
                 .map(|(id, (raw, source))| {
-                    // A source that can't be read has no text to find.
+                    // A source that can't be read has no text to find. Nor
+                    // has one whose reading panics: it is kept as read (with
+                    // no text) rather than tried, and panicking, every time.
                     let text = unpack(raw, source)
                         .ok()
                         .flatten()
-                        .map(|raw| crate::manage::attachment_text::extract(&raw))
+                        .and_then(|raw| {
+                            std::panic::catch_unwind(|| crate::manage::attachment_text::extract(&raw)).ok()
+                        })
                         .unwrap_or_default();
                     (id, text)
                 })
@@ -2562,6 +2747,22 @@ impl Store {
             .unwrap();
     }
 }
+/// What `Store::hold_all` holds.
+struct HeldConnections<'a> {
+    writer: MutexGuard<'a, Connection>,
+    readers: Vec<MutexGuard<'a, Connection>>,
+    prefs: MutexGuard<'a, Connection>,
+}
+
+/// Removes a database file and its journal, log and index, if there.
+fn remove_database_files(file: &Path) {
+    for suffix in ["", "-journal", "-wal", "-shm"] {
+        let mut name = file.as_os_str().to_owned();
+        name.push(suffix);
+        let _ = std::fs::remove_file(PathBuf::from(name));
+    }
+}
+
 impl Drop for Store {
     fn drop(&mut self) {
         // Closing the channel ends the writer once the queue is written.
@@ -2879,8 +3080,9 @@ const PUT_PREFERENCE: &str = "INSERT INTO preferences VALUES (?1,?2) ON CONFLICT
 
 /// The preference writer: writes whatever is pending each time it is told
 /// there is something, until the store closes.
-fn write_preferences(db: Connection, queue: &PrefQueue, rx: mpsc::Receiver<()>) {
+fn write_preferences(db: &Mutex<Connection>, queue: &PrefQueue, rx: mpsc::Receiver<()>) {
     let write = |batch: &HashMap<String, String>| -> Result<()> {
+        let db = db.lock().unwrap_or_else(|e| e.into_inner());
         let db = db.unchecked_transaction()?;
         for (key, value) in batch {
             db.execute(
@@ -3064,6 +3266,154 @@ mod tests {
         let p = std::env::temp_dir().join(format!("mail-test-{}", uuid::Uuid::new_v4()));
         let s = Store::open(&p)?;
         Ok((p, s))
+    }
+
+    /// Whether any file in `dir` holds `needle` as it is.
+    fn files_hold(dir: &Path, needle: &[u8]) -> Result<bool> {
+        for entry in std::fs::read_dir(dir)? {
+            let bytes = std::fs::read(entry?.path())?;
+            if bytes.windows(needle.len()).any(|w| w == needle) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Settings → Privacy: encrypting the database keeps everything in it
+    /// (messages, their sources, the search index, preferences, drafts),
+    /// leaves none of it readable in its files, opens again only with the
+    /// key, and decrypting puts it back as it was and forgets the key.
+    #[test]
+    fn the_database_is_encrypted_and_decrypted_in_place() -> Result<()> {
+        let p = std::env::temp_dir().join(format!("mail-test-{}", uuid::Uuid::new_v4()));
+        let keys: Arc<vault::MemoryKeys> = Arc::default();
+        let store = Store::open_with_keys(&p, keys.clone())?;
+        let mail = |id: &str, body: &str| Mail {
+            id: id.into(),
+            account: "a".into(),
+            folder: Folder::Inbox,
+            subject: "Itinerary".into(),
+            from: "ana@example.com".into(),
+            body: Some(body.into()),
+            date: 1,
+            ..Mail::default()
+        };
+        let words = |w: &[&str]| w.iter().map(|w| w.to_string()).collect::<Vec<_>>();
+        store.save_messages(&[mail("1", "Meet at the zanzibarquay at noon")])?;
+        store.save_raw("1", b"From: ana@example.com\r\n\r\nMeet at the zanzibarquay at noon\r\n")?;
+        store.set_preference("secretpref", "pinecone-value")?;
+        store.save_draft(&Draft { id: "d1".into(), account: "a".into(), ..Draft::default() })?;
+        store.set_preference_soon("queued", "still-written");
+        assert!(!store.encrypted());
+        assert!(files_hold(&p, b"zanzibarquay")?, "a plain database holds its text as is");
+
+        store.set_encrypted(true)?;
+        assert!(store.encrypted());
+        assert!(vault::is_encrypted(&p.join(vault::DATABASE_FILE))?);
+        assert!(!p.join(vault::CONVERTING_FILE).exists());
+        // Everything is read as before, and written as before.
+        assert_eq!(store.message("1")?.and_then(|m| m.body).as_deref(), Some("Meet at the zanzibarquay at noon"));
+        assert!(store.raw("1")?.is_some());
+        assert_eq!(store.search_texts(&words(&["zanzibarquay"]), &[], 10)?, vec!["1".to_string()]);
+        assert_eq!(store.preference("secretpref").as_deref(), Some("pinecone-value"));
+        assert_eq!(store.preference("queued").as_deref(), Some("still-written"));
+        assert!(store.drafts("a").is_ok_and(|d| d.iter().any(|d| d.id == "d1")));
+        let before = store.list_revision("a");
+        store.save_messages(&[mail("2", "A second note about the pinecone")])?;
+        assert!(store.list_revision("a") > before, "lists still hear of changes");
+        store.set_preference_soon("later", "written-encrypted");
+        store.flush();
+        store.free_pages()?;
+        drop(store);
+        assert!(!files_hold(&p, b"zanzibarquay")?, "no file holds the text");
+        assert!(!files_hold(&p, b"pinecone")?);
+        assert!(!files_hold(&p, b"SQLite format 3")?);
+        // Not without the key, nor with another.
+        let missing = Store::open_with_keys(&p, Arc::new(vault::MemoryKeys::default()));
+        assert_eq!(missing.err().as_ref().and_then(vault::key_problem), Some(vault::KeyProblem::Missing));
+        let other: Arc<vault::MemoryKeys> = Arc::default();
+        let name = std::fs::read_to_string(p.join(vault::KEY_NAME_FILE))?;
+        other.save(&name, &"ab".repeat(32))?;
+        let wrong = Store::open_with_keys(&p, other);
+        assert_eq!(wrong.err().as_ref().and_then(vault::key_problem), Some(vault::KeyProblem::Wrong));
+        assert!(
+            Connection::open(p.join(vault::DATABASE_FILE))?
+                .query_row("SELECT count(*) FROM sqlite_schema", [], |r| r.get::<_, i64>(0))
+                .is_err()
+        );
+
+        let store = Store::open_with_keys(&p, keys.clone())?;
+        assert!(store.encrypted());
+        assert_eq!(store.message("2")?.map(|m| m.id).as_deref(), Some("2"));
+        assert_eq!(store.preference("later").as_deref(), Some("written-encrypted"));
+        // Turning it on again changes nothing.
+        store.set_encrypted(true)?;
+
+        store.set_encrypted(false)?;
+        assert!(!store.encrypted());
+        assert!(!vault::is_encrypted(&p.join(vault::DATABASE_FILE))?);
+        assert_eq!(store.search_texts(&words(&["pinecone"]), &[], 10)?, vec!["2".to_string()]);
+        let name = std::fs::read_to_string(p.join(vault::KEY_NAME_FILE))?;
+        assert!(keys.load(&name)?.is_none(), "the key is forgotten");
+        drop(store);
+        // Plain again: opened without any key.
+        let store = Store::open_with_keys(&p, Arc::new(vault::MemoryKeys::default()))?;
+        assert_eq!(store.preference("secretpref").as_deref(), Some("pinecone-value"));
+        let mode: String = store.read().query_row("PRAGMA journal_mode", [], |r| r.get(0))?;
+        assert_eq!(mode, "wal");
+        drop(store);
+        std::fs::remove_dir_all(p)?;
+        Ok(())
+    }
+
+    /// A database whose key is gone is moved aside, not deleted, and a new
+    /// one opens in its place.
+    #[test]
+    fn an_unreadable_database_is_moved_aside_to_start_over() -> Result<()> {
+        let p = std::env::temp_dir().join(format!("mail-test-{}", uuid::Uuid::new_v4()));
+        let keys: Arc<vault::MemoryKeys> = Arc::default();
+        let store = Store::open_with_keys(&p, keys.clone())?;
+        store.set_preference("old", "yes")?;
+        store.set_encrypted(true)?;
+        drop(store);
+        let none = Arc::new(vault::MemoryKeys::default());
+        assert!(Store::open_with_keys(&p, none.clone()).is_err());
+        let aside = vault::move_aside(&p)?;
+        assert!(aside.exists() && vault::is_encrypted(&aside)?);
+        let fresh = Store::open_with_keys(&p, none)?;
+        assert!(!fresh.encrypted());
+        assert_eq!(fresh.preference("old"), None);
+        drop(fresh);
+        // With its key, the file moved aside still opens.
+        let back = std::env::temp_dir().join(format!("mail-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&back)?;
+        std::fs::copy(&aside, back.join(vault::DATABASE_FILE))?;
+        let mut name = aside.clone().into_os_string();
+        name.push(".keychain");
+        std::fs::copy(PathBuf::from(name), back.join(vault::KEY_NAME_FILE))?;
+        let restored = Store::open_with_keys(&back, keys)?;
+        assert_eq!(restored.preference("old").as_deref(), Some("yes"));
+        drop(restored);
+        std::fs::remove_dir_all(p)?;
+        std::fs::remove_dir_all(back)?;
+        Ok(())
+    }
+
+    /// A switch cut short by a crash leaves the database as it was: the
+    /// half-written copy is removed when the store opens.
+    #[test]
+    fn a_copy_left_by_a_crash_is_removed() -> Result<()> {
+        let (p, store) = temp_store()?;
+        store.set_preference("kept", "yes")?;
+        drop(store);
+        std::fs::write(p.join(vault::CONVERTING_FILE), b"half a database")?;
+        let store = Store::open_with_keys(&p, Arc::new(vault::MemoryKeys::default()))?;
+        assert!(!p.join(vault::CONVERTING_FILE).exists());
+        assert_eq!(store.preference("kept").as_deref(), Some("yes"));
+        assert!(!store.encrypted());
+        drop(store);
+        std::fs::remove_dir_all(p)?;
+        Ok(())
     }
 
     /// RFC 3501 §6.3.5: a renamed folder keeps its UIDs, so its cache

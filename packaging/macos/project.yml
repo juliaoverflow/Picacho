@@ -1,0 +1,49 @@
+# macOS WidgetKit extension for Notification Center and macOS 14+ Desktop widgets.
+# Reuses the SwiftUI views from packaging/ios/Widgets. Built and embedded into
+# dist/Picacho.app/Contents/PlugIns/PicachoWidgets.appex by scripts/bundle.sh.
+name: PicachoMacWidgets
+options:
+  deploymentTarget:
+    macOS: "14.0"
+  createIntermediateGroups: true
+settings:
+  base:
+    PICACHO_BUNDLE_ID: tech.pinal.picacho
+    # "<TEAM ID>.tech.pinal.picacho", passed in by scripts/bundle.sh.
+    PICACHO_APP_GROUP: ""
+    SWIFT_VERSION: "5.9"
+targets:
+  PicachoWidgets:
+    type: app-extension
+    platform: macOS
+    sources:
+      - path: ../ios/Widgets/WidgetSnapshot.swift
+      - path: ../ios/Widgets/PicachoWidgets.swift
+    entitlements:
+      path: PicachoWidgets.entitlements
+      properties:
+        com.apple.security.app-sandbox: true
+        com.apple.security.application-groups:
+          - $(PICACHO_APP_GROUP)
+    info:
+      path: Info.plist
+      properties:
+        CFBundleDisplayName: Picacho Widgets
+        # The App Group holding Picacho's widget-snapshot.json.
+        PicachoAppGroup: $(PICACHO_APP_GROUP)
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.widgetkit-extension
+    settings:
+      base:
+        PRODUCT_NAME: PicachoWidgets
+        PRODUCT_BUNDLE_IDENTIFIER: $(PICACHO_BUNDLE_ID).widgets
+        MARKETING_VERSION: 0.1.0
+        CURRENT_PROJECT_VERSION: 1
+        CODE_SIGN_STYLE: Automatic
+        SKIP_INSTALL: YES
+        APPLICATION_EXTENSION_API_ONLY: YES
+    dependencies:
+      - sdk: WidgetKit.framework
+      - sdk: SwiftUI.framework

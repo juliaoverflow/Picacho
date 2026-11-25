@@ -1,0 +1,18 @@
+{
+    "KPackageStructure": "Plasma/Applet",
+    "KPlugin": {
+        "Authors": [
+            {
+                "Name": "Pinal Technologies"
+            }
+        ],
+        "Category": "Online Services",
+        "Description": "Your recent tracked packages and delivery progress from Picacho",
+        "Icon": "tech.pinal.picacho",
+        "Id": "tech.pinal.picacho.packages",
+        "License": "MIT",
+        "Name": "Picacho Packages",
+        "Version": "0.1.0"
+    },
+    "X-Plasma-API-Minimum-Version": "6.0"
+}

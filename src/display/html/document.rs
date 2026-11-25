@@ -750,6 +750,42 @@ impl EmailDocument {
     pub(super) fn text_zoom(&self) -> f32 {
         self.text_zoom
     }
+    /// The width the document was laid out at, in CSS pixels.
+    pub(super) fn laid_width(&self) -> u32 {
+        self.laid_width.max(1)
+    }
+    /// Waits for inline or remote resources to finish loading, re-laying out
+    /// as they arrive, up to `max_wait`.
+    pub(super) fn wait_settled(&mut self, width: u32, max_wait: std::time::Duration) {
+        let deadline = std::time::Instant::now() + max_wait;
+        loop {
+            if self.changed.swap(false, Ordering::AcqRel) {
+                self.layout(width);
+            }
+            if self.settled() || std::time::Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        if self.changed.swap(false, Ordering::AcqRel) {
+            self.layout(width);
+        }
+    }
+    /// Paints the slice starting at document pixel `y` (`width` × `height`)
+    /// directly into `scene` (used for vector PDF export and printing).
+    pub(super) fn paint_into(
+        &mut self,
+        scene: &mut impl PaintScene,
+        width: u32,
+        height: u32,
+        y: f32,
+    ) {
+        self.doc
+            .set_viewport_scroll(blitz_dom::Point { x: 0., y: y as f64 });
+        blitz_paint::paint_scene(scene, &mut self.doc, 1., width, height, 0, 0);
+        self.doc
+            .set_viewport_scroll(blitz_dom::Point { x: 0., y: 0. });
+    }
     /// How much the email is scaled: down to fit the width asked for, and
     /// up by the person's text zoom.
     pub(super) fn zoom(&self) -> f32 {

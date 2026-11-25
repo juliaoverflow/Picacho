@@ -16,6 +16,7 @@ mod imap_ext;
 pub(crate) mod jmap;
 pub(crate) mod jscal;
 pub mod mime;
+pub mod msg;
 pub mod models;
 pub(crate) mod mta_sts;
 pub mod oauth;

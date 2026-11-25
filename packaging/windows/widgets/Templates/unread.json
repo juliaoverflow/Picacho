@@ -1,0 +1,67 @@
+{
+  "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+  "type": "AdaptiveCard",
+  "version": "1.5",
+  "selectAction": {
+    "type": "Action.OpenUrl",
+    "url": "${inboxUrl}"
+  },
+  "body": [
+    {
+      "type": "TextBlock",
+      "text": "${accountLabel}",
+      "size": "Small",
+      "isSubtle": true,
+      "wrap": false
+    },
+    {
+      "type": "TextBlock",
+      "text": "${unreadText}",
+      "size": "ExtraLarge",
+      "weight": "Bolder",
+      "color": "${if(unreadCount > 0, 'Accent', 'Default')}",
+      "spacing": "Small"
+    },
+    {
+      "type": "TextBlock",
+      "text": "${subtitle}",
+      "size": "Small",
+      "isSubtle": true,
+      "spacing": "None"
+    },
+    {
+      "type": "Container",
+      "separator": true,
+      "spacing": "Medium",
+      "isVisible": "${hasLatest}",
+      "selectAction": {
+        "type": "Action.OpenUrl",
+        "url": "${latestUrl}"
+      },
+      "items": [
+        {
+          "type": "TextBlock",
+          "text": "${latestSender}",
+          "size": "Small",
+          "weight": "Bolder",
+          "wrap": false
+        },
+        {
+          "type": "TextBlock",
+          "text": "${latestSubject}",
+          "size": "Small",
+          "isSubtle": true,
+          "spacing": "None",
+          "wrap": false
+        }
+      ]
+    }
+  ],
+  "actions": [
+    {
+      "type": "Action.OpenUrl",
+      "title": "Compose",
+      "url": "${composeUrl}"
+    }
+  ]
+}

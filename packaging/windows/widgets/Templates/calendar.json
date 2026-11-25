@@ -1,0 +1,100 @@
+{
+  "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+  "type": "AdaptiveCard",
+  "version": "1.5",
+  "selectAction": {
+    "type": "Action.OpenUrl",
+    "url": "picacho://widget/calendar"
+  },
+  "body": [
+    {
+      "type": "ColumnSet",
+      "columns": [
+        {
+          "type": "Column",
+          "width": "stretch",
+          "items": [
+            {
+              "type": "TextBlock",
+              "text": "Calendar",
+              "weight": "Bolder",
+              "size": "Medium"
+            }
+          ]
+        },
+        {
+          "type": "Column",
+          "width": "auto",
+          "items": [
+            {
+              "type": "TextBlock",
+              "text": "${todayLabel}",
+              "size": "Small",
+              "isSubtle": true
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "type": "Container",
+      "separator": true,
+      "spacing": "Small",
+      "isVisible": "${hasEvents}",
+      "items": [
+        {
+          "type": "Container",
+          "$data": "${events}",
+          "spacing": "Small",
+          "separator": true,
+          "items": [
+            {
+              "type": "TextBlock",
+              "text": "${title}",
+              "weight": "Bolder",
+              "size": "Small",
+              "wrap": false
+            },
+            {
+              "type": "TextBlock",
+              "text": "${time}",
+              "size": "Small",
+              "isSubtle": true,
+              "spacing": "None",
+              "wrap": false
+            },
+            {
+              "type": "TextBlock",
+              "text": "${location}",
+              "size": "Small",
+              "isSubtle": true,
+              "spacing": "None",
+              "wrap": false,
+              "isVisible": "${location != ''}"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "type": "TextBlock",
+      "text": "${emptyText}",
+      "isSubtle": true,
+      "horizontalAlignment": "Center",
+      "spacing": "Large",
+      "isVisible": "${!hasEvents}"
+    }
+  ],
+  "actions": [
+    {
+      "type": "Action.OpenUrl",
+      "title": "Open Calendar",
+      "url": "picacho://widget/calendar"
+    },
+    {
+      "type": "Action.Execute",
+      "title": "Refresh",
+      "verb": "refresh"
+    }
+  ]
+}

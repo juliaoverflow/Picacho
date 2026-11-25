@@ -263,6 +263,8 @@ pub(super) enum Screen {
     Subscriptions,
     /// An account's Summary.
     Summary,
+    /// Calendar or Contacts opened as its own full-screen view.
+    AppView(calendar_views::AppView),
     Settings,
 }
 
@@ -277,6 +279,8 @@ impl MailApp {
             Screen::Subscriptions
         } else if self.summary_open {
             Screen::Summary
+        } else if let Some(view) = self.app_view {
+            Screen::AppView(view)
         } else if self.selected.is_some() && self.selection.len() <= 1 {
             Screen::Reader
         } else if self.mobile.mailboxes {
@@ -321,6 +325,7 @@ impl MailApp {
             Screen::Settings => self.mobile_settings(insets, window, cx),
             Screen::Subscriptions => self.mobile_subscriptions(insets, window, cx),
             Screen::Summary => self.mobile_summary(insets, cx),
+            Screen::AppView(view) => self.mobile_app_view(view, insets, cx),
             _ if split => self.mobile_split_view(screen, insets, window, cx),
             Screen::Mailboxes => self.mobile_mailboxes(insets, cx),
             Screen::List => self.mobile_list(insets, window, cx),
@@ -586,6 +591,13 @@ impl MailApp {
             Screen::Summary => {
                 // The Summary was opened from the mailboxes.
                 self.open_mailbox(self.account.clone(), Folder::Inbox.into(), w, cx);
+                self.mobile.mailboxes = true;
+                self.mobile_popped(cx);
+                true
+            }
+            Screen::AppView(_) => {
+                // Calendar or Contacts was opened from the mailboxes.
+                self.app_view = None;
                 self.mobile.mailboxes = true;
                 self.mobile_popped(cx);
                 true
@@ -870,7 +882,7 @@ impl MailApp {
             Screen::List => true,
             Screen::Settings => self.fwd_reverse.is_none(),
             Screen::Subscriptions => self.selected.is_none() && self.subs_sender.is_none(),
-            Screen::Summary => true,
+            Screen::Summary | Screen::AppView(_) => true,
             Screen::Mailboxes | Screen::Setup => false,
         }
     }
@@ -888,7 +900,7 @@ impl MailApp {
         }
         Some(match screen {
             Screen::Reader => self.mobile_list(insets, window, cx),
-            Screen::List | Screen::Subscriptions | Screen::Summary => {
+            Screen::List | Screen::Subscriptions | Screen::Summary | Screen::AppView(_) => {
                 self.mobile_mailboxes(insets, cx)
             }
             Screen::Settings if self.mobile.settings_page => {
@@ -1062,6 +1074,9 @@ impl MailApp {
         ] {
             add(state, Keys::Text);
         }
+        for state in self.lock.fields() {
+            add(state, Keys::Password);
+        }
         add(&self.fwd_server, Keys::Url);
         add(&self.fwd_contact_new, Keys::Email);
         // Masked, so the password keyboard (see `add`): not listed before,
@@ -1069,6 +1084,34 @@ impl MailApp {
         for state in [&self.calendar_password, &self.contacts_password, &self.key_passphrase] {
             add(state, Keys::Password);
         }
+        for state in [&self.cal.interval, &self.cal.month_day, &self.cal.count, &self.cal.until] {
+            add(state, Keys::Text);
+        }
+        for state in [
+            &self.event_title,
+            &self.event_start,
+            &self.event_end,
+            &self.event_location,
+            &self.event_notes,
+            &self.event_zone,
+            &self.contact_name,
+            &self.contact_phones,
+            &self.contact_org,
+            &self.contact_note,
+            &self.contact_addresses,
+            &self.contact_birthday,
+            &self.contact_title,
+            &self.contact_nicknames,
+            &self.contact_links,
+            &self.contact_anniversary,
+            &self.contact_members,
+        ] {
+            add(state, Keys::Text);
+        }
+        for state in [&self.event_guests, &self.contact_emails] {
+            add(state, Keys::Email);
+        }
+        add(&self.contact_filter, Keys::Search);
         out.push((self.signature_input.read(cx).focus_handle(cx), Keys::Text));
         if let Some(focus) = self
             .picker

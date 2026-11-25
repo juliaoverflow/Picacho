@@ -48,6 +48,7 @@ impl MailApp {
         }
         if let Ok(json) = serde_json::to_string(&hidden) {
             self.backend.store.set_preference_soon(HIDDEN, &json);
+            crate::manage::widgets::publish_soon(self.backend.store.clone());
         }
         receipts::apply_hidden(&mut self.receipts, &hidden);
         // The search's `has:receipt` follows at once, without working out

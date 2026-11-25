@@ -72,8 +72,10 @@ impl MailApp {
             Page::Contacts => "Contacts".into(),
             Page::Calendar => "Calendar".into(),
             Page::Encryption => "Encryption".into(),
+            Page::Privacy => "Privacy".into(),
             Page::LocalAi => "Local AI".into(),
             Page::Organizing => "Rules & Layout".into(),
+            Page::Shortcuts => "Keyboard Shortcuts".into(),
             Page::About => "About Picacho".into(),
             Page::Account(id) => self
                 .accounts
@@ -171,6 +173,7 @@ impl MailApp {
                 row("mobile-settings-contacts", "contact", Page::Contacts),
                 row("mobile-settings-calendar", "clock", Page::Calendar),
                 row("mobile-settings-encryption", "lock", Page::Encryption),
+                row("mobile-settings-privacy", "shield", Page::Privacy),
                 row("mobile-settings-local-ai", "sparkle", Page::LocalAi),
                 row("mobile-settings-organizing", "filter", Page::Organizing),
             ]))
@@ -392,6 +395,55 @@ impl MailApp {
 }
 
 impl MailApp {
+    /// Calendar or Contacts opened as its own full-screen view on phones.
+    pub(super) fn mobile_app_view(
+        &mut self,
+        view: calendar_views::AppView,
+        insets: Insets,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let c = self.colors();
+        let back = self.back_icon("mobile-app-view-back", cx);
+        let (id, title, content) = match view {
+            calendar_views::AppView::Calendar => {
+                ("mobile-calendar", "Calendar", self.calendar_page(cx))
+            }
+            calendar_views::AppView::Contacts => {
+                ("mobile-contacts", "Contacts", self.contacts_page(cx))
+            }
+        };
+        div()
+            .id(id)
+            .debug_selector(move || id.into())
+            .size_full()
+            .flex()
+            .flex_col()
+            .bg(rgb(c.surface))
+            .child(self.nav_bar(
+                "mobile-app-view-bar",
+                insets,
+                Some(back),
+                title.to_owned(),
+                None,
+                vec![],
+            ))
+            .child(
+                div()
+                    .id("mobile-app-view-scroll")
+                    .track_scroll(&self.cal.scroll)
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .restrict_scroll_to_axis()
+                    .pl(px(insets.left + GUTTER))
+                    .pr(px(insets.right + GUTTER))
+                    .pt_4()
+                    .pb(px(insets.below() + 24.))
+                    .child(content),
+            )
+            .into_any_element()
+    }
+
     /// An account's Summary, full screen.
     pub(super) fn mobile_summary(&mut self, insets: Insets, cx: &mut Context<Self>) -> AnyElement {
         let c = self.colors();

@@ -1,0 +1,89 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/widget_cal_root"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@drawable/widget_bg"
+    android:orientation="vertical"
+    android:paddingStart="12dp"
+    android:paddingTop="10dp"
+    android:paddingEnd="12dp"
+    android:paddingBottom="10dp">
+
+    <LinearLayout
+        android:id="@+id/widget_cal_header"
+        android:layout_width="match_parent"
+        android:layout_height="32dp"
+        android:gravity="center_vertical"
+        android:orientation="horizontal">
+
+        <ImageView
+            android:id="@+id/widget_cal_icon"
+            android:layout_width="18dp"
+            android:layout_height="18dp"
+            android:importantForAccessibility="no"
+            android:src="@drawable/ic_widget_calendar" />
+
+        <TextView
+            android:id="@+id/widget_cal_title"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="8dp"
+            android:layout_weight="1"
+            android:ellipsize="end"
+            android:maxLines="1"
+            android:text="@string/widget_calendar_label"
+            android:textColor="@color/widget_text"
+            android:textSize="15sp"
+            android:textStyle="bold" />
+
+        <TextView
+            android:id="@+id/widget_cal_date"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginEnd="4dp"
+            android:maxLines="1"
+            android:textColor="@color/widget_text_muted"
+            android:textSize="12sp" />
+
+        <ImageView
+            android:id="@+id/widget_cal_refresh"
+            android:layout_width="28dp"
+            android:layout_height="28dp"
+            android:contentDescription="@string/widget_refresh"
+            android:padding="4dp"
+            android:src="@drawable/ic_widget_refresh" />
+    </LinearLayout>
+
+    <ImageView
+        android:layout_width="match_parent"
+        android:layout_height="1dp"
+        android:layout_marginTop="4dp"
+        android:layout_marginBottom="4dp"
+        android:background="@color/widget_divider"
+        android:importantForAccessibility="no" />
+
+    <FrameLayout
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="1">
+
+        <ListView
+            android:id="@+id/widget_cal_list"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:divider="@null"
+            android:dividerHeight="4dp"
+            android:scrollbars="none" />
+
+        <TextView
+            android:id="@+id/widget_cal_empty"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:gravity="center"
+            android:padding="12dp"
+            android:text="@string/widget_empty_calendar"
+            android:textColor="@color/widget_text_muted"
+            android:textSize="13sp" />
+    </FrameLayout>
+</LinearLayout>

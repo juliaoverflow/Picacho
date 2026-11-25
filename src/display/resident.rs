@@ -105,18 +105,22 @@ impl State {
         self.monitor.stop_and_wait(CHECK_WAIT);
         self.store.flush();
         instance::release(&self.socket);
-        // What later launches asked to open goes to the window's process.
-        let mut args: Vec<std::ffi::OsString> = vec![DATA_DIR_FLAG.into(), self.dir.into_os_string()];
-        args.extend(super::launch::take().into_iter().map(|r| {
-            match r.strip_prefix("file:") {
-                Some(path) => path.into(),
-                None => r.into(),
+        // What later launches (or tapped notifications) asked to open goes to
+        // the window's process through a private handover file inside the data
+        // directory rather than command-line arguments.
+        if matches!(command, TrayCommand::Open | TrayCommand::Widget) {
+            if command == TrayCommand::Widget {
+                super::launch::push("picacho://widget/panel".to_owned());
             }
-        }));
-        if command == TrayCommand::Open
-            && let Err(e) = spawn(&args)
-        {
-            eprintln!("Picacho: could not open the mail window: {e}");
+            let pending = super::launch::take();
+            if let Err(e) = super::launch::save_pending(&self.dir, &pending) {
+                eprintln!("Picacho: could not hand over pending requests: {e}");
+            }
+            let args: Vec<std::ffi::OsString> =
+                vec![DATA_DIR_FLAG.into(), self.dir.into_os_string()];
+            if let Err(e) = spawn(&args) {
+                eprintln!("Picacho: could not open the mail window: {e}");
+            }
         }
     }
 }
@@ -179,6 +183,15 @@ fn event_loop(
             }
             #[cfg(target_os = "macos")]
             Event::Reopen { .. } => Some(TrayCommand::Open),
+            #[cfg(target_os = "macos")]
+            Event::Opened { urls } => {
+                for url in urls {
+                    if let Some(req) = super::launch::request(url.as_str()) {
+                        super::launch::push(req);
+                    }
+                }
+                Some(TrayCommand::Open)
+            }
             Event::UserEvent(command) => Some(command),
             _ => None,
         };

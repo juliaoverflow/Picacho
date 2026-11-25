@@ -1,6 +1,8 @@
 //! Reusable HTML renderer. No dependency on MailApp, accounts, storage or sync.
 //! Callers supply HTML and a remote-content policy; this component owns its lifecycle.
 mod document;
+mod pdf_scene;
+pub mod print;
 mod resources;
 #[cfg(test)]
 mod rendering_tests;

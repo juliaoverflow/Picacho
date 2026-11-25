@@ -81,6 +81,13 @@ impl AssetSource for Assets {
             "mail/lock.svg" => Some(
                 "<rect x='4' y='10' width='16' height='11' rx='2'/><path d='M8 10V7a4 4 0 0 1 8 0v3'/>",
             ),
+            // The app lock's biometric unlock (display/applock.rs).
+            "mail/fingerprint.svg" => Some(
+                "<path d='M6.5 6.5a8 8 0 0 1 13.4 5.8M4.2 10.5A8 8 0 0 0 4 12.5c0 2 .4 3.6 1.2 5M8 18.5c-.7-1.8-1-3.8-1-6a5 5 0 0 1 10 0v1M12 12.5c0 3.5.7 6 2 8M17 16.5c-.2 1.4-.6 2.7-1 3.8M9.5 8.8A5 5 0 0 1 12 8'/>",
+            ),
+            "mail/face-id.svg" => Some(
+                "<path d='M3 8V5a2 2 0 0 1 2-2h3M16 3h3a2 2 0 0 1 2 2v3M21 16v3a2 2 0 0 1-2 2h-3M8 21H5a2 2 0 0 1-2-2v-3M9 9v1.5M15 9v1.5M12 9v4.5h-1M9 16a4.5 4.5 0 0 0 6 0'/>",
+            ),
             "mail/filter.svg" => Some(
                 "<path d='M4 5h16M7 12h10M10 19h4'/><circle cx='8' cy='5' r='2'/><circle cx='16' cy='12' r='2'/>",
             ),

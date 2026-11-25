@@ -1,5 +1,12 @@
 #[path = "accounts.rs"]
 mod accounts;
+#[path = "applock.rs"]
+mod applock;
+#[cfg(test)]
+#[path = "applock_tests.rs"]
+mod applock_tests;
+#[path = "recovery.rs"]
+mod recovery;
 #[path = "links.rs"]
 mod links;
 #[path = "proton_login.rs"]
@@ -51,6 +58,9 @@ mod local_ai_tests;
 mod when_tests;
 #[path = "message_window.rs"]
 mod message_window;
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+#[path = "widget_window.rs"]
+mod widget_window;
 /// The phone and tablet presentation of this same app state: touch-first
 /// screens, sheets and bars (src/display-mobile).
 #[path = "../display-mobile/mod.rs"]
@@ -178,6 +188,10 @@ actions!(
         ShowAttachments,
         Minimize,
         Zoom,
+        /// Opens Picacho's compact desktop widget window (macOS, Linux, Windows).
+        ShowWidget,
+        /// Locks Picacho now, when the app lock is on (Settings → Privacy).
+        LockApp,
         /// Emails larger, smaller, or at their own size (WCAG 1.4.4).
         ZoomIn,
         ZoomOut,
@@ -488,7 +502,6 @@ enum Modal {
     Connect,
     Settings,
     About,
-    Help,
     RemoveAccount(String),
     /// Confirms deleting a folder on an account's server: (account, folder).
     DeleteFolder(String, String),
@@ -636,10 +649,14 @@ enum Page {
     Contacts,
     Calendar,
     Encryption,
+    /// The app lock and the encrypted database.
+    Privacy,
     LocalAi,
     /// Rules & Layout: blocked senders, rules applied here, saved
-    /// searches, list density, the reader's place, shortcuts.
+    /// searches, list density, the reader's place.
     Organizing,
+    /// Keyboard Shortcuts: every shortcut, changed by pressing new keys.
+    Shortcuts,
     Account(String),
     /// About Picacho: a page of Settings on a phone, a dialog elsewhere.
     About,
@@ -1236,10 +1253,14 @@ enum Action {
     Organize(organize::OrgAction),
     /// Find in Message, printing, PDFs and opening attachments.
     Tools(tools::ToolAction),
+    /// Changing keyboard shortcuts in Settings.
+    Keys(shortcuts::KeyAction),
     /// Signatures per mailbox and templates.
     Templates(templates::TemplateAction),
     /// Calendar and Contacts views, the calendar's grids, custom repeats.
     Calendar(calendar_views::CalAction),
+    /// The app lock and the encrypted database (Settings → Privacy).
+    Lock(applock::LockAction),
 }
 
 /// A conversation's rows for one message at one list revision.
@@ -1335,6 +1356,9 @@ pub struct MailApp {
     /// A link to act on with the window at hand: a `mailto:` to write, or
     /// `open:<id>`, a message a `mid:` link named.
     pending_link: Option<String>,
+    /// The compact Desktop Widget window, when open (desktop only).
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    widget_window: Option<AnyWindowHandle>,
     modal: Option<Modal>,
     dark: bool,
     appearance: Appearance,
@@ -1568,6 +1592,8 @@ pub struct MailApp {
     /// layout (`manage::organize`), and Settings' fields for them.
     org: crate::manage::organize::Organizing,
     org_ui: organize::OrgUi,
+    /// Settings → Keyboard Shortcuts' recording.
+    keys_ui: shortcuts::KeysUi,
     /// Rows standing for a conversation, by message index: how many
     /// messages it holds (Group by Conversation).
     thread_counts: HashMap<usize, usize>,
@@ -1593,6 +1619,8 @@ pub struct MailApp {
     /// Settings → Composing: the mailbox whose signature is edited (None:
     /// every mailbox's), and the template being named.
     templates: templates::TemplatesUi,
+    /// The app lock: whether Picacho is locked, its screen and Settings.
+    lock: applock::LockUi,
     /// Calendar or Contacts shown in place of the list and reader.
     app_view: Option<calendar_views::AppView>,
     /// The calendar's view (agenda or grids) and custom repeat form.
@@ -2119,6 +2147,18 @@ impl MailApp {
             }
         }));
         let templates = templates::TemplatesUi::new(window, cx);
+        let lock = applock::LockUi::new(&backend.store, window, cx);
+        subscriptions.extend(lock.subscribe(window, cx));
+        #[cfg(target_os = "android")]
+        crate::android::set_recents_private(lock.settings.enabled());
+        if lock.locked {
+            // Biometrics are asked for once the window is up and in front.
+            cx.defer_in(window, |this: &mut Self, w, cx| {
+                if w.is_window_active() {
+                    this.lock_appeared(w, cx);
+                }
+            });
+        }
         let cal = calendar_views::CalViews::new(window, cx);
         let rename_input = input("Folder name", false, window, cx);
         subscriptions.push(
@@ -2281,6 +2321,7 @@ impl MailApp {
         }));
         subscriptions.push(cx.observe_window_activation(window, |this, w, cx| {
             this.active = w.is_window_active();
+            this.lock_activation(this.active, w, cx);
             // Text copied here (from a message, a sign-in code) reaches
             // other apps as Picacho goes to the background.
             #[cfg(target_os = "android")]
@@ -2646,6 +2687,8 @@ impl MailApp {
             menu_focus: cx.focus_handle(),
             menu_focus_pending: false,
             pending_link: None,
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
+            widget_window: None,
             modal: None,
             dark,
             appearance,
@@ -2966,6 +3009,7 @@ impl MailApp {
             filter_inputs,
             org,
             org_ui,
+            keys_ui: Default::default(),
             thread_counts: HashMap::new(),
             find,
             image_previews: HashMap::new(),
@@ -2976,6 +3020,7 @@ impl MailApp {
             local_results: None,
             applying_rules: false,
             templates,
+            lock,
             app_view: None,
             cal,
             server_notes: HashMap::new(),
@@ -3375,6 +3420,9 @@ impl MailApp {
                     } else {
                         store.unread_recipients()?
                     };
+                    // Unread counts changed, so may the widgets: published
+                    // after (and apart from) the counts, which don't wait.
+                    crate::manage::widgets::publish_soon(store.clone());
                     Ok::<_, anyhow::Error>((
                         fwd::view_counts(raw, &rows, &accounts, &forwarding, all_mail),
                         store.download_counts(crate::sync::transport::MAX_MESSAGE, &offline)?,
@@ -7281,6 +7329,7 @@ impl MailApp {
                     self.page = Page::General;
                     self.modal = Some(Modal::Settings);
                     self.anim += 1;
+                    self.refresh_default_app(cx);
                 }
             }
             Action::RetryAccount(id) => self.retry_account(id, cx),
@@ -7373,6 +7422,7 @@ impl MailApp {
                 self.accent = accent;
                 self.apply_theme(w, cx);
                 self.backend.store.set_preference_soon("accent", accent.key());
+                crate::manage::widgets::publish_soon(self.backend.store.clone());
             }
             Action::SetSync(id, sync) => self.set_sync(id, sync, w, cx),
             Action::SetLocalAi(on) => self.set_local_ai(on, cx),
@@ -7628,9 +7678,15 @@ impl MailApp {
                 }
             }
 
+            // Keyboard Shortcuts is a page of Settings.
             Action::Help => {
-                self.modal = Some(Modal::Help);
-                self.anim += 1;
+                self.settings_scroll.set_offset(point(px(0.), px(0.)));
+                self.fwd_reverse = None;
+                self.page = Page::Shortcuts;
+                if !self.reveal_settings_window(cx) && self.modal != Some(Modal::Settings) {
+                    self.modal = Some(Modal::Settings);
+                    self.anim += 1;
+                }
             }
             Action::Close => self.close(w, cx),
             Action::Theme => {
@@ -7861,8 +7917,10 @@ impl MailApp {
             Action::Filters(action) => self.filter_action(action, w, cx),
             Action::Organize(action) => self.org_action(action, w, cx),
             Action::Tools(action) => self.tool_action(action, w, cx),
+            Action::Keys(action) => self.key_action(action, cx),
             Action::Templates(action) => self.template_action(action, w, cx),
             Action::Calendar(action) => self.cal_action(action, w, cx),
+            Action::Lock(action) => self.lock_action(action, w, cx),
         }
         self.sync_selecting();
         cx.notify();
@@ -8404,7 +8462,7 @@ impl MailApp {
             )))
             .child(small(self.button(
                 "accounts",
-                "@Settings · ⌘,",
+                &shortcuts::tip("@Settings", "settings", cx),
                 "settings",
                 Action::Settings,
                 false,
@@ -8704,7 +8762,7 @@ impl MailApp {
             .child(
                 self.button(
                     "compose",
-                    "@New message · ⌘N",
+                    &shortcuts::tip("@New message", "new-message", cx),
                     "compose",
                     Action::Compose,
                     true,
@@ -9211,7 +9269,7 @@ impl MailApp {
                     .child(
                         small(self.button(
                             "search-toggle",
-                            "@Search · ⌘F",
+                            &shortcuts::tip("@Search", "find-in-message", cx),
                             "search",
                             if self.search_open {
                                 Action::CloseSearch
@@ -9227,10 +9285,10 @@ impl MailApp {
                         d.child(
                             small(self.button(
                                 "select-toggle",
-                                if self.selecting {
-                                    "@Done selecting · Esc"
+                                &if self.selecting {
+                                    shortcuts::tip("@Done selecting", "close", cx)
                                 } else {
-                                    "@Select messages · ⌘A selects all"
+                                    shortcuts::tip_then("@Select messages", "select-all", " selects all", cx)
                                 },
                                 "select",
                                 Action::ToggleSelectMode,
@@ -9268,7 +9326,7 @@ impl MailApp {
                     } else {
                         small(self.button(
                             "refresh",
-                            "@Refresh · ⌘R",
+                            &shortcuts::tip("@Refresh", "refresh", cx),
                             "refresh",
                             Action::Refresh,
                             false,
@@ -10380,61 +10438,6 @@ impl MailApp {
             .child(self.about_footer())
             .into_any_element()
     }
-    fn help_modal(&self) -> AnyElement {
-        let c = self.colors();
-        div()
-            .flex()
-            .flex_col()
-            .gap_3()
-            .children(
-                [
-                    ("New message", "⌘ N"),
-                    ("Find in message / search mailbox", "⌘ F / ⌘ ⌥ F"),
-                    ("Print message", "⌘ P"),
-                    ("Group by conversation", "⌘ ⇧ T"),
-                    ("Refresh mailbox", "⌘ R"),
-                    ("Next / previous message", "⌥ ↓ / ⌥ ↑"),
-                    ("Open message in new window", "⌘ O"),
-                    ("Reply", "⌘ ⇧ R"),
-                    ("Reply all", "⌘ ⌥ R"),
-                    ("Forward", "⌘ ⇧ F"),
-                    ("Mark read / unread", "⌘ ⇧ U"),
-                    ("Go to Inbox … All Mail", "⌘ 1 … ⌘ 8"),
-                    ("Settings", "⌘ ,"),
-                    ("Star message", "⌘ ⇧ S"),
-                    ("Archive message", "⌘ ⇧ A"),
-                    ("Select all messages", "⌘ A"),
-                    ("Select range / toggle", "⇧ Click / ⌘ Click"),
-                    ("Toggle sidebar", "⌃ ⌘ S"),
-                    ("Move to trash", "⌘ ⌫"),
-                    ("Send message", "⌘ Enter"),
-                    ("Save draft", "⌘ S"),
-                    ("Bold / italic / link", "⌘ B / ⌘ I / ⌘ K"),
-                    ("Bulleted / numbered list", "⌘ ⇧ 8 / ⌘ ⇧ 7"),
-                    ("Preview formatting", "⌘ ⇧ P"),
-                    ("Appearance", "⌘ ⇧ L"),
-                    ("Close / save draft", "Escape"),
-                ]
-                .into_iter()
-                .map(|(name, key)| {
-                    div()
-                        .flex()
-                        .items_center()
-                        .child(div().text_size(px(13.)).flex_1().child(name))
-                        .child(
-                            div()
-                                .px_2()
-                                .py_1()
-                                .rounded_md()
-                                .bg(rgb(c.bg))
-                                .text_size(px(12.))
-                                .text_color(rgb(c.muted))
-                                .child(keys(key)),
-                        )
-                }),
-            )
-            .into_any_element()
-    }
     /// The steps for adding an account, shared by onboarding and the Add
     /// Account dialog.
     fn setup_view(&self, cx: &Context<Self>) -> AnyElement {
@@ -11095,7 +11098,6 @@ impl MailApp {
             Modal::Reconnect(_) => "Sign In Again",
             Modal::Settings => "Settings",
             Modal::About => "About Picacho",
-            Modal::Help => "Keyboard Shortcuts",
             Modal::RemoveAccount(_) => "Remove Account",
             Modal::DeleteFolder(..) => "Delete Folder",
             Modal::Erase(Erase::Mail(_)) => "Delete Permanently",
@@ -11118,7 +11120,6 @@ impl MailApp {
             Modal::Reconnect(id) => self.reconnect_form(id, cx),
             Modal::Settings => self.settings_modal(window, cx),
             Modal::About => self.about_modal(cx),
-            Modal::Help => self.help_modal(),
             Modal::RemoveAccount(id) => self.remove_modal(id),
             Modal::DeleteFolder(id, name) => self.delete_folder_modal(id, name),
             Modal::Erase(erase) => self.erase_modal(erase),
@@ -11141,7 +11142,6 @@ impl MailApp {
             .flex_col()
             .w(px(match modal {
                 Modal::Connect => 680.,
-                Modal::Help => 460.,
                 Modal::AvatarPresets(_) => 560.,
                 Modal::Snooze(_) => 600.,
                 Modal::RemoveAccount(_)
@@ -11496,6 +11496,12 @@ impl Render for MailApp {
             window.focus(&self.menu_focus, cx);
         }
         SPINNING.with(|s| s.set(false));
+        if self.lock.locked {
+            return self.lock_screen(window, cx);
+        }
+        if self.lock.obscured {
+            return self.privacy_cover(window);
+        }
         let root = if self.mobile.on {
             self.mobile_root(window, cx)
         } else {
@@ -11722,6 +11728,15 @@ impl MailApp {
             }))
             .on_action(cx.listener(|_, _: &Minimize, w, _| w.minimize_window()))
             .on_action(cx.listener(|_, _: &Zoom, w, _| w.zoom_window()))
+            .on_action(cx.listener(|this, _: &LockApp, w, cx| {
+                this.handle(Action::Lock(applock::LockAction::LockNow), w, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ShowWidget, w, cx| {
+                #[cfg(not(any(target_os = "android", target_os = "ios")))]
+                this.open_widget_window(w, cx);
+                #[cfg(any(target_os = "android", target_os = "ios"))]
+                let _ = (this, w, cx);
+            }))
             .on_action(cx.listener(|this, _: &ZoomIn, _, cx| this.step_text_zoom(1, cx)))
             .on_action(cx.listener(|this, _: &ZoomOut, _, cx| this.step_text_zoom(-1, cx)))
             .on_action(cx.listener(|this, _: &ActualSize, _, cx| this.step_text_zoom(0, cx)))
@@ -11925,7 +11940,7 @@ impl MailApp {
                                     .text_color(rgb(c.accent))
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .tooltip(|w, cx| {
-                                        Tooltip::new(keys("Undo (⌘Z)")).build(w, cx)
+                                        Tooltip::new(shortcuts::tip("Undo", "undo", cx)).build(w, cx)
                                     }),
                             )
                             .child(div().w(px(1.)).h(px(20.)).flex_shrink_0().bg(rgb(c.border)))
@@ -12206,6 +12221,8 @@ fn icon_el(name: &str, size: f32, color: u32) -> Div {
         "print",
         "external",
         "template",
+        "fingerprint",
+        "face-id",
     ]
     .contains(&name)
     {
@@ -12458,17 +12475,24 @@ pub(super) fn key<A: gpui::Action>(
         .expect("a valid keystroke")
 }
 
-/// The main and detached windows' key bindings.
-fn app_bindings(cx: &App) -> Vec<KeyBinding> {
+/// The main and detached windows' key bindings from `path`, plus any
+/// unparseable override warnings.
+pub(super) fn app_bindings_from(path: &std::path::Path, cx: &App) -> (Vec<KeyBinding>, Vec<String>) {
     // The main window's, as the shortcuts file changes them.
-    let mut bindings = shortcuts::bindings(cx);
+    let (mut bindings, warnings) = shortcuts::bindings_from(path, cx);
     bindings.extend([
         key(cx, "secondary-w", CloseWindow, Some("Detached")),
         key(cx, "escape", Close, Some("Detached")),
         key(cx, "cmd-h", Hide, None),
         key(cx, "alt-cmd-h", HideOthers, None),
     ]);
-    bindings
+    (bindings, warnings)
+}
+
+/// The main and detached windows' key bindings.
+#[cfg(test)]
+fn app_bindings(cx: &App) -> Vec<KeyBinding> {
+    app_bindings_from(&shortcuts::file_path(), cx).0
 }
 
 /// The app's backend for `store`, announcing the provider's own notices
@@ -12478,6 +12502,9 @@ fn app_bindings(cx: &App) -> Vec<KeyBinding> {
 /// service) comes here, so pushes resume with the saved registration
 /// whenever one starts.
 pub fn new_backend(store: Arc<Store>) -> Arc<Backend> {
+    // What notifications may say (Settings → Privacy), for every process
+    // that shows them.
+    crate::manage::applock::load_hiding(&store);
     let settings = store.clone();
     let backend = Arc::new(Backend::new(store));
     backend.on_proton_notice(|a, title, body| {
@@ -12536,22 +12563,77 @@ pub fn run(store: Arc<Store>, instance: Option<super::instance::Listener>) {
     start(app, move |cx| shell::launch(store, instance, cx));
 }
 
+/// Runs the recovery window (`recovery`) when the store in `path` couldn't
+/// be opened, with `error`; once it opens, Picacho starts as `run` does.
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub fn run_recovery(
+    path: std::path::PathBuf,
+    error: anyhow::Error,
+    instance: Option<super::instance::Listener>,
+) {
+    let app = gpui_platform::application().with_quit_mode(QuitMode::Explicit);
+    let dir = path.clone();
+    let mut instance = Some(instance);
+    let opener: recovery::Opener = Box::new(move || {
+        let store = Arc::new(Store::open(&dir)?);
+        let instance = instance.take().flatten();
+        Ok(Box::new(move |cx: &mut App| shell::launch(store, instance, cx)) as recovery::Start)
+    });
+    // Once Picacho has started (its shell is up), as `run` does.
+    app.on_reopen(|cx| {
+        if cx.has_global::<shell::Shell>() {
+            shell::open(cx);
+        }
+    });
+    start(app, move |cx| {
+        if let Err(e) = recovery::open(path, error, opener, cx) {
+            eprintln!("Picacho: {e:#}");
+            cx.quit();
+        }
+    });
+}
+
 /// Runs the app on `app`'s platform (a phone's comes from its activity or
 /// app delegate) with `backend`. On iOS this returns once the window is set
 /// up to open; the host app's delegate then opens it
 /// (`gpui_ios_did_finish_launching`).
 #[cfg(any(target_os = "android", target_os = "ios"))]
 pub fn run_on(app: Application, backend: Arc<Backend>) {
-    start(app, move |cx| {
-        open_main_window(backend, cx).expect("Could not open the mail window");
-        cx.on_window_closed(|cx, _| {
-            if cx.windows().is_empty() {
-                cx.quit();
-            }
-        })
-        .detach();
-        cx.activate(true);
+    start(app, move |cx| open_app_window(backend, cx));
+}
+
+/// Runs the recovery window (`recovery`) on a phone's platform when its
+/// store couldn't be opened, with `error`. `open` tries again, and on
+/// success gives the backend Picacho then opens with.
+#[cfg(any(target_os = "android", target_os = "ios"))]
+pub fn run_recovery_on(
+    app: Application,
+    path: std::path::PathBuf,
+    error: anyhow::Error,
+    mut open: impl FnMut() -> anyhow::Result<Arc<Backend>> + 'static,
+) {
+    let opener: recovery::Opener = Box::new(move || {
+        let backend = open()?;
+        Ok(Box::new(move |cx: &mut App| open_app_window(backend, cx)) as recovery::Start)
     });
+    start(app, move |cx| {
+        if let Err(e) = recovery::open(path, error, opener, cx) {
+            log::error!("could not show the recovery window: {e:#}");
+        }
+    });
+}
+
+/// Opens a phone's mail window; the app ends with it.
+#[cfg(any(target_os = "android", target_os = "ios"))]
+fn open_app_window(backend: Arc<Backend>, cx: &mut App) {
+    open_main_window(backend, cx).expect("Could not open the mail window");
+    cx.on_window_closed(|cx, _| {
+        if cx.windows().is_empty() {
+            cx.quit();
+        }
+    })
+    .detach();
+    cx.activate(true);
 }
 
 /// Sets up the app, then runs `open` to open its window.
@@ -12559,18 +12641,22 @@ fn start(app: Application, open: impl FnOnce(&mut App) + 'static) {
     let app = app.with_assets(crate::display::assets::Assets);
     app.on_open_urls(crate::display::launch::opened);
     super::desktop::register();
+    #[cfg(windows)]
+    super::windows::register_default_app_if_unclaimed();
     let launch = move |cx: &mut gpui::App| {
         gpui_component::init(cx);
         prompt::install(cx);
+        shortcuts::save_base(cx);
         cx.on_action(|_: &Hide, cx| cx.hide());
         cx.on_action(|_: &HideOthers, cx| cx.hide_other_apps());
         cx.on_action(|_: &ShowAll, cx| cx.unhide_other_apps());
         cx.set_menus(menus());
-        // `secondary` is Command on macOS and Control elsewhere.
-        let bindings = composer::bindings(cx);
-        cx.bind_keys(bindings);
-        let bindings = app_bindings(cx);
-        cx.bind_keys(bindings);
+        // `secondary` is Command on macOS and Control elsewhere. Bound the
+        // way a changed shortcuts file is bound again, so the two never differ.
+        shortcuts::reload(cx);
+        // Phones have no shortcuts file to edit.
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        shortcuts::watch(cx);
         open(cx);
     };
     // UIKit owns iOS's run loop, so `run` returns at once there; keep the
@@ -12677,6 +12763,8 @@ fn menus() -> Vec<Menu> {
                 MenuItem::action("Settings…", ShowAccounts),
                 MenuItem::action("Add Account…", AddAccount),
                 MenuItem::separator(),
+                MenuItem::action("Lock Picacho", LockApp),
+                MenuItem::separator(),
                 MenuItem::os_submenu("Services", SystemMenuType::Services),
                 MenuItem::separator(),
                 MenuItem::action("Hide Picacho", Hide),
@@ -12774,6 +12862,8 @@ fn menus() -> Vec<Menu> {
             vec![
                 MenuItem::action("Minimize", Minimize),
                 MenuItem::action("Zoom", Zoom),
+                MenuItem::separator(),
+                MenuItem::action("Desktop Widget", ShowWidget),
             ],
         ),
         menu(
@@ -12904,7 +12994,7 @@ mod tests {
         // Launch binds these; a keystroke gpui can't parse panics there.
         cx.update(|cx| {
             assert!(!app_bindings(cx).is_empty());
-            assert!(!composer::bindings(cx).is_empty());
+            shortcuts::defaults_all_load(cx);
         });
     }
 

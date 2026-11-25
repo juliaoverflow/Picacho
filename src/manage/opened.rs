@@ -186,7 +186,7 @@ mod tests {
         let raw = b"From: a@example.org\r\nSubject: File\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=b\r\n\r\n--b\r\nContent-Type: text/plain\r\n\r\nSee attached\r\n--b\r\nContent-Type: text/plain; name=notes.txt\r\nContent-Disposition: attachment; filename=notes.txt\r\n\r\nThe notes\r\n--b--\r\n";
         let id = format!("{}:pop:1", a.id);
         let m = parse_message(raw, &a, &id, Folder::Inbox, "", 0)?;
-        b.store.save_messages(&[m.clone()])?;
+        b.store.save_messages(std::slice::from_ref(&m))?;
         b.store.save_raw(&id, raw)?;
         let part = m.attachments()[0].part;
 

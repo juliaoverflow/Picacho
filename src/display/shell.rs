@@ -76,6 +76,10 @@ pub(super) fn launch(store: Arc<Store>, listener: Option<instance::Listener>, cx
         while let Some(command) = requests.next().await {
             cx.update(|cx| match command {
                 TrayCommand::Open => open(cx),
+                TrayCommand::Widget => {
+                    crate::display::launch::push("picacho://widget/panel".to_owned());
+                    open(cx);
+                }
                 TrayCommand::Quit => quit(cx),
             });
         }

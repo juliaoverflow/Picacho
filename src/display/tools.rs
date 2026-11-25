@@ -1,22 +1,27 @@
 //! What can be done with an open message beyond reading it: finding text
-//! in it (⌘F / Ctrl+F), printing it or saving it as a PDF, and opening its
-//! attachments (with the system's app, Quick Look on macOS, Open With… on
-//! Windows, and images previewed in the reader).
+//! in it (⌘F / Ctrl+F), printing it or saving it as a vector PDF, and opening
+//! its attachments (from their saved file or one cached copy, with the system
+//! app, Quick Look on macOS, Open With… on Windows/macOS/Linux, and image
+//! previews in the reader).
 use super::*;
+use crate::display::open_with::OpenWithApp;
 
 #[derive(Clone, Debug, PartialEq)]
 pub(super) enum ToolAction {
-    /// Prints a message (its id): the system's browser shows it with its
-    /// print dialog, which also saves PDFs.
+    /// Prints a message (its id) as a vector PDF through the system's native
+    /// print dialog.
     Print(String),
-    /// Saves a message (its id) as a PDF of its headers and text.
+    /// Saves a message (its id) as a vector PDF with its formatting, images
+    /// and fonts.
     SavePdf(String),
     /// The open message's attachment, by index: opened with the system's
     /// app for its type; shown with Quick Look (macOS); offered to the
-    /// apps that open it (Windows' Open With); shown in its folder.
+    /// apps that open it (Open With…); shown in its folder.
     OpenAttachment(usize),
     QuickLook(usize),
     OpenWith(usize),
+    /// Opens an attachment file in a specific app chosen from Open With….
+    OpenAttachmentIn(std::path::PathBuf, OpenWithApp),
     RevealAttachment(usize),
     /// Shows an attached image in the reader, or hides it again.
     PreviewImage(usize),
@@ -24,14 +29,25 @@ pub(super) enum ToolAction {
     FindNext,
     FindPrevious,
     FindClose,
-    /// Opens the keyboard shortcuts file in the system's text editor.
-    OpenShortcuts,
     /// Publishes your OpenPGP public keys on keys.openpgp.org, which
     /// emails each address a link to confirm it.
     PublishKeys,
+    /// Publishes your OpenPGP public keys on the HKP keyserver typed in
+    /// Settings → Encryption (keyserver.ubuntu.com when none is), once the
+    /// person confirms: such servers list every address at once, for good.
+    PublishKeysCustomHkp,
+    /// Exports your OpenPGP public keys into a Web Key Directory (WKD) folder
+    /// tree ready to host on your own domain.
+    ExportWkd,
+    /// Makes Picacho the default email app (or opens Windows Default apps
+    /// directly on Picacho's page).
+    SetDefaultApp,
 }
 
-/// Find in Message.
+/// The HKP keyserver keys are published on when none is typed.
+const DEFAULT_HKP_SERVER: &str = "keyserver.ubuntu.com";
+
+/// Find in Message (and menu anchor for Open With…, plus Settings helpers).
 pub(super) struct Find {
     pub(super) open: bool,
     pub(super) input: Entity<InputState>,
@@ -41,6 +57,13 @@ pub(super) struct Find {
     pub(super) count: Cell<usize>,
     /// The current match should be scrolled to.
     pub(super) reveal: Cell<bool>,
+    /// Where the last attachment menu opened, so an Open With… picker can
+    /// open at the same spot.
+    pub(super) menu_pos: Option<Point<Pixels>>,
+    /// Custom HKP keyserver host/URL in Settings → Encryption.
+    pub(super) hkp_server: Entity<InputState>,
+    /// Cached result of checking whether Picacho is the OS default email app.
+    pub(super) default_mail_app: Option<bool>,
 }
 impl Find {
     pub(super) fn new(window: &mut Window, cx: &mut App) -> Self {
@@ -50,6 +73,9 @@ impl Find {
             current: 0,
             count: Cell::new(0),
             reveal: Cell::new(false),
+            menu_pos: None,
+            hkp_server: input(DEFAULT_HKP_SERVER, false, window, cx),
+            default_mail_app: None,
         }
     }
 }
@@ -170,117 +196,199 @@ pub(super) fn plain_as_html(text: &str) -> String {
     )
 }
 
-/// `html` with its `cid:` images as data: URLs from `inline`, for pages
-/// opened outside Picacho (printing).
-fn inline_images(html: &str, inline: &InlineParts) -> String {
-    use base64::Engine as _;
-    let mut out = String::with_capacity(html.len());
-    let mut rest = html;
-    while let Some(i) = rest.to_ascii_lowercase().find("cid:") {
-        out.push_str(&rest[..i]);
-        let after = &rest[i..];
-        let end = after
-            .find(|c: char| c == '"' || c == '\'' || c == ')' || c.is_whitespace() || c == '>')
-            .unwrap_or(after.len());
-        let url = &after[..end];
-        match inline.get(url) {
-            Some(bytes) => {
-                let mime = match image::guess_format(&bytes) {
-                    Ok(image::ImageFormat::Png) => "image/png",
-                    Ok(image::ImageFormat::Gif) => "image/gif",
-                    Ok(image::ImageFormat::WebP) => "image/webp",
-                    _ => "image/jpeg",
-                };
-                out.push_str(&format!(
-                    "data:{mime};base64,{}",
-                    base64::engine::general_purpose::STANDARD.encode(&*bytes)
-                ));
-            }
-            None => out.push_str(url),
-        }
-        rest = &after[end..];
+/// Maximum width/height when rasterizing SVG or decoding non-native images
+/// for inline attachment previews.
+const MAX_PREVIEW_DIM: u32 = 8192;
+/// Maximum byte allocation when decoding a non-native image preview.
+const MAX_PREVIEW_ALLOC: u64 = 64 * 1024 * 1024;
+/// Maximum pixel edge when rasterizing an SVG preview.
+const MAX_SVG_DIM: f32 = 1600.;
+
+fn is_svg(mime: &str, name: &str, bytes: Option<&[u8]>) -> bool {
+    let mime = mime.to_ascii_lowercase();
+    let name = name.to_ascii_lowercase();
+    if mime == "image/svg+xml" || name.ends_with(".svg") {
+        return true;
     }
-    out.push_str(rest);
-    out
+    bytes.is_some_and(|b| {
+        let head = std::str::from_utf8(&b[..b.len().min(512)]).unwrap_or("");
+        let lower = head.trim_start().to_ascii_lowercase();
+        lower.starts_with("<svg") || (lower.starts_with("<?xml") && lower.contains("<svg"))
+    })
 }
 
-/// A page for printing `m`: its headers, then its HTML (or text), with
-/// nothing run or fetched but the print dialog's script, unless `remote`
-/// allows the email's remote images.
-fn print_page(m: &Mail, remote: bool) -> String {
-    let nonce = uuid::Uuid::new_v4().simple().to_string();
-    let images = if remote { "data: https: http:" } else { "data:" };
-    let mut headers = String::new();
-    let mut header = |name: &str, value: &str| {
-        if !value.trim().is_empty() {
-            headers.push_str(&format!(
-                "<div><b>{name}:</b> {}</div>",
-                escape_html(value)
-            ));
-        }
-    };
-    let from = if m.sender.is_empty() || m.sender == m.from {
-        m.from.clone()
-    } else {
-        format!("{} <{}>", m.sender, m.from)
-    };
-    header("From", &from);
-    header("To", &m.to);
-    header("Cc", m.cc());
-    header("Date", &date_full(m.date));
-    let body = match (&m.html, &m.body) {
-        (Some(html), _) => inline_images(html, &m.inline),
-        (None, Some(text)) => format!("<pre>{}</pre>", escape_html(text)),
-        (None, None) => format!("<pre>{}</pre>", escape_html(&m.snippet)),
-    };
-    format!(
-        "<!doctype html><html><head><meta charset=\"utf-8\">\
-<meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; style-src 'unsafe-inline'; img-src {images}; font-src data:; script-src 'nonce-{nonce}'\">\
-<title>{title}</title>\
-<style>body{{font-family:system-ui,-apple-system,'Segoe UI',sans-serif;margin:24px;color:#111}}\
-.picacho-headers{{font-size:13px;line-height:1.6;border-bottom:1px solid #ccc;padding-bottom:12px;margin-bottom:18px}}\
-.picacho-headers h1{{font-size:20px;margin:0 0 8px}} pre{{white-space:pre-wrap;font-family:inherit;font-size:14px}}</style>\
-<script nonce=\"{nonce}\">addEventListener('load',function(){{setTimeout(function(){{print()}},400)}})</script>\
-</head><body><div class=\"picacho-headers\"><h1>{title}</h1>{headers}</div><div class=\"picacho-body\">{body}</div></body></html>",
-        title = escape_html(&m.subject),
-    )
-}
-
-/// A file in a folder of Picacho's own under the system's temporary
-/// folder, readable only by this user.
-fn temp_file(name: &str) -> std::io::Result<std::path::PathBuf> {
-    let dir = std::env::temp_dir().join(format!("picacho-{}", whoami()));
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt as _;
-        std::fs::DirBuilder::new().recursive(true).mode(0o700).create(&dir)?;
-    }
-    #[cfg(not(unix))]
-    std::fs::create_dir_all(&dir)?;
-    // One folder per file keeps its own name, so the app opening it shows it.
-    let sub = dir.join(uuid::Uuid::new_v4().simple().to_string());
-    std::fs::create_dir_all(&sub)?;
-    Ok(sub.join(safe_file_name(name)))
-}
-fn whoami() -> String {
-    std::env::var("USER")
-        .or_else(|_| std::env::var("USERNAME"))
-        .unwrap_or_else(|_| "user".into())
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric())
-        .collect()
-}
-
-/// Whether an attachment is an image the reader can show.
+/// Whether an attachment is an image the reader can preview inline.
 pub(super) fn is_image(a: &Attachment) -> bool {
     let mime = a.mime.to_ascii_lowercase();
     let name = a.name.to_ascii_lowercase();
-    matches!(
+    let base = matches!(
         mime.as_str(),
-        "image/png" | "image/jpeg" | "image/jpg" | "image/gif" | "image/webp"
-    ) || [".png", ".jpg", ".jpeg", ".gif", ".webp"]
-        .iter()
-        .any(|e| name.ends_with(e))
+        "image/png"
+            | "image/jpeg"
+            | "image/jpg"
+            | "image/gif"
+            | "image/webp"
+            | "image/svg+xml"
+            | "image/bmp"
+            | "image/x-ms-bmp"
+            | "image/x-icon"
+            | "image/vnd.microsoft.icon"
+            | "image/tiff"
+            | "image/x-tga"
+            | "image/tga"
+            | "image/x-portable-anymap"
+            | "image/x-portable-bitmap"
+            | "image/x-portable-graymap"
+            | "image/x-portable-pixmap"
+            | "image/qoi"
+            | "image/vnd.radiance"
+    ) || [
+        ".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".bmp", ".ico", ".tif", ".tiff",
+        ".tga", ".pbm", ".pgm", ".ppm", ".pnm", ".pam", ".qoi", ".hdr",
+    ]
+    .iter()
+    .any(|e| name.ends_with(e));
+    #[cfg(target_os = "macos")]
+    {
+        base || matches!(mime.as_str(), "image/heic" | "image/heif" | "image/avif")
+            || [".heic", ".heif", ".avif"].iter().any(|e| name.ends_with(e))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        base
+    }
+}
+
+/// Decodes any supported image attachment into a GPUI-renderable `(ImageFormat, Vec<u8>)`.
+///
+/// PNG, JPEG, GIF and WebP pass straight through (preserving animation);
+/// SVG is rasterized offline with `resvg` (no external fetches); BMP, ICO,
+/// TIFF, TGA, PNM, QOI and HDR are decoded with strict dimension/memory
+/// limits and encoded as PNG.
+fn decode_image_preview(bytes: Vec<u8>, mime: &str, name: &str) -> anyhow::Result<(ImageFormat, Vec<u8>)> {
+    if is_svg(mime, name, Some(&bytes)) {
+        // An SVG from mail loads nothing it names: no file (usvg's default
+        // reads any path an `<image>` names, even with no resources folder)
+        // and nothing remote; only images inside it (data: URLs). Its text
+        // is set in the system's fonts, read once.
+        static FONTS: std::sync::OnceLock<std::sync::Arc<resvg::usvg::fontdb::Database>> =
+            std::sync::OnceLock::new();
+        let fontdb = FONTS
+            .get_or_init(|| {
+                let mut db = resvg::usvg::fontdb::Database::new();
+                db.load_system_fonts();
+                std::sync::Arc::new(db)
+            })
+            .clone();
+        let opt = resvg::usvg::Options {
+            resources_dir: None,
+            fontdb,
+            image_href_resolver: resvg::usvg::ImageHrefResolver {
+                resolve_data: resvg::usvg::ImageHrefResolver::default_data_resolver(),
+                resolve_string: Box::new(|_, _| None),
+            },
+            ..Default::default()
+        };
+        let tree = resvg::usvg::Tree::from_data(&bytes, &opt)
+            .map_err(|e| anyhow::anyhow!("Couldn't read SVG image: {e}"))?;
+        let size = tree.size();
+        let (w, h) = (size.width().max(1.), size.height().max(1.));
+        let scale = (MAX_SVG_DIM / w.max(h)).clamp(0.01, 2.);
+        let pw = (w * scale).ceil().clamp(1., MAX_SVG_DIM) as u32;
+        let ph = (h * scale).ceil().clamp(1., MAX_SVG_DIM) as u32;
+        let mut pixmap = resvg::tiny_skia::Pixmap::new(pw, ph)
+            .ok_or_else(|| anyhow::anyhow!("SVG image size is invalid"))?;
+        let tx = resvg::tiny_skia::Transform::from_scale(pw as f32 / w, ph as f32 / h);
+        resvg::render(&tree, tx, &mut pixmap.as_mut());
+        let png = pixmap
+            .encode_png()
+            .map_err(|e| anyhow::anyhow!("Couldn't encode SVG preview: {e}"))?;
+        return Ok((ImageFormat::Png, png));
+    }
+
+    if let Ok(fmt) = image::guess_format(&bytes) {
+        match fmt {
+            image::ImageFormat::Png => return Ok((ImageFormat::Png, bytes)),
+            image::ImageFormat::Gif => return Ok((ImageFormat::Gif, bytes)),
+            image::ImageFormat::WebP => return Ok((ImageFormat::Webp, bytes)),
+            image::ImageFormat::Jpeg => return Ok((ImageFormat::Jpeg, bytes)),
+            _ => {}
+        }
+    }
+
+    // Try decoding via `image` (BMP, ICO, TIFF, TGA, PNM, QOI, HDR, …)
+    // using format detection from content, falling back to extension/MIME.
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(MAX_PREVIEW_DIM);
+    limits.max_image_height = Some(MAX_PREVIEW_DIM);
+    limits.max_alloc = Some(MAX_PREVIEW_ALLOC);
+
+    let reader = image::ImageReader::new(std::io::Cursor::new(&bytes))
+        .with_guessed_format()?;
+    let mut reader = if reader.format().is_some() {
+        reader
+    } else if let Some(fmt) = image::ImageFormat::from_path(name)
+        .ok()
+        .or_else(|| image::ImageFormat::from_mime_type(mime))
+    {
+        let mut r = image::ImageReader::new(std::io::Cursor::new(&bytes));
+        r.set_format(fmt);
+        r
+    } else {
+        reader
+    };
+    reader.limits(limits);
+
+    match reader.decode() {
+        Ok(decoded) => {
+            use image::ImageEncoder as _;
+            let rgba = decoded.to_rgba8();
+            let mut png = Vec::new();
+            image::codecs::png::PngEncoder::new(&mut png).write_image(
+                rgba.as_raw(),
+                rgba.width(),
+                rgba.height(),
+                image::ExtendedColorType::Rgba8,
+            )?;
+            Ok((ImageFormat::Png, png))
+        }
+        Err(err) => {
+            #[cfg(target_os = "macos")]
+            if let Ok(png) = convert_with_sips(&bytes, name) {
+                return Ok((ImageFormat::Png, png));
+            }
+            Err(anyhow::anyhow!("Can't preview this image: {err}"))
+        }
+    }
+}
+
+/// macOS fallback for Apple-native formats (HEIC, HEIF, AVIF) via `sips`.
+#[cfg(target_os = "macos")]
+fn convert_with_sips(bytes: &[u8], name: &str) -> anyhow::Result<Vec<u8>> {
+    // Readable by this user alone: it holds an attachment of their mail.
+    let dir = std::env::temp_dir().join(format!("picacho-sips-{}", uuid::Uuid::new_v4().simple()));
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        std::fs::DirBuilder::new().mode(0o700).create(&dir)?;
+    }
+    let src = dir.join(safe_file_name(name));
+    let dst = dir.join("preview.png");
+    std::fs::write(&src, bytes)?;
+    let status = std::process::Command::new("/usr/bin/sips")
+        .args(["-s", "format", "png"])
+        .arg(&src)
+        .arg("--out")
+        .arg(&dst)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    let png = if status.is_ok_and(|s| s.success()) {
+        std::fs::read(&dst).ok()
+    } else {
+        None
+    };
+    let _ = std::fs::remove_dir_all(&dir);
+    png.ok_or_else(|| anyhow::anyhow!("sips couldn't convert image"))
 }
 
 impl MailApp {
@@ -408,38 +516,57 @@ impl MailApp {
         match action {
             ToolAction::Print(id) => self.with_full_message(id, cx, |this, m, cx| {
                 let remote = !this.reading_options(&m).block_remote;
-                let page = print_page(&m, remote);
-                let name = format!("{}.html", if m.subject.is_empty() { "Message" } else { &m.subject });
-                match temp_file(&name).and_then(|p| std::fs::write(&p, page).map(|_| p)) {
-                    Ok(path) => {
-                        cx.open_with_system(&path);
-                        this.notice(
-                            "Opened for printing in your browser. Choose Save as PDF in its print dialog for a PDF.",
-                            false,
-                            cx,
-                        );
-                    }
-                    Err(e) => this.notice(format!("Couldn't prepare the message for printing: {e}"), true, cx),
-                }
-            }),
-            ToolAction::SavePdf(id) => self.with_full_message(id, cx, |this, m, cx| {
-                let body = match (&m.body, &m.html) {
-                    (Some(b), _) if !b.trim().is_empty() => b.clone(),
-                    (_, Some(h)) => crate::sync::mime::html_to_text(h),
-                    _ => m.snippet.clone(),
-                };
                 let from = if m.sender.is_empty() || m.sender == m.from {
                     m.from.clone()
                 } else {
                     format!("{} <{}>", m.sender, m.from)
                 };
-                let headers = [
-                    ("From", from),
-                    ("To", m.to.clone()),
-                    ("Cc", m.cc().to_owned()),
-                    ("Date", date_full(m.date).to_string()),
-                ];
-                let pdf = crate::manage::pdf::message_pdf(&m.subject, &headers, &body);
+                let date = date_full(m.date).to_string();
+                let title = m.subject.clone();
+                #[cfg(target_os = "macos")]
+                let title_mac = title.clone();
+                this.notice("Preparing to print…", false, cx);
+                this.task(
+                    cx,
+                    move |_| {
+                        let pdf = crate::display::html::print::message_pdf(&m, &from, &date, remote)?;
+                        // macOS shows its print dialog on the main thread, below.
+                        #[cfg(target_os = "macos")]
+                        return Ok((pdf, None));
+                        #[cfg(not(target_os = "macos"))]
+                        {
+                            let how = crate::display::html::print::print_pdf(&pdf, &title)?;
+                            Ok((Vec::new(), Some(how)))
+                        }
+                    },
+                    move |this, result: anyhow::Result<(Vec<u8>, Option<crate::display::html::print::Printed>)>, cx| {
+                        use crate::display::html::print::Printed;
+                        match result {
+                            #[cfg(target_os = "macos")]
+                            Ok((pdf, None)) => {
+                                if let Err(e) = crate::display::html::print::print_pdf_macos(&pdf, &title_mac) {
+                                    this.notice(format!("Couldn't print the message: {e:#}"), true, cx);
+                                }
+                            }
+                            Ok((_, Some(Printed::Viewer))) => this.notice(
+                                "Opened the message as a PDF: print it from there.",
+                                false,
+                                cx,
+                            ),
+                            Ok(_) => {}
+                            Err(e) => this.notice(format!("Couldn't print the message: {e:#}"), true, cx),
+                        }
+                    },
+                );
+            }),
+            ToolAction::SavePdf(id) => self.with_full_message(id, cx, |this, m, cx| {
+                let remote = !this.reading_options(&m).block_remote;
+                let from = if m.sender.is_empty() || m.sender == m.from {
+                    m.from.clone()
+                } else {
+                    format!("{} <{}>", m.sender, m.from)
+                };
+                let date = date_full(m.date).to_string();
                 let name = safe_file_name(&format!(
                     "{}.pdf",
                     if m.subject.is_empty() { "Message" } else { &m.subject }
@@ -448,10 +575,20 @@ impl MailApp {
                 let picker = cx.prompt_for_new_path(&start, Some(&name));
                 cx.spawn(async move |this, cx| {
                     if let Ok(Ok(Some(path))) = picker.await {
-                        let result = std::fs::write(&path, pdf);
-                        let _ = this.update(cx, |this, cx| match result {
-                            Ok(()) => this.notice("Saved as PDF", false, cx),
-                            Err(e) => this.notice(format!("Couldn't save the PDF: {e}"), true, cx),
+                        let _ = this.update(cx, |this, cx| {
+                            this.notice("Saving PDF…", false, cx);
+                            this.task(
+                                cx,
+                                move |_| {
+                                    let pdf = crate::display::html::print::message_pdf(&m, &from, &date, remote)?;
+                                    std::fs::write(&path, pdf)?;
+                                    Ok(())
+                                },
+                                |this, result: anyhow::Result<()>, cx| match result {
+                                    Ok(()) => this.notice("Saved as PDF", false, cx),
+                                    Err(e) => this.notice(format!("Couldn't save the PDF: {e:#}"), true, cx),
+                                },
+                            );
                         });
                     }
                 })
@@ -459,7 +596,6 @@ impl MailApp {
             }),
             ToolAction::OpenAttachment(i)
             | ToolAction::QuickLook(i)
-            | ToolAction::OpenWith(i)
             | ToolAction::RevealAttachment(i) => {
                 let how = action.clone();
                 let Some(m) = self.selected_mail() else { return };
@@ -467,22 +603,98 @@ impl MailApp {
                 let Some(account) = self.account_of(&m) else { return };
                 self.task(
                     cx,
-                    move |b| {
-                        let bytes = b.attachment(&account, &m, a.part)?;
-                        let path = temp_file(&a.name)?;
-                        std::fs::write(&path, bytes)?;
-                        Ok(path)
-                    },
+                    move |b| b.attachment_file(&account, &m, a.part, &a.name),
                     move |this, result: anyhow::Result<std::path::PathBuf>, cx| match result {
                         Ok(path) => match how {
                             ToolAction::QuickLook(_) => quick_look(&path),
-                            ToolAction::OpenWith(_) => open_with(&path, cx),
                             ToolAction::RevealAttachment(_) => cx.reveal_path(&path),
                             _ => cx.open_with_system(&path),
                         },
                         Err(e) => this.notice(format!("{e:#}"), true, cx),
                     },
                 );
+            }
+            ToolAction::OpenWith(i) => {
+                let Some(m) = self.selected_mail() else { return };
+                let Some(a) = m.attachments().get(i).cloned() else { return };
+                let Some(account) = self.account_of(&m) else { return };
+                let mime = if !a.mime.is_empty() && a.mime != "application/octet-stream" {
+                    a.mime.clone()
+                } else {
+                    mime_guess::from_path(&a.name)
+                        .first_or_octet_stream()
+                        .essence_str()
+                        .to_owned()
+                };
+                self.task(
+                    cx,
+                    move |b| -> anyhow::Result<(std::path::PathBuf, Option<Vec<OpenWithApp>>)> {
+                        let path = b.attachment_file(&account, &m, a.part, &a.name)?;
+                        #[cfg(windows)]
+                        {
+                            // Windows' own Open With dialog lists the apps.
+                            let _ = mime;
+                            open_with_windows(&path);
+                            Ok((path, None))
+                        }
+                        #[cfg(all(unix, not(any(target_os = "macos", target_os = "android", target_os = "ios"))))]
+                        {
+                            if futures::executor::block_on(
+                                crate::display::open_with::portal_open_with(path.clone()),
+                            )
+                            .is_ok()
+                            {
+                                return Ok((path, None));
+                            }
+                            let apps = crate::display::open_with::apps_for(&path, &mime);
+                            Ok((path, Some(apps)))
+                        }
+                        #[cfg(target_os = "macos")]
+                        {
+                            let apps = crate::display::open_with::apps_for(&path, &mime);
+                            Ok((path, Some(apps)))
+                        }
+                        #[cfg(any(target_os = "android", target_os = "ios"))]
+                        {
+                            let _ = mime;
+                            Ok((path, None))
+                        }
+                    },
+                    move |this, result, cx| match result {
+                        Ok((path, Some(apps))) => {
+                            if apps.is_empty() {
+                                cx.reveal_path(&path);
+                                return;
+                            }
+                            let mut entries: Vec<Entry> = apps
+                                .into_iter()
+                                .map(|app| {
+                                    let label = app.name.clone();
+                                    entry(
+                                        label,
+                                        "external",
+                                        Action::Tools(ToolAction::OpenAttachmentIn(path.clone(), app)),
+                                    )
+                                })
+                                .collect();
+                            entries.push(Entry::Separator);
+                            entries.push(entry(
+                                if cfg!(target_os = "macos") { "Show in Finder" } else { "Show in Folder" },
+                                "download",
+                                Action::Tools(ToolAction::RevealAttachment(i)),
+                            ));
+                            let pos = this.find.menu_pos.unwrap_or_else(|| point(px(360.), px(260.)));
+                            this.open_menu(pos, entries, cx);
+                        }
+                        Ok((_, None)) => {}
+                        Err(e) => this.notice(format!("{e:#}"), true, cx),
+                    },
+                );
+            }
+            ToolAction::OpenAttachmentIn(path, app) => {
+                if let Err(e) = crate::display::open_with::open_in(&app, &path) {
+                    self.notice(format!("Couldn't open in {}: {e:#}", app.name), true, cx);
+                }
             }
             ToolAction::PreviewImage(i) => {
                 let Some(m) = self.selected_mail() else { return };
@@ -497,14 +709,7 @@ impl MailApp {
                     cx,
                     move |b| {
                         let bytes = b.attachment(&account, &m, a.part)?;
-                        let format = match image::guess_format(&bytes)? {
-                            image::ImageFormat::Png => ImageFormat::Png,
-                            image::ImageFormat::Gif => ImageFormat::Gif,
-                            image::ImageFormat::WebP => ImageFormat::Webp,
-                            image::ImageFormat::Jpeg => ImageFormat::Jpeg,
-                            other => anyhow::bail!("Can't show {other:?} images"),
-                        };
-                        Ok((format, bytes))
+                        decode_image_preview(bytes, &a.mime, &a.name)
                     },
                     move |this, result: anyhow::Result<(ImageFormat, Vec<u8>)>, cx| match result {
                         Ok((format, bytes)) => {
@@ -582,12 +787,175 @@ impl MailApp {
                     },
                 );
             }
-            ToolAction::OpenShortcuts => match super::shortcuts::ensure_file() {
-                Ok(path) => cx.open_with_system(&path),
-                Err(e) => self.notice(format!("Couldn't write the shortcuts file: {e}"), true, cx),
-            },
+            ToolAction::PublishKeysCustomHkp => {
+                let typed = Self::value(&self.find.hkp_server, cx);
+                let server = match typed.trim() {
+                    "" => DEFAULT_HKP_SERVER.to_owned(),
+                    s => s.to_owned(),
+                };
+                // Checked before asking, so a mistyped address is said at once.
+                if let Err(e) = crate::sync::keys::hkp_add_url(&server) {
+                    self.notice(format!("{e:#}"), true, cx);
+                    return;
+                }
+                // HKP keyservers list every address on the key at once and
+                // never take a key down again: asked first.
+                let detail = format!(
+                    "{server} will list your public key and every email address on it right away, \
+                     without asking those addresses first. Keyservers share keys with each other \
+                     and can't remove them later."
+                );
+                let answer = w.prompt(
+                    PromptLevel::Warning,
+                    "Publish your public key for good?",
+                    Some(&detail),
+                    &["Publish", "Cancel"],
+                    cx,
+                );
+                cx.spawn(async move |this, cx| {
+                    if matches!(answer.await, Ok(0)) {
+                        let _ = this.update(cx, |this, cx| this.publish_keys_hkp(server, cx));
+                    }
+                })
+                .detach();
+            }
+            ToolAction::ExportWkd => {
+                let picker = cx.prompt_for_paths(PathPromptOptions {
+                    files: false,
+                    directories: true,
+                    multiple: false,
+                    prompt: Some("Choose folder for WKD export".into()),
+                });
+                cx.spawn(async move |this, cx| {
+                    if let Ok(Ok(Some(paths))) = picker.await
+                        && let Some(dir) = paths.into_iter().next()
+                    {
+                        let _ = this.update(cx, |this, cx| {
+                            this.task(
+                                cx,
+                                move |b| {
+                                    use pgp::ser::Serialize as _;
+                                    let ring = b.keyring();
+                                    let keys = ring.secret_keys();
+                                    anyhow::ensure!(
+                                        !keys.is_empty(),
+                                        "You have no OpenPGP key of your own to export."
+                                    );
+                                    // Each address's file holds the key with that
+                                    // address's user ID alone, so a domain's
+                                    // directory doesn't list the person's others.
+                                    let mut pairs = Vec::new();
+                                    for key in keys {
+                                        let public = pgp::composed::SignedPublicKey::from(key);
+                                        let emails: Vec<String> = public
+                                            .details
+                                            .users
+                                            .iter()
+                                            .filter_map(|u| extract_uid_email(&String::from_utf8_lossy(u.id.id())))
+                                            .collect();
+                                        for email in emails {
+                                            let mut only = public.clone();
+                                            only.details.users.retain(|u| {
+                                                extract_uid_email(&String::from_utf8_lossy(u.id.id()))
+                                                    .is_some_and(|e| e.eq_ignore_ascii_case(&email))
+                                            });
+                                            pairs.push((email, only.to_bytes()?));
+                                        }
+                                    }
+                                    let domains = crate::sync::keys::export_wkd(&pairs, &dir)?;
+                                    Ok((pairs.len(), domains))
+                                },
+                                move |this, result: anyhow::Result<(usize, Vec<std::path::PathBuf>)>, cx| match result {
+                                    Ok((n, domains)) => {
+                                        let names: Vec<String> = domains
+                                            .iter()
+                                            .filter_map(|d| d.file_name().map(|n| n.to_string_lossy().into_owned()))
+                                            .collect();
+                                        this.notice(
+                                            format!(
+                                                "Exported WKD files for {n} address{}: put the contents of each domain's folder ({}) in that domain's web root.",
+                                                if n == 1 { "" } else { "es" },
+                                                names.join(", ")
+                                            ),
+                                            false,
+                                            cx,
+                                        );
+                                        if let Some(first) = domains.first() {
+                                            cx.reveal_path(first);
+                                        }
+                                    }
+                                    Err(e) => this.notice(format!("{e:#}"), true, cx),
+                                },
+                            );
+                        });
+                    }
+                })
+                .detach();
+            }
+            ToolAction::SetDefaultApp => {
+                self.task(
+                    cx,
+                    |_| set_default_mail_app(),
+                    |this, result: anyhow::Result<(String, Option<bool>)>, cx| match result {
+                        Ok((msg, status)) => {
+                            if let Some(is_default) = status {
+                                this.find.default_mail_app = Some(is_default);
+                            }
+                            this.notice(msg, false, cx);
+                        }
+                        Err(e) => this.notice(format!("{e:#}"), true, cx),
+                    },
+                );
+            }
         }
         cx.notify();
+    }
+
+    /// Refreshes the cached OS default-email-app status on a background thread.
+    pub(super) fn refresh_default_app(&mut self, cx: &mut Context<Self>) {
+        if self.mobile.on {
+            return;
+        }
+        self.task(
+            cx,
+            |_| Ok(is_default_mail_app()),
+            |this, result: anyhow::Result<Option<bool>>, cx| {
+                if let Ok(status) = result {
+                    this.find.default_mail_app = status;
+                    cx.notify();
+                }
+            },
+        );
+    }
+
+    fn publish_keys_hkp(&mut self, server: String, cx: &mut Context<Self>) {
+        self.notice(format!("Publishing your public key on {server}…"), false, cx);
+        self.task(
+            cx,
+            move |b| {
+                let ring = b.keyring();
+                let keys = ring.secret_keys();
+                anyhow::ensure!(
+                    !keys.is_empty(),
+                    "You have no OpenPGP key of your own to publish."
+                );
+                let mut host = server.clone();
+                for key in keys {
+                    let armored = pgp::composed::SignedPublicKey::from(key)
+                        .to_armored_string(Default::default())?;
+                    host = crate::sync::keys::publish_hkp(&server, &armored, b.tls_connector_pub()?)?;
+                }
+                Ok(host)
+            },
+            |this, result: anyhow::Result<String>, cx| match result {
+                Ok(host) => this.notice(
+                    format!("Published your public key on {host} — it is listed right away."),
+                    false,
+                    cx,
+                ),
+                Err(e) => this.notice(format!("{e:#}"), true, cx),
+            },
+        );
     }
 
     /// Acts on what Picacho was opened with (`launch`): writes to `mailto:`
@@ -601,7 +969,9 @@ impl MailApp {
         let mut started: Option<Entity<Composer>> = None;
         let mut files = Vec::new();
         for request in requests {
-            if let Some(target) = request.strip_prefix(crate::display::launch::NOTIFICATION) {
+            if let Some(action) = crate::manage::widgets::WidgetAction::parse(&request) {
+                self.open_widget_action(action, w, cx);
+            } else if let Some(target) = request.strip_prefix(crate::display::launch::NOTIFICATION) {
                 // A notification tapped (or Reply pressed) while Picacho ran
                 // in the background, which started this window for it.
                 if let Ok(target) = serde_json::from_str(target) {
@@ -629,6 +999,129 @@ impl MailApp {
             }
         }
         w.activate_window();
+    }
+
+    /// Opens what a home-screen widget asked for: an inbox (one account or
+    /// All Accounts), a specific inbox message, a new composer, or Calendar.
+    pub(super) fn open_widget_action(
+        &mut self,
+        action: crate::manage::widgets::WidgetAction,
+        w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::manage::widgets::WidgetAction;
+        if self.onboarding || self.retired {
+            return;
+        }
+        self.menu = None;
+        self.presets_for = None;
+        if self.modal == Some(Modal::Settings) {
+            self.modal = None;
+        }
+        match action {
+            WidgetAction::Inbox { account } => {
+                let target_account = match account {
+                    Some(id) if self.accounts.iter().any(|a| a.id == id) => Some(id),
+                    _ if self.shows_all_mail() => Some(ALL_MAIL.to_owned()),
+                    _ => self.accounts.first().map(|a| a.id.clone()),
+                };
+                if target_account.is_some() {
+                    self.open_mailbox(target_account, Folder::Inbox.into(), w, cx);
+                    if self.mobile.on {
+                        self.mobile.mailboxes = false;
+                        self.mobile_pushed(cx);
+                    }
+                }
+            }
+            WidgetAction::Message { account, id } => {
+                // Messages linked from Packages/Receipts widgets may live in
+                // Archive or another folder rather than Inbox. A link names
+                // a message kept here, of that account, or opens its inbox:
+                // `picacho:` links can come from anywhere (a web page), and
+                // they only ever show what is here.
+                let Some(mailbox) = self
+                    .backend
+                    .store
+                    .message(&id)
+                    .ok()
+                    .flatten()
+                    .filter(|m| m.account == account)
+                    .map(|m| m.mailbox())
+                else {
+                    let account = Some(account).filter(|a| self.accounts.iter().any(|x| &x.id == a));
+                    self.open_widget_action(WidgetAction::Inbox { account }, w, cx);
+                    return;
+                };
+                self.open_notified(
+                    crate::display::notify::Target {
+                        account,
+                        mailbox,
+                        message: Some(id),
+                        messages: Vec::new(),
+                        action: None,
+                    },
+                    w,
+                    cx,
+                );
+            }
+            WidgetAction::Compose { account } => {
+                if let Some(id) = account
+                    && self.accounts.iter().any(|a| a.id == id)
+                    && self.account.as_deref() != Some(id.as_str())
+                {
+                    self.open_mailbox(Some(id), Folder::Inbox.into(), w, cx);
+                }
+                self.compose_with(0, None, None, None, None, w, cx);
+            }
+            WidgetAction::Calendar => {
+                self.cal_action(
+                    calendar_views::CalAction::Open(calendar_views::AppView::Calendar),
+                    w,
+                    cx,
+                );
+                if self.mobile.on {
+                    self.mobile.mailboxes = false;
+                    self.mobile_pushed(cx);
+                }
+            }
+            WidgetAction::Packages { account } => {
+                let target_account = match account {
+                    Some(id) if self.accounts.iter().any(|a| a.id == id) => Some(id),
+                    _ if self.shows_all_mail() => Some(ALL_MAIL.to_owned()),
+                    _ => self.accounts.first().map(|a| a.id.clone()),
+                };
+                if let Some(id) = target_account {
+                    self.open_summary(id, w, cx);
+                    self.summary_packages = true;
+                    self.summary_receipts = false;
+                    if self.mobile.on {
+                        self.mobile.mailboxes = false;
+                        self.mobile_pushed(cx);
+                    }
+                }
+            }
+            WidgetAction::Receipts { account } => {
+                let target_account = match account {
+                    Some(id) if self.accounts.iter().any(|a| a.id == id) => Some(id),
+                    _ if self.shows_all_mail() => Some(ALL_MAIL.to_owned()),
+                    _ => self.accounts.first().map(|a| a.id.clone()),
+                };
+                if let Some(id) = target_account {
+                    self.open_summary(id, w, cx);
+                    self.summary_receipts = true;
+                    self.summary_packages = false;
+                    if self.mobile.on {
+                        self.mobile.mailboxes = false;
+                        self.mobile_pushed(cx);
+                    }
+                }
+            }
+            WidgetAction::Panel => {
+                #[cfg(not(any(target_os = "android", target_os = "ios")))]
+                self.open_widget_window(w, cx);
+            }
+        }
+        cx.notify();
     }
 
     /// A button on a new-mail notification: Mark as Read, Archive, Delete
@@ -719,7 +1212,8 @@ impl MailApp {
         let more: Vec<Entry> = [
             cfg!(target_os = "macos")
                 .then(|| entry("Quick Look", "preview", Action::Tools(ToolAction::QuickLook(i)))),
-            cfg!(windows).then(|| entry("Open With…", "external", Action::Tools(ToolAction::OpenWith(i)))),
+            cfg!(not(any(target_os = "android", target_os = "ios")))
+                .then(|| entry("Open With…", "external", Action::Tools(ToolAction::OpenWith(i)))),
             Some(entry(
                 if cfg!(target_os = "macos") { "Show in Finder" } else { "Show in Folder" },
                 "download",
@@ -747,6 +1241,7 @@ impl MailApp {
                     MouseButton::Left,
                     cx.listener(move |this, e: &MouseDownEvent, _, cx| {
                         cx.stop_propagation();
+                        this.find.menu_pos = Some(e.position);
                         this.open_menu(e.position, more.clone(), cx)
                     }),
                 )
@@ -771,6 +1266,113 @@ impl MailApp {
     }
 }
 
+/// Extracts an email address from an OpenPGP User ID (`Name <addr@domain>` or `addr@domain`).
+fn extract_uid_email(uid: &str) -> Option<String> {
+    let addr = match (uid.rfind('<'), uid.rfind('>')) {
+        (Some(a), Some(b)) if a < b => &uid[a + 1..b],
+        _ => uid,
+    }
+    .trim();
+    addr.contains('@').then(|| addr.to_owned())
+}
+
+/// Whether Picacho is currently the OS default handler for `mailto:` links.
+pub(super) fn is_default_mail_app() -> Option<bool> {
+    #[cfg(windows)]
+    {
+        Some(crate::display::windows::is_default_mail_app())
+    }
+    #[cfg(all(unix, not(any(target_os = "macos", target_os = "android", target_os = "ios"))))]
+    {
+        let out = std::process::Command::new("xdg-settings")
+            .args(["get", "default-url-scheme-handler", "mailto"])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .or_else(|| {
+                std::process::Command::new("xdg-mime")
+                    .args(["query", "default", "x-scheme-handler/mailto"])
+                    .output()
+                    .ok()
+                    .filter(|o| o.status.success())
+            })?;
+        let text = String::from_utf8_lossy(&out.stdout);
+        Some(text.trim().eq_ignore_ascii_case("tech.pinal.picacho.desktop"))
+    }
+    #[cfg(target_os = "macos")]
+    {
+        use objc2::rc::autoreleasepool;
+        use objc2_app_kit::NSWorkspace;
+        use objc2_foundation::{NSString, NSURL};
+        autoreleasepool(|_| {
+            let url = NSURL::URLWithString(&NSString::from_str("mailto:test@example.com"))?;
+            let app = NSWorkspace::sharedWorkspace().URLForApplicationToOpenURL(&url)?;
+            let path = app.path()?.to_string();
+            Some(path.to_ascii_lowercase().contains("picacho"))
+        })
+    }
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    {
+        None
+    }
+}
+
+/// Sets Picacho as the default email app where the OS allows it, or opens the
+/// OS Default apps page directly on Picacho's entry.
+fn set_default_mail_app() -> anyhow::Result<(String, Option<bool>)> {
+    #[cfg(windows)]
+    {
+        crate::display::windows::open_default_apps()?;
+        Ok((
+            "Opened Windows Default apps to Picacho — click Set default there to finish.".into(),
+            Some(crate::display::windows::is_default_mail_app()),
+        ))
+    }
+    #[cfg(all(unix, not(any(target_os = "macos", target_os = "android", target_os = "ios"))))]
+    {
+        crate::display::desktop::register_sync();
+        let desktop = format!("{}.desktop", crate::display::desktop::APP_ID);
+        let mime = std::process::Command::new("xdg-mime")
+            .args([
+                "default",
+                &desktop,
+                "x-scheme-handler/mailto",
+                "message/rfc822",
+                "application/vnd.ms-outlook",
+            ])
+            .status();
+        let settings = std::process::Command::new("xdg-settings")
+            .args(["set", "default-url-scheme-handler", "mailto", &desktop])
+            .status();
+        let ok = mime.as_ref().is_ok_and(|s| s.success())
+            || settings.as_ref().is_ok_and(|s| s.success());
+        anyhow::ensure!(
+            ok,
+            "Could not set default email app (xdg-mime / xdg-settings not available)."
+        );
+        Ok((
+            "Picacho is now your default email app for mailto: links, .eml and .msg files.".into(),
+            Some(true),
+        ))
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("/usr/bin/open")
+            .args(["-b", "com.apple.mail"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+        Ok((
+            "In Apple Mail, choose Settings → General → Default email reader → Picacho.".into(),
+            is_default_mail_app(),
+        ))
+    }
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    {
+        anyhow::bail!("Choose your default email app in your phone's Settings.")
+    }
+}
+
 /// Quick Look (macOS): a preview window of the file, as Finder's space bar.
 fn quick_look(path: &std::path::Path) {
     #[cfg(target_os = "macos")]
@@ -786,19 +1388,13 @@ fn quick_look(path: &std::path::Path) {
     let _ = path;
 }
 
-/// Windows' Open With dialog for the file; elsewhere, its folder, where
-/// the file manager offers the apps that open it.
-fn open_with(path: &std::path::Path, cx: &mut App) {
-    #[cfg(windows)]
-    {
-        let _ = cx;
-        let _ = std::process::Command::new("rundll32.exe")
-            .arg("shell32.dll,OpenAs_RunDLL")
-            .arg(path)
-            .spawn();
-    }
-    #[cfg(not(windows))]
-    cx.reveal_path(path);
+/// Windows' Open With dialog for the file.
+#[cfg(windows)]
+fn open_with_windows(path: &std::path::Path) {
+    let _ = std::process::Command::new("rundll32.exe")
+        .arg("shell32.dll,OpenAs_RunDLL")
+        .arg(path)
+        .spawn();
 }
 
 #[cfg(test)]
@@ -825,17 +1421,65 @@ mod tests {
         assert!(marked.contains("a <mark"));
     }
 
+    /// An SVG from mail can't show files from this computer.
     #[test]
-    fn print_pages_run_only_their_own_script() {
-        let m = Mail {
-            subject: "Hi <there>".into(),
-            from: "a@example.com".into(),
-            html: Some("<p onclick=\"x()\">Hello</p><script>alert(1)</script>".into()),
-            ..Mail::default()
-        };
-        let page = print_page(&m, false);
-        assert!(page.contains("script-src 'nonce-"));
-        assert!(page.contains("img-src data:;"));
-        assert!(page.contains("Hi &lt;there&gt;"));
+    fn svg_previews_load_no_files() {
+        let dir = std::env::temp_dir().join(format!("picacho-svg-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let png = dir.join("secret.png");
+        image::RgbaImage::from_pixel(8, 8, image::Rgba([255, 0, 0, 255]))
+            .save(&png)
+            .unwrap();
+        let svg = format!(
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" xmlns:xlink=\"http://www.w3.org/1999/xlink\" width=\"8\" height=\"8\">\
+             <image width=\"8\" height=\"8\" xlink:href=\"{}\"/></svg>",
+            png.display()
+        );
+        let (_, out) = decode_image_preview(svg.into_bytes(), "image/svg+xml", "x.svg").unwrap();
+        let shown = image::load_from_memory(&out).unwrap().to_rgba8();
+        assert!(shown.pixels().all(|p| p[3] == 0), "the file's pixels must not be drawn");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn previews_decode_svg_bmp_tiff_qoi_and_pnm() {
+        // SVG
+        let svg = b"<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"24\" height=\"24\"><circle cx=\"12\" cy=\"12\" r=\"10\" fill=\"#2a7\"/></svg>";
+        let (fmt, png) = decode_image_preview(svg.to_vec(), "image/svg+xml", "logo.svg").unwrap();
+        assert_eq!(fmt, ImageFormat::Png);
+        assert!(png.starts_with(b"\x89PNG\r\n\x1a\n"));
+
+        // BMP, TIFF, QOI, PNM via image crate
+        let img = image::RgbaImage::from_pixel(4, 4, image::Rgba([20, 120, 220, 255]));
+        for (image_fmt, mime, name) in [
+            (image::ImageFormat::Bmp, "image/bmp", "pic.bmp"),
+            (image::ImageFormat::Tiff, "image/tiff", "scan.tiff"),
+            (image::ImageFormat::Qoi, "image/qoi", "shot.qoi"),
+            (image::ImageFormat::Pnm, "image/x-portable-pixmap", "img.ppm"),
+            (image::ImageFormat::Ico, "image/x-icon", "fav.ico"),
+            (image::ImageFormat::Tga, "image/x-tga", "tex.tga"),
+        ] {
+            let mut buf = std::io::Cursor::new(Vec::new());
+            if image_fmt == image::ImageFormat::Pnm {
+                image::DynamicImage::ImageRgba8(img.clone())
+                    .to_rgb8()
+                    .write_to(&mut buf, image_fmt)
+                    .unwrap();
+            } else {
+                img.write_to(&mut buf, image_fmt).unwrap();
+            }
+            let att = Attachment {
+                name: name.into(),
+                mime: mime.into(),
+                size: buf.get_ref().len(),
+                part: 0,
+                section: String::new(),
+                encoding: String::new(),
+            };
+            assert!(is_image(&att), "{name} should be previewable");
+            let (fmt, out) = decode_image_preview(buf.into_inner(), mime, name).unwrap();
+            assert_eq!(fmt, ImageFormat::Png, "{name} should transcode to PNG");
+            assert!(out.starts_with(b"\x89PNG\r\n\x1a\n"));
+        }
     }
 }

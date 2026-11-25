@@ -1,0 +1,122 @@
+{
+  "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+  "type": "AdaptiveCard",
+  "version": "1.5",
+  "body": [
+    {
+      "type": "ColumnSet",
+      "columns": [
+        {
+          "type": "Column",
+          "width": "stretch",
+          "selectAction": {
+            "type": "Action.OpenUrl",
+            "url": "${packagesUrl}"
+          },
+          "items": [
+            {
+              "type": "TextBlock",
+              "text": "Packages",
+              "weight": "Bolder",
+              "size": "Medium"
+            }
+          ]
+        },
+        {
+          "type": "Column",
+          "width": "auto",
+          "verticalContentAlignment": "Center",
+          "isVisible": "${hasMultipleAccounts}",
+          "selectAction": {
+            "type": "Action.Execute",
+            "verb": "cycleAccount"
+          },
+          "items": [
+            {
+              "type": "TextBlock",
+              "text": "${accountLabel}",
+              "size": "Small",
+              "color": "Accent",
+              "wrap": false
+            }
+          ]
+        },
+        {
+          "type": "Column",
+          "width": "auto",
+          "verticalContentAlignment": "Center",
+          "isVisible": "${hasPackages}",
+          "selectAction": {
+            "type": "Action.OpenUrl",
+            "url": "${packagesUrl}"
+          },
+          "items": [
+            {
+              "type": "TextBlock",
+              "text": "${viewAllText}",
+              "size": "Small",
+              "weight": "Bolder",
+              "color": "Accent",
+              "wrap": false
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "type": "Container",
+      "separator": true,
+      "spacing": "Small",
+      "isVisible": "${hasPackages}",
+      "items": [
+        {
+          "type": "Container",
+          "$data": "${packages}",
+          "spacing": "Small",
+          "separator": true,
+          "selectAction": {
+            "type": "Action.OpenUrl",
+            "url": "${url}"
+          },
+          "items": [
+            {
+              "type": "TextBlock",
+              "text": "${title}",
+              "weight": "Bolder",
+              "size": "Small",
+              "wrap": false
+            },
+            {
+              "type": "TextBlock",
+              "text": "${detail}",
+              "size": "Small",
+              "isSubtle": true,
+              "spacing": "None",
+              "wrap": false
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "type": "TextBlock",
+      "text": "No recent packages",
+      "isSubtle": true,
+      "horizontalAlignment": "Center",
+      "spacing": "Large",
+      "isVisible": "${!hasPackages}"
+    }
+  ],
+  "actions": [
+    {
+      "type": "Action.OpenUrl",
+      "title": "All Packages",
+      "url": "${packagesUrl}"
+    },
+    {
+      "type": "Action.Execute",
+      "title": "Refresh",
+      "verb": "refresh"
+    }
+  ]
+}
