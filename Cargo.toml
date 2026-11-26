@@ -450,16 +450,16 @@ ashpd = { version = "0.13", default-features = false, features = ["async-io", "b
 # `path` outside this repository: CI couldn't build it, and releases would
 # come from an unpublished local tree (`scripts/check-patches.sh`).
 # The HTML reader needs blitz-dom's `set_media_device_pixel_ratio` (0007).
-blitz-dom = { git = "https://github.com/juliaoverflow/Picacho-Patches", rev = "382f207c209d1fcb3946cfb0aee492df2172d36a" }
+blitz-dom =  { git = "https://github.com/pinaltech/Picacho-Patches", branch = "vendor-split-dev" }
 # Inline boxes paint gradient backgrounds (emails' dark styles); SVG images
 # are drawn in layers the dark recoloring recognizes (`is_image_layer`).
-blitz-paint = { git = "https://github.com/juliaoverflow/Picacho-Patches", rev = "382f207c209d1fcb3946cfb0aee492df2172d36a" }
+blitz-paint = { git = "https://github.com/pinaltech/Picacho-Patches", branch = "vendor-split-dev" }
 # prefers-reduced-motion and prefers-contrast media queries (Media Queries 5
 # §11.3, §11.4), which blitz-dom's `set_media_preferences` sets.
 # TEMPORARY, as blitz-dom above: the fix/blitz-table-block-children
 # branch, pinned, until it is merged; then the git dependency like stylo_derive's.
-stylo = { git = "https://github.com/juliaoverflow/Picacho-Patches", rev = "382f207c209d1fcb3946cfb0aee492df2172d36a" }
-stylo_atoms = { git = "https://github.com/juliaoverflow/Picacho-Patches", rev = "382f207c209d1fcb3946cfb0aee492df2172d36a" }
+stylo = { git = "https://github.com/pinaltech/Picacho-Patches", branch = "vendor-split-dev" }
+stylo_atoms =  { git = "https://github.com/pinaltech/Picacho-Patches", branch = "vendor-split-dev" }
 # ToCss error inference with GPUI's log/serde feature.
 stylo_derive = { git = "https://github.com/pinaltech/Picacho-Patches", branch = "vendor-split-dev" }
 # Parses Gmail's X-GM-MSGID and thread ids, OBJECTID, PREVIEW, SAVEDATE,
@@ -470,8 +470,8 @@ gpui-component = { git = "https://github.com/pinaltech/Picacho-Patches", branch 
 # Backdrop blur (`Window::paint_backdrop_blur`), drawn by the wgpu renderer
 # (Linux), for the closing cover. TEMPORARY, as blitz-dom above: the
 # fix/blitz-table-block-children branch, pinned, until it is merged.
-gpui-pre = { git = "https://github.com/juliaoverflow/Picacho-Patches", rev = "382f207c209d1fcb3946cfb0aee492df2172d36a" }
-gpui-pre-wgpu = { git = "https://github.com/juliaoverflow/Picacho-Patches", rev = "382f207c209d1fcb3946cfb0aee492df2172d36a" }
+gpui-pre =  { git = "https://github.com/pinaltech/Picacho-Patches", branch = "vendor-split-dev" }
+gpui-pre-wgpu =  { git = "https://github.com/pinaltech/Picacho-Patches", branch = "vendor-split-dev" }
 
 # Proton push notifications: Android messaging tokens registered against
 # their Firebase installation (see the folder's README). A [patch] only
@@ -481,7 +481,7 @@ gpui-pre-wgpu = { git = "https://github.com/juliaoverflow/Picacho-Patches", rev 
 # password keyboard (patch 0003, `KeyboardType::Password`), until merged;
 # then this section goes and `cargo update -p gpui-mobile`.
 [patch."https://github.com/pinaltech/Picacho-Patches"]
-gpui-mobile = { git = "https://github.com/juliaoverflow/Picacho-Patches", rev = "382f207c209d1fcb3946cfb0aee492df2172d36a" }
+gpui-mobile = { git = "https://github.com/pinaltech/Picacho-Patches", branch = "vendor-split-dev" }
 
 [patch."https://github.com/agusibrahim/fcm_receiver.rs"]
 fcm_receiver_rs = { git = "https://github.com/pinaltech/Picacho-Patches", branch = "vendor-split-dev" }
