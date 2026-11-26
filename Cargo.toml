@@ -477,11 +477,6 @@ gpui-pre-wgpu =  { git = "https://github.com/pinaltech/Picacho-Patches", branch 
 # their Firebase installation (see the folder's README). A [patch] only
 # applies from the top-level workspace, so it must be here rather than in
 # protected_email_bridge.
-# TEMPORARY, as blitz above: that branch's gpui-mobile, pinned, with its
-# password keyboard (patch 0003, `KeyboardType::Password`), until merged;
-# then this section goes and `cargo update -p gpui-mobile`.
-[patch."https://github.com/pinaltech/Picacho-Patches"]
-gpui-mobile = { git = "https://github.com/pinaltech/Picacho-Patches", branch = "vendor-split-dev" }
 
 [patch."https://github.com/agusibrahim/fcm_receiver.rs"]
 fcm_receiver_rs = { git = "https://github.com/pinaltech/Picacho-Patches", branch = "vendor-split-dev" }
