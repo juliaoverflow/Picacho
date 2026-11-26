@@ -35,15 +35,40 @@ pub fn is_msg(bytes: &[u8]) -> bool {
 /// is turned into an error rather than taking down the caller (the search
 /// indexer reads attached `.msg` files of received mail).
 pub fn to_eml(bytes: &[u8]) -> Result<Vec<u8>> {
-    std::panic::catch_unwind(|| to_eml_depth(bytes, 0))
+    to_eml_within(bytes, usize::MAX)
+}
+
+/// `to_eml`, refusing (before writing it) a message that would come to
+/// more than `limit` bytes as `.eml`.
+pub fn to_eml_within(bytes: &[u8], limit: usize) -> Result<Vec<u8>> {
+    std::panic::catch_unwind(|| to_eml_depth(bytes, 0, limit))
         .unwrap_or_else(|_| bail!(t!("sync-msg-this-msg-file-couldnt-be-read")))
 }
 
-fn to_eml_depth(bytes: &[u8], depth: usize) -> Result<Vec<u8>> {
+fn to_eml_depth(bytes: &[u8], depth: usize, limit: usize) -> Result<Vec<u8>> {
     ensure!(depth <= MAX_DEPTH, t!("sync-msg-embedded-msg-files-are-nested-too"));
     let cf = CompoundFile::parse(bytes)?;
     let msg = parse_storage(&cf, 0, depth)?;
+    ensure!(eml_size_at_most(&msg) <= limit, t!("sync-msg-this-msg-file-is-too-large"));
     Ok(build_eml(&msg))
+}
+
+/// At most how large `build_eml` makes `msg`: its text and attachments in
+/// base64 (4 bytes for 3, and a line break every 76), with room for the
+/// headers and each part's own.
+fn eml_size_at_most(msg: &ParsedMsg) -> usize {
+    let base64 = |n: usize| n.div_ceil(3).saturating_mul(4).saturating_mul(78) / 76 + 4;
+    let headers = [&msg.subject, &msg.from, &msg.to, &msg.cc, &msg.bcc, &msg.message_id, &msg.in_reply_to, &msg.references]
+        .iter()
+        .map(|h| base64(h.len()) * 2)
+        .sum::<usize>();
+    msg.attachments.iter().fold(
+        base64(msg.plain.len()).saturating_add(base64(msg.html.len())).saturating_add(headers).saturating_add(4096),
+        |sum, a| {
+            sum.saturating_add(base64(a.data.len()))
+                .saturating_add(base64(a.name.len()) * 2 + a.mime.len() + a.content_id.len() + 512)
+        },
+    )
 }
 
 #[derive(Debug, Default)]
@@ -1386,6 +1411,12 @@ mod tests {
         let raw = b.build();
         assert!(is_msg(&raw));
         let eml = to_eml(&raw)?;
+        // The size reckoned before writing it is at least what is written,
+        // and a limit below it refuses the file.
+        let msg = parse_storage(&CompoundFile::parse(&raw)?, 0, 0)?;
+        assert!(eml_size_at_most(&msg) >= eml.len());
+        assert!(to_eml_within(&raw, eml_size_at_most(&msg)).is_ok());
+        assert!(to_eml_within(&raw, eml.len() / 2).is_err());
 
         let account = crate::manage::model::Account::new(crate::manage::model::Provider::Imap);
         let parsed = crate::sync::mime::parse_message(

@@ -558,11 +558,30 @@ impl MailApp {
     }
 }
 
+/// The largest email file opened, and the largest a converted Outlook
+/// .msg may become: the largest message the cache reads back.
+const MAX_EMAIL_FILE: u64 = crate::manage::store::MAX_SOURCE;
+/// The largest Outlook .msg file opened: converting one reads its streams,
+/// perhaps several times over, before the message is written.
+const MAX_MSG_FILE: u64 = 64 * 1024 * 1024;
+
 /// An email file (.eml, or Outlook's .msg converted) read as a message.
+/// Its size is checked before it is read, on the file opened (not its
+/// name, which could be another file by then), and it is read no further
+/// than the limit, however it grows meanwhile.
 fn read_email_file(path: &std::path::Path) -> anyhow::Result<Mail> {
-    let raw = std::fs::read(path)?;
-    let raw = if crate::sync::msg::is_msg(&raw) || path.extension().is_some_and(|e| e.eq_ignore_ascii_case("msg")) {
-        crate::sync::msg::to_eml(&raw)?
+    use std::io::Read as _;
+    let named_msg = path.extension().is_some_and(|e| e.eq_ignore_ascii_case("msg"));
+    let file = std::fs::File::open(path)?;
+    let limit = if named_msg { MAX_MSG_FILE } else { MAX_EMAIL_FILE };
+    let size = file.metadata()?.len();
+    anyhow::ensure!(size <= limit, t!("message-window-the-file-is-too-large"));
+    let mut raw = Vec::with_capacity(size as usize);
+    file.take(limit + 1).read_to_end(&mut raw)?;
+    anyhow::ensure!(raw.len() as u64 <= limit, t!("message-window-the-file-is-too-large"));
+    let raw = if crate::sync::msg::is_msg(&raw) || named_msg {
+        anyhow::ensure!(raw.len() as u64 <= MAX_MSG_FILE, t!("message-window-the-file-is-too-large"));
+        crate::sync::msg::to_eml_within(&raw, MAX_EMAIL_FILE as usize)?
     } else {
         raw
     };
@@ -570,4 +589,31 @@ fn read_email_file(path: &std::path::Path) -> anyhow::Result<Mail> {
     account.id = String::new();
     let id = format!("file:{}", path.display());
     crate::sync::mime::parse_message(&raw, &account, &id, Folder::Inbox, "", 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::prelude::v1::test;
+
+    /// An email file larger than may be opened is refused by its size,
+    /// before it is read (sparse files here, so nothing is written); one
+    /// within it opens.
+    #[test]
+    fn email_files_are_refused_by_size_before_being_read() -> anyhow::Result<()> {
+        let dir = std::env::temp_dir().join(format!("picacho-eml-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir)?;
+        let huge = dir.join("huge.eml");
+        std::fs::File::create(&huge)?.set_len(MAX_EMAIL_FILE + 1)?;
+        let err = read_email_file(&huge).unwrap_err();
+        assert_eq!(err.to_string(), t!("message-window-the-file-is-too-large"));
+        let msg = dir.join("large.msg");
+        std::fs::File::create(&msg)?.set_len(MAX_MSG_FILE + 1)?;
+        assert_eq!(read_email_file(&msg).unwrap_err().to_string(), t!("message-window-the-file-is-too-large"));
+        let small = dir.join("small.eml");
+        std::fs::write(&small, b"From: ana@example.com\r\nSubject: Hello\r\n\r\nHi\r\n")?;
+        assert_eq!(read_email_file(&small)?.subject, "Hello");
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
 }

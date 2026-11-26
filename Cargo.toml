@@ -127,6 +127,10 @@ pgp = "0.21"
 # S/MIME (manage/smime.rs): PKCS#7 and PKCS#12, from the OpenSSL already
 # linked for native-tls and Proton's push encryption.
 openssl = "0.10"
+# Reading a CRL's extensions (its scope: issuing distribution point, delta
+# indicator) and a certificate's distribution points, which the openssl
+# crate doesn't expose (manage/smime/revocation.rs).
+x509-parser = "0.18"
 # Proton Mail without Bridge: Proton's API (SRP sign-in, keys, sync, send),
 # used directly by sync/proton.rs. Its IMAP/SMTP listeners are not started.
 protected_email_bridge = { git = "https://github.com/pinaltech/Protected-Email-Bridge" }

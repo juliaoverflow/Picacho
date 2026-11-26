@@ -41,6 +41,13 @@ pub struct Store {
     pref_db: Arc<Mutex<Connection>>,
     pref_tx: Mutex<Option<mpsc::Sender<()>>>,
     pref_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
+    /// What `widget_scans` last found in each account, with the account's
+    /// scan generation then.
+    widget_scans: Mutex<HashMap<String, WidgetScan>>,
+    /// How many times an account's messages were listed for `parcels` and
+    /// `receipts` (`scan_rows`), for tests.
+    #[cfg(test)]
+    pub(crate) scan_rows_calls: std::sync::atomic::AtomicUsize,
     /// The database's key while it is encrypted (see `vault`).
     key: Mutex<Option<DatabaseKey>>,
     /// Where that key is kept: the system keychain, but in tests.
@@ -217,6 +224,21 @@ impl Store {
             None
         };
         crate::manage::sealed_files::set_key(path, key.as_ref().map(DatabaseKey::file_key));
+        // The files beside the database follow its encryption: a switch
+        // that a crash or a failure cut short carries on now, whichever
+        // state the database is in. Not a reason not to open: it is tried
+        // again on the next opening or switch.
+        if let Err(e) = crate::manage::sealed_files::resume(path, &*keys, key.as_ref()) {
+            eprintln!("Picacho: draft files haven't all followed the database's encryption yet: {e:#}");
+        }
+        // Partial downloads are raw mail: never kept in the clear beside an
+        // encrypted database (`large.rs` seals them), even ones an older
+        // version left.
+        if key.is_some()
+            && let Err(e) = crate::manage::sealed_files::discard_plain_partials(path)
+        {
+            eprintln!("Picacho: couldn't remove partial downloads: {e}");
+        }
         let mut db = connect(&file, key.as_ref())?;
         // Free pages go back to the system on `incremental_vacuum` (see
         // `pack_saved_sources`). Takes effect for a new database; an older
@@ -280,6 +302,43 @@ impl Store {
              CREATE INDEX IF NOT EXISTS message_id ON messages(json_extract(data,'$.message_id'));
              CREATE INDEX IF NOT EXISTS starred ON messages(account, date) WHERE json_extract(data,'$.starred');
              CREATE INDEX IF NOT EXISTS with_attachments ON messages(account) WHERE json_extract(data,'$.has_attachments');"
+        ))?;
+        // Each account's scan generation (`scan_generation`): changed by
+        // every write to its messages that changes what `parcels` and
+        // `receipts` look at, in any process, so the widgets know when an
+        // account's mail needn't be looked through again. Flags and the like
+        // leave it.
+        let fields = [
+            "$.folder", "$.remote_folder", "$.subject", "$.snippet", "$.from", "$.sender",
+            "$.message_id", "$.pending",
+        ];
+        let mut differs: Vec<String> = fields
+            .iter()
+            .map(|f| format!("json_extract(OLD.data,'{f}') IS NOT json_extract(NEW.data,'{f}')"))
+            .collect();
+        differs.push("(json_type(OLD.data,'$.body')='text') IS NOT (json_type(NEW.data,'$.body')='text')".into());
+        differs.push(
+            "(coalesce(json_extract(OLD.data,'$.html'),'')!='') IS NOT (coalesce(json_extract(NEW.data,'$.html'),'')!='')"
+                .into(),
+        );
+        let bump = |who: &str| {
+            format!(
+                "INSERT INTO scan_generation (account, generation) VALUES ({who}.account, 1)
+                   ON CONFLICT(account) DO UPDATE SET generation = generation + 1;"
+            )
+        };
+        db.execute_batch(&format!(
+            "CREATE TABLE IF NOT EXISTS scan_generation (account TEXT PRIMARY KEY, generation INTEGER NOT NULL) WITHOUT ROWID;
+             CREATE TRIGGER IF NOT EXISTS scan_generation_insert AFTER INSERT ON messages BEGIN {new} END;
+             CREATE TRIGGER IF NOT EXISTS scan_generation_delete AFTER DELETE ON messages BEGIN {old} END;
+             CREATE TRIGGER IF NOT EXISTS scan_generation_update AFTER UPDATE OF account, folder, date, data, raw, source ON messages
+               WHEN OLD.account IS NOT NEW.account OR OLD.folder IS NOT NEW.folder OR OLD.date IS NOT NEW.date
+                 OR (OLD.raw IS NULL AND OLD.source IS NULL) IS NOT (NEW.raw IS NULL AND NEW.source IS NULL)
+                 OR (OLD.data IS NOT NEW.data AND ({differs}))
+             BEGIN {new} {old} END;",
+            new = bump("NEW"),
+            old = bump("OLD"),
+            differs = differs.join(" OR "),
         ))?;
         // The local full-text index of messages' subjects, people, text and
         // attachments' text (FTS5, contentless: the text itself stays in
@@ -360,6 +419,9 @@ impl Store {
             pref_db,
             pref_tx: Mutex::new(Some(tx)),
             pref_thread: Mutex::new(Some(thread)),
+            widget_scans: Default::default(),
+            #[cfg(test)]
+            scan_rows_calls: Default::default(),
             key: Mutex::new(key),
             keys,
             path: path.into(),
@@ -368,6 +430,9 @@ impl Store {
         // phone's service or widget refresh) announces mail with Hide mail
         // outside Picacho as set.
         crate::manage::applock::load_hiding(&store);
+        // Whether requests strangers chose may go through the system's
+        // proxy (Settings → Reading), for this process's requests.
+        crate::sync::public_net::load_proxy_setting(&store);
         Ok(store)
     }
     /// Whether the database is encrypted (Settings → Privacy).
@@ -384,9 +449,16 @@ impl Store {
     /// a failure, or a crash, the database is as it was. The new key is in
     /// the keychain before the new file replaces the old, and the old key
     /// is forgotten only after.
+    ///
+    /// The files kept beside the database (`sealed_files`) follow it as a
+    /// journaled migration, begun before the database changes, with the
+    /// old key kept apart until every file is converted and read back.
+    /// Success means the database and every file are as asked; an error
+    /// after the database changed leaves the migration pending, and asking
+    /// again (the same switch included) or opening the store resumes it.
     pub fn set_encrypted(&self, on: bool) -> Result<()> {
         if on == self.encrypted() {
-            return Ok(());
+            return self.finish_file_migration();
         }
         // Preferences waiting to be written go into the copy.
         self.flush();
@@ -395,11 +467,16 @@ impl Store {
         // this one waited, and going on would replace its key (and, on a
         // failure, forget the key the database is now encrypted with).
         if on == self.encrypted() {
-            return Ok(());
+            drop(held);
+            return self.finish_file_migration();
         }
         let file = self.path.join(vault::DATABASE_FILE);
         let converting = self.path.join(vault::CONVERTING_FILE);
         remove_database_files(&converting);
+        let old_key = self.key.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        // Before anything changes: the files must follow, and the key they
+        // may be sealed with now is kept until they have.
+        crate::manage::sealed_files::begin(&self.path, &*self.keys, old_key.as_ref())?;
         let new_key = on.then(DatabaseKey::random);
         if let Some(key) = &new_key {
             vault::save_key(&self.path, &*self.keys, key)?;
@@ -449,7 +526,6 @@ impl Store {
             drop(std::mem::replace(&mut **r, closed()?));
         }
         drop(std::mem::replace(&mut *held.prefs, closed()?));
-        let old_key = self.key.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let replaced = (|| -> Result<()> {
             std::fs::rename(&converting, &file).with_context(|| t!("manage-store-couldnt-replace-the-local-database"))?;
             // The old file's log and index, now empty, are not the new one's.
@@ -485,28 +561,25 @@ impl Store {
             return Err(e);
         }
         *self.key.lock().unwrap_or_else(|e| e.into_inner()) = key.clone();
+        crate::manage::sealed_files::set_key(&self.path, key.as_ref().map(DatabaseKey::file_key));
         drop(held);
-        // The files kept beside the database follow it (it was replaced, or
-        // this returned above): sealed with the new key, or opened again
-        // while the old one is still here.
-        {
-            let old = old_key.as_ref().map(DatabaseKey::file_key);
-            let new = key.as_ref().map(DatabaseKey::file_key);
-            crate::manage::sealed_files::set_key(&self.path, new.clone());
-            let failed = crate::manage::sealed_files::reseal_dir(
-                &self.path.join("draft-files"),
-                old.as_deref(),
-                new.as_deref(),
-            );
-            if failed > 0 {
-                eprintln!("Picacho: {failed} draft files couldn't follow the database's encryption");
-            }
-        }
-        // The old key opens nothing now.
+        // The old key opens no database now. The files that may still need
+        // it have their own copy (`sealed_files::begin`), forgotten only
+        // once they are all converted.
         if !on && let Err(e) = vault::forget_key(&self.path, &*self.keys) {
             eprintln!("Picacho: couldn't remove the old database key from the keychain: {e:#}");
         }
-        reopened.with_context(|| t!("manage-store-couldnt-open-the-local-database-again"))
+        reopened.with_context(|| t!("manage-store-couldnt-open-the-local-database-again"))?;
+        // The files kept beside the database follow it: sealed with the new
+        // key, or opened again with the old one kept.
+        self.finish_file_migration()
+    }
+    /// Carries a pending migration of the files beside the database to its
+    /// encryption as it is now (`sealed_files::resume`): Ok once nothing
+    /// is pending.
+    fn finish_file_migration(&self) -> Result<()> {
+        let key = self.key.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        crate::manage::sealed_files::resume(&self.path, &*self.keys, key.as_ref())
     }
     /// Every connection, held: for replacing the file under them. Taken
     /// all at once or not at all, so this never waits holding one that a
@@ -1308,295 +1381,165 @@ impl Store {
         accounts: &[String],
         model: Option<&crate::manage::local_ai::parcel::Confirmer>,
     ) -> Result<ParcelScan> {
-        use crate::manage::parcels::{self, MailText, Parcel, Sighting};
-        let version = PARCEL_SCAN * 2 + i64::from(model.is_some());
-        let download_since = chrono::Utc::now().timestamp() - PARCEL_DOWNLOAD_DAYS * 86_400;
-        let mut found = Vec::new();
-        let mut to_download = Vec::new();
-        let mut scanned = 0;
-        let mut looked_at = HashSet::new();
-        let mut with_parcels = HashSet::new();
+        let mut out = ParcelsFound::default();
         for account in accounts {
             let listed = self.scan_rows(account)?;
-            // What was found before, without the text of the many messages
-            // where nothing was ("[]"): one string kept per message of the
-            // account added up.
-            let cached: HashMap<String, (bool, i64, Option<String>)> = {
-                let db = self.read();
-                let mut q =
-                    db.prepare("SELECT id, state, version, data FROM parcel_scan WHERE account=?1")?;
-                q.query_map([account], |r| {
-                    let data: String = r.get(3)?;
-                    let data = (data != "[]").then_some(data);
-                    Ok((r.get::<_, String>(0)?, (r.get::<_, i64>(1)? != 0, r.get(2)?, data)))
-                })?
-                .collect::<rusqlite::Result<_>>()?
-            };
-            let mut fresh: Vec<(String, bool, Vec<Parcel>)> = Vec::new();
-            let mut results: HashMap<String, Vec<Parcel>> = HashMap::new();
-            let mut unread: Vec<&ScanRow> = Vec::new();
-            for row in &listed {
-                let folder = row.folder();
-                if row.pending || matches!(folder, Folder::Sent | Folder::Drafts | Folder::Junk) {
-                    continue;
-                }
-                scanned += 1;
-                match cached.get(&row.id) {
-                    Some((state, v, data)) if *state == row.content && *v == version => {
-                        let list: Vec<Parcel> = data
-                            .as_deref()
-                            .and_then(|d| serde_json::from_str(d).ok())
-                            .unwrap_or_default();
-                        results.insert(row.id.clone(), list);
-                    }
-                    // Downloaded, but nothing in its subject, preview or
-                    // sender is about orders or shipping: not worth
-                    // reading whole (in a large mailbox, minutes of work).
-                    _ if row.content
-                        && !parcels::worth_reading(&row.subject, &row.snippet, &row.from) =>
-                    {
-                        fresh.push((row.id.clone(), true, Vec::new()));
-                        results.insert(row.id.clone(), Vec::new());
-                    }
-                    _ if row.content => unread.push(row),
-                    _ => {
-                        let list = parcels::find_in_mail(
-                            &MailText {
-                                subject: &row.subject,
-                                text: &row.snippet,
-                                html: None,
-                                sent: row.date,
-                            },
-                            model,
-                        );
-                        fresh.push((row.id.clone(), false, list.clone()));
-                        results.insert(row.id.clone(), list);
-                    }
-                }
-                // A message saying a delivery moved is downloaded however
-                // old: without it an old parcel never reaches "Delivered".
-                if !row.content
-                    && (row.date >= download_since || parcels::delivery_news(&row.subject))
-                    && parcels::looks_like_shipping(&row.subject, &row.snippet, &row.from)
-                {
-                    to_download.push((row.date, account.clone(), row.id.clone()));
-                }
-            }
-            // In batches, so other work gets the cache in between. Each
-            // batch's sources are inflated, parsed and read on several
-            // threads; with the model, which reads on one thread, only the
-            // first two.
-            let with_model = model.is_some();
-            self.source_batches(unread.iter().map(|r| r.id.as_str()), PARCEL_BATCH, |rows| {
-                let read = parallel_map(rows, |(id, data, raw, source)| {
-                    // A source that can't be read leaves the cached text.
-                    let raw = unpack_scan(raw, source);
-                    let readable = serde_json::from_str::<Mail>(&data)
-                        .ok()
-                        .map(|mail| ParcelText::of(mail, raw.as_deref()));
-                    let found = readable.as_ref().filter(|_| !with_model).map(|r| r.find(None));
-                    (id, readable, found)
-                });
-                for (id, readable, found) in read {
-                    let list = match (found, readable) {
-                        (Some(list), _) => list,
-                        (None, Some(r)) => r.find(model),
-                        (None, None) => Vec::new(),
-                    };
-                    fresh.push((id.clone(), true, list.clone()));
-                    results.insert(id, list);
-                }
-                Ok(())
-            })?;
-            if !fresh.is_empty() {
-                let mut db = self.write();
-                let tx = db.transaction()?;
-                {
-                    let mut put = tx.prepare(
-                        "INSERT OR REPLACE INTO parcel_scan (id, account, state, version, data) VALUES (?1, ?2, ?3, ?4, ?5)",
-                    )?;
-                    for (id, content, list) in &fresh {
-                        put.execute(params![
-                            id,
-                            account,
-                            i64::from(*content),
-                            version,
-                            serde_json::to_string(list)?
-                        ])?;
-                    }
-                }
-                // What was found in mail that is gone goes too.
-                if cached.len() > listed.len() {
-                    tx.execute(
-                        "DELETE FROM parcel_scan WHERE account=?1 AND id NOT IN (SELECT id FROM messages WHERE account=?1)",
-                        [account],
-                    )?;
-                }
-                tx.commit()?;
-            }
-            for row in &listed {
-                let Some(list) = results.get(&row.id) else {
-                    continue;
-                };
-                looked_at.insert(row.id.clone());
-                if !list.is_empty() {
-                    with_parcels.insert(row.id.clone());
-                }
-                for parcel in list {
-                    found.push((
-                        parcel.clone(),
-                        Sighting {
-                            account: account.clone(),
-                            mail_id: row.id.clone(),
-                            message_id: row.message_id.clone(),
-                            mailbox: row.mailbox(),
-                            subject: row.subject.clone(),
-                            sender: if row.sender.is_empty() {
-                                row.from.clone()
-                            } else {
-                                row.sender.clone()
-                            },
-                            sent: row.date,
-                        },
-                    ));
-                }
-            }
+            self.parcels_in(account, &listed, model, &mut out)?;
         }
+        let ParcelsFound { found, mut to_download, scanned, looked_at, with_parcels } = out;
         to_download.sort_by_key(|a| std::cmp::Reverse(a.0));
         Ok(ParcelScan {
-            tracked: parcels::summarize(found),
+            tracked: crate::manage::parcels::summarize(found),
             to_download: to_download.into_iter().map(|(_, a, id)| (a, id)).collect(),
             scanned,
             looked_at,
             with_parcels,
         })
     }
-    /// Every receipt `accounts`' cached mail holds, outside Sent, Drafts
-    /// and Spam, newest first (see `receipts::summarize`), and how many
-    /// messages were looked at.
-    ///
-    /// As with `parcels`, what was found in each message is kept (in
-    /// `receipt_scan`), so a message is read again only once its text is
-    /// downloaded or the way of reading (`RECEIPT_SCAN`) changes. Only
-    /// downloaded mail whose subject or sender may be a receipt's
-    /// (`receipts::worth_reading`) is read whole; mail not downloaded is
-    /// read by its subject and preview.
-    pub fn receipts(&self, accounts: &[String]) -> Result<ReceiptScan> {
-        use crate::manage::parcels::Sighting;
-        use crate::manage::receipts::{self, MailText, Receipt};
+    /// The way of reading parcels `parcel_scan` rows were found with.
+    fn parcel_version(model: Option<&crate::manage::local_ai::parcel::Confirmer>) -> i64 {
+        PARCEL_SCAN * 2 + i64::from(model.is_some())
+    }
+    /// `parcels` for one account, whose messages are `listed`, added to `out`.
+    fn parcels_in(
+        &self,
+        account: &str,
+        listed: &[ScanRow],
+        model: Option<&crate::manage::local_ai::parcel::Confirmer>,
+        out: &mut ParcelsFound,
+    ) -> Result<()> {
+        use crate::manage::parcels::{self, MailText, Parcel, Sighting};
+        let version = Self::parcel_version(model);
         let download_since = chrono::Utc::now().timestamp() - PARCEL_DOWNLOAD_DAYS * 86_400;
-        let mut found = Vec::new();
-        let mut to_download = Vec::new();
-        let mut scanned = 0;
-        for account in accounts {
-            let listed = self.scan_rows(account)?;
-            // As `parcels`: none kept for messages that hold no receipt.
-            let cached: HashMap<String, (bool, i64, Option<String>)> = {
-                let db = self.read();
-                let mut q = db
-                    .prepare("SELECT id, state, version, data FROM receipt_scan WHERE account=?1")?;
-                q.query_map([account], |r| {
-                    let data: String = r.get(3)?;
-                    let data = (data != "null").then_some(data);
-                    Ok((r.get::<_, String>(0)?, (r.get::<_, i64>(1)? != 0, r.get(2)?, data)))
-                })?
-                .collect::<rusqlite::Result<_>>()?
-            };
-            let mut fresh: Vec<(String, bool, Option<Receipt>)> = Vec::new();
-            let mut results: HashMap<String, Option<Receipt>> = HashMap::new();
-            let mut unread: Vec<&ScanRow> = Vec::new();
-            for row in &listed {
-                if row.pending || matches!(row.folder(), Folder::Sent | Folder::Drafts | Folder::Junk)
-                {
-                    continue;
+        // What was found before, without the text of the many messages
+        // where nothing was ("[]"): one string kept per message of the
+        // account added up.
+        let cached: HashMap<String, (bool, i64, Option<String>)> = {
+            let db = self.read();
+            let mut q =
+                db.prepare("SELECT id, state, version, data FROM parcel_scan WHERE account=?1")?;
+            q.query_map([account], |r| {
+                let data: String = r.get(3)?;
+                let data = (data != "[]").then_some(data);
+                Ok((r.get::<_, String>(0)?, (r.get::<_, i64>(1)? != 0, r.get(2)?, data)))
+            })?
+            .collect::<rusqlite::Result<_>>()?
+        };
+        let mut fresh: Vec<(String, bool, Vec<Parcel>)> = Vec::new();
+        let mut results: HashMap<String, Vec<Parcel>> = HashMap::new();
+        let mut unread: Vec<&ScanRow> = Vec::new();
+        for row in listed {
+            let folder = row.folder();
+            if row.pending || matches!(folder, Folder::Sent | Folder::Drafts | Folder::Junk) {
+                continue;
+            }
+            out.scanned += 1;
+            match cached.get(&row.id) {
+                Some((state, v, data)) if *state == row.content && *v == version => {
+                    let list: Vec<Parcel> = data
+                        .as_deref()
+                        .and_then(|d| serde_json::from_str(d).ok())
+                        .unwrap_or_default();
+                    results.insert(row.id.clone(), list);
                 }
-                scanned += 1;
-                let from = row.sender_line();
-                if !row.content
-                    && row.date >= download_since
-                    && receipts::worth_downloading(&row.subject, &from)
+                // Downloaded, but nothing in its subject, preview or
+                // sender is about orders or shipping: not worth
+                // reading whole (in a large mailbox, minutes of work).
+                _ if row.content
+                    && !parcels::worth_reading(&row.subject, &row.snippet, &row.from) =>
                 {
-                    to_download.push((row.date, account.clone(), row.id.clone()));
+                    fresh.push((row.id.clone(), true, Vec::new()));
+                    results.insert(row.id.clone(), Vec::new());
                 }
-                match cached.get(&row.id) {
-                    Some((state, v, data)) if *state == row.content && *v == RECEIPT_SCAN => {
-                        let r: Option<Receipt> = data
-                            .as_deref()
-                            .and_then(|d| serde_json::from_str(d).ok())
-                            .unwrap_or_default();
-                        results.insert(row.id.clone(), r);
-                    }
-                    _ if !receipts::worth_reading(&row.subject, &from) => {
-                        fresh.push((row.id.clone(), row.content, None));
-                        results.insert(row.id.clone(), None);
-                    }
-                    _ if row.content => unread.push(row),
-                    _ => {
-                        let r = receipts::find(&MailText {
+                _ if row.content => unread.push(row),
+                _ => {
+                    let list = parcels::find_in_mail(
+                        &MailText {
                             subject: &row.subject,
                             text: &row.snippet,
                             html: None,
-                            from: &from,
-                        });
-                        fresh.push((row.id.clone(), false, r.clone()));
-                        results.insert(row.id.clone(), r);
-                    }
+                            sent: row.date,
+                        },
+                        model,
+                    );
+                    fresh.push((row.id.clone(), false, list.clone()));
+                    results.insert(row.id.clone(), list);
                 }
             }
-            self.source_batches(unread.iter().map(|r| r.id.as_str()), PARCEL_BATCH, |rows| {
-                let read = parallel_map(rows, |(id, data, raw, source)| {
-                    let raw = unpack_scan(raw, source);
-                    let r = serde_json::from_str::<Mail>(&data).ok().and_then(|mail| {
-                        let from = format!("{} <{}>", mail.sender, mail.from);
-                        let read = ParcelText::of(mail, raw.as_deref());
-                        receipts::find(&MailText {
-                            subject: &read.mail.subject,
-                            text: read.text(),
-                            html: read.mail.html.as_deref(),
-                            from: &from,
-                        })
-                    });
-                    (id, r)
-                });
-                for (id, r) in read {
-                    fresh.push((id.clone(), true, r.clone()));
-                    results.insert(id, r);
-                }
-                Ok(())
-            })?;
-            if !fresh.is_empty() {
-                let mut db = self.write();
-                let tx = db.transaction()?;
-                {
-                    let mut put = tx.prepare(
-                        "INSERT OR REPLACE INTO receipt_scan (id, account, state, version, data) VALUES (?1, ?2, ?3, ?4, ?5)",
-                    )?;
-                    for (id, content, r) in &fresh {
-                        put.execute(params![
-                            id,
-                            account,
-                            i64::from(*content),
-                            RECEIPT_SCAN,
-                            serde_json::to_string(r)?
-                        ])?;
-                    }
-                }
-                if cached.len() > listed.len() {
-                    tx.execute(
-                        "DELETE FROM receipt_scan WHERE account=?1 AND id NOT IN (SELECT id FROM messages WHERE account=?1)",
-                        [account],
-                    )?;
-                }
-                tx.commit()?;
+            // A message saying a delivery moved is downloaded however
+            // old: without it an old parcel never reaches "Delivered".
+            if !row.content
+                && (row.date >= download_since || parcels::delivery_news(&row.subject))
+                && parcels::looks_like_shipping(&row.subject, &row.snippet, &row.from)
+            {
+                out.to_download.push((row.date, account.to_owned(), row.id.clone()));
             }
-            for row in &listed {
-                let Some(Some(receipt)) = results.remove(&row.id) else {
-                    continue;
+        }
+        // In batches, so other work gets the cache in between. Each
+        // batch's sources are inflated, parsed and read on several
+        // threads; with the model, which reads on one thread, only the
+        // first two.
+        let with_model = model.is_some();
+        self.source_batches(unread.iter().map(|r| r.id.as_str()), PARCEL_BATCH, |rows| {
+            let read = parallel_map(rows, |(id, data, raw, source)| {
+                // A source that can't be read leaves the cached text.
+                let raw = unpack_scan(raw, source);
+                let readable = serde_json::from_str::<Mail>(&data)
+                    .ok()
+                    .map(|mail| ParcelText::of(mail, raw.as_deref()));
+                let found = readable.as_ref().filter(|_| !with_model).map(|r| r.find(None));
+                (id, readable, found)
+            });
+            for (id, readable, found) in read {
+                let list = match (found, readable) {
+                    (Some(list), _) => list,
+                    (None, Some(r)) => r.find(model),
+                    (None, None) => Vec::new(),
                 };
-                found.push((
-                    receipt,
+                fresh.push((id.clone(), true, list.clone()));
+                results.insert(id, list);
+            }
+            Ok(())
+        })?;
+        if !fresh.is_empty() {
+            let mut db = self.write();
+            let tx = db.transaction()?;
+            {
+                let mut put = tx.prepare(
+                    "INSERT OR REPLACE INTO parcel_scan (id, account, state, version, data) VALUES (?1, ?2, ?3, ?4, ?5)",
+                )?;
+                for (id, content, list) in &fresh {
+                    put.execute(params![
+                        id,
+                        account,
+                        i64::from(*content),
+                        version,
+                        serde_json::to_string(list)?
+                    ])?;
+                }
+            }
+            // What was found in mail that is gone goes too.
+            if cached.len() > listed.len() {
+                tx.execute(
+                    "DELETE FROM parcel_scan WHERE account=?1 AND id NOT IN (SELECT id FROM messages WHERE account=?1)",
+                    [account],
+                )?;
+            }
+            tx.commit()?;
+        }
+        for row in listed {
+            let Some(list) = results.get(&row.id) else {
+                continue;
+            };
+            out.looked_at.insert(row.id.clone());
+            if !list.is_empty() {
+                out.with_parcels.insert(row.id.clone());
+            }
+            for parcel in list {
+                out.found.push((
+                    parcel.clone(),
                     Sighting {
-                        account: account.clone(),
+                        account: account.to_owned(),
                         mail_id: row.id.clone(),
                         message_id: row.message_id.clone(),
                         mailbox: row.mailbox(),
@@ -1611,16 +1554,234 @@ impl Store {
                 ));
             }
         }
+        Ok(())
+    }
+    /// Every receipt `accounts`' cached mail holds, outside Sent, Drafts
+    /// and Spam, newest first (see `receipts::summarize`), and how many
+    /// messages were looked at.
+    ///
+    /// As with `parcels`, what was found in each message is kept (in
+    /// `receipt_scan`), so a message is read again only once its text is
+    /// downloaded or the way of reading (`RECEIPT_SCAN`) changes. Only
+    /// downloaded mail whose subject or sender may be a receipt's
+    /// (`receipts::worth_reading`) is read whole; mail not downloaded is
+    /// read by its subject and preview.
+    pub fn receipts(&self, accounts: &[String]) -> Result<ReceiptScan> {
+        let mut out = ReceiptsFound::default();
+        for account in accounts {
+            let listed = self.scan_rows(account)?;
+            self.receipts_in(account, &listed, &mut out)?;
+        }
+        let ReceiptsFound { found, mut to_download, scanned } = out;
         to_download.sort_by_key(|a| std::cmp::Reverse(a.0));
         Ok(ReceiptScan {
-            listed: receipts::summarize(found),
+            listed: crate::manage::receipts::summarize(found),
             to_download: to_download.into_iter().map(|(_, a, id)| (a, id)).collect(),
             scanned,
         })
     }
+    /// `receipts` for one account, whose messages are `listed`, added to `out`.
+    fn receipts_in(&self, account: &str, listed: &[ScanRow], out: &mut ReceiptsFound) -> Result<()> {
+        use crate::manage::parcels::Sighting;
+        use crate::manage::receipts::{self, MailText, Receipt};
+        let download_since = chrono::Utc::now().timestamp() - PARCEL_DOWNLOAD_DAYS * 86_400;
+        // As `parcels`: none kept for messages that hold no receipt.
+        let cached: HashMap<String, (bool, i64, Option<String>)> = {
+            let db = self.read();
+            let mut q = db
+                .prepare("SELECT id, state, version, data FROM receipt_scan WHERE account=?1")?;
+            q.query_map([account], |r| {
+                let data: String = r.get(3)?;
+                let data = (data != "null").then_some(data);
+                Ok((r.get::<_, String>(0)?, (r.get::<_, i64>(1)? != 0, r.get(2)?, data)))
+            })?
+            .collect::<rusqlite::Result<_>>()?
+        };
+        let mut fresh: Vec<(String, bool, Option<Receipt>)> = Vec::new();
+        let mut results: HashMap<String, Option<Receipt>> = HashMap::new();
+        let mut unread: Vec<&ScanRow> = Vec::new();
+        for row in listed {
+            if row.pending || matches!(row.folder(), Folder::Sent | Folder::Drafts | Folder::Junk)
+            {
+                continue;
+            }
+            out.scanned += 1;
+            let from = row.sender_line();
+            if !row.content
+                && row.date >= download_since
+                && receipts::worth_downloading(&row.subject, &from)
+            {
+                out.to_download.push((row.date, account.to_owned(), row.id.clone()));
+            }
+            match cached.get(&row.id) {
+                Some((state, v, data)) if *state == row.content && *v == RECEIPT_SCAN => {
+                    let r: Option<Receipt> = data
+                        .as_deref()
+                        .and_then(|d| serde_json::from_str(d).ok())
+                        .unwrap_or_default();
+                    results.insert(row.id.clone(), r);
+                }
+                _ if !receipts::worth_reading(&row.subject, &from) => {
+                    fresh.push((row.id.clone(), row.content, None));
+                    results.insert(row.id.clone(), None);
+                }
+                _ if row.content => unread.push(row),
+                _ => {
+                    let r = receipts::find(&MailText {
+                        subject: &row.subject,
+                        text: &row.snippet,
+                        html: None,
+                        from: &from,
+                    });
+                    fresh.push((row.id.clone(), false, r.clone()));
+                    results.insert(row.id.clone(), r);
+                }
+            }
+        }
+        self.source_batches(unread.iter().map(|r| r.id.as_str()), PARCEL_BATCH, |rows| {
+            let read = parallel_map(rows, |(id, data, raw, source)| {
+                let raw = unpack_scan(raw, source);
+                let r = serde_json::from_str::<Mail>(&data).ok().and_then(|mail| {
+                    let from = format!("{} <{}>", mail.sender, mail.from);
+                    let read = ParcelText::of(mail, raw.as_deref());
+                    receipts::find(&MailText {
+                        subject: &read.mail.subject,
+                        text: read.text(),
+                        html: read.mail.html.as_deref(),
+                        from: &from,
+                    })
+                });
+                (id, r)
+            });
+            for (id, r) in read {
+                fresh.push((id.clone(), true, r.clone()));
+                results.insert(id, r);
+            }
+            Ok(())
+        })?;
+        if !fresh.is_empty() {
+            let mut db = self.write();
+            let tx = db.transaction()?;
+            {
+                let mut put = tx.prepare(
+                    "INSERT OR REPLACE INTO receipt_scan (id, account, state, version, data) VALUES (?1, ?2, ?3, ?4, ?5)",
+                )?;
+                for (id, content, r) in &fresh {
+                    put.execute(params![
+                        id,
+                        account,
+                        i64::from(*content),
+                        RECEIPT_SCAN,
+                        serde_json::to_string(r)?
+                    ])?;
+                }
+            }
+            if cached.len() > listed.len() {
+                tx.execute(
+                    "DELETE FROM receipt_scan WHERE account=?1 AND id NOT IN (SELECT id FROM messages WHERE account=?1)",
+                    [account],
+                )?;
+            }
+            tx.commit()?;
+        }
+        for row in listed {
+            let Some(Some(receipt)) = results.remove(&row.id) else {
+                continue;
+            };
+            out.found.push((
+                receipt,
+                Sighting {
+                    account: account.to_owned(),
+                    mail_id: row.id.clone(),
+                    message_id: row.message_id.clone(),
+                    mailbox: row.mailbox(),
+                    subject: row.subject.clone(),
+                    sender: if row.sender.is_empty() {
+                        row.from.clone()
+                    } else {
+                        row.sender.clone()
+                    },
+                    sent: row.date,
+                },
+            ));
+        }
+        Ok(())
+    }
+    /// An account's scan generation: changes with every write, by any
+    /// process, that changes what `parcels` and `receipts` look at in its
+    /// messages (see the triggers made in `open`).
+    fn scan_generation(&self, account: &str) -> Result<i64> {
+        use rusqlite::OptionalExtension;
+        Ok(self
+            .read()
+            .query_row("SELECT generation FROM scan_generation WHERE account=?1", [account], |r| r.get(0))
+            .optional()?
+            .unwrap_or(0))
+    }
+    /// The parcels and receipts of `accounts`' mail, as `parcels` and
+    /// `receipts` find them, for the widgets: an account whose scan
+    /// generation hasn't changed since the last call (with the same way of
+    /// reading parcels) isn't looked through again, and one that has is
+    /// listed once for both. What is kept is what was found in the mail;
+    /// it is summed up (which depends on the day) on every call.
+    pub fn widget_scans(
+        &self,
+        accounts: &[String],
+        model: Option<&crate::manage::local_ai::parcel::Confirmer>,
+    ) -> Result<(Vec<crate::manage::parcels::Tracked>, Vec<crate::manage::receipts::Listed>)> {
+        let version = Self::parcel_version(model);
+        let mut parcels = Vec::new();
+        let mut receipts = Vec::new();
+        for account in accounts {
+            // Read before looking: a change while looking makes the next
+            // call look again.
+            let generation = self.scan_generation(account)?;
+            let kept = self
+                .widget_scans
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(account)
+                .filter(|k| k.generation == generation)
+                .cloned();
+            let parcels_kept = kept.as_ref().and_then(|k| (k.parcel_version == version).then(|| k.parcels.clone()));
+            let receipts_kept = kept.as_ref().map(|k| k.receipts.clone());
+            let (found_parcels, found_receipts) = match (parcels_kept, receipts_kept) {
+                (Some(p), Some(r)) => (p, r),
+                (p, r) => {
+                    let listed = self.scan_rows(account)?;
+                    let p = match p {
+                        Some(p) => p,
+                        None => {
+                            let mut out = ParcelsFound::default();
+                            self.parcels_in(account, &listed, model, &mut out)?;
+                            Arc::new(out.found)
+                        }
+                    };
+                    let r = match r {
+                        Some(r) => r,
+                        None => {
+                            let mut out = ReceiptsFound::default();
+                            self.receipts_in(account, &listed, &mut out)?;
+                            Arc::new(out.found)
+                        }
+                    };
+                    self.widget_scans.lock().unwrap_or_else(|e| e.into_inner()).insert(
+                        account.clone(),
+                        WidgetScan { generation, parcel_version: version, parcels: p.clone(), receipts: r.clone() },
+                    );
+                    (p, r)
+                }
+            };
+            parcels.extend(found_parcels.iter().cloned());
+            receipts.extend(found_receipts.iter().cloned());
+        }
+        Ok((crate::manage::parcels::summarize(parcels), crate::manage::receipts::summarize(receipts)))
+    }
     /// An account's messages as `parcels` and `receipts` look through
     /// them, without their text.
     fn scan_rows(&self, account: &str) -> Result<Vec<ScanRow>> {
+        #[cfg(test)]
+        self.scan_rows_calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let db = self.read();
         let mut q = db.prepare(&format!(
             "SELECT id, json_extract(data,'$.folder'), json_extract(data,'$.remote_folder'), date, \
@@ -3012,6 +3173,36 @@ pub struct ParcelScan {
     pub with_parcels: HashSet<String>,
 }
 
+/// What `Store::parcels_in` found, added up over accounts: the parcels
+/// with where each was seen, shipping mail to download (date, account,
+/// message id), and the messages looked at.
+#[derive(Default)]
+struct ParcelsFound {
+    found: Vec<(crate::manage::parcels::Parcel, crate::manage::parcels::Sighting)>,
+    to_download: Vec<(i64, String, String)>,
+    scanned: usize,
+    looked_at: HashSet<String>,
+    with_parcels: HashSet<String>,
+}
+
+/// What `Store::widget_scans` found in an account's mail, and the
+/// account's scan generation and the way of reading parcels then.
+#[derive(Clone)]
+struct WidgetScan {
+    generation: i64,
+    parcel_version: i64,
+    parcels: Arc<Vec<(crate::manage::parcels::Parcel, crate::manage::parcels::Sighting)>>,
+    receipts: Arc<Vec<(crate::manage::receipts::Receipt, crate::manage::parcels::Sighting)>>,
+}
+
+/// What `Store::receipts_in` found, added up over accounts.
+#[derive(Default)]
+struct ReceiptsFound {
+    found: Vec<(crate::manage::receipts::Receipt, crate::manage::parcels::Sighting)>,
+    to_download: Vec<(i64, String, String)>,
+    scanned: usize,
+}
+
 /// A message as `Store::parcels` lists it, without its text.
 struct ScanRow {
     id: String,
@@ -3509,7 +3700,14 @@ mod tests {
     /// Whether any file in `dir` holds `needle` as it is.
     fn files_hold(dir: &Path, needle: &[u8]) -> Result<bool> {
         for entry in std::fs::read_dir(dir)? {
-            let bytes = std::fs::read(entry?.path())?;
+            let path = entry?.path();
+            if path.is_dir() {
+                if files_hold(&path, needle)? {
+                    return Ok(true);
+                }
+                continue;
+            }
+            let bytes = std::fs::read(path)?;
             if bytes.windows(needle.len()).any(|w| w == needle) {
                 return Ok(true);
             }
@@ -3604,6 +3802,66 @@ mod tests {
         let mode: String = store.read().query_row("PRAGMA journal_mode", [], |r| r.get(0))?;
         assert_eq!(mode, "wal");
         drop(store);
+        std::fs::remove_dir_all(p)?;
+        Ok(())
+    }
+
+    /// The drafts' files follow the database's encryption as a migration
+    /// that lasts failures and crashes: a switch whose files couldn't all
+    /// be converted reports it, keeps the old key, and asking again (the
+    /// same switch) or opening the store again carries on; partial
+    /// downloads (raw mail) never stay beside an encrypted database.
+    #[test]
+    fn draft_files_follow_the_encryption_through_failures_and_crashes() -> Result<()> {
+        use crate::manage::sealed_files;
+        let p = std::env::temp_dir().join(format!("mail-test-{}", uuid::Uuid::new_v4()));
+        let keys: Arc<vault::MemoryKeys> = Arc::default();
+        let store = Store::open_with_keys(&p, keys.clone())?;
+        let dir = p.join(sealed_files::DIR).join("d");
+        std::fs::create_dir_all(&dir)?;
+        let file = dir.join("budget.txt");
+        std::fs::write(&file, b"Secret budget")?;
+        let partials = p.join("partial-downloads");
+        std::fs::create_dir_all(&partials)?;
+        std::fs::write(partials.join("0123"), b"Subject: raw mail")?;
+        store.set_encrypted(true)?;
+        assert!(!files_hold(&p, b"Secret budget")?, "the draft's file is sealed");
+        assert!(!partials.join("0123").exists(), "plain partial downloads are gone");
+        assert!(!p.join(sealed_files::JOURNAL).exists());
+
+        // Decrypting with a file no key here opens: an error, the database
+        // decrypted, what could be opened opened, the old key kept.
+        let stranger = dir.join("stranger.bin");
+        std::fs::write(&stranger, b"PICACHO-SEALED1\n0123456789ab0123456789abcdef")?;
+        assert!(store.set_encrypted(false).is_err());
+        assert!(!store.encrypted());
+        assert_eq!(std::fs::read(&file)?, b"Secret budget");
+        let journal = std::fs::read_to_string(p.join(sealed_files::JOURNAL))?;
+        let kept = journal.lines().nth(1).context("a key kept")?.to_owned();
+        assert!(keys.load(&kept)?.is_some());
+        // The same switch again doesn't return at once: it tries again.
+        assert!(store.set_encrypted(false).is_err());
+        std::fs::remove_file(&stranger)?;
+        store.set_encrypted(false)?;
+        assert!(!p.join(sealed_files::JOURNAL).exists());
+        assert!(keys.load(&kept)?.is_none(), "forgotten once every file followed");
+
+        // A crash after the database was encrypted, before its files were:
+        // opening the store again seals them.
+        store.set_encrypted(true)?;
+        drop(store);
+        std::fs::write(&file, b"Secret budget")?;
+        std::fs::write(p.join(sealed_files::JOURNAL), "picacho draft files migration 1\n")?;
+        std::fs::create_dir_all(&partials)?;
+        std::fs::write(partials.join("0123"), b"Subject: raw mail")?;
+        let store = Store::open_with_keys(&p, keys.clone())?;
+        assert!(store.encrypted());
+        assert!(!files_hold(&p, b"Secret budget")?, "sealed on opening");
+        assert!(!p.join(sealed_files::JOURNAL).exists());
+        assert!(!partials.join("0123").exists(), "plain partial downloads are gone on opening");
+        assert_eq!(sealed_files::read(&file)?, b"Secret budget");
+        drop(store);
+        sealed_files::set_key(&p, None);
         std::fs::remove_dir_all(p)?;
         Ok(())
     }

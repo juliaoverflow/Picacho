@@ -109,6 +109,63 @@ openssl ca -config crl.tmp/ca.cnf -revoke bo.pem -keyfile ca.key -cert ca.pem 2>
 openssl ca -config crl.tmp/ca.cnf -gencrl -keyfile ca.key -cert ca.pem -out crl-bo-revoked.pem 2>/dev/null
 rm -rf crl.tmp
 
+# Partitioned and scoped CRLs (RFC 5280 §5.2.4, §5.2.5): Cara's certificate
+# names partition 1 as its distribution point. Lists for partition 1
+# (empty, and revoking Cara), for partition 2 (revoking nothing, signed by
+# the same authority), limited to key compromise (empty, and revoking
+# Cara), for CA certificates only, and a delta CRL.
+mkdir -p crl.tmp && : > crl.tmp/index.txt
+cat > crl.tmp/ca.cnf <<'EOF2'
+[ca]
+default_ca = test
+[test]
+database = crl.tmp/index.txt
+default_md = sha256
+default_crl_days = 36500
+[cara]
+basicConstraints = CA:FALSE
+keyUsage = critical, digitalSignature, keyEncipherment
+extendedKeyUsage = emailProtection
+subjectAltName = email:cara@example.net
+crlDistributionPoints = URI:http://crl.example.org/partition-1.crl
+[partition1]
+issuingDistributionPoint = critical, @p1
+[p1]
+fullname = URI:http://crl.example.org/partition-1.crl
+[partition2]
+issuingDistributionPoint = critical, @p2
+[p2]
+fullname = URI:http://crl.example.org/partition-2.crl
+[reasons]
+issuingDistributionPoint = critical, @r
+[r]
+onlysomereasons = keyCompromise
+[caonly]
+issuingDistributionPoint = critical, @c
+[c]
+onlyCA = TRUE
+[delta]
+2.5.29.27 = critical, DER:02:01:07
+EOF2
+openssl req -new -newkey rsa:2048 -nodes -keyout cara.key -out cara.csr -subj "/CN=Cara" 2>/dev/null
+openssl x509 -req -in cara.csr -CA ca.pem -CAkey ca.key -CAcreateserial -out cara.pem \
+    -days $days -extfile crl.tmp/ca.cnf -extensions cara 2>/dev/null
+rm -f cara.csr ca.srl
+crl() {
+    openssl ca -config crl.tmp/ca.cnf -gencrl -crlexts "$1" -keyfile ca.key -cert ca.pem \
+        -out "$2" 2>/dev/null
+}
+crl partition1 crl-partition-1-empty.pem
+crl partition2 crl-partition-2-empty.pem
+crl reasons crl-reasons-empty.pem
+crl caonly crl-ca-only-empty.pem
+crl delta crl-delta-empty.pem
+openssl ca -config crl.tmp/ca.cnf -revoke cara.pem -crl_reason keyCompromise \
+    -keyfile ca.key -cert ca.pem 2>/dev/null
+crl partition1 crl-partition-1-cara-revoked.pem
+crl reasons crl-reasons-cara-revoked.pem
+rm -rf crl.tmp
+
 # Mail travels with CRLF line ends (RFC 5322 §2.1); openssl writes LF
 # outside the signed content, which already has CRLF.
 for f in *.eml; do

@@ -620,8 +620,10 @@ impl MailApp {
             .spawn(move || {
                 let result = backend.store.set_encrypted(on);
                 // Decrypted copies of opened attachments lie outside the
-                // database: gone, written again when opened.
-                if on && result.is_ok() {
+                // database: gone, written again when opened. Also when the
+                // database is encrypted but its draft files haven't all
+                // followed yet (an error, retried later).
+                if on && backend.store.encrypted() {
                     backend.forget_opened_attachments();
                 }
                 let _ = tx.send(result);
@@ -639,7 +641,7 @@ impl MailApp {
                 this.lock.encrypting = false;
                 this.lock.encrypted = this.backend.store.encrypted();
                 // The widgets' snapshot is a file outside the database.
-                if on && result.is_ok() && !this.lock.hide_contents {
+                if on && this.lock.encrypted && !this.lock.hide_contents {
                     this.set_hide_contents(true, cx);
                 }
                 match result {

@@ -18,5 +18,7 @@ message-window-to = to { $to }
 
 message-window-couldnt-open = Couldn't open { $path }: { $e }
 
+message-window-the-file-is-too-large = the file is too large to open as an email
+
 # Who a message went to, and who got copies
 message-window-to-cc = to { $to } · cc { $cc }

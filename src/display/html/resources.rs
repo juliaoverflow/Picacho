@@ -343,36 +343,47 @@ impl Proxies {
             .parse::<http::Uri>()
             .is_ok_and(|uri| self.matcher.intercept(&uri).is_some())
     }
-    /// Whether an email may load `url` (see `fetchable`). Through a proxy,
-    /// which looks its name up itself, the name is also looked up here
-    /// first: one that leads only to this computer or its network is
-    /// refused, so the proxy isn't asked to reach inside. One that can't be
-    /// looked up here (only the proxy can) goes on.
+    /// Whether an email may load `url` (see `fetchable`). Straight to its
+    /// server, the name is checked as it connects (`PublicOnly`). Through a
+    /// proxy, which looks the name up itself, nothing here can say where
+    /// the request goes: it is refused, unless the proxy is declared to
+    /// refuse this computer and its network itself (in Settings or the
+    /// environment, `public_net::proxy_filters_egress`); even then, a name
+    /// that leads inside here is refused before the proxy is asked.
     fn admits(&self, url: &url::Url) -> bool {
+        self.admits_with(url, crate::sync::public_net::proxy_filters_egress())
+    }
+    fn admits_with(&self, url: &url::Url, filtered: bool) -> bool {
         if !fetchable(url) {
             return false;
         }
-        let Some(url::Host::Domain(name)) = url.host() else {
-            return true;
+        let name = match url.host() {
+            Some(url::Host::Domain(name)) => Some(name),
+            _ => None,
         };
         // The proxy itself, at any port: `PublicOnly` lets its name reach
         // the local network (to connect through it), and a proxy on this
         // computer or the network is usually left out of the proxying.
-        if self.hosts.contains(&name.to_ascii_lowercase()) {
+        if name.is_some_and(|name| self.hosts.contains(&name.to_ascii_lowercase())) {
             return false;
         }
         if !self.routes(url) {
             // Straight there: `PublicOnly` checks the name as it connects.
             return true;
         }
+        if !filtered {
+            return false;
+        }
+        let Some(name) = name else {
+            // An address, public (`fetchable`): the proxy goes there.
+            return true;
+        };
         use std::net::ToSocketAddrs as _;
         match (name, 0).to_socket_addrs() {
-            Ok(found) => {
-                let found: Vec<_> = found.collect();
-                // Every address: with a public one and a private one, the
-                // proxy may well connect to the private one.
-                found.is_empty() || found.iter().all(|a| allowed_ip(a.ip()))
-            }
+            // Every address: with a public one and a private one, the
+            // proxy may well connect to the private one.
+            Ok(mut found) => found.all(|a| allowed_ip(a.ip())),
+            // Only the proxy can look it up; it refuses what's inside.
             Err(_) => true,
         }
     }
@@ -545,8 +556,19 @@ mod tests {
         assert!(proxies.routes(&url("https://images.example/a.png")));
         assert!(!proxies.routes(&url("https://direct.example/a.png")));
         // The proxy itself isn't a place an email may load from, at any port.
-        assert!(!proxies.admits(&url("http://proxy.corp.example:8080/admin")));
-        assert!(!proxies.admits(&url("https://PROXY.corp.example/")));
+        assert!(!proxies.admits_with(&url("http://proxy.corp.example:8080/admin"), true));
+        assert!(!proxies.admits_with(&url("https://PROXY.corp.example/"), true));
+        // Through a proxy, which looks names up itself, nothing is loaded
+        // unless the proxy refuses the local network itself: not a name
+        // that can't be looked up here, nor a public address.
+        assert!(!proxies.admits_with(&url("https://does-not-resolve.invalid/a.png"), false));
+        assert!(!proxies.admits_with(&url("https://93.184.215.14/a.png"), false));
+        // With such a proxy, it is asked (names that lead inside here are
+        // refused too, but tests allow this computer's addresses).
+        assert!(proxies.admits_with(&url("https://does-not-resolve.invalid/a.png"), true));
+        assert!(proxies.admits_with(&url("https://93.184.215.14/a.png"), true));
+        // Straight to its server, the name is checked as it connects.
+        assert!(proxies.admits_with(&url("https://direct.example/a.png"), false));
         // `localhost` is this computer however it is reached.
         assert!(!public_ip("127.0.0.1".parse().unwrap()));
         assert!(Proxies::with(Matcher::builder().build()).hosts.is_empty());

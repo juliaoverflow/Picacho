@@ -967,6 +967,22 @@ manage-smime-revocation-no-revocation-list-could-be-fetched = No revocation list
 
 manage-smime-revocation-gave-a-list-its-issuer-didnt = { $url } gave a list its issuer didn't sign, or an outdated one.
 
+# Why a revocation list, signed by the certificate's issuer, can't say
+# whether that certificate is revoked. { $why } is one of the reasons below.
+manage-smime-revocation-list-doesnt-apply = { $url } gave a list that doesn't cover this certificate: { $why }
+
+manage-smime-revocation-list-unreadable = it couldn't be read
+
+manage-smime-revocation-list-indirect = it is issued on another authority's behalf
+
+manage-smime-revocation-list-delta = it lists only changes since another list
+
+manage-smime-revocation-list-unsupported = it has a limit Picacho doesn't understand
+
+manage-smime-revocation-list-for-other-certificates = it is for other certificates
+
+manage-smime-revocation-list-only-some-reasons = { $url } gave a list of certificates revoked for some reasons only, which doesn't name this one.
+
 manage-smime-revocation-the-request-couldnt-be-made = the request couldn't be made
 
 manage-smime-revocation-the-answer-isnt-an-ocsp-response = the answer isn't an OCSP response
@@ -1060,6 +1076,15 @@ manage-sealed-files-couldnt-encrypt-a-file = Couldn't encrypt a draft's file.
 manage-sealed-files-an-encrypted-file-is-damaged = A draft's encrypted file is damaged and can't be read.
 
 manage-sealed-files-this-file-is-encrypted-with-a-key = This draft's file is encrypted with the local database's key, which is no longer here.
+
+# After turning the local database's encryption on or off, when some of
+# the drafts' files kept beside it couldn't be converted yet.
+manage-sealed-files-some-files-couldnt-follow = { $count ->
+        [one] One draft file couldn't
+       *[other] { $count } draft files couldn't
+    } be converted to follow the local database's encryption. Picacho keeps the key they need and will try again.
+
+manage-sealed-files-couldnt-keep-track = Couldn't keep track of converting the drafts' files
 
 manage-store-the-server-did-not-supply-a = The server did not supply a valid UIDVALIDITY
 

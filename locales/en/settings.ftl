@@ -98,6 +98,15 @@ settings-block-remote-content = Block remote content
 
 settings-prevent-images-stylesheets-and-fonts-from = Loading images can reveal that you opened an email.
 
+# Settings → Reading, shown when a proxy is set for the system. A proxy looks
+# names up itself, so Picacho can't tell whether a request through it would
+# reach your local network.
+settings-proxy-blocks-local-network = Proxy blocks local network
+
+settings-proxy-blocks-local-network-explained = Turn on only if your proxy refuses requests to your own network. Until then, images and other requests senders choose aren't sent through the proxy.
+
+settings-proxy-blocks-local-network-set-by-environment = Set for this computer by PICACHO_PROXY_BLOCKS_LOCAL_NETWORK.
+
 settings-remove-tracking-from-links = Remove tracking from links
 
 settings-take-campaign-and-click-identifiers-such = Strip tracking parameters and known redirects.

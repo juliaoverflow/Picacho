@@ -421,8 +421,22 @@ pub fn snapshot(store: &Store, now: i64) -> Snapshot {
         .map(|a| (a.id.as_str(), a.name.as_str()))
         .collect();
     let (calendar_connected, events) = calendar_agenda(store, now);
-    let (packages, package_counts) = recent_packages(store, &account_ids, &account_labels);
-    let (receipts, receipt_counts) = recent_receipts(store, &account_ids, &account_labels);
+    // Mail looked through only for accounts whose mail changed in ways
+    // that matter to parcels and receipts since the last snapshot, and
+    // then once for both (`Store::widget_scans`).
+    let (tracked, listed) = if account_ids.is_empty() {
+        Default::default()
+    } else {
+        let model = local_ai::parcel_enabled(store)
+            .then(|| local_ai::parcel_confirmer(store).ok())
+            .flatten();
+        store.widget_scans(&account_ids, model.as_ref()).unwrap_or_else(|e| {
+            eprintln!("Picacho: could not scan packages and receipts for widgets: {e:#}");
+            Default::default()
+        })
+    };
+    let (packages, package_counts) = recent_packages(store, tracked, &account_labels);
+    let (receipts, receipt_counts) = recent_receipts(store, listed, &account_labels);
     for a in &mut account_summaries {
         a.packages = package_counts.get(&a.id).copied().unwrap_or(0);
         a.receipts = receipt_counts.get(&a.id).copied().unwrap_or(0);
@@ -599,28 +613,18 @@ pub fn redact(snap: &mut Snapshot) {
 /// flags saved by the Summary; and how many the Summary lists per account.
 fn recent_packages(
     store: &Store,
-    account_ids: &[String],
+    mut tracked: Vec<parcels::Tracked>,
     account_labels: &HashMap<&str, &str>,
 ) -> (Vec<WidgetPackage>, HashMap<String, usize>) {
-    if account_ids.is_empty() {
+    if tracked.is_empty() {
         return Default::default();
     }
-    let model = local_ai::parcel_enabled(store)
-        .then(|| local_ai::parcel_confirmer(store).ok())
-        .flatten();
-    let mut scan = match store.parcels(account_ids, model.as_ref()) {
-        Ok(scan) => scan,
-        Err(e) => {
-            eprintln!("Picacho: could not scan packages for widgets: {e:#}");
-            return Default::default();
-        }
-    };
     let overrides: Vec<ParcelOverride> = store
         .preference(PARCEL_OVERRIDES)
         .and_then(|json| serde_json::from_str(&json).ok())
         .unwrap_or_default();
-    parcels::apply_overrides(&mut scan.tracked, &overrides);
-    scan.tracked.sort_by(|a, b| {
+    parcels::apply_overrides(&mut tracked, &overrides);
+    tracked.sort_by(|a, b| {
         b.updated
             .cmp(&a.updated)
             .then_with(|| a.parcel.key().cmp(&b.parcel.key()))
@@ -628,7 +632,7 @@ fn recent_packages(
 
     let mut per_account: HashMap<String, usize> = HashMap::new();
     let mut out = Vec::new();
-    for t in scan.tracked.into_iter().filter(|t| !t.hidden) {
+    for t in tracked.into_iter().filter(|t| !t.hidden) {
         let latest = t.latest();
         let count = per_account.entry(latest.account.clone()).or_insert(0);
         *count += 1;
@@ -685,27 +689,19 @@ fn recent_packages(
 /// and how many the Summary lists per account.
 fn recent_receipts(
     store: &Store,
-    account_ids: &[String],
+    mut found: Vec<receipts::Listed>,
     account_labels: &HashMap<&str, &str>,
 ) -> (Vec<WidgetReceipt>, HashMap<String, usize>) {
-    if account_ids.is_empty() {
+    if found.is_empty() {
         return Default::default();
     }
-    let mut scan = match store.receipts(account_ids) {
-        Ok(scan) => scan,
-        Err(e) => {
-            eprintln!("Picacho: could not scan receipts for widgets: {e:#}");
-            return Default::default();
-        }
-    };
     let hidden: Vec<String> = store
         .preference(receipts::HIDDEN_PREFERENCE)
         .and_then(|json| serde_json::from_str(&json).ok())
         .unwrap_or_default();
-    receipts::apply_hidden(&mut scan.listed, &hidden);
+    receipts::apply_hidden(&mut found, &hidden);
 
-    let mut listed: Vec<(i64, receipts::Listed)> = scan
-        .listed
+    let mut listed: Vec<(i64, receipts::Listed)> = found
         .into_iter()
         .filter(|l| !l.hidden && !l.emails.is_empty())
         .map(|l| {
@@ -1687,6 +1683,66 @@ mod tests {
         assert_eq!(snap2.receipts.len(), 7);
         assert_eq!(snap2.receipt_total(None), 7);
         assert_eq!(snap2.receipts[0].merchant, "Coffee 7");
+
+        drop(store);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A background check that changes nothing parcels or receipts look at
+    /// (no news, or only flags) looks through no account's mail again for
+    /// the widgets; new mail, or a downloaded source, has its own account
+    /// looked through once, for parcels and receipts both.
+    #[test]
+    fn unchanged_mail_isnt_looked_through_again_for_widgets() {
+        use std::sync::atomic::Ordering;
+        let (store, dir) = temp_store();
+        store.save_account(&account("work", "me@example.com", "Work")).unwrap();
+        store.save_account(&account("home", "me@example.org", "Home")).unwrap();
+        let template = demo_mail().remove(0);
+        let mail = |account: &str, i: i64| {
+            let mut ship = template.clone();
+            ship.id = format!("{account}:inbox:ship-{i}");
+            ship.message_id = format!("<ship-{i}@shop.example>");
+            ship.account = account.into();
+            ship.folder = Folder::Inbox;
+            ship.sender = format!("Shop {i} <orders@shop{i}.example>");
+            ship.subject = format!("Your order #ORD-100{i} has shipped");
+            ship.body = Some(format!("Your package for order #ORD-100{i} is on the way via UPS."));
+            ship.date = 1_700_000_000 + i * 3600;
+            ship
+        };
+        let mut messages = vec![mail("work", 1), mail("work", 2), mail("home", 3)];
+        store.save_messages(&messages).unwrap();
+        let scans = || store.scan_rows_calls.load(Ordering::Relaxed);
+        let snap = snapshot(&store, 1_700_100_000);
+        assert_eq!(snap.packages.len(), 3);
+        assert_eq!(scans(), 2, "each account listed once, for parcels and receipts both");
+
+        // A check with no news, and one that only changes flags.
+        store.save_messages(&messages).unwrap();
+        messages[0].unread = !messages[0].unread;
+        messages[1].starred = !messages[1].starred;
+        store.save_messages(&messages).unwrap();
+        let again = snapshot(&store, 1_700_100_000);
+        assert_eq!(scans(), 2, "nothing looked through again");
+        assert_eq!(again.packages.len(), 3);
+        let json = |v: &Snapshot| serde_json::to_string(&(&v.packages, &v.receipts)).unwrap();
+        assert_eq!(json(&again), json(&snap));
+
+        // New mail in one account: that account alone, once.
+        store.save_messages(&[mail("work", 4)]).unwrap();
+        let newer = snapshot(&store, 1_700_100_000);
+        assert_eq!(scans(), 3);
+        assert_eq!(newer.packages.len(), 4);
+        // A source downloaded changes what is read.
+        store.save_raw("home:inbox:ship-3", b"From: a@b\r\n\r\nHi").unwrap();
+        snapshot(&store, 1_700_100_000);
+        assert_eq!(scans(), 4);
+        // Mail that goes changes what is found.
+        store.delete_ids("work", &["work:inbox:ship-4".to_owned()]).unwrap();
+        let fewer = snapshot(&store, 1_700_100_000);
+        assert_eq!(scans(), 5);
+        assert_eq!(fewer.packages.len(), 3);
 
         drop(store);
         let _ = std::fs::remove_dir_all(dir);

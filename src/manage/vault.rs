@@ -270,6 +270,31 @@ pub fn forget_key(dir: &Path, keys: &dyn KeyStore) -> Result<()> {
     Ok(())
 }
 
+/// Keeps `key` under a keychain entry of its own, apart from the database's
+/// (which the next switch reuses), and returns the entry's name: an old
+/// database key that files beside the database may still be sealed with,
+/// kept until every one of them is converted (`sealed_files::begin`).
+pub fn retain_key(keys: &dyn KeyStore, key: &DatabaseKey) -> Result<String> {
+    let name = format!("draft-files-key:{}", uuid::Uuid::new_v4());
+    keys.save(&name, &key.to_hex())
+        .with_context(|| t!("manage-vault-couldnt-save-the-database-key-in"))?;
+    // Read back, as `save_key` does: files may come to depend on it alone.
+    let back = keys.load(&name)?;
+    if back.as_deref().map(|s| s.as_str()) != Some(key.to_hex().as_str()) {
+        let _ = keys.delete(&name);
+        bail!(t!("manage-vault-couldnt-save-the-database-key-in"));
+    }
+    Ok(name)
+}
+
+/// The key kept under `name` by `retain_key`; `None` once it is gone.
+pub fn retained_key(keys: &dyn KeyStore, name: &str) -> Result<Option<DatabaseKey>> {
+    match keys.load(name)? {
+        Some(hex) => Ok(Some(DatabaseKey::from_hex(&hex)?)),
+        None => Ok(None),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1343,6 +1343,10 @@ fn is_zero_i64(v: &i64) -> bool {
 pub struct InlineParts {
     /// By Content-ID, lowercase, without its angle brackets.
     parts: std::collections::HashMap<String, std::sync::Arc<Vec<u8>>>,
+    /// The parts' bytes in all, kept as they are added and replaced, so
+    /// adding one needn't add up all the others (a message of thousands
+    /// of small parts made that quadratic).
+    bytes: usize,
 }
 impl InlineParts {
     /// No parts, shared: every message read from the cache starts with
@@ -1360,8 +1364,11 @@ impl InlineParts {
     }
     /// At most this much is kept per message.
     pub const MAX_BYTES: usize = 32 * 1024 * 1024;
+    /// At most this many parts are kept per message.
+    pub const MAX_PARTS: usize = 1024;
     /// Adds a part under its Content-ID header (`<id>`). Returns false,
-    /// adding nothing, once the message's parts would grow too large.
+    /// adding nothing, once the message's parts would grow too large or
+    /// too many.
     pub fn insert(&mut self, content_id: &str, bytes: Vec<u8>) -> bool {
         let id = content_id
             .trim()
@@ -1369,10 +1376,15 @@ impl InlineParts {
             .trim_end_matches('>')
             .trim()
             .to_lowercase();
-        let total: usize = self.parts.values().map(|b| b.len()).sum();
-        if id.is_empty() || total + bytes.len() > Self::MAX_BYTES {
+        if id.is_empty() {
             return false;
         }
+        let replaced = self.parts.get(&id).map(|b| b.len());
+        let total = self.bytes - replaced.unwrap_or(0) + bytes.len();
+        if total > Self::MAX_BYTES || (replaced.is_none() && self.parts.len() >= Self::MAX_PARTS) {
+            return false;
+        }
+        self.bytes = total;
         self.parts.insert(id, std::sync::Arc::new(bytes));
         true
     }

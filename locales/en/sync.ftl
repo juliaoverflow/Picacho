@@ -1069,6 +1069,8 @@ sync-models-the-model-download-was-interrupted = The model download was interrup
 
 sync-msg-this-msg-file-couldnt-be-read = This .msg file couldn't be read.
 
+sync-msg-this-msg-file-is-too-large = This .msg file is too large to open.
+
 sync-msg-embedded-msg-files-are-nested-too = Embedded .msg files are nested too deeply.
 
 sync-msg-unexpected-end-of-msg-file = Unexpected end of .msg file

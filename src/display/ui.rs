@@ -948,6 +948,10 @@ enum Action {
     SetReadingDefaults(ReadingOptions),
     /// Removes tracking from links in mail, or stops.
     SetCleanLinks(bool),
+    /// Says the system's proxy refuses requests to the local network itself,
+    /// so remote content and other requests strangers chose may go
+    /// through it (`public_net::PROXY_PREFERENCE`), or takes that back.
+    SetProxyBlocksLocalNetwork(bool),
     /// Keep running in the background once the windows close.
     SetBackground(bool),
     /// Shows the interface in this language (a code; empty: the system's).
@@ -1725,6 +1729,9 @@ pub struct MailApp {
     all_mail: bool,
     /// Links in mail lose their tracking parameters and redirect wrappers.
     clean_links: bool,
+    /// The system's proxy is said to refuse requests to the local network
+    /// (Settings → Reading; see `public_net::PROXY_PREFERENCE`).
+    proxy_blocks_local: bool,
     /// Opening links from email: the phone's warning, trusted sites, the
     /// desktop's hovered address (see `links`).
     links: links::LinkSafety,
@@ -2148,6 +2155,7 @@ impl MailApp {
         let alias_routes = fwd::routes(&store);
         let reverse_contacts = Arc::new(fwd::reverse_contacts(&store));
         let clean_links = store.preference("clean_links").as_deref() != Some("false");
+        let proxy_blocks_local = crate::sync::public_net::proxy_setting(&store);
         let link_safety = links::LinkSafety::load(&store);
         let local_ai = crate::manage::local_ai::enabled(&store);
         let hide_codes = crate::manage::local_ai::otp_enabled(&store);
@@ -2964,6 +2972,7 @@ impl MailApp {
             reverse_contacts,
             contacts_fetched: HashSet::new(),
             clean_links,
+            proxy_blocks_local,
             links: link_safety,
             background,
             tray_icon,
@@ -8143,6 +8152,16 @@ impl MailApp {
                 self.contrast = c;
                 self.backend.store.set_preference_soon(motion::Contrast::PREFERENCE, c.key());
                 self.apply_motion(cx);
+            }
+            Action::SetProxyBlocksLocalNetwork(on) => {
+                self.proxy_blocks_local = on;
+                crate::sync::public_net::set_proxy_filters_egress(on);
+                self.backend.store.set_preference_soon(
+                    crate::sync::public_net::PROXY_PREFERENCE,
+                    if on { "true" } else { "false" },
+                );
+                // Fetches asked for from now on go by it.
+                cx.notify();
             }
             Action::SetCleanLinks(on) => {
                 self.clean_links = on;
@@ -15087,6 +15106,28 @@ mod tests {
             frame(cx);
             assert!(cx.debug_bounds("closing-cover").is_some(), "{kind:?}");
         }
+    }
+
+    /// Settings → Reading: saying the system's proxy blocks the local
+    /// network is kept, and offered (once on) to be turned off again.
+    #[gpui::test]
+    fn the_proxy_setting_is_kept(cx: &mut TestAppContext) {
+        let (view, cx, store) = two_accounts(cx);
+        view.read_with(cx, |this, _| assert!(!this.proxy_blocks_local, "off by default"));
+        act(&view, Action::Settings, cx);
+        act(&view, Action::SettingsPage(Page::Reading), cx);
+        act(&view, Action::SetProxyBlocksLocalNetwork(true), cx);
+        frame(cx);
+        frame(cx);
+        assert!(cx.debug_bounds("proxy-blocks-local").is_some());
+        cx.run_until_parked();
+        store.flush();
+        assert_eq!(store.preference(crate::sync::public_net::PROXY_PREFERENCE).as_deref(), Some("true"));
+        assert!(crate::sync::public_net::proxy_setting(&store));
+        act(&view, Action::SetProxyBlocksLocalNetwork(false), cx);
+        cx.run_until_parked();
+        store.flush();
+        assert!(!crate::sync::public_net::proxy_setting(&store));
     }
 
     #[gpui::test]

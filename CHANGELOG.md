@@ -514,6 +514,27 @@ same version in `Cargo.toml`.
 
 ### Security
 
+- Turning the local database's encryption on or off converts the drafts'
+  files kept beside it as a migration that lasts failures and crashes:
+  Picacho reports success only once every file is converted and read back,
+  keeps the old key until then, and carries on when the switch is asked for
+  again or Picacho starts. Converting no longer writes over an attachment
+  named like its temporary file.
+- While the local database is encrypted, the pieces of a large message
+  kept on disk so its download can resume are encrypted too, each checked
+  when the download resumes; unencrypted pieces left from before are
+  deleted.
+- With a proxy set for the system, email images and other requests to
+  addresses strangers chose (one-click unsubscribing, MTA-STS policies, key
+  lookups, revocation checks) are no longer sent through it, since a proxy
+  looks names up itself and could reach your local network. If your proxy
+  refuses such requests itself, turn on **Proxy blocks local network** in
+  Settings → Reading (shown when a proxy is set), or set
+  `PICACHO_PROXY_BLOCKS_LOCAL_NETWORK=1` for the whole computer.
+- Check sender no longer says a certificate isn't revoked on the strength
+  of a revocation list that doesn't cover it: another partition of its
+  issuer's lists, a list for some reasons only, a delta list, or one not yet
+  issued or without an end date. Only lists that cover it are kept.
 - Exchange accounts no longer fall back to Basic sign-in on their own,
   which sent the password itself to any server that left out NTLM. Where
   your Exchange server offers only Basic, Picacho now says so and syncing
@@ -557,6 +578,13 @@ same version in `Cargo.toml`.
 
 ### Performance
 
+- Widgets are refreshed after a background check without looking through
+  every account's mail again unless it changed in ways packages and
+  receipts depend on, and then once for both.
+- Reading a message of thousands of parts no longer takes time growing
+  with the square of their number, and at most 4096 parts are looked at.
+- Opening a large email file checks its size before reading it, so an
+  oversized `.eml` or `.msg` can't run Picacho out of memory.
 - Reading and downloading mail no longer reads every OpenPGP key again
   for each message, and other people's keys are kept in the database
   rather than rewritten whole into the system keychain for each new one.

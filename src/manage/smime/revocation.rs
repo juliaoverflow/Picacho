@@ -104,8 +104,9 @@ impl RevocationFetcher for HttpFetcher {
 /// What revocation checking found for one certificate.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Status {
-    /// Its issuer's current list doesn't name it (RFC 5280 §5), or its
-    /// OCSP responder says good (RFC 6960 §2.2).
+    /// A current, complete list of its issuer's that covers it doesn't
+    /// name it (RFC 5280 §5, §6.3.3), or its OCSP responder says good
+    /// (RFC 6960 §2.2).
     Good,
     /// Its issuer revoked it.
     Revoked,
@@ -135,9 +136,15 @@ fn unix(time: &openssl::asn1::Asn1TimeRef) -> Option<i64> {
     Some(i64::from(d.days) * 86_400 + i64::from(d.secs))
 }
 
-/// RFC 5280 §6.3.3: whether `crl` is `issuer`'s and still current at
-/// `now`: issued by it (same name, signature by its key), and not past
-/// its nextUpdate. A list without nextUpdate is taken as current.
+/// Clock difference allowed for a list's thisUpdate.
+const CRL_SLACK: i64 = 5 * 60;
+
+/// RFC 5280 §6.3.3: whether `crl` is `issuer`'s and current at `now`:
+/// issued by it (same name, signature by its key, a key it may sign lists
+/// with), already issued (thisUpdate, give or take `CRL_SLACK`), and not
+/// past its nextUpdate. A list without nextUpdate, which RFC 5280 §5.1.2.5
+/// requires, can't be told to be current. Whether it speaks for a given
+/// certificate is `scope`'s to say.
 pub fn current_from(
     crl: &openssl::x509::X509CrlRef,
     issuer: &openssl::x509::X509Ref,
@@ -145,8 +152,148 @@ pub fn current_from(
 ) -> bool {
     let same_name = crl.issuer_name().to_der().ok() == issuer.subject_name().to_der().ok();
     let signed = issuer.public_key().is_ok_and(|key| crl.verify(&key).unwrap_or(false));
-    let fresh = crl.next_update().and_then(unix).is_none_or(|next| now < next);
-    same_name && signed && fresh
+    let issued = unix(crl.last_update()).is_some_and(|this| this <= now + CRL_SLACK);
+    let fresh = crl.next_update().and_then(unix).is_some_and(|next| now < next);
+    same_name && signed && issued && fresh && signs_crls(issuer)
+}
+
+/// RFC 5280 §4.2.1.3: an issuer whose key usage is given signs lists only
+/// with cRLSign among it.
+fn signs_crls(issuer: &openssl::x509::X509Ref) -> bool {
+    let Ok(der) = issuer.to_der() else { return false };
+    let Ok((_, cert)) = x509_parser::parse_x509_certificate(&der) else {
+        return false;
+    };
+    match cert.key_usage() {
+        Ok(Some(usage)) => usage.value.crl_sign(),
+        Ok(None) => true,
+        Err(_) => false,
+    }
+}
+
+/// How far a list speaks for a certificate (RFC 5280 §5.2.4, §5.2.5,
+/// §6.3.3).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Scope {
+    /// It covers the certificate for every reason: one it doesn't name
+    /// isn't revoked.
+    Complete,
+    /// It covers the certificate for some reasons only (`onlySomeReasons`,
+    /// or a distribution point's `reasons`): one it names is revoked, but
+    /// one it doesn't may be revoked for another.
+    Partial,
+    /// It isn't for the certificate, or can't be told to be: another
+    /// partition of the issuer's lists, another kind of certificate, a
+    /// delta list, an indirect one, or one with a critical extension not
+    /// understood here. Nothing it says counts.
+    Unrelated(String),
+}
+
+/// `crl`'s scope for `cert`, fetched from `url`: whether the list covers
+/// the certificate's distribution point (the one `url` is in, else any of
+/// the certificate's) and its kind, and for which reasons. A list without
+/// an issuing distribution point covers all its issuer's certificates for
+/// every reason, but a distribution point with reasons of its own limits
+/// what it may say. Only a complete list (not a delta, §5.2.4) applies;
+/// indirect lists (§5.2.5's indirectCRL, a point's cRLIssuer) aren't
+/// supported.
+pub fn scope(cert: &openssl::x509::X509Ref, crl: &openssl::x509::X509CrlRef, url: &str) -> Scope {
+    use x509_parser::extensions::{DistributionPointName, GeneralName, ParsedExtension};
+    use x509_parser::oid_registry::{
+        OID_X509_EXT_AUTHORITY_KEY_IDENTIFIER, OID_X509_EXT_CRL_NUMBER, OID_X509_EXT_DELTA_CRL_INDICATOR,
+        OID_X509_EXT_ISSUER_DISTRIBUTION_POINT,
+    };
+    let unrelated = |why: &str| Scope::Unrelated(why.to_owned());
+    let (Ok(cert_der), Ok(crl_der)) = (cert.to_der(), crl.to_der()) else {
+        return unrelated(t!("manage-smime-revocation-list-unreadable"));
+    };
+    let (Ok((_, cert)), Ok((_, crl))) =
+        (x509_parser::parse_x509_certificate(&cert_der), x509_parser::parse_x509_crl(&crl_der))
+    else {
+        return unrelated(t!("manage-smime-revocation-list-unreadable"));
+    };
+    // The certificate's distribution points, and the one `url` is in.
+    let points: Vec<_> = cert
+        .extensions()
+        .iter()
+        .find_map(|e| match e.parsed_extension() {
+            ParsedExtension::CRLDistributionPoints(points) => Some(points.points.clone()),
+            _ => None,
+        })
+        .unwrap_or_default();
+    let names_url = |names: &[GeneralName]| names.iter().any(|n| matches!(n, GeneralName::URI(u) if *u == url));
+    let point = points.iter().find(|p| {
+        matches!(&p.distribution_point, Some(DistributionPointName::FullName(names)) if names_url(names))
+    });
+    if point.is_some_and(|p| p.crl_issuer.is_some()) {
+        return unrelated(t!("manage-smime-revocation-list-indirect"));
+    }
+    let mut partial = point.is_some_and(|p| p.reasons.is_some());
+    let mut idp = None;
+    for ext in crl.extensions() {
+        if ext.oid == OID_X509_EXT_DELTA_CRL_INDICATOR {
+            return unrelated(t!("manage-smime-revocation-list-delta"));
+        }
+        if ext.oid == OID_X509_EXT_ISSUER_DISTRIBUTION_POINT {
+            match ext.parsed_extension() {
+                ParsedExtension::IssuingDistributionPoint(found) => idp = Some(found),
+                _ => return unrelated(t!("manage-smime-revocation-list-unreadable")),
+            }
+            continue;
+        }
+        let known = ext.oid == OID_X509_EXT_CRL_NUMBER || ext.oid == OID_X509_EXT_AUTHORITY_KEY_IDENTIFIER;
+        // §5.2: a list with a critical extension not understood isn't used.
+        if ext.critical && !known {
+            return unrelated(t!("manage-smime-revocation-list-unsupported"));
+        }
+    }
+    if let Some(idp) = idp {
+        if idp.indirect_crl {
+            return unrelated(t!("manage-smime-revocation-list-indirect"));
+        }
+        let ca = cert.is_ca();
+        if idp.only_contains_attribute_certs || (idp.only_contains_ca_certs && !ca) || (idp.only_contains_user_certs && ca) {
+            return unrelated(t!("manage-smime-revocation-list-for-other-certificates"));
+        }
+        match &idp.distribution_point {
+            None => {}
+            // §6.3.3 (b)(2)(i): one of its names must be one of the
+            // certificate's point's (the one fetched from, if it is one).
+            Some(DistributionPointName::FullName(names)) => {
+                let shares = |p: &&x509_parser::extensions::CRLDistributionPoint| {
+                    matches!(&p.distribution_point, Some(DistributionPointName::FullName(theirs))
+                        if theirs.iter().any(|n| names.contains(n)))
+                };
+                let covered = match point {
+                    Some(p) => shares(&p),
+                    None => points.iter().any(|p| shares(&p)),
+                };
+                if !covered {
+                    return unrelated(t!("manage-smime-revocation-list-for-other-certificates"));
+                }
+            }
+            Some(DistributionPointName::NameRelativeToCRLIssuer(_)) => {
+                return unrelated(t!("manage-smime-revocation-list-unsupported"));
+            }
+        }
+        partial |= idp.only_some_reasons.is_some();
+    }
+    if partial { Scope::Partial } else { Scope::Complete }
+}
+
+/// What `crl`, current and its issuer's, says of `cert` (fetched from
+/// `url`): revoked if it names it and covers it; good only if it covers it
+/// completely; otherwise unknown, with why.
+fn judged(cert: &openssl::x509::X509Ref, crl: &openssl::x509::X509CrlRef, url: &str) -> Status {
+    let scope = scope(cert, crl, url);
+    if let Scope::Unrelated(why) = scope {
+        return Status::Unknown(t!("manage-smime-revocation-list-doesnt-apply", url = url, why = why));
+    }
+    match crl.get_by_cert(&cert.to_owned()) {
+        openssl::x509::CrlStatus::Revoked(_) => Status::Revoked,
+        _ if scope == Scope::Complete => Status::Good,
+        _ => Status::Unknown(t!("manage-smime-revocation-list-only-some-reasons", url = url)),
+    }
 }
 
 /// Where fetched lists are kept: one file per URL, as PEM, named by the
@@ -185,8 +332,10 @@ fn parse_crl(bytes: &[u8]) -> Result<openssl::x509::X509Crl> {
 /// RFC 5280 §6.3: `cert`'s status by its issuer's CRL. A current one kept
 /// in `cache` is used; else each distribution point is fetched (only with
 /// `fetcher`, which is how the user asking is told apart from reading)
-/// until one gives a list that is the issuer's and current, which is then
-/// kept. `urls` overrides the certificate's own points (tests).
+/// until one gives a list that is the issuer's, current and covers the
+/// certificate (`scope`), which is then kept. Only a list that covers it
+/// completely can say it isn't revoked. `urls` overrides the certificate's
+/// own points (tests).
 pub fn crl_status(
     cert: &openssl::x509::X509Ref,
     issuer: &openssl::x509::X509Ref,
@@ -199,24 +348,34 @@ pub fn crl_status(
     if urls.is_empty() {
         return Status::Unknown(t!("manage-smime-revocation-its-certificate-names-no-revocation-list").into());
     }
-    let status = |crl: &openssl::x509::X509CrlRef| match crl.get_by_cert(&cert.to_owned()) {
-        openssl::x509::CrlStatus::Revoked(_) => Status::Revoked,
-        _ => Status::Good,
-    };
+    let mut why = None;
     for url in &urls {
         if let Some(crl) = cache.fresh(url, issuer, now) {
-            return status(&crl);
+            match judged(cert, &crl, url) {
+                Status::Unknown(w) => why = Some(w),
+                known => return known,
+            }
         }
     }
     let Some(fetcher) = fetcher else {
-        return Status::Unknown(t!("manage-smime-revocation-its-revocation-list-hasnt-been-fetched").into());
+        return Status::Unknown(
+            why.unwrap_or_else(|| t!("manage-smime-revocation-its-revocation-list-hasnt-been-fetched").into()),
+        );
     };
     let mut why = String::from(t!("manage-smime-revocation-no-revocation-list-could-be-fetched"));
     for url in &urls {
         match fetcher.get(url).and_then(|bytes| parse_crl(&bytes)) {
             Ok(crl) if current_from(&crl, issuer, now) => {
-                let _ = cache.keep(url, &crl);
-                return status(&crl);
+                let status = judged(cert, &crl, url);
+                // Kept only when it speaks for this certificate: one for
+                // another partition, or a delta, isn't this URL's list.
+                if !matches!(scope(cert, &crl, url), Scope::Unrelated(_)) {
+                    let _ = cache.keep(url, &crl);
+                }
+                match status {
+                    Status::Unknown(w) => why = w,
+                    known => return known,
+                }
             }
             Ok(_) => why = t!("manage-smime-revocation-gave-a-list-its-issuer-didnt", url = url),
             Err(e) => why = format!("{e:#}"),
@@ -445,6 +604,57 @@ mod tests {
         // The fixtures name no distribution point of their own.
         assert!(crl_urls(&bo).is_empty());
         assert!(matches!(crl_status(&bo, &ca, &[], &cache(), Some(&revoking), now), Status::Unknown(_)));
+    }
+
+    /// RFC 5280 §5.2.4, §5.2.5, §6.3.3: a list signed by the issuer speaks
+    /// only for the certificates and reasons it covers. Another partition
+    /// of the issuer's lists (served at the certificate's point, by
+    /// mistake or by someone in the way), a delta list, or one for CA
+    /// certificates never says a certificate isn't revoked, and isn't kept;
+    /// one limited to some reasons can say it is revoked, but not that it
+    /// isn't.
+    #[test]
+    fn crls_speak_only_for_the_certificates_and_reasons_they_cover() {
+        let (ca, cara, bo) = (cert("ca.pem"), cert("cara.pem"), cert("bo.pem"));
+        let now = chrono::Utc::now().timestamp();
+        let p1 = "http://crl.example.org/partition-1.crl";
+        assert_eq!(crl_urls(&cara), vec![p1.to_owned()]);
+        let unknown = |fixture: &str| {
+            let fetcher = FakeFetcher::with(&[(p1, der_of(fixture))]);
+            let kept = cache();
+            let status = crl_status(&cara, &ca, &[], &kept, Some(&fetcher), now);
+            let unkept = kept.fresh(p1, &ca, now).is_none();
+            let _ = std::fs::remove_dir_all(&kept.folder);
+            matches!(status, Status::Unknown(_)) && unkept
+        };
+        // Partition 2, signed by the same authority: not "good" for Cara,
+        // whose point is partition 1, and not kept as partition 1's list.
+        assert!(unknown("crl-partition-2-empty.pem"));
+        assert!(unknown("crl-delta-empty.pem"));
+        assert!(unknown("crl-ca-only-empty.pem"));
+        // Its own partition: good when empty, revoked when it names her.
+        let kept = cache();
+        let own = FakeFetcher::with(&[(p1, der_of("crl-partition-1-empty.pem"))]);
+        assert_eq!(crl_status(&cara, &ca, &[], &kept, Some(&own), now), Status::Good);
+        assert!(kept.fresh(p1, &ca, now).is_some(), "kept");
+        let revoking = FakeFetcher::with(&[(p1, der_of("crl-partition-1-cara-revoked.pem"))]);
+        assert_eq!(crl_status(&cara, &ca, &[], &cache(), Some(&revoking), now), Status::Revoked);
+        // Kept for partition 1, it doesn't speak for Bo, who names no point.
+        assert!(matches!(crl_status(&bo, &ca, &[p1.to_owned()], &kept, None, now), Status::Unknown(_)));
+        let _ = std::fs::remove_dir_all(&kept.folder);
+        // Key compromise only: revoked when it names her, else unknown.
+        let reasons = FakeFetcher::with(&[(p1, der_of("crl-reasons-empty.pem"))]);
+        assert!(matches!(crl_status(&cara, &ca, &[], &cache(), Some(&reasons), now), Status::Unknown(_)));
+        let reasons = FakeFetcher::with(&[(p1, der_of("crl-reasons-cara-revoked.pem"))]);
+        assert_eq!(crl_status(&cara, &ca, &[], &cache(), Some(&reasons), now), Status::Revoked);
+        // The scopes themselves.
+        let crl = |f: &str| openssl::x509::X509Crl::from_pem(&fixture(f)).unwrap();
+        assert_eq!(scope(&cara, &crl("crl-partition-1-empty.pem"), p1), Scope::Complete);
+        assert_eq!(scope(&cara, &crl("crl-empty.pem"), p1), Scope::Complete);
+        assert_eq!(scope(&cara, &crl("crl-reasons-empty.pem"), p1), Scope::Partial);
+        assert!(matches!(scope(&cara, &crl("crl-partition-2-empty.pem"), p1), Scope::Unrelated(_)));
+        // A list not yet issued isn't current.
+        assert!(!current_from(&crl("crl-empty.pem"), &ca, now - 400 * 86_400));
     }
 
     /// An OCSP responder for tests: answers each request with `openssl

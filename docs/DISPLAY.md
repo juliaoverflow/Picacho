@@ -113,10 +113,17 @@ cells), and legacy attributes (`align`, `background`, `bgcolor` names,
 `<font>`) apply through blitz-dom's patches. The email's `body` background
 fills the page and frames it. Remote resources are fetched six at a time, at
 most 400 and 64 MB per email, never from this computer or its local network
-(addresses and names that lead there are refused). A proxy set for the system
-(`HTTPS_PROXY` and the like, or the macOS and Windows settings) is used, even
-one on the local network; a name it is asked for that leads only inside the
-network is refused before the proxy is asked. Images, inline ones too,
+(addresses and names that lead there are refused as the connection is made).
+A proxy looks names up itself, so Picacho can't tell where a request through
+one goes: with a proxy set for the system (`HTTPS_PROXY` and the like, or the
+macOS and Windows settings), remote resources aren't fetched, unless
+Settings → Reading → Proxy blocks local network (offered when a proxy is
+set), or `PICACHO_PROXY_BLOCKS_LOCAL_NETWORK=1` for a whole computer, says
+the proxy itself refuses requests to its computer and network. Then the proxy is used, even one on the local
+network, and a name that leads inside the network here is still refused
+before the proxy is asked. The same holds for other requests to addresses
+strangers chose (one-click unsubscribing, MTA-STS policies, key lookups,
+revocation checks). Images, inline ones too,
 are decoded only up to 40 million pixels each and 160 million per email, so a
 small, very compressible file can't stand for gigabytes of memory. While no
 resource is on its way, the document's thread sleeps until the view asks it

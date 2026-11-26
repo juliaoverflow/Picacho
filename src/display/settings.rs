@@ -960,18 +960,43 @@ impl MailApp {
                 cx,
             )
             .debug_selector(|| "clean-links".into());
+        // Only with a proxy set for the system (or the setting already on):
+        // through one, remote content isn't fetched unless the proxy refuses
+        // the local network itself (`public_net::proxy_filters_egress`).
+        let fixed = crate::sync::public_net::proxy_filters_egress_fixed();
+        let proxy = (crate::sync::public_net::proxy_configured() || self.proxy_blocks_local || fixed).then(|| {
+            self.switch(
+                "proxy-blocks-local".into(),
+                self.proxy_blocks_local || fixed,
+                Action::SetProxyBlocksLocalNetwork(!self.proxy_blocks_local),
+                cx,
+            )
+            .when(fixed, |d| d.opacity(0.6))
+            .debug_selector(|| "proxy-blocks-local".into())
+        });
+        let mut rows = Rows::new()
+            .row(self.toggle_row(t!("settings-render-html"), "", html))
+            .row(self.setting_row(t!("settings-email-colors"), "", theme))
+            .row(self.toggle_row(
+                t!("settings-block-remote-content"),
+                t!("settings-prevent-images-stylesheets-and-fonts-from"),
+                remote,
+            ));
+        if let Some(proxy) = proxy {
+            rows = rows.row(self.toggle_row(
+                t!("settings-proxy-blocks-local-network"),
+                if fixed {
+                    t!("settings-proxy-blocks-local-network-set-by-environment")
+                } else {
+                    t!("settings-proxy-blocks-local-network-explained")
+                },
+                proxy,
+            ));
+        }
         self.settings_column()
             .child(self.settings_group(
                 t!("settings-reading"),
-                Rows::new()
-                    .row(self.toggle_row(t!("settings-render-html"), "", html))
-                    .row(self.setting_row(t!("settings-email-colors"), "", theme))
-                    .row(self.toggle_row(
-                        t!("settings-block-remote-content"),
-                        t!("settings-prevent-images-stylesheets-and-fonts-from"),
-                        remote,
-                    ))
-                    .row(self.toggle_row(
+                rows.row(self.toggle_row(
                         t!("settings-remove-tracking-from-links"),
                         t!("settings-take-campaign-and-click-identifiers-such"),
                         clean,

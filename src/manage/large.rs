@@ -1,6 +1,8 @@
 //! Large messages. Up to `MAX_DOWNLOAD`, a message's source downloads in
 //! pieces (`BODY.PEEK[]<offset.length>`), each kept in a file as it
-//! arrives, so a download that is interrupted resumes where it stopped.
+//! arrives (sealed while the database is encrypted, see
+//! `sealed_files::SealedPartial`), so a download that is interrupted
+//! resumes where it stopped.
 //! Larger messages are never downloaded whole: their structure
 //! (BODYSTRUCTURE) says which parts are text, those are fetched alone
 //! (decoded by the server with BINARY where it can), and each attachment
@@ -29,7 +31,7 @@ impl Backend {
             .iter()
             .map(|b| format!("{b:02x}"))
             .collect();
-        self.store.path.join("partial-downloads").join(name)
+        self.store.path.join(crate::manage::sealed_files::PARTIALS).join(name)
     }
     /// Pieces of downloads left a week (the message was deleted, or never
     /// opened again) are deleted rather than kept forever. Run when the
@@ -47,17 +49,40 @@ impl Backend {
         {
             return;
         }
+        // While the database is encrypted, none are kept in the clear.
+        if self.store.encrypted() {
+            let _ = crate::manage::sealed_files::discard_plain_partials(&self.store.path);
+        }
         remove_older_than(
-            &self.store.path.join("partial-downloads"),
+            &self.store.path.join(crate::manage::sealed_files::PARTIALS),
             std::time::Duration::from_secs(7 * 86_400),
             |_| true,
         );
     }
     /// Downloads a selected message's source in pieces, resuming from what
     /// an earlier, interrupted download kept. Callers selected its mailbox.
+    ///
+    /// While the database is encrypted the pieces are sealed
+    /// (`download_sealed`): raw mail mustn't lie readable beside it.
     pub(super) fn download_resumable(&self, c: &mut Connection, m: &Mail) -> Result<Vec<u8>> {
         use std::io::Write;
         let path = self.partial_file(&m.id);
+        if self.store.encrypted() {
+            return match crate::manage::sealed_files::current_key(&self.store.path) {
+                Some(key) => self.download_sealed(c, m, &path, &key),
+                // No key to seal with (never so while encrypted): nothing
+                // kept, not even what an earlier download left.
+                None => {
+                    let _ = std::fs::remove_file(&path);
+                    download_in_memory(c, m)
+                }
+            };
+        }
+        // Sealed while the database was encrypted: not appended to in the
+        // clear, and not resumed with the key gone.
+        if crate::manage::sealed_files::is_sealed_partial(&path) {
+            let _ = std::fs::remove_file(&path);
+        }
         let dir = path.parent().with_context(|| t!("manage-large-invalid-download-folder"))?;
         std::fs::create_dir_all(dir)?;
         self.remove_stale_partials();
@@ -97,6 +122,39 @@ impl Backend {
         let whole = std::fs::read(&path)?;
         let _ = std::fs::remove_file(&path);
         Ok(whole)
+    }
+    /// `download_resumable` while the database is encrypted: each piece
+    /// sealed as it arrives with keys from `key`, the database's file key,
+    /// and every kept piece checked before the download resumes after it.
+    fn download_sealed(&self, c: &mut Connection, m: &Mail, path: &std::path::Path, key: &[u8; 32]) -> Result<Vec<u8>> {
+        use crate::manage::sealed_files::SealedPartial;
+        let dir = path.parent().with_context(|| t!("manage-large-invalid-download-folder"))?;
+        std::fs::create_dir_all(dir)?;
+        self.remove_stale_partials();
+        let mut partial = SealedPartial::open(path, key, &m.id, CHUNK)?;
+        // A piece from another generation, or past the message, is no use.
+        if partial.len() > u64::from(m.size) && m.size > 0 {
+            drop(partial);
+            let _ = std::fs::remove_file(path);
+            partial = SealedPartial::open(path, key, &m.id, CHUNK)?;
+        }
+        loop {
+            let have = partial.len() as usize;
+            let piece = fetch_range(&mut c.session, m.uid, have, CHUNK)?;
+            if have + piece.len() > MAX_DOWNLOAD {
+                drop(partial);
+                let _ = std::fs::remove_file(path);
+                bail!(t!("manage-large-this-message-is-larger-than-picacho"));
+            }
+            partial.append(&piece)?;
+            if piece.len() < CHUNK {
+                break;
+            }
+        }
+        ensure!(partial.len() > 0, t!("manage-large-message-no-longer-exists-on-the"));
+        let whole = partial.read_all(CHUNK);
+        let _ = std::fs::remove_file(path);
+        whole
     }
     /// A message too large to download whole, read from its parts: the
     /// headers, the first plain and HTML text, and a list of attachments
@@ -329,6 +387,25 @@ impl Backend {
             }
         }
     }
+}
+
+/// `download_resumable` without a file: the pieces held in memory, within
+/// the same limit.
+fn download_in_memory(c: &mut Connection, m: &Mail) -> Result<Vec<u8>> {
+    let mut whole = Vec::new();
+    loop {
+        let piece = fetch_range(&mut c.session, m.uid, whole.len(), CHUNK)?;
+        if whole.len() + piece.len() > MAX_DOWNLOAD {
+            bail!(t!("manage-large-this-message-is-larger-than-picacho"));
+        }
+        let last = piece.len() < CHUNK;
+        whole.extend_from_slice(&piece);
+        if last {
+            break;
+        }
+    }
+    ensure!(!whole.is_empty(), t!("manage-large-message-no-longer-exists-on-the"));
+    Ok(whole)
 }
 
 /// Base64 decoded as it arrives, in pieces: whitespace is passed over, and

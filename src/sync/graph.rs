@@ -577,7 +577,7 @@ impl Session {
         // Microsoft said, with the account's TLS settings.
         let parsed = url::Url::parse(url).with_context(|| t!("sync-graph-microsoft-gave-nowhere-to-upload"))?;
         ensure!(
-            (parsed.scheme() == "https" || cfg!(test)) && !crate::sync::public_net::reaches_inside(&parsed),
+            (parsed.scheme() == "https" || cfg!(test)) && !crate::sync::public_net::vouched_reaches_inside(&parsed),
             t!("sync-graph-microsoft-gave-nowhere-to-upload")
         );
         let http = reqwest::blocking::Client::builder()

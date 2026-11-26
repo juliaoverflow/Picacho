@@ -25,9 +25,11 @@ pub fn parse_message(
     let mut html = None;
     let mut attachments = Vec::new();
     let mut inline = InlineParts::default();
+    // Each leaf with whether it is one of a multipart/alternative's
+    // versions, found in the one walk through the tree.
     let mut leaves = Vec::new();
-    collect_leaves(&p, &mut leaves);
-    for (index, part) in leaves.iter().enumerate() {
+    collect_marked_leaves(&p, false, &mut leaves);
+    for (index, &(part, alternative)) in leaves.iter().enumerate() {
         // Parts with a Content-ID can be shown in the HTML (`cid:` images),
         // also when listed as attachments.
         if let Some(content_id) = part.headers.get_first_value("Content-ID")
@@ -69,7 +71,7 @@ pub fn parse_message(
             });
         } else if part.ctype.mimetype == "text/html" && html.is_none() {
             html = part.get_body().ok();
-        } else if part.ctype.mimetype == "text/plain" && !body.is_empty() && !in_alternative(&p, part) {
+        } else if part.ctype.mimetype == "text/plain" && !body.is_empty() && !alternative {
             // More text after an attachment (a mailing list's footer, a
             // forwarded note): shown after the first, as mail apps do.
             let more = part.get_body().unwrap_or_default();
@@ -259,19 +261,6 @@ pub(crate) fn display_name(name: &str) -> String {
     }
 }
 
-/// Whether `part` is one of a multipart/alternative's versions (the plain
-/// text beside the HTML, not more text of its own).
-fn in_alternative(root: &mailparse::ParsedMail<'_>, part: &mailparse::ParsedMail<'_>) -> bool {
-    fn walk(node: &mailparse::ParsedMail<'_>, target: *const u8, alternative: bool) -> Option<bool> {
-        if node.raw_bytes.as_ptr() == target && node.subparts.is_empty() {
-            return Some(alternative);
-        }
-        let here = node.ctype.mimetype.eq_ignore_ascii_case("multipart/alternative");
-        node.subparts.iter().find_map(|s| walk(s, target, here))
-    }
-    walk(root, part.raw_bytes.as_ptr(), false).unwrap_or(false)
-}
-
 /// The first mailbox of an address list, groups included.
 fn first_mailbox(list: &mailparse::MailAddrList) -> Option<mailparse::SingleInfo> {
     list.iter().find_map(|a| match a {
@@ -309,11 +298,35 @@ pub(crate) fn collect_leaves<'a>(
     p: &'a mailparse::ParsedMail<'a>,
     out: &mut Vec<&'a mailparse::ParsedMail<'a>>,
 ) {
+    let mut marked = Vec::new();
+    collect_marked_leaves(p, false, &mut marked);
+    out.extend(marked.into_iter().map(|(leaf, _)| leaf));
+}
+
+/// The most leaves of a message's MIME tree looked at (`collect_leaves`):
+/// a message of many small parts, well within any size limit, otherwise
+/// costs work and memory for each. Past it, parts are left out, the same
+/// way wherever a part is found again by its index.
+pub(crate) const MAX_LEAVES: usize = 4096;
+
+/// `collect_leaves`, each with whether it is one of a
+/// multipart/alternative's versions (the plain text beside the HTML, not
+/// more text of its own): whether its own parent is one. `alternative`
+/// says whether `p`'s is.
+fn collect_marked_leaves<'a>(
+    p: &'a mailparse::ParsedMail<'a>,
+    alternative: bool,
+    out: &mut Vec<(&'a mailparse::ParsedMail<'a>, bool)>,
+) {
+    if out.len() >= MAX_LEAVES {
+        return;
+    }
     if p.subparts.is_empty() {
-        out.push(p);
+        out.push((p, alternative));
     } else {
+        let here = p.ctype.mimetype.eq_ignore_ascii_case("multipart/alternative");
         for part in &p.subparts {
-            collect_leaves(part, out);
+            collect_marked_leaves(part, here, out);
         }
     }
 }
@@ -736,6 +749,48 @@ mod tests {
         assert_eq!(crate::sync::smtp::flowed("From here\n>quoted"), " From here\r\n> quoted");
     }
     use super::*;
+
+    /// A wide message (thousands of small parts, far within any size
+    /// limit) is read in one walk: the plain text beside the HTML isn't
+    /// shown twice, text after it is; leaves past `MAX_LEAVES` and inline
+    /// parts past `InlineParts::MAX_PARTS` are left out.
+    #[test]
+    fn wide_messages_are_read_in_one_walk_within_a_part_budget() {
+        let mut raw = String::from(
+            "Content-Type: multipart/mixed; boundary=m\r\n\r\n--m\r\nContent-Type: multipart/alternative; boundary=a\r\n\r\n--a\r\nContent-Type: text/plain\r\n\r\nPlain version\r\n--a\r\nContent-Type: text/html\r\n\r\n<p>Rich version</p>\r\n--a--\r\n--m\r\nContent-Type: text/plain\r\n\r\nThe footer\r\n",
+        );
+        for i in 0..MAX_LEAVES + 50 {
+            raw.push_str(&format!(
+                "--m\r\nContent-Type: image/png\r\nContent-ID: <p{i}@x>\r\n\r\npng{i}\r\n"
+            ));
+        }
+        raw.push_str("--m--\r\n");
+        let a = Account::new(Provider::Imap);
+        let m = parse_message(raw.as_bytes(), &a, "id", Folder::Inbox, "INBOX", 1).unwrap();
+        assert_eq!(m.body.as_deref(), Some("Plain version\n\nThe footer"));
+        assert_eq!(m.html.as_deref(), Some("<p>Rich version</p>"));
+        let parsed = mailparse::parse_mail(raw.as_bytes()).unwrap();
+        let mut leaves = Vec::new();
+        collect_leaves(&parsed, &mut leaves);
+        assert_eq!(leaves.len(), MAX_LEAVES);
+        assert!(m.inline.get("cid:p0@x").is_some());
+        assert!(m.inline.get(&format!("cid:p{}@x", InlineParts::MAX_PARTS)).is_none());
+    }
+
+    /// The inline parts' total is kept as parts are added and replaced.
+    #[test]
+    fn inline_parts_keep_their_total() {
+        let mut parts = InlineParts::default();
+        let half = InlineParts::MAX_BYTES / 2;
+        assert!(parts.insert("<a>", vec![0; half]));
+        assert!(parts.insert("<b>", vec![0; half]));
+        assert!(!parts.insert("<c>", vec![0; 1]), "full");
+        // Replacing one counts it once.
+        assert!(parts.insert("<a>", vec![0; half - 10]));
+        assert!(parts.insert("<c>", vec![0; 10]));
+        assert!(!parts.insert("<d>", vec![0; 1]));
+    }
+
     #[test]
     fn retains_html_alternative_without_treating_html_attachments_as_body() {
         let raw = b"Content-Type: multipart/mixed; boundary=m\r\n\r\n--m\r\nContent-Type: multipart/alternative; boundary=a\r\n\r\n--a\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nPlain alternative\r\n--a\r\nContent-Type: text/html; charset=utf-8\r\nContent-Transfer-Encoding: base64\r\n\r\nPGI+UmljaCBhbHRlcm5hdGl2ZTwvYj4=\r\n--a--\r\n--m\r\nContent-Type: text/html; name=attachment.html\r\nContent-Disposition: attachment; filename=attachment.html\r\n\r\n<script>attachment</script>\r\n--m--\r\n";
