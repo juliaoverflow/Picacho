@@ -299,7 +299,11 @@ impl MailApp {
             move |b| b.preview_attached(&a, &m, part),
             move |this, result, cx| {
                 let text = result.unwrap_or_else(|e| format!("{e:#}"));
-                std::rc::Rc::make_mut(&mut this.attached_previews).insert(key.clone(), text);
+                let previews = std::rc::Rc::make_mut(&mut this.attached_previews);
+                if previews.len() >= super::READER_CACHE {
+                    previews.clear();
+                }
+                previews.insert(key.clone(), text);
                 cx.notify();
             },
         );

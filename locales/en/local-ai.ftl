@@ -12,6 +12,8 @@ local-ai-this-messages-sign-in-code-is-2 = This message's sign-in code is hidden
 
 local-ai-code-copied = Code copied
 
+local-ai-the-code-model-isnt-ready = The sign-in code model isn't ready yet, so the code can't be picked out. Show the code to copy it yourself.
+
 local-ai-picacho-forgot-which-replies-you-chose = Picacho forgot which replies you chose and turned away
 
 local-ai-deleted-the = Deleted the { $to_lowercase }

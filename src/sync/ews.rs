@@ -4,7 +4,7 @@
 //!
 //! Signing in is what IIS offers Exchange: NTLM (NTLMv2 only, `ntlm.rs`),
 //! Kerberos (HTTP Negotiate, with the system's ticket, `gss.rs`), Basic
-//! over TLS, or an access token from Microsoft Entra (hybrid modern
+//! over TLS where the account chose it, or an access token from Microsoft Entra (hybrid modern
 //! authentication). NTLM and Negotiate authenticate a connection, so each
 //! request goes through its handshake on one kept connection, one request
 //! at a time; both are bound to the TLS channel and the service (Extended
@@ -527,9 +527,41 @@ fn read(r: reqwest::blocking::Response) -> Result<(u16, Vec<u8>)> {
     Ok((status, out))
 }
 
+/// Where a request goes, which decides whether Basic sign-in (the
+/// password itself) may be sent there.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Reach {
+    /// A server Autodiscover asks. Basic is never sent there: any server
+    /// the address's domain names would otherwise be handed the password.
+    Autodiscover,
+    /// The account's own EWS server. Basic is sent there, over TLS only,
+    /// when the account chose it (`Account::ews_basic`).
+    Server,
+}
+
+/// The server offers only Basic sign-in, which sends the password itself,
+/// and the account hasn't chosen it. Account setup and the account's
+/// settings offer to allow it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BasicOnly;
+impl std::fmt::Display for BasicOnly {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&t!("sync-ews-this-server-accepts-only-basic-sign-in"))
+    }
+}
+impl std::error::Error for BasicOnly {}
+
 /// POSTs `body` to `url`, signed in as `auth`: the answer's status and bytes.
-fn post(http: &reqwest::blocking::Client, url: &str, auth: &Auth, content_type: &str, body: &[u8], binding: &Binding) -> Result<(u16, Vec<u8>)> {
-    read(send(http, url, auth, content_type, body, binding)?)
+fn post(
+    http: &reqwest::blocking::Client,
+    url: &str,
+    auth: &Auth,
+    content_type: &str,
+    body: &[u8],
+    binding: &Binding,
+    reach: Reach,
+) -> Result<(u16, Vec<u8>)> {
+    read(send(http, url, auth, content_type, body, binding, reach, Some(TRANSFER_TIMEOUT))?)
 }
 
 /// POSTs `body` to `url`, signed in as `auth`: the answer, not yet read
@@ -543,12 +575,19 @@ fn send(
     content_type: &str,
     body: &[u8],
     binding: &Binding,
+    reach: Reach,
+    // A request's own time limit, or (None) the client's: a streaming
+    // subscription's client waits as long as the subscription lasts, which
+    // a transfer's limit set here would cut short.
+    timeout: Option<Duration>,
 ) -> Result<reqwest::blocking::Response> {
     let request = |authorization: Option<String>, with_body: bool| -> Result<reqwest::blocking::Response> {
         let mut b = http
             .post(url)
-            .header(reqwest::header::CONTENT_TYPE, content_type)
-            .timeout(TRANSFER_TIMEOUT);
+            .header(reqwest::header::CONTENT_TYPE, content_type);
+        if let Some(timeout) = timeout {
+            b = b.timeout(timeout);
+        }
         if let Some(a) = authorization {
             b = b.header(reqwest::header::AUTHORIZATION, a);
         }
@@ -572,6 +611,8 @@ fn send(
     let host = url::Url::parse(url)?.host_str().unwrap_or_default().to_owned();
     match auth {
         Auth::Basic { user, password } => {
+            // Only to the account's own server, and only over TLS.
+            ensure!(reach == Reach::Server && url.starts_with("https://"), t!("sync-ews-basic-sign-in-is-only-sent-over-https"));
             let token = b64(format!("{user}:{password}").as_bytes());
             checked(request(Some(format!("Basic {token}")), true)?)
         }
@@ -588,11 +629,11 @@ fn send(
                 .collect();
             let _ = read(first)?;
             let offered = schemes.iter().find_map(|v| v.strip_prefix("NTLM ").map(str::to_owned));
-            // A server that takes only Basic (over TLS): the same name and
-            // password, as it asks.
+            // A server that takes only Basic would be sent the password
+            // itself. That is the account's own choice (`Auth::Basic`), never
+            // made here: the server is refused, saying why.
             if offered.is_none() && schemes.iter().any(|v| v.to_ascii_lowercase().starts_with("basic")) {
-                let user = if id.domain.is_empty() { id.user.clone() } else { format!("{}\\{}", id.domain, id.user) };
-                return send(http, url, &Auth::Basic { user, password: id.password.clone() }, content_type, body, binding);
+                return Err(anyhow::Error::new(BasicOnly));
             }
             let challenge = ntlm::parse_challenge(&unb64(&offered.ok_or_else(refused)?)?)?;
             let bound = binding.lock().unwrap().clone();
@@ -659,7 +700,7 @@ impl Session {
         let envelope = Self::envelope(body);
         let (status, bytes) = {
             let _one = self.one_at_a_time.lock().unwrap_or_else(|e| e.into_inner());
-            post(&self.http, &self.url, &self.auth, "text/xml; charset=utf-8", envelope.as_bytes(), &self.binding)?
+            post(&self.http, &self.url, &self.auth, "text/xml; charset=utf-8", envelope.as_bytes(), &self.binding, Reach::Server)?
         };
         let answer = String::from_utf8_lossy(&bytes).into_owned();
         checked(status, answer, allow)
@@ -1328,7 +1369,7 @@ impl Session {
                 "<m:GetStreamingEvents><m:SubscriptionIds><t:SubscriptionId>{}</t:SubscriptionId></m:SubscriptionIds><m:ConnectionTimeout>{minutes}</m:ConnectionTimeout></m:GetStreamingEvents>",
                 esc(&subscription)
             ));
-            let mut response = send(&http, &self.url, &self.auth, "text/xml; charset=utf-8", request.as_bytes(), &self.binding)?;
+            let mut response = send(&http, &self.url, &self.auth, "text/xml; charset=utf-8", request.as_bytes(), &self.binding, Reach::Server, None)?;
             if response.status().as_u16() != 200 {
                 let (status, body) = read(response)?;
                 checked(status, String::from_utf8_lossy(&body).into_owned(), &[])?;
@@ -1561,6 +1602,9 @@ fn autodiscover_with(email: &str, auth: &Auth, tls: native_tls::TlsConnector, pl
     };
     let mut refused = None;
     let mut address = email.to_owned();
+    // The address's own domain: answers may send the question (and with
+    // it the password) on only within it, or to Microsoft's cloud.
+    let home = email.rsplit_once('@').map(|(_, d)| d.to_ascii_lowercase()).context("not an address")?;
     let mut asked: Vec<String> = Vec::new();
     'addresses: for _ in 0..10 {
         let domain = address.rsplit_once('@').map(|(_, d)| d.to_ascii_lowercase()).context("not an address")?;
@@ -1580,7 +1624,7 @@ fn autodiscover_with(email: &str, auth: &Auth, tls: native_tls::TlsConnector, pl
             asked.push(format!("{address} {url}"));
             // A connection's binding is its own server's.
             let binding = Binding::default();
-            let found = match post(&http, &url, auth, "text/xml; charset=utf-8", pox_request(&address).as_bytes(), &binding) {
+            let found = match post(&http, &url, auth, "text/xml; charset=utf-8", pox_request(&address).as_bytes(), &binding, Reach::Autodiscover) {
                 Ok((200, body)) => match pox_answer(&String::from_utf8_lossy(&body)) {
                     Found::Nothing => soap_autodiscover(&http, &url, auth, &address, &binding),
                     found => found,
@@ -1594,11 +1638,27 @@ fn autodiscover_with(email: &str, auth: &Auth, tls: native_tls::TlsConnector, pl
             };
             match found {
                 Found::Ews(url) => return Ok(Some(url)),
-                Found::Address(next) if next.contains('@') && !next.eq_ignore_ascii_case(&address) => {
+                Found::Address(next)
+                    if next.contains('@')
+                        && !next.eq_ignore_ascii_case(&address)
+                        && next.rsplit_once('@').is_some_and(|(_, d)| autodiscover_vouched(d, &home)) =>
+                {
                     address = next;
                     continue 'addresses;
                 }
-                Found::Server(next) if next.starts_with("https://") || (cfg!(test) && next.starts_with("http://")) => queue.push_front(next),
+                Found::Server(next)
+                    if (next.starts_with("https://") || (cfg!(test) && next.starts_with("http://")))
+                        && url::Url::parse(&next).ok().is_some_and(|u| {
+                            u.host_str().is_some_and(|h| autodiscover_vouched(h, &home))
+                                && (crate::sync::discover::in_domain(u.host_str().unwrap_or_default(), &home)
+                                    || !crate::sync::public_net::reaches_inside(&u))
+                        }) =>
+                {
+                    queue.push_front(next)
+                }
+                // Anywhere else, the server that said so may not be the
+                // address's: a website on its domain, or one taken over.
+                // The password isn't sent there; the server can be entered.
                 _ => {}
             }
         }
@@ -1609,6 +1669,42 @@ fn autodiscover_with(email: &str, auth: &Auth, tls: native_tls::TlsConnector, pl
         None => Ok(None),
     }
 }
+/// Microsoft's own cloud, where Exchange Online's Autodiscover sends an
+/// address's question on (a hybrid organization's `redirectAddr` to its
+/// `onmicrosoft.com` address, then `redirectUrl` to `outlook.com`).
+const MICROSOFT_AUTODISCOVER: &[&str] = &[
+    "onmicrosoft.com",
+    "outlook.com",
+    "office365.com",
+    "office.com",
+    "microsoft.com",
+    "microsoftonline.com",
+    "office365.us",
+    "partner.outlook.cn",
+];
+
+/// Whether an Autodiscover answer may send the question, and the password,
+/// on to `host` (a server, or an address's domain) for an address in
+/// `home`: within `home`'s registered domain (by the Public Suffix List),
+/// or Microsoft's cloud. Any other is refused: whoever answers at `home`
+/// (often a website host) isn't thereby trusted with the password elsewhere.
+fn autodiscover_vouched(host: &str, home: &str) -> bool {
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    let home = home.trim_end_matches('.').to_ascii_lowercase();
+    if crate::sync::discover::in_domain(&host, &home) {
+        return true;
+    }
+    // This computer's test servers, by address.
+    if cfg!(test) && host == "127.0.0.1" {
+        return true;
+    }
+    let ip = |h: &str| h.trim_start_matches('[').trim_end_matches(']').parse::<std::net::IpAddr>().is_ok();
+    (!ip(&host) && !ip(&home) && psl::domain_str(&host).is_some_and(|d| Some(d) == psl::domain_str(&home)))
+        || MICROSOFT_AUTODISCOVER
+            .iter()
+            .any(|d| crate::sync::discover::in_domain(&host, d))
+}
+
 /// A POX Autodiscover answer: the EWS address, or where to ask instead.
 fn pox_answer(xml: &str) -> Found {
     if let Some(url) = ews_url_in(xml) {
@@ -1631,7 +1727,7 @@ fn soap_autodiscover(http: &reqwest::blocking::Client, pox_url: &str, auth: &Aut
         esc(&url),
         esc(address)
     );
-    match post(http, &url, auth, "text/xml; charset=utf-8", request.as_bytes(), binding) {
+    match post(http, &url, auth, "text/xml; charset=utf-8", request.as_bytes(), binding, Reach::Autodiscover) {
         Ok((200, body)) => soap_answer(&String::from_utf8_lossy(&body)),
         _ => Found::Nothing,
     }

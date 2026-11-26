@@ -545,10 +545,18 @@ impl Backend {
         );
         let count = added.len();
         let mut all = self.contacts();
-        for card in added {
-            all.retain(|c| c.uid != card.uid);
-            all.push(card);
-        }
+        // As if each card in turn replaced any of its uid (the last of a
+        // uid imported twice standing): by an index, not by going through
+        // every contact again for each card imported.
+        let last: HashMap<String, usize> = added.iter().enumerate().map(|(i, c)| (c.uid.clone(), i)).collect();
+        all.retain(|c| !last.contains_key(&c.uid));
+        all.extend(
+            added
+                .into_iter()
+                .enumerate()
+                .filter(|(i, c)| last.get(&c.uid) == Some(i))
+                .map(|(_, c)| c),
+        );
         self.save_contacts(&all)?;
         Ok(count)
     }

@@ -29,6 +29,7 @@ extern void picacho_ios_app_launched(void);
 extern void picacho_ios_scene_started(void);
 extern void picacho_ios_scene_backgrounded(void);
 extern void picacho_ios_collect_shares(void);
+extern bool picacho_ios_privacy_cover(void);
 
 // Opens `url`: a share the Share extension handed over
 // (<scheme>://share/<id>) is taken here; the rest go to GPUI (sign-in
@@ -48,6 +49,8 @@ static void openURL(NSURL *url) {
 @property(nonatomic, strong) UIWindow *window;
 @property(nonatomic, strong) CADisplayLink *link;
 @property(nonatomic) void *gpuiWindow;
+// Over the window while Picacho is away with the app lock on.
+@property(nonatomic, strong) UIView *privacyCover;
 - (void)tick:(CADisplayLink *)link;
 @end
 
@@ -164,12 +167,26 @@ static void wake(void *context) {
 - (void)sceneDidBecomeActive:(UIScene *)scene {
     gpui_ios_did_become_active(NULL);
     self.link.paused = NO;
+    [self.privacyCover removeFromSuperview];
+    self.privacyCover = nil;
     // A share the extension couldn't open Picacho for.
     picacho_ios_collect_shares();
 }
 
 - (void)sceneWillResignActive:(UIScene *)scene {
     gpui_ios_will_resign_active(NULL);
+    // With the app lock on, a cover of UIKit's own over the window before
+    // iOS pictures it for the app switcher: GPUI's privacy cover needs a
+    // frame drawn, and the display link stops as Picacho goes to the
+    // background, so the picture could show the mail.
+    if (picacho_ios_privacy_cover() && self.privacyCover == nil && self.window != nil) {
+        UIVisualEffectView *cover = [[UIVisualEffectView alloc]
+            initWithEffect:[UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemMaterial]];
+        cover.frame = self.window.bounds;
+        cover.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+        [self.window addSubview:cover];
+        self.privacyCover = cover;
+    }
 }
 
 - (void)sceneDidEnterBackground:(UIScene *)scene {

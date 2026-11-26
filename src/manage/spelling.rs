@@ -24,11 +24,17 @@ pub trait Speller: Send + Sync {
 pub struct Spelling {
     speller: Option<Arc<dyn Speller>>,
     known: Mutex<HashMap<String, bool>>,
-    /// Words learned here, and where they are kept.
-    personal: Mutex<HashSet<String>>,
-    personal_path: Mutex<Option<std::path::PathBuf>>,
+    /// Words learned here, and where they are kept: under one lock, so
+    /// that reading them and learning one can't each hold half.
+    personal: Mutex<Personal>,
     /// Words to let be, this session.
     ignored: Mutex<HashSet<String>>,
+}
+
+#[derive(Default)]
+struct Personal {
+    words: HashSet<String>,
+    path: Option<std::path::PathBuf>,
 }
 
 static SPELLING: OnceLock<Spelling> = OnceLock::new();
@@ -38,8 +44,7 @@ pub fn spelling() -> &'static Spelling {
     SPELLING.get_or_init(|| Spelling {
         speller: platform(),
         known: Mutex::new(HashMap::new()),
-        personal: Mutex::new(HashSet::new()),
-        personal_path: Mutex::new(None),
+        personal: Mutex::new(Personal::default()),
         ignored: Mutex::new(HashSet::new()),
     })
 }
@@ -51,15 +56,16 @@ impl Spelling {
     }
     /// Keeps learned words in `path` (one per line), reading those there.
     pub fn use_personal(&self, path: std::path::PathBuf) {
-        let mut current = self.personal_path.lock().unwrap();
-        if current.as_ref() == Some(&path) {
+        let mut personal = self.personal.lock().unwrap_or_else(|e| e.into_inner());
+        if personal.path.as_ref() == Some(&path) {
             return;
         }
         if let Ok(text) = std::fs::read_to_string(&path) {
-            let mut personal = self.personal.lock().unwrap();
-            personal.extend(text.lines().map(str::trim).filter(|w| !w.is_empty()).map(str::to_owned));
+            personal
+                .words
+                .extend(text.lines().map(str::trim).filter(|w| !w.is_empty()).map(str::to_owned));
         }
-        *current = Some(path);
+        personal.path = Some(path);
     }
     /// Whether `word` reads as a mistake: unknown to the checker, and not
     /// learned or ignored. Never for what isn't a word to check (numbers,
@@ -69,7 +75,9 @@ impl Spelling {
         if !checkable(word) {
             return false;
         }
-        if self.personal.lock().unwrap().contains(word) || self.ignored.lock().unwrap().contains(word) {
+        if self.personal.lock().unwrap_or_else(|e| e.into_inner()).words.contains(word)
+            || self.ignored.lock().unwrap().contains(word)
+        {
             return false;
         }
         if let Some(&ok) = self.known.lock().unwrap().get(word) {
@@ -96,11 +104,12 @@ impl Spelling {
             speller.learn(word);
         }
         self.known.lock().unwrap().insert(word.to_owned(), true);
-        let mut personal = self.personal.lock().unwrap();
-        if personal.insert(word.to_owned())
-            && let Some(path) = self.personal_path.lock().unwrap().as_ref()
+        let mut personal = self.personal.lock().unwrap_or_else(|e| e.into_inner());
+        let Personal { words, path } = &mut *personal;
+        if words.insert(word.to_owned())
+            && let Some(path) = path.as_ref()
         {
-            let mut words: Vec<&String> = personal.iter().collect();
+            let mut words: Vec<&String> = words.iter().collect();
             words.sort();
             let text: String = words.iter().map(|w| format!("{w}\n")).collect();
             if let Err(e) = std::fs::write(path, text) {
@@ -215,86 +224,157 @@ mod mac {
 
 /// Windows' spell checking API (Windows 8 and later), in the languages
 /// set in Settings → Time & language.
+///
+/// The checkers are COM objects made in a single-threaded apartment, which
+/// may only be called from the thread that made them: one thread of their
+/// own makes them and answers every question, in turn, over a channel. They
+/// never leave it, and composers on any thread just wait for its answer.
 #[cfg(windows)]
 mod windows_speller {
+    use std::sync::{Mutex, mpsc};
     use windows::Win32::Globalization::{ISpellChecker, ISpellCheckerFactory, SpellCheckerFactory};
-    use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx};
+    use windows::Win32::System::Com::{
+        CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx, CoUninitialize,
+    };
     use windows::core::{HSTRING, PCWSTR};
 
-    pub struct System {
-        checkers: Vec<ISpellChecker>,
+    enum Ask {
+        Correct(String, mpsc::Sender<bool>),
+        Suggest(String, mpsc::Sender<Vec<String>>),
+        Learn(String),
     }
 
-    // The checkers are free-threaded COM objects.
-    unsafe impl Send for System {}
-    unsafe impl Sync for System {}
+    pub struct System {
+        asks: Mutex<mpsc::Sender<Ask>>,
+    }
 
     impl System {
         pub fn new() -> Option<Self> {
-            unsafe {
-                let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
-                let factory: ISpellCheckerFactory = CoCreateInstance(&SpellCheckerFactory, None, CLSCTX_INPROC_SERVER).ok()?;
-                let mut languages = Vec::new();
-                for tag in super::languages() {
-                    let tag = HSTRING::from(tag.replace('_', "-"));
-                    if factory.IsSupported(PCWSTR(tag.as_ptr())).is_ok_and(|b| b.as_bool()) {
-                        languages.push(tag);
+            let (asks, questions) = mpsc::channel::<Ask>();
+            let (ready_tx, ready) = mpsc::channel::<bool>();
+            std::thread::Builder::new()
+                .name("spelling".into())
+                .spawn(move || {
+                    // SAFETY: this thread's own apartment, entered once and
+                    // left when the thread ends; the checkers are made, used
+                    // and dropped here only.
+                    let entered = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }.is_ok();
+                    {
+                        let checkers = make_checkers();
+                        let _ = ready_tx.send(!checkers.is_empty());
+                        if !checkers.is_empty() {
+                            for ask in questions {
+                                match ask {
+                                    Ask::Correct(word, answer) => {
+                                        let _ = answer.send(correct(&checkers, &word));
+                                    }
+                                    Ask::Suggest(word, answer) => {
+                                        let _ = answer.send(suggest(&checkers, &word));
+                                    }
+                                    Ask::Learn(word) => learn(&checkers, &word),
+                                }
+                            }
+                        }
                     }
+                    if entered {
+                        unsafe { CoUninitialize() };
+                    }
+                })
+                .ok()?;
+            ready.recv().unwrap_or(false).then(|| System { asks: Mutex::new(asks) })
+        }
+        fn ask(&self, ask: Ask) -> bool {
+            self.asks.lock().unwrap_or_else(|e| e.into_inner()).send(ask).is_ok()
+        }
+    }
+
+    fn make_checkers() -> Vec<ISpellChecker> {
+        unsafe {
+            let Ok(factory) =
+                CoCreateInstance::<_, ISpellCheckerFactory>(&SpellCheckerFactory, None, CLSCTX_INPROC_SERVER)
+            else {
+                return Vec::new();
+            };
+            let mut languages = Vec::new();
+            for tag in super::languages() {
+                let tag = HSTRING::from(tag.replace('_', "-"));
+                if factory.IsSupported(PCWSTR(tag.as_ptr())).is_ok_and(|b| b.as_bool()) {
+                    languages.push(tag);
                 }
-                if languages.is_empty() {
-                    languages.push(HSTRING::from("en-US"));
+            }
+            if languages.is_empty() {
+                languages.push(HSTRING::from("en-US"));
+            }
+            languages
+                .iter()
+                .filter_map(|tag| factory.CreateSpellChecker(PCWSTR(tag.as_ptr())).ok())
+                .collect()
+        }
+    }
+
+    fn correct(checkers: &[ISpellChecker], word: &str) -> bool {
+        let text = HSTRING::from(word);
+        checkers.iter().any(|c| unsafe {
+            // No errors listed: right in this language.
+            match c.Check(PCWSTR(text.as_ptr())) {
+                Ok(errors) => {
+                    let mut error = None;
+                    errors.Next(&mut error).is_err() || error.is_none()
                 }
-                let checkers: Vec<ISpellChecker> = languages
-                    .iter()
-                    .filter_map(|tag| factory.CreateSpellChecker(PCWSTR(tag.as_ptr())).ok())
-                    .collect();
-                (!checkers.is_empty()).then_some(System { checkers })
+                Err(_) => true,
+            }
+        })
+    }
+
+    fn suggest(checkers: &[ISpellChecker], word: &str) -> Vec<String> {
+        let text = HSTRING::from(word);
+        let mut out = Vec::new();
+        for c in checkers {
+            unsafe {
+                let Ok(list) = c.Suggest(PCWSTR(text.as_ptr())) else { continue };
+                loop {
+                    let mut item = [windows::core::PWSTR::null()];
+                    let mut fetched = 0;
+                    if list.Next(&mut item, Some(&mut fetched)).is_err() || fetched == 0 {
+                        break;
+                    }
+                    if let Ok(s) = item[0].to_string() {
+                        out.push(s);
+                    }
+                    windows::Win32::System::Com::CoTaskMemFree(Some(item[0].0 as _));
+                }
+            }
+        }
+        out
+    }
+
+    fn learn(checkers: &[ISpellChecker], word: &str) {
+        let text = HSTRING::from(word);
+        if let Some(c) = checkers.first() {
+            unsafe {
+                let _ = c.Add(PCWSTR(text.as_ptr()));
             }
         }
     }
 
     impl super::Speller for System {
         fn correct(&self, word: &str) -> bool {
-            let text = HSTRING::from(word);
-            self.checkers.iter().any(|c| unsafe {
-                // No errors listed: right in this language.
-                match c.Check(PCWSTR(text.as_ptr())) {
-                    Ok(errors) => {
-                        let mut error = None;
-                        errors.Next(&mut error).is_err() || error.is_none()
-                    }
-                    Err(_) => true,
-                }
-            })
+            let (tx, rx) = mpsc::channel();
+            // Unanswered (the thread gone): not marked as a mistake.
+            if !self.ask(Ask::Correct(word.to_owned(), tx)) {
+                return true;
+            }
+            rx.recv().unwrap_or(true)
         }
         fn suggest(&self, word: &str) -> Vec<String> {
-            let text = HSTRING::from(word);
-            let mut out = Vec::new();
-            for c in &self.checkers {
-                unsafe {
-                    let Ok(list) = c.Suggest(PCWSTR(text.as_ptr())) else { continue };
-                    loop {
-                        let mut item = [windows::core::PWSTR::null()];
-                        let mut fetched = 0;
-                        if list.Next(&mut item, Some(&mut fetched)).is_err() || fetched == 0 {
-                            break;
-                        }
-                        if let Ok(s) = item[0].to_string() {
-                            out.push(s);
-                        }
-                        windows::Win32::System::Com::CoTaskMemFree(Some(item[0].0 as _));
-                    }
-                }
+            let (tx, rx) = mpsc::channel();
+            if !self.ask(Ask::Suggest(word.to_owned(), tx)) {
+                return Vec::new();
             }
-            out
+            rx.recv().unwrap_or_default()
         }
         fn learn(&self, word: &str) {
-            let text = HSTRING::from(word);
-            if let Some(c) = self.checkers.first() {
-                unsafe {
-                    let _ = c.Add(PCWSTR(text.as_ptr()));
-                }
-            }
+            self.ask(Ask::Learn(word.to_owned()));
         }
     }
 }

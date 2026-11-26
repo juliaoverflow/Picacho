@@ -13,6 +13,17 @@ same version in `Cargo.toml`.
 
 ### Added
 
+- Start in the background when you sign in (Settings → General): Picacho
+  starts with your computer without a window, showing its tray icon and
+  checking for mail. Turning off running in the background turns it off too.
+- Closing Picacho blurs its window behind "Closing Picacho…" or "Moving
+  Picacho to the background…" until it's gone, while it saves and tidies
+  its cache. (On macOS and Windows the window is covered without the blur.)
+- On Linux, the dock or task manager shows Picacho as starting from the
+  moment it's launched until its window opens, also when it was running in
+  the background.
+- Opening Picacho from its tray icon brings the window to the front on
+  Wayland, and the icon pulses until the window opens.
 - Tasks on JMAP servers (JMAP for Task Lists): with calendars from a JMAP
   account, its open tasks are listed in Settings → Calendar and can be
   added, edited, marked done and deleted, as on CalDAV servers. A repeating
@@ -51,9 +62,12 @@ same version in `Cargo.toml`.
   not drafts; new mail is noticed within half a minute. An existing
   account switches either way in its Settings.
 - Exchange Server in an organization's own data center, through Exchange
-  Web Services: found by Autodiscover, signed in with NTLMv2, Kerberos or
-  Basic, or through Microsoft Entra where the organization uses hybrid
-  modern authentication. Mail, folders, drafts, sending and scheduled
+  Web Services: found by Autodiscover, signed in with NTLMv2 or Kerberos,
+  or through Microsoft Entra where the organization uses hybrid modern
+  authentication. A server that offers only Basic sign-in, which sends the
+  password itself, is used only once you turn on **Allow Basic sign-in**
+  (offered when adding the account, and in its Settings), and only over
+  HTTPS. Mail, folders, drafts, sending and scheduled
   sending, inbox rules and Out of Office, calendars (with availability),
   contacts and the organization's directory. New mail is noticed as it
   arrives (Exchange's streaming notifications). Servers requiring Extended
@@ -500,6 +514,22 @@ same version in `Cargo.toml`.
 
 ### Security
 
+- Exchange accounts no longer fall back to Basic sign-in on their own,
+  which sent the password itself to any server that left out NTLM. Where
+  your Exchange server offers only Basic, Picacho now says so and syncing
+  stops until you turn on **Allow Basic sign-in** in the account's
+  Settings. Autodiscover never sends Basic.
+- An Autocrypt header, which anyone can forge, no longer replaces a
+  contact's OpenPGP key found on their domain or a keyserver, so a forged
+  message can't have mail you encrypt go to someone else's key. Keys from
+  Autocrypt headers are limited in size and number.
+- An inline PGP message's attachments that its signature or encryption
+  doesn't cover are named in the message details, which no longer show the
+  message as fully signed or encrypted.
+- CardDAV and CalDAV send your password only to the server's own site,
+  even when the server names an address elsewhere.
+- Release builds ignore environment variables that would point sign-in and
+  Pinal Mail at other servers.
 - A received message's Message-ID, read-receipt address or invitation
   organizer can no longer add headers to the read receipts, replies and
   calendar answers Picacho sends.
@@ -527,6 +557,12 @@ same version in `Cargo.toml`.
 
 ### Performance
 
+- Reading and downloading mail no longer reads every OpenPGP key again
+  for each message, and other people's keys are kept in the database
+  rather than rewritten whole into the system keychain for each new one.
+- Verification results are kept for recently read messages only, and
+  pictures in quoted replies are decoded within the same limits as
+  attachment previews.
 - An open email's thread, and Proton and JMAP accounts' watches, sleep
   instead of waking several times a second.
 - Syncing Proton and JMAP accounts, marking a mailbox read and emptying a

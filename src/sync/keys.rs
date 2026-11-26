@@ -54,14 +54,30 @@ pub fn wkd_urls(email: &str) -> Option<[String; 2]> {
     ])
 }
 
+/// The client for key lookups. Their addresses come from correspondents'
+/// domains, anyone's to choose: only servers on the internet
+/// (`public_net::PublicOnly`), redirected only there, over https.
 fn http(tls: native_tls::TlsConnector) -> Result<reqwest::blocking::Client> {
     Ok(reqwest::blocking::Client::builder()
         .use_preconfigured_tls(tls)
         .timeout(Duration::from_secs(10))
         .connect_timeout(Duration::from_secs(6))
         .https_only(true)
+        .dns_resolver(std::sync::Arc::new(super::public_net::PublicOnly))
+        .redirect(super::public_net::public_redirects(5))
         .user_agent(concat!("Picacho/", env!("CARGO_PKG_VERSION")))
         .build()?)
+}
+
+/// GETs `url` unless it would reach this computer or its network: a host
+/// given as such an address, or a name a proxy would lead there
+/// (`public_net::reaches_inside`), which the resolver doesn't see.
+fn get(client: &reqwest::blocking::Client, url: &str) -> Option<reqwest::blocking::Response> {
+    let parsed = url::Url::parse(url).ok()?;
+    if super::public_net::reaches_inside(&parsed) {
+        return None;
+    }
+    client.get(parsed).send().ok()
 }
 
 /// The most a key lookup reads: keys are a few kilobytes, and a server
@@ -130,15 +146,12 @@ pub fn lookup(email: &str, tls: native_tls::TlsConnector) -> Result<Option<(Vec<
         // domain with the openpgpkey subdomain (its policy file there)
         // answers for its keys there alone (§3.1).
         let advanced = format!("https://openpgpkey.{domain}/.well-known/openpgpkey/{domain}/policy");
-        let advanced_set_up = client
-            .get(&advanced)
-            .send()
-            .is_ok_and(|r| r.status().is_success());
+        let advanced_set_up = get(&client, &advanced).is_some_and(|r| r.status().is_success());
         for (i, url) in urls.into_iter().enumerate() {
             if i == 1 && advanced_set_up {
                 break;
             }
-            if let Ok(response) = client.get(&url).send()
+            if let Some(response) = get(&client, &url)
                 && response.status().is_success()
             {
                 let bytes = limited(response)?;

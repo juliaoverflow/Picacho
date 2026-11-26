@@ -144,6 +144,22 @@ pub struct Read {
     pub whole: bool,
 }
 
+/// Whether `href`, which a server named, is on the same site as `base`,
+/// the address it was asked at: the same scheme, and the same host or
+/// registrable domain (`p42-caldav.icloud.com` for `caldav.icloud.com`).
+/// The account's password goes with every request, and hrefs can name any
+/// address; redirects already stay on the host.
+pub fn same_site(href: &url::Url, base: &url::Url) -> bool {
+    if href.scheme() != base.scheme() {
+        return false;
+    }
+    let (Some(url::Host::Domain(a)), Some(url::Host::Domain(b))) = (href.host(), base.host()) else {
+        return href.host() == base.host() && href.port_or_known_default() == base.port_or_known_default();
+    };
+    let (a, b) = (a.trim_end_matches('.').to_ascii_lowercase(), b.trim_end_matches('.').to_ascii_lowercase());
+    a == b || psl::domain_str(&a).is_some_and(|d| Some(d) == psl::domain_str(&b))
+}
+
 /// Whether `href` is a resource in `collection`.
 pub fn in_collection(href: &str, collection: &url::Url) -> bool {
     let Ok(href) = url::Url::parse(href) else {
@@ -753,6 +769,7 @@ impl Client {
         let mut out: Vec<url::Url> = Vec::new();
         for h in hrefs_in(doc.root(), property) {
             if let Ok(u) = url.join(&h)
+                && same_site(&u, url)
                 && !out.contains(&u)
             {
                 out.push(u);
@@ -778,6 +795,9 @@ impl Client {
                 continue;
             }
             let Ok(url) = home.join(&href) else { continue };
+            if !same_site(&url, home) {
+                continue;
+            }
             // Without a privilege set, assume it can be written.
             let privileges: Vec<&str> = response
                 .descendants()
@@ -882,6 +902,9 @@ impl Client {
             let Ok(href) = collection.join(&href) else {
                 continue;
             };
+            if !same_site(&href, collection) {
+                continue;
+            }
             out.push(Resource {
                 href,
                 etag: text_of(response, "getetag").unwrap_or_default(),
@@ -1490,6 +1513,9 @@ fn parse_changes(collection: &url::Url, text: &str) -> Result<(Changes, bool)> {
         let Ok(url) = collection.join(&href) else {
             continue;
         };
+        if !same_site(&url, collection) {
+            continue;
+        }
         // The collection itself may be listed; it isn't one of its items,
         // but its 507 says the answer was cut short.
         if url.path().trim_end_matches('/') == collection.path().trim_end_matches('/') {
@@ -1614,24 +1640,22 @@ impl std::fmt::Display for Moved {
 }
 impl std::error::Error for Moved {}
 
-/// Whether `to` is in the same domain as `from`: the same host, one under
-/// it, or one under its parent domain where that is more than a
-/// top-level one (`p12-caldav.icloud.com` for `caldav.icloud.com`, not
-/// `evil.com` for `dav.example.com`'s `com`).
+/// Whether `to` is in the same domain as `from`: the same host, or one in
+/// the same registered domain by the Public Suffix List (`p12-caldav.icloud.com`
+/// for `caldav.icloud.com`; not `evil.co.uk` for `example.co.uk`, nor another
+/// customer's `b.synology.me` for `a.synology.me`, whose suffixes are
+/// shared by many owners), as `same_site` and JMAP's redirects judge.
 fn same_domain(from: &str, to: &str) -> bool {
     let (from, to) = (from.trim_end_matches('.').to_ascii_lowercase(), to.trim_end_matches('.').to_ascii_lowercase());
     if from.is_empty() || to.is_empty() {
         return false;
     }
-    let under = |d: &str| to == d || to.ends_with(&format!(".{d}"));
-    // The parent only where it is clearly a registered domain: three or
-    // more labels left of a two-letter country code's second level
-    // (`co.uk`, `com.au`) aren't counted as one.
-    let parent = from.split_once('.').map(|(_, p)| p).filter(|p| {
-        let labels: Vec<&str> = p.split('.').collect();
-        labels.len() >= 2 && !(labels.len() == 2 && labels[1].len() == 2 && labels[0].len() <= 3)
-    });
-    under(&from) || parent.is_some_and(under)
+    if from == to {
+        return true;
+    }
+    // Addresses have no domain: only the same one (above).
+    let ip = |h: &str| h.trim_start_matches('[').trim_end_matches(']').parse::<std::net::IpAddr>().is_ok();
+    !ip(&from) && !ip(&to) && psl::domain_str(&from).is_some_and(|d| Some(d) == psl::domain_str(&to))
 }
 
 /// Where discovery starts for the address `given` (RFC 6764): the address
@@ -2154,6 +2178,14 @@ mod tests {
         assert!(!same_domain("example.co.uk", "evil.co.uk"));
         assert!(same_domain("example.co.uk", "dav.example.co.uk"));
         assert!(!same_domain("localhost", "127.0.0.1"));
+        // Suffixes many owners share are no one's domain.
+        assert!(!same_domain("alice.synology.me", "mallory.synology.me"));
+        assert!(!same_domain("a.herokuapp.com", "b.herokuapp.com"));
+        assert!(!same_domain("site.github.io", "other.github.io"));
+        assert!(!same_domain("mairie.gouv.fr", "evil.gouv.fr"));
+        assert!(!same_domain("x.govt.nz", "y.govt.nz"));
+        assert!(same_domain("alice.synology.me", "dav.alice.synology.me"));
+        assert!(!same_domain("127.0.0.1", "10.0.0.1"));
         let principal = "<d:multistatus xmlns:d=\"DAV:\"><d:response><d:href>/</d:href><d:propstat><d:prop><d:current-user-principal><d:href>/p/ana/</d:href></d:current-user-principal></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response></d:multistatus>";
         // Another port, the same host: redirected there and followed.
         let (target, target_server) = test_server(1, move |_, path, _| {
@@ -2200,5 +2232,24 @@ mod tests {
         assert_eq!(paths, ["/home1/work/", "/home2/shared/"]);
         assert_eq!(server.join().unwrap().len(), 6);
         Ok(())
+    }
+
+    /// Hrefs a server names are followed (with the password) only on its
+    /// own site: the same host or registrable domain, and scheme.
+    #[test]
+    fn hrefs_stay_on_the_servers_site() {
+        let u = |s: &str| url::Url::parse(s).unwrap();
+        let base = u("https://caldav.icloud.com/123/principal/");
+        assert!(same_site(&u("https://p42-caldav.icloud.com/123/calendars/"), &base));
+        assert!(same_site(&u("https://CALDAV.icloud.com./x"), &base));
+        assert!(!same_site(&u("https://evil.example/123/"), &base));
+        assert!(!same_site(&u("http://caldav.icloud.com/123/"), &base));
+        assert!(!same_site(&u("https://icloud.com.evil.example/"), &base));
+        // A public suffix shared is no site shared.
+        assert!(!same_site(&u("https://alice.github.io/"), &u("https://bob.github.io/")));
+        // Addresses by number: the same one, and port.
+        assert!(same_site(&u("http://127.0.0.1:8080/a"), &u("http://127.0.0.1:8080/b")));
+        assert!(!same_site(&u("http://127.0.0.1:8081/a"), &u("http://127.0.0.1:8080/b")));
+        assert!(!same_site(&u("http://10.0.0.1/a"), &u("http://127.0.0.1/b")));
     }
 }

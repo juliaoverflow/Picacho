@@ -57,6 +57,7 @@ pub(super) fn combine(outer: Verdict, inner: Verdict) -> Verdict {
         decrypted: outer.decrypted || inner.decrypted,
         signature: stronger(outer.signature, inner.signature),
         from_mismatch: inner.from_mismatch.or(outer.from_mismatch),
+        uncovered: [outer.uncovered, inner.uncovered].concat(),
     }
 }
 
@@ -152,26 +153,44 @@ pub(super) fn message_signature(message: &Message<'_>, public: &[SignedPublicKey
     signature
 }
 
-/// The keys in `public` whose signature on a message read to its end
-/// checks out, on any signed layer: who vouches for its protected From
-/// (RFC 9788 §4.4.1.2).
-pub(super) fn message_signers<'k>(message: &Message<'_>, public: &'k [SignedPublicKey]) -> Vec<&'k SignedPublicKey> {
+/// `message_signature`, together with the keys in `public` whose signature
+/// on a message read to its end checks out, on any signed layer: who
+/// vouches for its protected From (RFC 9788 §4.4.1.2). One pass: each
+/// signature's signers are looked up, and each candidate checked, once.
+pub(super) fn message_signature_and_signers<'k>(
+    message: &Message<'_>,
+    public: &'k [SignedPublicKey],
+    from: Option<&str>,
+) -> (Signature, Vec<&'k SignedPublicKey>) {
+    let mut signature = Signature::None;
     let mut out: Vec<&SignedPublicKey> = Vec::new();
     let mut layer = message;
     while let Message::Signed { reader, .. } = layer {
+        let mut verdicts = Vec::new();
         for index in 0..reader.num_signatures() {
             let Some(made) = reader.signature(index) else { continue };
-            for (key, verifier) in &super::signers::signers(made, public).keys {
-                if layer.verify_nested_explicit(index, verifier.as_dyn()).is_ok()
-                    && !out.iter().any(|k| std::ptr::eq(*k, *key))
-                {
-                    out.push(key);
+            let candidates = super::signers::signers(made, public);
+            let mut made_by = None;
+            for (key, verifier) in &candidates.keys {
+                if layer.verify_nested_explicit(index, verifier.as_dyn()).is_ok() {
+                    made_by.get_or_insert(*key);
+                    if !out.iter().any(|k| std::ptr::eq(*k, *key)) {
+                        out.push(key);
+                    }
                 }
             }
+            verdicts.push(super::signers::judged(made, &candidates, made_by, from));
         }
+        let verdict = verdicts
+            .iter()
+            .find(|s| matches!(s, Signature::Good(_) | Signature::OtherSender(_)))
+            .or(verdicts.first())
+            .cloned()
+            .unwrap_or(Signature::UnknownKey);
+        signature = stronger(signature, verdict);
         layer = reader.get_ref();
     }
-    out
+    (signature, out)
 }
 
 #[cfg(test)]

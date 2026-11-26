@@ -133,8 +133,14 @@ pub(super) fn group(messages: &[Mail], rows: &[usize]) -> (Vec<usize>, HashMap<u
     let mut by_thread: HashMap<(&str, &str), Vec<usize>> = HashMap::new();
     let mut by_id: HashMap<(&str, String), Vec<usize>> = HashMap::new();
     let mut referring: HashMap<(&str, String), Vec<usize>> = HashMap::new();
-    // By subject: every message with it, and those that are replies.
+    // By subject: every message with it, and those that are replies; and
+    // the same without messages a permanent thread id places (Gmail's,
+    // JMAP's), which `belongs` settles by their thread alone: a message in
+    // such a thread looks only at the others by subject, rather than going
+    // through (and sorting) every message of a common subject for each row.
     let mut by_subject: HashMap<(&str, String), SubjectRows> = HashMap::new();
+    let mut by_subject_loose: HashMap<(&str, String), SubjectRows> = HashMap::new();
+    let permanent = |x: &Mail| !x.thread_id().is_empty() && !x.thread_id().starts_with("t:");
     let mut subjects: Vec<String> = Vec::with_capacity(messages.len());
     for (i, x) in messages.iter().enumerate() {
         let key = conversation_subject(&x.subject);
@@ -153,10 +159,18 @@ pub(super) fn group(messages: &[Mail], rows: &[usize]) -> (Vec<usize>, HashMap<u
             referring.entry((account, r.to_owned())).or_default().push(i);
         }
         if key.chars().count() > 2 {
+            let reply = !x.references().is_empty() || x.subject.trim().to_lowercase() != key;
             let entry = by_subject.entry((account, key.clone())).or_default();
             entry.0.push(i);
-            if !x.references().is_empty() || x.subject.trim().to_lowercase() != key {
+            if reply {
                 entry.1.push(i);
+            }
+            if !permanent(x) {
+                let entry = by_subject_loose.entry((account, key.clone())).or_default();
+                entry.0.push(i);
+                if reply {
+                    entry.1.push(i);
+                }
             }
         }
         subjects.push(key);
@@ -193,7 +207,8 @@ pub(super) fn group(messages: &[Mail], rows: &[usize]) -> (Vec<usize>, HashMap<u
                 candidates.extend(v);
             }
         }
-        if let Some((all, replies)) = by_subject.get(&(account, key.clone())) {
+        let subject_rows = if permanent(m) { &by_subject_loose } else { &by_subject };
+        if let Some((all, replies)) = subject_rows.get(&(account, key.clone())) {
             let replyish = !m.references().is_empty() || m.subject.trim().to_lowercase() != *key;
             candidates.extend(if replyish { all } else { replies });
         }

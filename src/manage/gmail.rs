@@ -194,10 +194,10 @@ impl Backend {
 
     /// A row for a listed message: the cached one with its flags, folder
     /// and labels brought up to date, or a new one from its headers.
-    fn gmail_mail(&self, a: &Account, labels: &[Label], m: &Metadata) -> Result<Mail> {
+    fn gmail_mail(&self, a: &Account, labels: &[Label], m: &Metadata, pre: Option<&Prefetched>) -> Result<Mail> {
         let id = row_id(a, &m.id);
         let (folder, remote) = location(m, labels);
-        let mut mail = match self.store.message(&id)? {
+        let mut mail = match Prefetched::cached(pre, &self.store, &id)? {
             Some(cached) => cached,
             None => {
                 let mut fresh = parse_message(&m.header_block(), a, &id, folder, &remote, 0)?;
@@ -258,14 +258,15 @@ impl Backend {
         // mailbox is.
         let cached: Vec<String> = changed
             .into_iter()
-            .filter(|id| self.store.message(&row_id(a, id)).ok().flatten().is_some())
+            .filter(|id| self.store.has_message(&row_id(a, id)).unwrap_or(false))
             .collect();
         let current = s.metadata(&cached)?;
         let still: HashSet<&str> = current.iter().map(|m| m.id.as_str()).collect();
         let mut gone: Vec<String> = deleted.iter().map(|id| row_id(a, id)).collect();
         gone.extend(cached.iter().filter(|id| !still.contains(id.as_str())).map(|id| row_id(a, id)));
+        let pre = Prefetched::new(&self.store, current.iter().map(|m| row_id(a, &m.id)).collect())?;
         for m in &current {
-            rows.push(self.gmail_mail(a, labels, m)?);
+            rows.push(self.gmail_mail(a, labels, m, Some(&pre))?);
         }
         self.forget_gmail_rows(a, &gone)?;
         self.store.save_messages(&rows)?;
@@ -317,12 +318,12 @@ impl Backend {
             listed.truncate(limit);
             let new: Vec<String> = listed
                 .iter()
-                .filter(|id| self.store.message(&row_id(a, id)).ok().flatten().is_none())
+                .filter(|id| !self.store.has_message(&row_id(a, id)).unwrap_or(false))
                 .cloned()
                 .collect();
             let mut rows = Vec::new();
             for m in &s.metadata(&new)? {
-                rows.push(self.gmail_mail(a, &labels, m)?);
+                rows.push(self.gmail_mail(a, &labels, m, None)?);
             }
             self.store.save_messages(&rows)?;
             // What the cache has here that Gmail didn't list: within the
@@ -331,11 +332,10 @@ impl Backend {
             let listed_rows: HashSet<String> = listed.iter().map(|id| row_id(a, id)).collect();
             let oldest = listed
                 .iter()
-                .filter_map(|id| self.store.message(&row_id(a, id)).ok().flatten())
-                .map(|m| m.date)
-                .filter(|&t| t > 0)
-                .min()
-                .unwrap_or(i64::MIN);
+                .map(|id| row_id(a, id))
+                .collect::<Vec<_>>();
+            // Their dates alone, in one query, not each row whole.
+            let oldest = self.store.oldest_date(&oldest)?.unwrap_or(i64::MIN);
             let unlisted: Vec<Mail> = self
                 .store
                 .summaries(&a.id, mailbox.clone())?
@@ -349,7 +349,7 @@ impl Backend {
                 let still: HashSet<String> = current.iter().map(|m| row_id(a, &m.id)).collect();
                 let mut moved = Vec::new();
                 for m in &current {
-                    moved.push(self.gmail_mail(a, &labels, m)?);
+                    moved.push(self.gmail_mail(a, &labels, m, None)?);
                 }
                 self.store.save_messages(&moved)?;
                 let gone: Vec<String> =
@@ -386,11 +386,11 @@ impl Backend {
                 let (listed, next) = s.list(label.as_deref(), &query, page.as_deref(), 500)?;
                 let new: Vec<String> = listed
                     .into_iter()
-                    .filter(|id| self.store.message(&row_id(a, id)).ok().flatten().is_none())
+                    .filter(|id| !self.store.has_message(&row_id(a, id)).unwrap_or(false))
                     .take(batch.max(1) - added.len().min(batch.max(1) - 1))
                     .collect();
                 for m in &s.metadata(&new)? {
-                    added.push(self.gmail_mail(a, &labels, m)?);
+                    added.push(self.gmail_mail(a, &labels, m, None)?);
                 }
                 match next {
                     Some(n) if added.len() < batch => page = Some(n),
@@ -416,11 +416,17 @@ impl Backend {
 
     /// Downloads one message's source and caches it.
     pub(super) fn download_gmail(&self, a: &Account, m: &Mail) -> Result<Vec<u8>> {
+        let raw = self.fetch_gmail_raw(a, m)?;
+        self.store.save_raw(&m.id, &raw)?;
+        Ok(raw)
+    }
+
+    /// One message's source, as Gmail has it, not yet kept.
+    fn fetch_gmail_raw(&self, a: &Account, m: &Mail) -> Result<Vec<u8>> {
         let id = gmail_id(a, m).with_context(|| t!("manage-gmail-this-message-isnt-from-this-gmail"))?;
         let raw = self.with_gmail(a, |s| s.raw(id))?;
         ensure!(raw.len() <= large::MAX_DOWNLOAD, t!("manage-proton-message-exceeds-the-download-limit"));
         self.note_traffic(a, raw.len());
-        self.store.save_raw(&m.id, &raw)?;
         Ok(raw)
     }
 
@@ -431,7 +437,8 @@ impl Backend {
             if stored > 0 && self.someone_waiting(&a.id) {
                 break;
             }
-            let raw = match self.download_gmail(a, &m) {
+            // Kept once (`keep_source`), not compressed and written twice.
+            let raw = match self.fetch_gmail_raw(a, &m) {
                 Ok(raw) => raw,
                 Err(e) if not_found(&e) => {
                     self.forget_gmail_rows(a, std::slice::from_ref(&m.id))?;
@@ -571,8 +578,10 @@ impl Backend {
             let q = if scope.is_empty() { query.trim().to_owned() } else { format!("{} {scope}", query.trim()) };
             let found = s.list_all(label.as_deref(), &q, SEARCH_MOST)?;
             let mut out = ServerResults { total: found.len(), ..Default::default() };
-            for m in &s.metadata(&found[..found.len().min(limit)])? {
-                out.mails.push(self.gmail_mail(a, &labels, m)?);
+            let page = s.metadata(&found[..found.len().min(limit)])?;
+            let pre = Prefetched::new(&self.store, page.iter().map(|m| row_id(a, &m.id)).collect())?;
+            for m in &page {
+                out.mails.push(self.gmail_mail(a, &labels, m, Some(&pre))?);
             }
             self.store.save_messages(&out.mails)?;
             out.mails.sort_by(Mail::newest_first);
@@ -779,17 +788,17 @@ impl Backend {
         let rows: Vec<Mail> = if a.ews() {
             self.with_ews(a, |s| {
                 let folders = s.folders()?;
-                s.messages(ids)?.iter().map(|m| self.ews_mail(a, &folders, m)).collect()
+                s.messages(ids)?.iter().map(|m| self.ews_mail(a, &folders, m, None)).collect()
             })?
         } else if a.gmail_api() {
             self.with_gmail(a, |s| {
                 let labels = s.labels()?;
-                s.metadata(ids)?.iter().map(|m| self.gmail_mail(a, &labels, m)).collect()
+                s.metadata(ids)?.iter().map(|m| self.gmail_mail(a, &labels, m, None)).collect()
             })?
         } else {
             self.with_graph(a, |s| {
                 let folders = s.folders()?;
-                s.messages(ids)?.iter().map(|m| self.graph_mail(a, &folders, m)).collect()
+                s.messages(ids)?.iter().map(|m| self.graph_mail(a, &folders, m, None)).collect()
             })?
         };
         self.store.save_messages(&rows)?;

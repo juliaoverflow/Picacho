@@ -507,11 +507,12 @@ impl Composer {
             return;
         }
         let store = self.backend.store.clone();
+        // In order with the other draft writes (`queue_draft_write`).
+        let saved = queue_draft_write(move || store.save_draft(&draft));
         cx.spawn(async move |this, cx| {
-            let result = cx
-                .background_executor()
-                .spawn(async move { store.save_draft(&draft) })
-                .await;
+            let result = saved
+                .await
+                .unwrap_or_else(|_| Err(anyhow::anyhow!(t!("ui-something-went-wrong-while-doing-this"))));
             let _ = this.update(cx, |this, cx| {
                 match result {
                     Ok(()) => {
@@ -526,14 +527,18 @@ impl Composer {
         .detach();
     }
 
-    /// Saves at once, on this thread: for quitting and closing windows.
+    /// Saves the draft as it is now, for closing, sending and quitting:
+    /// what is written is taken here, and written off this thread in order
+    /// with the other draft writes (`queue_draft_write`). Quitting waits for
+    /// it (`MailApp::persist_draft`); what reads drafts waits for it too.
     pub(super) fn save_now(&mut self, cx: &App) {
         if self.sending {
             return;
         }
         let draft = self.snapshot(cx);
         if !draft.is_empty() {
-            let _ = self.backend.store.save_draft(&draft);
+            let store = self.backend.store.clone();
+            drop(queue_draft_write(move || store.save_draft(&draft)));
         }
     }
 
@@ -828,7 +833,8 @@ impl Composer {
     /// (remote pictures, which could tell the sender each recipient read
     /// it) are left out.
     fn pasted_doc(&mut self, html: &str, cx: &mut Context<Self>) -> rt::Doc {
-        let mut doc = rhtml::parse(html, false);
+        // Without what would load from the page's server (`parse_pasted`).
+        let mut doc = rhtml::parse_pasted(html);
         let mut saved = Vec::new();
         for i in 0..doc.blocks.len() {
             if !doc.blocks[i].runs.iter().any(|r| r.image.is_some()) {
@@ -849,8 +855,8 @@ impl Composer {
                 let (Some((meta, _)), Some(bytes)) = (data, bytes) else {
                     continue;
                 };
-                let extension = meta.rsplit('/').next().unwrap_or("png");
-                let extension = extension.split('+').next().unwrap_or(extension);
+                // Letters and digits only: the type is the pasted page's.
+                let extension = crate::manage::backend::picture_extension(meta);
                 let name = t!("composer-pasted-image", extension = extension);
                 match self.backend.save_pasted(&self.draft.id, &name, &bytes) {
                     Ok(path) => {
@@ -2889,7 +2895,7 @@ impl Composer {
             if !listed(path) {
                 continue;
             }
-            let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+            let size = crate::manage::sealed_files::len(path).unwrap_or(0);
             list = list.child(
                 div()
                     .id(("attachment", i))
@@ -3307,3 +3313,137 @@ impl Render for ComposeWindow {
     }
 }
 
+
+/// Draft writes made from the window (saves and discards), done by one
+/// thread in the order made: a later save never lands before an earlier one
+/// (two autosaves on the executor's threads could write older text over
+/// newer), a discard never before a save of the same draft (which brought
+/// it back), and the window never waits for the cache's writer, which a
+/// sync can hold a while. What reads drafts back waits first for the writes
+/// queued before it (`wait_for_draft_writes`), and quitting waits for all of
+/// them. In tests, at once (their executor doesn't wait for other threads).
+struct DraftWrites {
+    sender: std::sync::Mutex<Option<std::sync::mpsc::Sender<Box<dyn FnOnce() + Send>>>>,
+    /// Writes queued and done so far.
+    counts: std::sync::Mutex<(u64, u64)>,
+    finished: std::sync::Condvar,
+}
+
+fn draft_writes() -> &'static DraftWrites {
+    static WRITES: std::sync::OnceLock<DraftWrites> = std::sync::OnceLock::new();
+    WRITES.get_or_init(|| {
+        let (sender, receiver) = std::sync::mpsc::channel::<Box<dyn FnOnce() + Send>>();
+        let started = std::thread::Builder::new()
+            .name("picacho-draft-writes".into())
+            .spawn(move || {
+                for write in receiver {
+                    write();
+                }
+            });
+        DraftWrites {
+            // No thread to take them: written where they're made.
+            sender: std::sync::Mutex::new(started.ok().map(|_| sender)),
+            counts: std::sync::Mutex::new((0, 0)),
+            finished: std::sync::Condvar::new(),
+        }
+    })
+}
+
+/// Queues `write` after the draft writes queued before it; the receiver
+/// hears how it went.
+pub(super) fn queue_draft_write(
+    write: impl FnOnce() -> anyhow::Result<()> + Send + 'static,
+) -> futures::channel::oneshot::Receiver<anyhow::Result<()>> {
+    let (tx, rx) = futures::channel::oneshot::channel();
+    let run = move || {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(write))
+            .unwrap_or_else(|_| Err(anyhow::anyhow!(t!("ui-something-went-wrong-while-doing-this"))));
+        let _ = tx.send(result);
+    };
+    if cfg!(test) {
+        run();
+        return rx;
+    }
+    queue_on_thread(run);
+    rx
+}
+
+/// Queues `run` on the draft writes' thread (see `queue_draft_write`).
+fn queue_on_thread(run: impl FnOnce() + Send + 'static) {
+    let writes = draft_writes();
+    writes.counts.lock().unwrap_or_else(|e| e.into_inner()).0 += 1;
+    let job: Box<dyn FnOnce() + Send> = Box::new(move || {
+        run();
+        let writes = draft_writes();
+        writes.counts.lock().unwrap_or_else(|e| e.into_inner()).1 += 1;
+        writes.finished.notify_all();
+    });
+    let sender = writes.sender.lock().unwrap_or_else(|e| e.into_inner());
+    let job = match sender.as_ref() {
+        Some(s) => match s.send(job) {
+            Ok(()) => return,
+            Err(std::sync::mpsc::SendError(job)) => job,
+        },
+        None => job,
+    };
+    drop(sender);
+    // No thread to take it (`draft_writes`): written here.
+    job();
+}
+
+/// Waits until the draft writes queued so far are done, at most `limit`
+/// (None: as long as they take). False if it stopped waiting first.
+pub(super) fn wait_for_draft_writes(limit: Option<Duration>) -> bool {
+    if cfg!(test) {
+        return true;
+    }
+    wait_on_thread(limit)
+}
+
+/// Waits for the draft writes' thread (see `wait_for_draft_writes`).
+fn wait_on_thread(limit: Option<Duration>) -> bool {
+    let writes = draft_writes();
+    let counts = writes.counts.lock().unwrap_or_else(|e| e.into_inner());
+    let wanted = counts.0;
+    let done = |c: &mut (u64, u64)| c.1 >= wanted;
+    match limit {
+        None => {
+            let waited = writes.finished.wait_while(counts, |c| !done(c));
+            drop(waited);
+            true
+        }
+        Some(limit) => writes
+            .finished
+            .wait_timeout_while(counts, limit, |c| !done(c))
+            .map(|(_, timeout)| !timeout.timed_out())
+            .unwrap_or(false),
+    }
+}
+
+#[cfg(test)]
+mod draft_write_tests {
+    use super::*;
+    use std::prelude::v1::test;
+
+    /// Draft writes are done one after another in the order queued, off the
+    /// thread that queued them, and waiting for them waits for all queued
+    /// before.
+    #[test]
+    fn draft_writes_keep_their_order_and_can_be_waited_for() {
+        let done = Arc::new(std::sync::Mutex::new(Vec::new()));
+        for i in 0..50 {
+            let done = done.clone();
+            queue_on_thread(move || {
+                // The first ones slowest: they still land first.
+                std::thread::sleep(Duration::from_millis(if i < 3 { 30 } else { 0 }));
+                done.lock().unwrap().push(i);
+            });
+        }
+        assert!(wait_on_thread(Some(Duration::from_secs(10))));
+        assert_eq!(*done.lock().unwrap(), (0..50).collect::<Vec<_>>());
+        // A write that takes longer than the wait: it stops waiting.
+        queue_on_thread(|| std::thread::sleep(Duration::from_millis(300)));
+        assert!(!wait_on_thread(Some(Duration::from_millis(20))));
+        assert!(wait_on_thread(None));
+    }
+}

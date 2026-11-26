@@ -225,8 +225,15 @@ fn birthday_value(value: &str) -> String {
 /// tab), with CRLF or LF line ends. vCard 2.1's quoted-printable soft
 /// breaks (a line ending in `=`) join too.
 fn unfold(text: &str) -> Vec<String> {
+    const QP: &[u8] = b"QUOTED-PRINTABLE";
     let mut lines: Vec<String> = Vec::new();
     let mut soft = false;
+    // Whether the line being unfolded says it's quoted-printable, and how
+    // much of it was looked through for that: only what each piece adds
+    // (and a word's length before it) is, not the whole line again for
+    // every piece, which made a long soft-broken line quadratic.
+    let mut qp = false;
+    let mut scanned: usize = 0;
     for line in text.split('\n') {
         let line = line.strip_suffix('\r').unwrap_or(line);
         if soft && let Some(last) = lines.last_mut() {
@@ -238,9 +245,16 @@ fn unfold(text: &str) -> Vec<String> {
             last.push_str(rest);
         } else {
             lines.push(line.to_owned());
+            qp = false;
+            scanned = 0;
         }
         let last = lines.last().map(String::as_str).unwrap_or("");
-        soft = last.ends_with('=') && last.to_ascii_uppercase().contains("QUOTED-PRINTABLE");
+        if !qp {
+            let from = scanned.saturating_sub(QP.len() - 1).min(last.len());
+            qp = last.as_bytes()[from..].windows(QP.len()).any(|w| w.eq_ignore_ascii_case(QP));
+        }
+        scanned = last.len();
+        soft = last.ends_with('=') && qp;
     }
     lines
 }

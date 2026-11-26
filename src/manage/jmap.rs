@@ -503,11 +503,11 @@ impl Backend {
 
     /// A row for a listed message: the cached one with its flags, folder
     /// and labels brought up to date, or a new one from the listing.
-    fn jmap_mail(&self, a: &Account, places: &[Place], e: &Email) -> Result<Mail> {
+    fn jmap_mail(&self, a: &Account, places: &[Place], e: &Email, pre: Option<&Prefetched>) -> Result<Mail> {
         let id = row_id(a, &e.id);
         let (folder, remote) = location(e, places);
         let first = e.from.as_ref().and_then(|f| f.first());
-        let mut mail = match self.store.message(&id)? {
+        let mut mail = match Prefetched::cached(pre, &self.store, &id)? {
             Some(cached) => cached,
             None => {
                 let mut m = Mail {
@@ -639,16 +639,19 @@ impl Backend {
             {
                 let added: Vec<String> = changes.added.iter().map(|(id, _)| id.clone()).collect();
                 let mut rows = Vec::new();
-                for e in &s.emails(&added)? {
-                    rows.push(self.jmap_mail(a, &places, e)?);
+                let emails = s.emails(&added)?;
+                let pre = Prefetched::new(&self.store, emails.iter().map(|e| row_id(a, &e.id)).collect())?;
+                for e in &emails {
+                    rows.push(self.jmap_mail(a, &places, e, Some(&pre))?);
                 }
                 // Removed from this mailbox's results: moved elsewhere
                 // (asked again, to update the row) or gone.
                 if !changes.removed.is_empty() {
                     let current = s.emails(&changes.removed)?;
                     let still: HashSet<String> = current.iter().map(|e| row_id(a, &e.id)).collect();
+                    let pre = Prefetched::new(&self.store, current.iter().map(|e| row_id(a, &e.id)).collect())?;
                     for e in &current {
-                        rows.push(self.jmap_mail(a, &places, e)?);
+                        rows.push(self.jmap_mail(a, &places, e, Some(&pre))?);
                     }
                     let gone: Vec<String> = changes
                         .removed
@@ -667,10 +670,12 @@ impl Backend {
                         .updated
                         .into_iter()
                         .filter(|id| !listed.contains(&row_id(a, id)))
-                        .filter(|id| self.store.message(&row_id(a, id)).ok().flatten().is_some())
+                        .filter(|id| self.store.has_message(&row_id(a, id)).unwrap_or(false))
                         .collect();
-                    for e in &s.emails(&updated)? {
-                        rows.push(self.jmap_mail(a, &places, e)?);
+                    let emails = s.emails(&updated)?;
+                    let pre = Prefetched::new(&self.store, emails.iter().map(|e| row_id(a, &e.id)).collect())?;
+                    for e in &emails {
+                        rows.push(self.jmap_mail(a, &places, e, Some(&pre))?);
                     }
                     self.store.save_messages(&rows)?;
                     self.store.set_preference(
@@ -703,8 +708,9 @@ impl Backend {
                 }
             }
             let mut rows = Vec::with_capacity(listed.len());
+            let pre = Prefetched::new(&self.store, listed.iter().map(|e| row_id(a, &e.id)).collect())?;
             for e in &listed {
-                rows.push(self.jmap_mail(a, &places, e)?);
+                rows.push(self.jmap_mail(a, &places, e, Some(&pre))?);
             }
             // What the cache has here that wasn't listed: within the listed
             // range (or anywhere, when the whole mailbox was listed), it has
@@ -728,8 +734,9 @@ impl Backend {
             if !unlisted.is_empty() {
                 let current = s.emails(&ids(a, &unlisted))?;
                 let still: HashSet<String> = current.iter().map(|e| row_id(a, &e.id)).collect();
+                let pre = Prefetched::new(&self.store, current.iter().map(|e| row_id(a, &e.id)).collect())?;
                 for e in &current {
-                    rows.push(self.jmap_mail(a, &places, e)?);
+                    rows.push(self.jmap_mail(a, &places, e, Some(&pre))?);
                 }
                 let gone: Vec<String> = unlisted
                     .iter()
@@ -794,8 +801,8 @@ impl Backend {
                 let short = page.emails.len() < want;
                 position += page.emails.len();
                 for e in &page.emails {
-                    if self.store.message(&row_id(a, &e.id))?.is_none() {
-                        added.push(self.jmap_mail(a, &places, e)?);
+                    if !self.store.has_message(&row_id(a, &e.id))? {
+                        added.push(self.jmap_mail(a, &places, e, None)?);
                     }
                 }
                 if short {
@@ -875,6 +882,20 @@ impl Backend {
         self.with_jmap(a, |s| s.header_block(id))
     }
     /// One attachment of a message too large to download whole.
+    /// `jmap_attachment`, written to `out` as it downloads: up to the size
+    /// of attachment a message too large to keep may have (`large::MAX_PART`),
+    /// as it is never held whole in memory. Returns its size.
+    pub(super) fn jmap_attachment_into(&self, a: &Account, attachment: &Attachment, out: &mut dyn std::io::Write) -> Result<u64> {
+        self.with_jmap(a, |s| {
+            s.download_to(
+                &attachment.section,
+                &attachment.name,
+                &attachment.mime,
+                large::MAX_PART,
+                out,
+            )
+        })
+    }
     pub(super) fn jmap_attachment(&self, a: &Account, attachment: &Attachment) -> Result<Vec<u8>> {
         self.with_jmap(a, |s| {
             s.download(
@@ -996,8 +1017,9 @@ impl Backend {
             let filter = json!({ "operator": "AND", "conditions": conditions });
             let page = s.query(&filter, 0, limit.clamp(1, SEARCH_MOST), true)?;
             let mut out = ServerResults::default();
+            let pre = Prefetched::new(&self.store, page.emails.iter().map(|e| row_id(a, &e.id)).collect())?;
             for e in &page.emails {
-                out.mails.push(self.jmap_mail(a, &places, e)?);
+                out.mails.push(self.jmap_mail(a, &places, e, Some(&pre))?);
             }
             out.total = page.total.unwrap_or(out.mails.len());
             self.store.save_messages(&out.mails)?;
@@ -1392,7 +1414,7 @@ impl Backend {
                 let rows: Vec<Mail> = s
                     .emails(&missing)?
                     .iter()
-                    .map(|e| self.jmap_mail(a, &places, e))
+                    .map(|e| self.jmap_mail(a, &places, e, None))
                     .collect::<Result<_>>()?;
                 self.store.save_messages(&rows)?;
                 out.extend(rows);

@@ -25,6 +25,50 @@ const PING: &str = "ping";
 /// Before a request a launch passes on (`launch::request`): a `mailto:`
 /// address or an email file to open.
 const OPEN: &str = "open ";
+/// Before the activation token the desktop gave a launch (Wayland's
+/// xdg-activation, `XDG_ACTIVATION_TOKEN`): the window the background process
+/// starts for it uses it, so the window comes forward and the launcher's
+/// "starting" feedback (a bouncing or busy dock item) ends as it shows.
+const ACTIVATE: &str = "activate ";
+
+/// The latest launch's activation token, until it is used (`take_activation`).
+static ACTIVATION: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Whether `token` can be an activation token: a short run of visible ASCII,
+/// as compositors make them (it goes into another process's environment).
+fn usable_token(token: &str) -> bool {
+    !token.is_empty() && token.len() <= 256 && token.bytes().all(|b| b.is_ascii_graphic())
+}
+
+/// The activation token this process was started with, if any.
+fn launch_token() -> Option<String> {
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    {
+        std::env::var("XDG_ACTIVATION_TOKEN")
+            .ok()
+            .filter(|token| usable_token(token))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+    {
+        None
+    }
+}
+
+/// Keeps `token` (the tray's, for its Open) for the window opened next.
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+pub fn offer_activation(token: String) {
+    if usable_token(&token) {
+        *ACTIVATION.lock().unwrap_or_else(|e| e.into_inner()) = Some(token);
+    }
+}
+
+/// The activation token the latest launch passed on, once.
+pub fn take_activation() -> Option<String> {
+    ACTIVATION
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
+}
 
 /// The outcome of [`claim`].
 pub enum Claim {
@@ -96,22 +140,100 @@ fn socket_path(dir: &Path) -> PathBuf {
 /// Makes the data directory readable by this user alone from the start:
 /// made with the usual permissions, it was open to others until the store
 /// restricted it, after the lock and socket were already made inside it.
+///
+/// One already there is used only if it is this user's: made by another
+/// account (on a shared computer, beforehand, or open to all), whoever can
+/// reach the socket inside could drive Picacho. Left open to others, it is
+/// limited to this user before the socket is made in it.
 fn private_dir(dir: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::DirBuilderExt as _;
-        std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)
+        use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, PermissionsExt as _};
+        std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
+        // Where a link leads: the folder itself is what must be private.
+        let meta = std::fs::metadata(dir)?;
+        if !meta.is_dir() || meta.uid() != current_uid() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "the data folder belongs to another user",
+            ));
+        }
+        if meta.mode() & 0o077 != 0 {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+        }
+        Ok(())
     }
     #[cfg(not(unix))]
     std::fs::create_dir_all(dir)
 }
 
+#[cfg(unix)]
+fn current_uid() -> u32 {
+    unsafe extern "C" {
+        fn getuid() -> u32;
+    }
+    // SAFETY: getuid takes nothing and can't fail (POSIX).
+    unsafe { getuid() }
+}
+
+/// The user on the other end of a Unix socket, where the system tells it.
+#[cfg(unix)]
+fn peer_uid(stream: &std::os::unix::net::UnixStream) -> Option<u32> {
+    use std::os::fd::AsRawFd as _;
+    let fd = stream.as_raw_fd();
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    {
+        #[cfg(target_os = "linux")]
+        {
+            let mut cred = libc::ucred { pid: 0, uid: 0, gid: 0 };
+            let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+            // SAFETY: `cred` and `len` are valid for writes of their sizes.
+            let r = unsafe {
+                libc::getsockopt(
+                    fd,
+                    libc::SOL_SOCKET,
+                    libc::SO_PEERCRED,
+                    (&raw mut cred).cast(),
+                    &mut len,
+                )
+            };
+            (r == 0).then_some(cred.uid)
+        }
+        #[cfg(target_os = "freebsd")]
+        {
+            let (mut uid, mut gid) = (0, 0);
+            // SAFETY: both are valid for writes.
+            (unsafe { libc::getpeereid(fd, &mut uid, &mut gid) } == 0).then_some(uid)
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        unsafe extern "C" {
+            fn getpeereid(fd: std::ffi::c_int, uid: *mut u32, gid: *mut u32) -> std::ffi::c_int;
+        }
+        let (mut uid, mut gid) = (0u32, 0u32);
+        // SAFETY: both are valid for writes.
+        (unsafe { getpeereid(fd, &mut uid, &mut gid) } == 0).then_some(uid)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "freebsd", target_os = "macos")))]
+    {
+        let _ = fd;
+        None
+    }
+}
+
 pub fn claim(dir: &Path, requests: &[String]) -> Option<Claim> {
     let path = socket_path(dir);
-    // What this launch was to open goes to the running Picacho first.
+    // Read before GPUI starts (it takes the token from the environment).
+    let token = launch_token();
+    // What this launch was to open goes to the running Picacho first, then
+    // the token its window may come forward with.
     let pass_on = |path: &Path| -> std::io::Result<()> {
         for r in requests {
             forward(path, &format!("{OPEN}{r}"))?;
+        }
+        if let Some(token) = &token {
+            forward(path, &format!("{ACTIVATE}{token}"))?;
         }
         forward(path, SHOW)
     };
@@ -234,6 +356,12 @@ impl Listener {
                     let Ok(stream) = stream else {
                         continue;
                     };
+                    // Only this user's launches (where the system says
+                    // who connected); the folder is this user's alone too.
+                    #[cfg(unix)]
+                    if peer_uid(&stream).is_some_and(|uid| uid != current_uid()) {
+                        continue;
+                    }
                     // A launch that connects and says nothing, or a great
                     // deal slowly, can't hold the next one up for long: a
                     // few bytes, within a deadline for them all.
@@ -250,6 +378,14 @@ impl Listener {
                         // could send anything.
                         if let Some(request) = super::launch::request(request) {
                             super::launch::push(request);
+                        }
+                        continue;
+                    }
+                    if let Some(token) = line.strip_prefix(ACTIVATE) {
+                        let token = token.trim();
+                        if usable_token(token) {
+                            *ACTIVATION.lock().unwrap_or_else(|e| e.into_inner()) =
+                                Some(token.to_owned());
                         }
                         continue;
                     }
@@ -347,6 +483,34 @@ mod tests {
         let start = std::time::Instant::now();
         assert_eq!(read_message(b), None);
         assert!(start.elapsed() < SAY_WITHIN + Duration::from_secs(1));
+    }
+
+    /// A launch's activation token reaches the running Picacho before it is
+    /// asked to show, for the window it opens; anything else isn't kept.
+    #[cfg(unix)]
+    #[test]
+    fn activation_tokens_are_passed_on() {
+        assert!(usable_token("kwin-1234_TIME5678"));
+        assert!(!usable_token(""));
+        assert!(!usable_token("two words"));
+        assert!(!usable_token("line\nbreak"));
+        assert!(!usable_token(&"x".repeat(300)));
+        let dir = std::env::temp_dir().join(format!("picacho-activate-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let listener = claim_resident(&dir).expect("a fresh folder is claimed");
+        let (tx, rx) = std::sync::mpsc::channel::<Option<String>>();
+        let socket = listener.serve(move || {
+            let _ = tx.send(take_activation());
+            false
+        });
+        forward(&socket, "activate bad token").unwrap();
+        forward(&socket, &format!("{ACTIVATE}kwin-1234_TIME5678")).unwrap();
+        forward(&socket, SHOW).unwrap();
+        let token = rx.recv_timeout(Duration::from_secs(2)).expect("shown");
+        assert_eq!(token.as_deref(), Some("kwin-1234_TIME5678"));
+        assert_eq!(take_activation(), None, "used once");
+        release(&socket);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

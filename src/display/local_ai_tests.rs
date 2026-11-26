@@ -6,6 +6,26 @@ use super::*;
 use crate::manage::local_ai;
 use std::prelude::v1::test;
 
+/// The replies suggested for `m`, the model having read it off the
+/// window's thread as drawing starts it.
+fn replies_for(view: &Entity<MailApp>, m: &Mail, cx: &mut VisualTestContext) -> Rc<local_ai::replies::Suggestions> {
+    view.update(cx, |this, cx| {
+        this.smart_replies_for(m, cx);
+    });
+    cx.run_until_parked();
+    view.read_with(cx, |this, _| this.smart_replies(m))
+}
+
+/// The parcels the reader finds in `m`, the model (when on) having read it
+/// off the window's thread as drawing starts it.
+fn parcels_for(view: &Entity<MailApp>, m: &Mail, cx: &mut VisualTestContext) -> Rc<Vec<crate::manage::parcels::Parcel>> {
+    view.update(cx, |this, cx| {
+        this.found_parcels_for(m, cx);
+    });
+    cx.run_until_parked();
+    view.read_with(cx, |this, _| this.found_parcels(m))
+}
+
 /// A store with one account whose inbox has a sign-in code and an order.
 fn mailbox() -> (Arc<Store>, String) {
     let store = store();
@@ -275,13 +295,11 @@ fn finding_tracking_numbers_installs_the_unpublished_model_from_its_training_dir
     view.read_with(cx, |this, _| {
         assert!(this.parcel_error.is_none(), "{:?}", this.parcel_error);
         assert!(this.find_parcels && this.parcel_model.is_some());
-        let found: Vec<String> = this
-            .found_parcels(&m)
-            .iter()
-            .map(|p| p.tracking_number.clone())
-            .collect();
-        assert_eq!(found, ["986578788855"]);
+        // The model reads the message off the window's thread: nothing yet.
+        assert!(this.found_parcels(&m).is_empty());
     });
+    let found: Vec<String> = parcels_for(&view, &m, cx).iter().map(|p| p.tracking_number.clone()).collect();
+    assert_eq!(found, ["986578788855"]);
     assert!(local_ai::PARCEL.is_installed(&store));
     assert_eq!(
         store.preference(local_ai::PARCEL_PREFERENCE).as_deref(),
@@ -347,9 +365,15 @@ fn suggested_replies_are_worded_in_the_message_language_and_learn(cx: &mut TestA
     act(&view, Action::SetSuggestReplies(true), cx);
     cx.run_until_parked();
     assert!(local_ai::REPLIES.is_installed(&store));
-    let first = view.read_with(cx, |this, _| {
+    view.read_with(cx, |this, _| {
         assert!(this.replies_error.is_none(), "{:?}", this.replies_error);
-        let found = this.smart_replies(&meeting);
+        // The model reads the message off the window's thread: nothing yet.
+        assert!(this.smart_replies(&meeting).replies.is_empty());
+    });
+    let found = replies_for(&view, &meeting, cx);
+    // Mailing lists get none.
+    assert!(replies_for(&view, &newsletter, cx).replies.is_empty());
+    let first = {
         assert_eq!(found.language, "de");
         assert!(
             !found.replies.is_empty(),
@@ -366,10 +390,8 @@ fn suggested_replies_are_worded_in_the_message_language_and_learn(cx: &mut TestA
             .contains(i)),
             "{intents:?}"
         );
-        // Mailing lists get none.
-        assert!(this.smart_replies(&newsletter).replies.is_empty());
         found.replies[0].clone()
-    });
+    };
     act(&view, Action::Select(meeting.id.clone()), cx);
     frame(cx);
     assert!(cx.debug_bounds("smart-replies").is_some());
@@ -395,25 +417,10 @@ fn suggested_replies_are_worded_in_the_message_language_and_learn(cx: &mut TestA
         Action::DismissSmartReply(first.intent.to_owned()),
         cx,
     );
-    view.read_with(cx, |this, _| {
-        assert!(
-            !this
-                .smart_replies(&meeting)
-                .replies
-                .iter()
-                .any(|s| s.intent == first.intent)
-        );
-    });
+    assert!(!replies_for(&view, &meeting, cx).replies.iter().any(|s| s.intent == first.intent));
     act(&view, Action::ForgetReplyHistory, cx);
-    view.read_with(cx, |this, _| {
-        assert!(this.reply_history.is_empty());
-        assert!(
-            this.smart_replies(&meeting)
-                .replies
-                .iter()
-                .any(|s| s.intent == first.intent)
-        );
-    });
+    view.read_with(cx, |this, _| assert!(this.reply_history.is_empty()));
+    assert!(replies_for(&view, &meeting, cx).replies.iter().any(|s| s.intent == first.intent));
     // Off again: the model is deleted and nothing is suggested.
     act(&view, Action::SetSuggestReplies(false), cx);
     view.read_with(cx, |this, _| {
@@ -421,4 +428,74 @@ fn suggested_replies_are_worded_in_the_message_language_and_learn(cx: &mut TestA
         assert!(this.smart_replies(&meeting).replies.is_empty());
     });
     assert!(!local_ai::REPLIES.is_installed(&store));
+}
+
+/// What a model found arrives only while it is still wanted: a result
+/// started before the cache was cleared, or for text since changed, is
+/// dropped.
+#[test]
+fn inferred_results_arrive_only_while_still_wanted() {
+    let mut cache = ai::Inferred::<usize, &str>::default();
+    assert!(cache.start("a", &1));
+    assert!(!cache.start("a", &1), "already running");
+    cache.clear();
+    assert!(!cache.finish("a", 1, "old"));
+    assert!(cache.get("a", &1).is_none());
+    assert!(cache.start("a", &2));
+    assert!(!cache.finish("a", 1, "stale"));
+    assert!(cache.finish("a", 2, "new"));
+    assert_eq!(cache.get("a", &2).as_deref(), Some(&"new"));
+    assert!(cache.get("a", &1).is_none());
+}
+
+/// While codes are hidden, a new-mail notification (on the lock screen)
+/// never shows one, even after Show code was clicked in the app: those the
+/// model finds are hidden, or, while it isn't loaded, every string shaped
+/// like a code. In the app a code shows only once Show code is clicked, the
+/// same strings hidden until then.
+#[gpui::test]
+fn codes_show_only_on_show_code_and_never_in_notifications(cx: &mut TestAppContext) {
+    let (store, _) = mailbox();
+    install(&store);
+    let (view, cx) = open(store.clone(), cx);
+    act(&view, Action::SetLocalAi(true), cx);
+    act(&view, Action::SetHideCodes(true), cx);
+    let (code, order) = view.read_with(cx, |this, _| {
+        let code = this.messages.iter().find(|m| m.subject.contains("482913")).unwrap().clone();
+        let order = this.messages.iter().find(|m| m.subject.contains("839201")).unwrap().clone();
+        assert_eq!(this.announced_subject(&code), "•••••• is your Acme verification code");
+        // Not a code to the model: shown.
+        assert_eq!(this.announced_subject(&order), order.subject);
+        assert_eq!(this.hide_codes(&order, &order.subject), order.subject);
+        (code, order)
+    });
+    // Shown in the app: still hidden in notifications.
+    act(&view, Action::ShowCodes(code.id.clone(), true), cx);
+    view.read_with(cx, |this, _| {
+        assert_eq!(this.hide_codes(&code, &code.subject), code.subject);
+        assert!(!this.announced_subject(&code).contains("482913"));
+    });
+    act(&view, Action::ShowCodes(code.id.clone(), false), cx);
+    // The model not loaded (installing, or it couldn't load): everything
+    // shaped like a code is hidden in the app too, until Show code.
+    view.update(cx, |this, _| {
+        this.otp = None;
+        this.otp_found.borrow_mut().clear();
+    });
+    view.read_with(cx, |this, _| {
+        assert!(!this.announced_subject(&code).contains("482913"));
+        assert!(!this.announced_subject(&order).contains("839201"), "shaped like a code");
+        assert!(!this.hide_codes(&code, &code.subject).contains("482913"));
+        assert!(!this.hide_codes(&order, &order.subject).contains("839201"));
+        let full = this.backend.store.message(&code.id).unwrap().unwrap();
+        assert!(!this.hide_codes(&full, full.body.as_deref().unwrap()).contains("482913"));
+    });
+    // Copying waits for the model, which alone can tell which is the code.
+    act(&view, Action::CopyCode(code.id.clone()), cx);
+    assert!(cx.read_from_clipboard().and_then(|c| c.text()).is_none_or(|t| t != "839201"));
+    act(&view, Action::ShowCodes(code.id.clone(), true), cx);
+    view.read_with(cx, |this, _| {
+        assert_eq!(this.hide_codes(&code, &code.subject), code.subject);
+        assert!(!this.announced_subject(&code).contains("482913"));
+    });
 }

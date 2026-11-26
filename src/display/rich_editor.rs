@@ -137,6 +137,9 @@ pub(super) struct RichEditor {
     /// The draft's attachments, which `file:` pictures name.
     files: Vec<PathBuf>,
     pictures: HashMap<String, Picture>,
+    /// The revision `pictures` were last matched with the text at: those
+    /// the text no longer shows are let go (`retire_unshown_pictures`).
+    pictures_revision: u64,
     placeholder: SharedString,
     pub(super) disabled: bool,
     pub(super) look: Look,
@@ -206,6 +209,7 @@ impl RichEditor {
             goal_x: None,
             files: Vec::new(),
             pictures: HashMap::new(),
+            pictures_revision: 0,
             placeholder: placeholder.to_owned().into(),
             disabled: false,
             look,
@@ -877,7 +881,7 @@ impl RichEditor {
                 let Some(name) = image.file_name() else { return true };
                 let path = files.iter().find(|p| p.file_name().is_some_and(|n| n.to_string_lossy() == name));
                 let data = path.filter(|p| std::fs::metadata(p).is_ok_and(|m| m.len() < 8 * 1024 * 1024)).and_then(|p| {
-                    let bytes = std::fs::read(p).ok()?;
+                    let bytes = crate::manage::sealed_files::read(p).ok()?;
                     let mime = mime_guess::from_path(p).first_or_octet_stream();
                     use base64::Engine as _;
                     Some(format!("data:{mime};base64,{}", base64::engine::general_purpose::STANDARD.encode(bytes)))
@@ -1526,9 +1530,16 @@ fn decode_picture(source: &str) -> Option<(RenderImage, (f32, f32))> {
         use base64::Engine as _;
         base64::engine::general_purpose::STANDARD.decode(payload.trim()).ok()?
     } else {
-        std::fs::read(source).ok()?
+        // A draft's picture, sealed while the database is encrypted.
+        crate::manage::sealed_files::read(std::path::Path::new(source)).ok()?
     };
-    let image = image::load_from_memory(&bytes).ok()?;
+    // Within the attachment preview's limits: a data: picture in quoted
+    // HTML can say it is any size, and was decoded with the library's.
+    let mut reader = image::ImageReader::new(std::io::Cursor::new(&bytes))
+        .with_guessed_format()
+        .ok()?;
+    reader.limits(super::tools::preview_limits());
+    let image = reader.decode().ok()?;
     let size = (image.width() as f32, image.height() as f32);
     let image = if image.width() > PICTURE_MAX || image.height() > PICTURE_MAX {
         image.thumbnail(PICTURE_MAX, PICTURE_MAX)
@@ -1670,8 +1681,46 @@ impl EntityInputHandler for RichEditor {
     }
 }
 
+impl RichEditor {
+    /// Lets go of the pictures the text no longer shows (deleted, or the
+    /// draft replaced): their textures leave the windows' atlases
+    /// (`textures`). Once per change of the text.
+    fn retire_unshown_pictures(&mut self) {
+        if self.pictures_revision == self.revision || self.pictures.is_empty() {
+            return;
+        }
+        self.pictures_revision = self.revision;
+        let shown: std::collections::HashSet<String> = self
+            .doc
+            .blocks
+            .iter()
+            .flat_map(|b| b.runs.iter())
+            .filter_map(|r| r.image.as_ref())
+            .filter_map(|image| self.picture_key(image))
+            .collect();
+        let gone: Vec<String> = self.pictures.keys().filter(|k| !shown.contains(*k)).cloned().collect();
+        for key in gone {
+            if let Some(Picture::Ready(image, _)) = self.pictures.remove(&key) {
+                crate::display::textures::retire_rendered(image);
+            }
+        }
+    }
+}
+
+impl Drop for RichEditor {
+    /// The draft closed: its pictures leave the windows' atlases.
+    fn drop(&mut self) {
+        for (_, picture) in self.pictures.drain() {
+            if let Picture::Ready(image, _) = picture {
+                crate::display::textures::retire_rendered(image);
+            }
+        }
+    }
+}
+
 impl Render for RichEditor {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.retire_unshown_pictures();
         div()
             .id("rich-editor")
             .debug_selector(|| "rich-editor".into())

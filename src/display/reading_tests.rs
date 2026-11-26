@@ -818,3 +818,38 @@ fn delivery_reports_show_each_recipients_outcome(cx: &mut TestAppContext) {
     show(cx, &ids[1]);
     assert!(cx.debug_bounds("delivery-report").is_none());
 }
+
+/// Drawn again (a hover, a scroll, a spinner), the reader hands the HTML
+/// view the HTML it prepared once, which the view knows by its pointer: the
+/// document isn't started again, nor the HTML compared. Changed, it is.
+#[gpui::test]
+fn the_reader_hands_the_same_html_to_the_view_each_frame(cx: &mut TestAppContext) {
+    let (view, cx, _store) = two_accounts(cx);
+    view.update_in(cx, |this, _, cx| {
+        this.messages[0].html = Some("<p>First version of a long message</p>".into());
+        this.selected = Some(this.messages[0].id.clone());
+        cx.notify();
+    });
+    frame(cx);
+    frame(cx);
+    let prepared = |view: &Entity<MailApp>, cx: &mut VisualTestContext| {
+        view.read_with(cx, |this, _| this.prepared_html.borrow().as_ref().map(|p| p.1.clone()).unwrap())
+    };
+    let html = prepared(&view, cx);
+    let (started, same) = view.read_with(cx, |this, cx| this.html_view.read(cx).started(&html));
+    assert!(same, "the view holds the reader's HTML itself");
+    for _ in 0..3 {
+        view.update(cx, |_, cx| cx.notify());
+        frame(cx);
+    }
+    assert_eq!(view.read_with(cx, |this, cx| this.html_view.read(cx).started(&html)), (started, true));
+    // Changed: a new document.
+    view.update_in(cx, |this, _, cx| {
+        this.messages[0].html = Some("<p>Second version, longer than the first one</p>".into());
+        cx.notify();
+    });
+    frame(cx);
+    let next = prepared(&view, cx);
+    let (later, same) = view.read_with(cx, |this, cx| this.html_view.read(cx).started(&next));
+    assert!(same && later > started);
+}

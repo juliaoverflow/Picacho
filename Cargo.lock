@@ -1158,6 +1158,7 @@ dependencies = [
 [[package]]
 name = "blitz-dom"
 version = "0.3.0-beta.4"
+source = "git+https://github.com/juliaoverflow/Picacho-Patches?rev=3b4f2483c853eed387097614296206ea0fdfab4f#3b4f2483c853eed387097614296206ea0fdfab4f"
 dependencies = [
  "app_units",
  "atomic_refcell",
@@ -1215,6 +1216,7 @@ dependencies = [
 [[package]]
 name = "blitz-paint"
 version = "0.3.0-beta.4"
+source = "git+https://github.com/juliaoverflow/Picacho-Patches?rev=3b4f2483c853eed387097614296206ea0fdfab4f#3b4f2483c853eed387097614296206ea0fdfab4f"
 dependencies = [
  "anyrender",
  "anyrender_svg",
@@ -4606,6 +4608,7 @@ dependencies = [
 [[package]]
 name = "gpui-mobile"
 version = "0.1.0"
+source = "git+https://github.com/juliaoverflow/Picacho-Patches?rev=3b4f2483c853eed387097614296206ea0fdfab4f#3b4f2483c853eed387097614296206ea0fdfab4f"
 dependencies = [
  "android-activity",
  "android_logger",
@@ -4638,8 +4641,7 @@ dependencies = [
 [[package]]
 name = "gpui-pre"
 version = "0.3.12"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "29db89613527079737f53752eab27fb65c9a7dd94979256c65a0e590c9fd34d8"
+source = "git+https://github.com/juliaoverflow/Picacho-Patches?rev=382f207c209d1fcb3946cfb0aee492df2172d36a#382f207c209d1fcb3946cfb0aee492df2172d36a"
 dependencies = [
  "accesskit",
  "anyhow",
@@ -5079,8 +5081,7 @@ dependencies = [
 [[package]]
 name = "gpui-pre-wgpu"
 version = "0.3.12"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dc76608d385f6d0dcbad44504b1bf669dac3b7d7ffa2885acdb7c1c358caf852"
+source = "git+https://github.com/juliaoverflow/Picacho-Patches?rev=382f207c209d1fcb3946cfb0aee492df2172d36a#382f207c209d1fcb3946cfb0aee492df2172d36a"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -12057,6 +12058,7 @@ dependencies = [
 [[package]]
 name = "stylo"
 version = "0.22.0"
+source = "git+https://github.com/juliaoverflow/Picacho-Patches?rev=3b4f2483c853eed387097614296206ea0fdfab4f#3b4f2483c853eed387097614296206ea0fdfab4f"
 dependencies = [
  "app_units",
  "arrayvec 0.7.8",
@@ -12112,6 +12114,7 @@ dependencies = [
 [[package]]
 name = "stylo_atoms"
 version = "0.22.0"
+source = "git+https://github.com/juliaoverflow/Picacho-Patches?rev=3b4f2483c853eed387097614296206ea0fdfab4f#3b4f2483c853eed387097614296206ea0fdfab4f"
 dependencies = [
  "string_cache 0.11.0",
  "string_cache_codegen 0.11.2",
@@ -12572,7 +12575,7 @@ dependencies = [
  "memchr",
  "ntapi",
  "rayon",
- "windows 0.57.0",
+ "windows 0.54.0",
 ]
 
 [[package]]
@@ -14575,16 +14578,6 @@ dependencies = [
 
 [[package]]
 name = "windows"
-version = "0.57.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "12342cb4d8e3b046f3d80effd474a7a02447231330ef77d71daa6fbc40681143"
-dependencies = [
- "windows-core 0.57.0",
- "windows-targets 0.52.6",
-]
-
-[[package]]
-name = "windows"
 version = "0.58.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dd04d41d93c4992d421894c18c8b43496aa748dd4c081bac0dc93eb0489272b6"
@@ -14661,18 +14654,6 @@ dependencies = [
 
 [[package]]
 name = "windows-core"
-version = "0.57.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d2ed2439a290666cd67ecce2b0ffaad89c2a56b976b736e6ece670297897832d"
-dependencies = [
- "windows-implement 0.57.0",
- "windows-interface 0.57.0",
- "windows-result 0.1.2",
- "windows-targets 0.52.6",
-]
-
-[[package]]
-name = "windows-core"
 version = "0.58.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ba6d44ec8c2591c134257ce647b7ea6b20335bf6379a27dac5f1641fcf59f99"
@@ -14734,17 +14715,6 @@ dependencies = [
 
 [[package]]
 name = "windows-implement"
-version = "0.57.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9107ddc059d5b6fbfbffdfa7a7fe3e22a226def0b2608f72e9d552763d3e1ad7"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.119",
-]
-
-[[package]]
-name = "windows-implement"
 version = "0.58.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2bbd5b46c938e506ecbce286b6628a02171d56153ba733b6c741fc627ec9579b"
@@ -14759,17 +14729,6 @@ name = "windows-implement"
 version = "0.60.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "053e2e040ab57b9dc951b72c264860db7eb3b0200ba345b4e4c3b14f67855ddf"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.119",
-]
-
-[[package]]
-name = "windows-interface"
-version = "0.57.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "29bee4b38ea3cde66011baa44dba677c432a78593e202392d1e9070cf2a7fca7"
 dependencies = [
  "proc-macro2",
  "quote",

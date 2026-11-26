@@ -61,6 +61,14 @@ pub(super) fn launch(store: Arc<Store>, listener: Option<instance::Listener>, cx
         let commands = commands.clone();
         listener.serve(move || commands.unbounded_send(TrayCommand::Open).is_ok())
     });
+    // The login item follows the app should it have moved (an update, an
+    // AppImage elsewhere).
+    if background::starts_at_login(&backend.store) {
+        let dir = backend.store.path.clone();
+        cx.background_executor()
+            .spawn(async move { crate::display::autostart::refresh(&dir) })
+            .detach();
+    }
     cx.set_global(Shell {
         backend,
         main: None,
@@ -92,6 +100,13 @@ pub(super) fn launch(store: Arc<Store>, listener: Option<instance::Listener>, cx
     })
     .detach();
     open(cx);
+}
+
+/// Whether closing the last window leaves Picacho running in the
+/// background (as `window_closed` decides) rather than quitting.
+pub(super) fn hands_over(cx: &App) -> bool {
+    cx.try_global::<Shell>()
+        .is_some_and(|shell| background::enabled(&shell.backend.store) && shell.instance.is_some())
 }
 
 /// Brings Picacho's window forward, opening the main window if none is.

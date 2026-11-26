@@ -242,18 +242,19 @@ pub(crate) fn build_to(
         .expect("a valid content type");
         let mut related = MultiPart::builder().header(kind).singlepart(html());
         for image in &inline.images {
-            let meta = std::fs::metadata(&image.path).with_context(|| {
+            let size = crate::manage::sealed_files::len(&image.path).with_context(|| {
                 t!(
                     "sync-smtp-the-picture-cant-be-read",
                     path = image.path.display()
                 )
             })?;
-            total += meta.len() as usize;
+            total += size as usize;
             ensure!(
                 total < 4 * DEFAULT_LIMIT,
                 t!("sync-smtp-attachments-are-too-large-to-send")
             );
-            let bytes = std::fs::read(&image.path)?;
+            // A draft's files are sealed while the database is encrypted.
+            let bytes = crate::manage::sealed_files::read(&image.path)?;
             let name = image.name.clone();
             related = related.singlepart(
                 Attachment::new_inline_with_name(image.content_id.clone(), name)
@@ -272,20 +273,20 @@ pub(crate) fn build_to(
         .iter()
         .filter(|p| !inline.images.iter().any(|i| &i.path == *p))
     {
-        let meta = std::fs::metadata(path).with_context(|| {
+        let size = crate::manage::sealed_files::len(path).with_context(|| {
             t!(
                 "sync-smtp-the-attachment-cant-be-read",
                 path = path.display()
             )
         })?;
-        total += meta.len() as usize;
+        total += size as usize;
         // The server's own limit is checked once connected; this only
         // keeps absurd files out of memory.
         ensure!(
             total < 4 * DEFAULT_LIMIT,
             t!("sync-smtp-attachments-are-too-large-to-send")
         );
-        let bytes = std::fs::read(path)?;
+        let bytes = crate::manage::sealed_files::read(path)?;
         let name = path
             .file_name()
             .unwrap_or_default()

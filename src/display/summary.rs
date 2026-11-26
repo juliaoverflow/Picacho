@@ -12,14 +12,12 @@ use crate::manage::local_ai::parcel::Confirmer;
 use crate::manage::parcels::{self, Event, Override, Parcel, STAGES, Source, Status, Tracked};
 use std::sync::atomic::AtomicBool;
 
-/// The parcels found in a message, with the lengths of the subject and text
+/// The parcels found per message, by the lengths of the subject and text
 /// they were found in and whether the model confirmed them.
-pub(super) type Found = ((usize, usize, bool), Rc<Vec<Parcel>>);
+pub(super) type Found = super::ai::Inferred<(usize, usize, bool), Vec<Parcel>>;
 
 /// Banners shown above a message at most, one per parcel.
 const BANNERS: [&str; 3] = ["parcel-banner-0", "parcel-banner-1", "parcel-banner-2"];
-/// Parcels cached per message for the reader; cleared past this many.
-const FOUND_CACHE: usize = 4000;
 /// Shipping messages downloaded between two looks through the mail.
 const DOWNLOAD_BATCH: usize = 150;
 /// Parcels the Summary's Packages widget lists; the rest are on its
@@ -1034,8 +1032,7 @@ impl MailApp {
                                         .text_color(rgb(c.muted))
                                         .child(p.title()),
                                 )
-                            })
-                            .when_some(account, |d, name| d.child(tag(&name, c))),
+                            }),
                     )
                     .child(
                         div()
@@ -1048,7 +1045,18 @@ impl MailApp {
                                 c.muted
                             }))
                             .child(detail.join(" · ")),
-                    ),
+                    )
+                    // The mailbox it came to, on a line of its own.
+                    .when_some(account, |d, name| {
+                        d.child(
+                            div()
+                                .min_w_0()
+                                .truncate()
+                                .text_size(px(11.))
+                                .text_color(rgb(c.muted))
+                                .child(name),
+                        )
+                    }),
             )
             .child(self.stepper(format!("summary-widget-stepper-{i}"), t, false))
             .into_any_element()
@@ -1494,10 +1502,11 @@ impl MailApp {
             detail.push(t!("summary-updated", date = date_full(t.updated)));
         }
         let latest = t.latest();
+        let subject = self.hide_codes_in(&latest.subject);
         let mut from = if t.from().is_empty() {
-            latest.subject.clone()
+            subject.into_owned()
         } else {
-            format!("{} · {}", t.from(), latest.subject)
+            format!("{} · {}", t.from(), subject)
         };
         let editing_name = self.editing(&key, ParcelField::Name);
         let editing_sender = self.editing(&key, ParcelField::Sender);
@@ -1578,7 +1587,6 @@ impl MailApp {
                             .when(matches!(p.source, Source::Markup), |d| {
                                 d.child(tag(t!("summary-from-sender"), c))
                             })
-                            .when_some(account, |d, name| d.child(tag(&name, c)))
                             .when(t.hidden, |d| d.child(tag(t!("summary-hidden"), c)))
                             .when(in_email, |d| {
                                 d.child(
@@ -1614,6 +1622,17 @@ impl MailApp {
                                 .text_size(px(12.))
                                 .text_color(rgb(c.muted))
                                 .child(from),
+                        )
+                    })
+                    // The mailbox it came to, under who sent it.
+                    .when_some(account, |d, name| {
+                        d.child(
+                            div()
+                                .min_w_0()
+                                .truncate()
+                                .text_size(px(11.))
+                                .text_color(rgb(c.muted))
+                                .child(name),
                         )
                     }),
             )
@@ -1816,7 +1835,7 @@ impl MailApp {
                             .min_w_0()
                             .truncate()
                             .text_size(px(12.))
-                            .child(s.subject.clone()),
+                            .child(self.hide_codes_in(&s.subject).into_owned()),
                     )
                     .when(!who.is_empty(), |d| {
                         d.child(
@@ -1833,42 +1852,68 @@ impl MailApp {
     }
 
     /// The parcels the reader finds in received mail `m`: in its markup,
-    /// links and, confirmed by the model when it is loaded, its text.
+    /// links and, confirmed by the model when it is loaded, its text. Only
+    /// what was already found where the model is used: `found_parcels_for`
+    /// starts it.
+    #[cfg(test)]
     pub(super) fn found_parcels(&self, m: &Mail) -> Rc<Vec<Parcel>> {
-        if matches!(m.folder, Folder::Sent | Folder::Drafts) {
+        match self.parcels_wanted(m) {
+            Some((None, key)) => self.parcels_now(m, key),
+            Some((Some(_), key)) => self.parcels_found.borrow().get(&m.id, &key).unwrap_or_default(),
+            None => Rc::default(),
+        }
+    }
+    /// `found_parcels`, starting the model off the window's thread where it
+    /// hasn't read `m` yet: the parcels appear once it has.
+    pub(super) fn found_parcels_for(&self, m: &Mail, cx: &Context<Self>) -> Rc<Vec<Parcel>> {
+        let (model, key) = match self.parcels_wanted(m) {
+            Some((Some(model), key)) => (model, key),
+            Some((None, key)) => return self.parcels_now(m, key),
+            None => return Rc::default(),
+        };
+        if let Some(found) = self.parcels_found.borrow().get(&m.id, &key) {
+            return found;
+        }
+        if !self.parcels_found.borrow_mut().start(&m.id, &key) {
             return Rc::default();
         }
-        if m.body.is_none() && m.html.is_none() {
-            return Rc::default();
+        let id = m.id.clone();
+        let (subject, body, html, date) = (m.subject.clone(), m.body.clone().unwrap_or_default(), m.html.clone(), m.date);
+        self.infer(
+            cx,
+            move || parcels::find(&subject, &body, html.as_deref(), date, Some(&model)),
+            move |this, found| this.parcels_found.borrow_mut().finish(&id, key, found.unwrap_or_default()),
+        );
+        Rc::default()
+    }
+    /// For `found_parcels`: the model, when it is used, and what the parcels
+    /// in `m` are worked out from; None where none are looked for.
+    fn parcels_wanted(&self, m: &Mail) -> Option<(Option<Arc<Confirmer>>, (usize, usize, bool))> {
+        if matches!(m.folder, Folder::Sent | Folder::Drafts) || (m.body.is_none() && m.html.is_none()) {
+            return None;
         }
-        let body = m.body.as_deref().unwrap_or_default();
-        let model = self.parcel_model.as_deref().filter(|_| self.find_parcels);
-        let size = body.len() + m.html.as_deref().map_or(0, str::len);
+        let model = self.parcel_model.clone().filter(|_| self.find_parcels);
+        let size = m.body.as_deref().map_or(0, str::len) + m.html.as_deref().map_or(0, str::len);
         let key = (m.subject.len(), size, model.is_some());
-        if let Some((k, found)) = self.parcels_found.borrow().get(&m.id)
-            && *k == key
-        {
-            return found.clone();
+        Some((model, key))
+    }
+    /// The parcels in `m` found without the model (its markup, links and
+    /// the rules for numbers), which is quick enough while drawing.
+    fn parcels_now(&self, m: &Mail, key: (usize, usize, bool)) -> Rc<Vec<Parcel>> {
+        if let Some(found) = self.parcels_found.borrow().get(&m.id, &key) {
+            return found;
         }
-        let found = Rc::new(parcels::find(
-            &m.subject,
-            body,
-            m.html.as_deref(),
-            m.date,
-            model,
-        ));
+        let found = parcels::find(&m.subject, m.body.as_deref().unwrap_or_default(), m.html.as_deref(), m.date, None);
         let mut cache = self.parcels_found.borrow_mut();
-        if cache.len() >= FOUND_CACHE {
-            cache.clear();
-        }
-        cache.insert(m.id.clone(), (key, found.clone()));
-        found
+        cache.start(&m.id, &key);
+        cache.finish(&m.id, key.clone(), found);
+        cache.get(&m.id, &key).unwrap_or_default()
     }
 
     /// Above a message that tells of parcels: each, its carrier and stage,
     /// and links to track it and copy its number.
     pub(super) fn parcel_banners(&self, m: &Mail, cx: &Context<Self>) -> Vec<AnyElement> {
-        let found = self.found_parcels(m);
+        let found = self.found_parcels_for(m, cx);
         let c = self.colors();
         found
             .iter()

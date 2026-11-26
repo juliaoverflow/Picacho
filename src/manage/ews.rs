@@ -101,15 +101,25 @@ pub(super) fn remote_folders(folders: &[MailFolder]) -> Vec<RemoteFolder> {
         .collect()
 }
 /// The account's sign-in for EWS: the organization's (an access token),
-/// Kerberos, or NTLM (Basic where that's all the server takes) with its
-/// name and password.
+/// Kerberos, Basic where the account chose it (`Account::ews_basic`), or
+/// NTLM with its name and password.
 fn auth(a: &Account, secret: &Secret) -> Auth {
     if a.sso.is_some() {
         Auth::Bearer(secret.access_token.clone())
     } else if a.kerberos {
         Auth::Kerberos
+    } else if a.ews_basic {
+        Auth::Basic { user: a.login().to_owned(), password: secret.password.clone() }
     } else {
         Auth::Ntlm(ews::ntlm::Identity::new(a.login(), &secret.password))
+    }
+}
+/// The sign-in Autodiscover uses: the account's, except that Basic is
+/// never sent to the servers it asks, so NTLM is tried there instead.
+fn autodiscover_auth(a: &Account, secret: &Secret) -> Auth {
+    match auth(a, secret) {
+        Auth::Basic { .. } => Auth::Ntlm(ews::ntlm::Identity::new(a.login(), &secret.password)),
+        other => other,
     }
 }
 
@@ -144,7 +154,7 @@ impl Backend {
     /// EWS address was given, Autodiscover finds it (kept in the account).
     pub(super) fn check_ews(&self, a: &mut Account, secret: &Secret) -> Result<()> {
         if a.ews_url.is_empty()
-            && let Ok(Some(found)) = ews::autodiscover(&a.email, &auth(a, secret), self.tls_connector()?)
+            && let Ok(Some(found)) = ews::autodiscover(&a.email, &autodiscover_auth(a, secret), self.tls_connector()?)
         {
             a.ews_url = found;
             if let Some(host) = url::Url::parse(&a.ews_url).ok().and_then(|u| u.host_str().map(str::to_owned)) {
@@ -164,10 +174,10 @@ impl Backend {
         Ok(folders)
     }
 
-    pub(super) fn ews_mail(&self, a: &Account, folders: &[MailFolder], m: &Message) -> Result<Mail> {
+    pub(super) fn ews_mail(&self, a: &Account, folders: &[MailFolder], m: &Message, pre: Option<&Prefetched>) -> Result<Mail> {
         let id = row_id(a, &m.id);
         let (folder, remote) = location(m, folders);
-        let mut mail = match self.store.message(&id)? {
+        let mut mail = match Prefetched::cached(pre, &self.store, &id)? {
             Some(cached) => cached,
             None => Mail {
                 id,
@@ -232,8 +242,9 @@ impl Backend {
             }
             listed.truncate(limit);
             let mut rows = Vec::with_capacity(listed.len());
+            let pre = Prefetched::new(&self.store, listed.iter().map(|m| row_id(a, &m.id)).collect())?;
             for m in &listed {
-                rows.push(self.ews_mail(a, &folders, m)?);
+                rows.push(self.ews_mail(a, &folders, m, Some(&pre))?);
             }
             let oldest = listed.iter().map(|m| m.received).filter(|&t| t > 0).min().unwrap_or(i64::MIN);
             let listed_ids: HashSet<&str> = rows.iter().map(|m| m.id.as_str()).collect();
@@ -247,8 +258,9 @@ impl Backend {
             if !unlisted.is_empty() {
                 let current = s.messages(&ids(a, &unlisted))?;
                 let still: HashSet<String> = current.iter().map(|m| row_id(a, &m.id)).collect();
+                let pre = Prefetched::new(&self.store, current.iter().map(|m| row_id(a, &m.id)).collect())?;
                 for m in &current {
-                    rows.push(self.ews_mail(a, &folders, m)?);
+                    rows.push(self.ews_mail(a, &folders, m, Some(&pre))?);
                 }
                 let gone: Vec<String> = unlisted.iter().map(|m| m.id.clone()).filter(|id| !still.contains(id)).collect();
                 if !gone.is_empty() {
@@ -285,8 +297,8 @@ impl Backend {
                 let (page, last) = s.list(&folder, offset, 250, since, None)?;
                 offset += page.len();
                 for m in &page {
-                    if added.len() < batch.max(1) && self.store.message(&row_id(a, &m.id))?.is_none() {
-                        added.push(self.ews_mail(a, &folders, m)?);
+                    if added.len() < batch.max(1) && !self.store.has_message(&row_id(a, &m.id))? {
+                        added.push(self.ews_mail(a, &folders, m, None)?);
                     }
                 }
                 if last || page.is_empty() {
@@ -341,7 +353,7 @@ impl Backend {
     }
     /// A row as it is now, where it moved since (its id changed).
     pub(super) fn ews_current(&self, a: &Account, m: &Mail) -> Mail {
-        if self.store.message(&m.id).ok().flatten().is_some() {
+        if self.store.has_message(&m.id).unwrap_or(false) {
             return m.clone();
         }
         let moved: Vec<(String, String)> = self
@@ -413,6 +425,7 @@ impl Backend {
                     .unwrap_or_default();
                 let mut rows = Vec::new();
                 let mut gone = Vec::new();
+                let mut renamed = Vec::new();
                 for (m, new) in current.iter().filter(|m| ews_id(a, m).is_some()).zip(new_ids) {
                     gone.push(m.id.clone());
                     if new.is_empty() {
@@ -429,17 +442,20 @@ impl Backend {
                             .find(|f| f.id == target || f.distinguished.as_deref() == Some(target.as_str()))
                             .map_or(remote.clone(), |f| f.name.clone())
                     };
-                    if let Ok(Some(raw)) = self.store.raw(&m.id) {
-                        let _ = self.store.save_raw(&row.id, &raw);
-                    }
+                    renamed.push((m.id.clone(), row.id.clone()));
                     moved.push((m.id.clone(), row.id.clone()));
                     rows.push(row);
                 }
                 let skip = moved.len().saturating_sub(MOVED_KEPT);
                 moved.drain(..skip);
                 self.store.set_preference(&Self::ews_moved_key(a), &serde_json::to_string(&moved)?)?;
-                self.store.delete_ids(&a.id, &gone)?;
+                // The new rows first, then their downloaded sources copied
+                // over as stored (not inflated and compressed again), and
+                // only then the old rows gone: saved before its row existed,
+                // a source was dropped, and the message downloaded again.
                 self.store.save_messages(&rows)?;
+                self.store.copy_sources(&renamed)?;
+                self.store.delete_ids(&a.id, &gone)?;
                 Ok(true)
             }
         })
@@ -486,8 +502,9 @@ impl Backend {
                 }
             }
             let mut out = ServerResults { total: found.len(), ..Default::default() };
+            let pre = Prefetched::new(&self.store, found.iter().take(limit).map(|m| row_id(a, &m.id)).collect())?;
             for m in found.iter().take(limit) {
-                out.mails.push(self.ews_mail(a, &folders, m)?);
+                out.mails.push(self.ews_mail(a, &folders, m, Some(&pre))?);
             }
             self.store.save_messages(&out.mails)?;
             out.mails.sort_by(Mail::newest_first);

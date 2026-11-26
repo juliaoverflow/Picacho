@@ -1745,3 +1745,63 @@ fn caldav_task_reminders_are_shown() -> Result<()> {
     std::fs::remove_dir_all(path)?;
     Ok(())
 }
+
+/// Autocrypt-Gossip (Autocrypt 1.1 §2.4) is learned only from mail OpenPGP
+/// actually decrypted: the same header in plain mail, or inside mail that
+/// is only signed (here under a forged signature), teaches no key.
+#[test]
+fn gossip_keys_come_only_from_decrypted_mail() -> Result<()> {
+    use crate::manage::openpgp::{Keyring, Protect, protect, test_key};
+    use base64::Engine as _;
+    use pgp::composed::SignedPublicKey;
+    use pgp::ser::Serialize as _;
+    let ana = test_key("Ana <ana@example.org>", "");
+    let bo = test_key("Bo <bo@example.se>", "");
+    let cy = test_key("Cy <cy@example.net>", "");
+    let public = |k: &pgp::composed::SignedSecretKey| SignedPublicKey::from(k.clone()).to_armored_string(Default::default()).unwrap();
+    // Bo reads; Bo knows Ana, but not Cy.
+    let (b, mut a, path) = backend(b"")?;
+    a.email = "bo@example.se".into();
+    let mut bos = Keyring::default();
+    bos.import(&bo.to_armored_string(Default::default())?, "")?;
+    bos.import(&public(&ana), "")?;
+    b.set_keyring(bos)?;
+    let mail = |id: &str| {
+        let mut m = Mail { id: id.into(), account: a.id.clone(), to: "Bo <bo@example.se>".into(), ..Default::default() };
+        m.set_cc("cy@example.net".to_owned());
+        m
+    };
+    let cy_data = base64::engine::general_purpose::STANDARD.encode(SignedPublicKey::from(cy.clone()).to_bytes()?);
+    let gossip = format!("Autocrypt-Gossip: addr=cy@example.net; keydata={cy_data}\r\n");
+    let knows_cy = |b: &Backend| b.keyring().key_for("cy@example.net").is_some();
+
+    // Plain mail carrying the header.
+    let plain = format!(
+        "From: Ana <ana@example.org>\r\nTo: Bo <bo@example.se>\r\nCc: cy@example.net\r\n{gossip}Subject: Plans\r\nMIME-Version: 1.0\r\nContent-Type: text/plain\r\n\r\nMeet at noon.\r\n"
+    );
+    b.parse_read(&a, &mail("plain"), plain.as_bytes())?;
+    assert!(!knows_cy(&b));
+
+    // Signed only: the header in the signed part, the signature forged.
+    let signed = format!(
+        "From: Ana <ana@example.org>\r\nTo: Bo <bo@example.se>\r\nCc: cy@example.net\r\nSubject: Plans\r\nMIME-Version: 1.0\r\nContent-Type: multipart/signed; micalg=pgp-sha256; protocol=\"application/pgp-signature\"; boundary=\"b\"\r\n\r\n--b\r\nContent-Type: text/plain; protected-headers=\"v1\"\r\n{gossip}\r\nMeet at noon.\r\n--b\r\nContent-Type: application/pgp-signature\r\n\r\n-----BEGIN PGP SIGNATURE-----\r\n\r\nAAAA\r\n-----END PGP SIGNATURE-----\r\n--b--\r\n"
+    );
+    b.parse_read(&a, &mail("signed"), signed.as_bytes())?;
+    assert!(!knows_cy(&b));
+    assert!(!b.verdict("signed").is_some_and(|v| v.decrypted));
+
+    // Encrypted by Ana to Bo and Cy: decrypted, so Cy's key is learned.
+    let mut anas = Keyring::default();
+    anas.import(&ana.to_armored_string(Default::default())?, "")?;
+    anas.import(&public(&bo), "")?;
+    anas.import(&public(&cy), "")?;
+    let source = b"From: Ana <ana@example.org>\r\nTo: Bo <bo@example.se>\r\nCc: cy@example.net\r\nSubject: Plans\r\nMessage-ID: <1@example.org>\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nMeet at noon.\r\n";
+    let to = ["bo@example.se".to_owned(), "cy@example.net".to_owned()];
+    let sealed = protect(source, "ana@example.org", &to, Protect { sign: true, encrypt: true, ..Default::default() }, &anas)?;
+    b.parse_read(&a, &mail("sealed"), &sealed)?;
+    assert!(b.verdict("sealed").is_some_and(|v| v.decrypted));
+    assert!(knows_cy(&b));
+    drop(b);
+    std::fs::remove_dir_all(path)?;
+    Ok(())
+}

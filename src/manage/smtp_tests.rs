@@ -954,3 +954,64 @@ fn other_apps_html_drafts_open_with_their_formatting() -> Result<()> {
     std::fs::remove_dir_all(path)?;
     Ok(())
 }
+
+/// A draft sealed with your OpenPGP key, found on the server while the
+/// database is encrypted: its attachment, decrypted to edit the draft, is
+/// kept encrypted on disk, read back whole to send, and opened again in
+/// place when the database's encryption is turned off.
+#[test]
+fn sealed_drafts_keep_their_attachments_encrypted_on_disk() -> Result<()> {
+    use crate::manage::openpgp::{Keyring, test_key};
+    let path = std::env::temp_dir().join(format!("pinal-sealed-draft-{}", uuid::Uuid::new_v4()));
+    let keys: Arc<crate::manage::vault::MemoryKeys> = Arc::default();
+    let store = Arc::new(Store::open_with_keys(&path, keys)?);
+    store.set_encrypted(true)?;
+    let b = Backend::new(store);
+    let mut a = Account::new(Provider::Imap);
+    a.email = "qa@example.com".into();
+    a.name = "QA".into();
+    let mut ring = Keyring::default();
+    ring.import(&test_key("QA <qa@example.com>", "").to_armored_string(Default::default())?, "")?;
+    b.set_keyring(ring)?;
+    let picked = path.join("budget.txt");
+    std::fs::write(&picked, b"Secret budget figures")?;
+    let d = Draft {
+        id: "sealed-up".into(),
+        account: a.id.clone(),
+        to: "rae@example.com".into(),
+        subject: "Budget".into(),
+        body: "Attached.".into(),
+        encrypt: true,
+        attachments: vec![picked],
+        ..Draft::default()
+    };
+    let uploaded = b.draft_upload(&a, &d)?.context("sealed")?;
+    assert!(!String::from_utf8_lossy(&uploaded).contains("Secret budget"));
+    let back = b.draft_from(&a, "sealed-back", &uploaded)?;
+    assert!(back.encrypt);
+    assert_eq!(back.attachments.len(), 1);
+    let file = &back.attachments[0];
+    assert_eq!(file.file_name().unwrap(), "budget.txt");
+    let on_disk = std::fs::read(file)?;
+    assert!(!on_disk.windows(6).any(|w| w == b"Secret"), "kept encrypted");
+    assert_eq!(crate::manage::sealed_files::read(file)?, b"Secret budget figures");
+    assert_eq!(crate::manage::sealed_files::len(file)?, 21);
+    // Built to send: the attachment as it was.
+    let built = crate::sync::smtp::build(&a, &Draft { encrypt: false, ..back.clone() }, false)?.formatted();
+    let parsed = mailparse::parse_mail(&built)?;
+    let mut leaves = Vec::new();
+    collect_leaves(&parsed, &mut leaves);
+    assert!(leaves.iter().any(|l| l.get_body_raw().is_ok_and(|b| b == b"Secret budget figures")));
+    // The database decrypted: the file is plain again, the draft the same.
+    let before = back.fingerprint();
+    b.store.set_encrypted(false)?;
+    assert_eq!(std::fs::read(file)?, b"Secret budget figures");
+    assert_eq!(back.fingerprint(), before);
+    // And encrypted again: sealed in place.
+    b.store.set_encrypted(true)?;
+    assert!(!std::fs::read(file)?.windows(6).any(|w| w == b"Secret"));
+    assert_eq!(crate::manage::sealed_files::read(file)?, b"Secret budget figures");
+    drop(b);
+    std::fs::remove_dir_all(path)?;
+    Ok(())
+}

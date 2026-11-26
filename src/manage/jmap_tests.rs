@@ -3309,3 +3309,37 @@ fn jmap_submissions_carry_the_delivery_time_limit() -> Result<()> {
     assert!(params(2).get("BY").is_none() && params(2).get("HOLDUNTIL").is_some(), "{}", params(2));
     Ok(())
 }
+
+/// An attachment of a message not kept whole goes from the server to the
+/// file it is saved or opened as, as it downloads, beyond the size a
+/// download held in memory may have.
+#[test]
+fn jmap_attachments_download_straight_to_their_file() -> Result<()> {
+    let mut fixture = Server::default();
+    let data: Vec<u8> = (0..700_000u32).map(|i| (i * 31 % 251) as u8).collect();
+    fixture.blobs.insert("B-file".into(), data.clone());
+    let (cert, port, _server, _running) = start(fixture)?;
+    let (b, mut a, path) = backend(&cert)?;
+    let _cleanup = Cleanup(path.clone());
+    a.provider = Provider::Jmap;
+    a.incoming_port = port;
+    let mut m = Mail { id: format!("{}:jmap:m1", a.id), account: a.id.clone(), ..Mail::default() };
+    m.set_attachments(vec![Attachment {
+        name: "data.bin".into(),
+        size: data.len(),
+        mime: "application/octet-stream".into(),
+        part: 1,
+        section: "B-file".into(),
+        encoding: String::new(),
+    }]);
+    let file = path.join("data.bin");
+    let written = b.attachment_to(&a, &m, 1, &file)?;
+    assert_eq!(written.size, data.len() as u64);
+    assert_eq!(std::fs::read(&file)?, data);
+    // A missing blob leaves no half-written file behind.
+    let mut gone = m.clone();
+    gone.set_attachments(vec![Attachment { section: "B-gone".into(), ..m.attachments()[0].clone() }]);
+    assert!(b.attachment_to(&a, &gone, 1, &path.join("gone.bin")).is_err());
+    assert!(!path.join("gone.bin").exists());
+    Ok(())
+}

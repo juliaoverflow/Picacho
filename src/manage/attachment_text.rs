@@ -16,10 +16,34 @@ const MAX_TEXT: usize = 4 << 20;
 const MAX_PART_TEXT: usize = 1 << 20;
 /// Attachments larger than this (decoded) aren't read.
 const MAX_PART: usize = 25 << 20;
-/// The most a file inside an office document may inflate to.
+/// The most a file inside an office document, or a PDF stream, may
+/// inflate to.
 const MAX_INFLATED: u64 = 32 << 20;
+/// The most one office document or PDF may inflate to in all, its files
+/// or streams together: a zip's entries can all name the same deflated
+/// data, and a file that yields no text never reaches `MAX_PART_TEXT`.
+const MAX_DOCUMENT_INFLATED: u64 = 64 << 20;
+/// The most entries of a zip's directory read, and streams of a PDF.
+const MAX_ZIP_ENTRIES: usize = 4096;
+const MAX_PDF_STREAMS: usize = 20_000;
+/// The most codes all of a PDF's ToUnicode maps may name, and the longest
+/// text (in hex digits) one code may stand for: a `bfrange` line of a few
+/// bytes names up to 65,536 codes, each with its own copy of the text.
+const MAX_CMAP_ENTRIES: usize = 65_536;
+const MAX_CMAP_HEX: usize = 64;
 /// How deep attached emails are read into (an email in an email…).
 const MAX_DEPTH: usize = 3;
+/// The most strings a PDF content stream may draw before its next
+/// operator: a stream of nothing but `(a)(a)(a)…` would otherwise keep
+/// millions of them.
+const MAX_PENDING: usize = 4096;
+
+/// Whether a part is too large to read: its encoded size, before any of it
+/// is decoded. Decoding never makes a part larger (base64 is a third
+/// larger encoded, with line breaks a little more).
+fn too_large(part: &mailparse::ParsedMail) -> bool {
+    part.raw_bytes.len() > MAX_PART + MAX_PART / 2
+}
 
 /// The text of the attachments in `raw` (a message's source), names
 /// first, one attachment after another.
@@ -71,6 +95,7 @@ fn message(raw: &[u8], depth: usize, whole: bool, out: &mut String) {
                 push(out, &html_to_text(&part.get_body().unwrap_or_default()));
             } else if mime == "message/rfc822"
                 && depth < MAX_DEPTH
+                && !too_large(part)
                 && let Ok(bytes) = part.get_body_raw()
             {
                 message(&bytes, depth + 1, true, out);
@@ -80,6 +105,9 @@ fn message(raw: &[u8], depth: usize, whole: bool, out: &mut String) {
         let name = name.unwrap_or_default();
         if !name.is_empty() {
             push(out, &name);
+        }
+        if too_large(part) {
+            continue;
         }
         let Ok(bytes) = part.get_body_raw() else {
             continue;
@@ -196,6 +224,9 @@ fn truncate(text: &mut String, max: usize) {
 /// in `.xml`) in the ZIP archive `zip`.
 fn office_text(zip: &[u8], entries: &[&str]) -> String {
     let mut out = String::new();
+    let mut budget = MAX_DOCUMENT_INFLATED;
+    // Entries that share their data (a zip bomb's trick) are read once.
+    let mut read = std::collections::HashSet::new();
     let mut files = zip_entries(zip);
     // Slides in their order: slide2 before slide10.
     files.sort_by_key(|f| {
@@ -206,10 +237,14 @@ fn office_text(zip: &[u8], entries: &[&str]) -> String {
         let wanted = entries
             .iter()
             .any(|e| file.name == *e || (file.name.starts_with(e) && file.name.ends_with(".xml")));
-        if !wanted {
+        if !wanted || !read.insert(file.local) {
             continue;
         }
-        if let Some(xml) = zip_read(zip, &file) {
+        if budget == 0 {
+            break;
+        }
+        if let Some(xml) = zip_read(zip, &file, budget.min(MAX_INFLATED)) {
+            budget = budget.saturating_sub(xml.len() as u64);
             push(&mut out, &xml_text(&String::from_utf8_lossy(&xml)));
         }
         if out.len() >= MAX_PART_TEXT {
@@ -249,7 +284,7 @@ fn zip_entries(zip: &[u8]) -> Vec<ZipEntry> {
         return out;
     };
     let mut at = offset as usize;
-    for _ in 0..count {
+    for _ in 0..usize::from(count).min(MAX_ZIP_ENTRIES) {
         if u32_at(zip, at) != Some(0x0201_4b50) {
             break;
         }
@@ -277,8 +312,9 @@ fn zip_entries(zip: &[u8]) -> Vec<ZipEntry> {
     out
 }
 
-/// A file's contents, stored or deflated; None for other methods.
-fn zip_read(zip: &[u8], file: &ZipEntry) -> Option<Vec<u8>> {
+/// A file's contents, stored or deflated (up to `limit` bytes inflated);
+/// None for other methods.
+fn zip_read(zip: &[u8], file: &ZipEntry, limit: u64) -> Option<Vec<u8>> {
     if u32_at(zip, file.local)? != 0x0403_4b50 {
         return None;
     }
@@ -291,7 +327,7 @@ fn zip_read(zip: &[u8], file: &ZipEntry) -> Option<Vec<u8>> {
         8 => {
             let mut out = Vec::new();
             flate2::read::DeflateDecoder::new(data)
-                .take(MAX_INFLATED)
+                .take(limit)
                 .read_to_end(&mut out)
                 .ok()?;
             Some(out)
@@ -350,7 +386,7 @@ fn pdf_text(pdf: &[u8]) -> String {
         if find(s, b"begincmap").is_some() {
             continue;
         }
-        content_text(s, &map, &mut out);
+        content_text(s, &map, &mut out, MAX_PART_TEXT);
         if out.len() >= MAX_PART_TEXT {
             break;
         }
@@ -368,7 +404,10 @@ fn pdf_streams(pdf: &[u8]) -> Vec<Vec<u8>> {
     let mut out = Vec::new();
     let mut at = 0;
     let mut total = 0u64;
-    while let Some(i) = find(&pdf[at..], b"stream") {
+    while out.len() < MAX_PDF_STREAMS
+        && total < MAX_DOCUMENT_INFLATED
+        && let Some(i) = find(&pdf[at..], b"stream")
+    {
         let start_kw = at + i;
         at = start_kw + 6;
         // "endstream" contains "stream".
@@ -410,7 +449,7 @@ fn pdf_streams(pdf: &[u8]) -> Vec<Vec<u8>> {
         let bytes = if flate {
             let mut inflated = Vec::new();
             let read = flate2::read::ZlibDecoder::new(data)
-                .take(MAX_INFLATED)
+                .take(MAX_INFLATED.min(MAX_DOCUMENT_INFLATED - total))
                 .read_to_end(&mut inflated);
             // A damaged stream often still gives most of its text.
             if read.is_err() && inflated.is_empty() {
@@ -418,13 +457,11 @@ fn pdf_streams(pdf: &[u8]) -> Vec<Vec<u8>> {
             }
             inflated
         } else {
-            data.to_vec()
+            let left = (MAX_DOCUMENT_INFLATED - total).min(MAX_INFLATED) as usize;
+            data[..data.len().min(left)].to_vec()
         };
         total += bytes.len() as u64;
         out.push(bytes);
-        if total > 4 * MAX_INFLATED {
-            break;
-        }
     }
     out
 }
@@ -475,7 +512,11 @@ impl CMap {
                 continue;
             }
             let h = hexes(line);
+            if self.one.len() + self.two.len() >= MAX_CMAP_ENTRIES {
+                break;
+            }
             match (section, h.as_slice()) {
+                (_, [.., (_, _, dst)]) if dst.len() > MAX_CMAP_HEX => {}
                 ("char", [(code, len, _), (_, _, dst)]) => {
                     self.put(*code, *len, utf16(dst));
                 }
@@ -484,15 +525,20 @@ impl CMap {
                         continue;
                     };
                     let prefix = utf16(&dst[..dst.len().saturating_sub(4)]);
-                    for (i, code) in (*lo..=*hi).take(65_536).enumerate() {
+                    let room = MAX_CMAP_ENTRIES.saturating_sub(self.one.len() + self.two.len());
+                    for (i, code) in (*lo..=*hi).take(room).enumerate() {
                         let c = char::from_u32(first + i as u32).map(String::from).unwrap_or_default();
                         self.put(code, *len, format!("{prefix}{c}"));
                     }
                 }
                 ("range", [(lo, len, _), (_, _, _), rest @ ..]) => {
                     // An array of destinations, one per code.
-                    for (i, (_, _, dst)) in rest.iter().enumerate() {
-                        self.put(lo + i as u32, *len, utf16(dst));
+                    let room = MAX_CMAP_ENTRIES.saturating_sub(self.one.len() + self.two.len());
+                    for (i, (_, _, dst)) in rest.iter().take(room).enumerate() {
+                        if dst.len() > MAX_CMAP_HEX {
+                            continue;
+                        }
+                        self.put(lo.wrapping_add(i as u32), *len, utf16(dst));
                     }
                 }
                 _ => {}
@@ -506,13 +552,20 @@ impl CMap {
             self.one.insert(code, text);
         }
     }
-    /// A drawn string's text.
-    fn decode(&self, bytes: &[u8], out: &mut String) {
+    /// A drawn string's text, added to `out` until it holds `limit` bytes:
+    /// a code may stand for dozens of bytes of text, so a stream of one
+    /// code repeated stands for many times its size.
+    fn decode(&self, bytes: &[u8], out: &mut String, limit: usize) {
+        if out.len() >= limit {
+            return;
+        }
         if bytes.starts_with(&[0xFE, 0xFF]) {
+            let room = limit - out.len();
             let units: Vec<u16> = bytes[2..]
                 .as_chunks::<2>()
                 .0
                 .iter()
+                .take(room)
                 .map(|c| u16::from_be_bytes(*c))
                 .collect();
             out.push_str(&String::from_utf16_lossy(&units));
@@ -528,6 +581,9 @@ impl CMap {
             let known = codes.iter().filter(|c| self.two.contains_key(c)).count();
             if known * 2 >= codes.len() {
                 for c in codes {
+                    if out.len() >= limit {
+                        return;
+                    }
                     if let Some(t) = self.two.get(&c) {
                         out.push_str(t);
                     }
@@ -536,6 +592,9 @@ impl CMap {
             }
         }
         for &b in bytes {
+            if out.len() >= limit {
+                return;
+            }
             match self.one.get(&u32::from(b)) {
                 Some(t) => out.push_str(t),
                 None if b >= 0x20 || b == b'\t' => out.push(char::from(b)),
@@ -545,8 +604,9 @@ impl CMap {
     }
 }
 
-/// Adds the text a content stream draws (Tj, TJ, ' and ") to `out`.
-fn content_text(s: &[u8], map: &CMap, out: &mut String) {
+/// Adds the text a content stream draws (Tj, TJ, ' and ") to `out`,
+/// stopping once `out` holds `limit` bytes.
+fn content_text(s: &[u8], map: &CMap, out: &mut String, limit: usize) {
     let mut i = 0;
     let mut pending: Vec<Vec<u8>> = Vec::new();
     let mut numbers: Vec<f32> = Vec::new();
@@ -557,7 +617,9 @@ fn content_text(s: &[u8], map: &CMap, out: &mut String) {
         match c {
             b'(' => {
                 let (bytes, next) = literal(s, i + 1);
-                pending.push(bytes);
+                if pending.len() < MAX_PENDING {
+                    pending.push(bytes);
+                }
                 i = next;
                 continue;
             }
@@ -572,7 +634,9 @@ fn content_text(s: &[u8], map: &CMap, out: &mut String) {
                         u8::from_str_radix(std::str::from_utf8(&h).ok()?, 16).ok()
                     })
                     .collect();
-                pending.push(bytes);
+                if pending.len() < MAX_PENDING {
+                    pending.push(bytes);
+                }
                 i = end + 1;
                 continue;
             }
@@ -581,6 +645,9 @@ fn content_text(s: &[u8], map: &CMap, out: &mut String) {
                 let mut j = i + 1;
                 let mut parts: Vec<Vec<u8>> = Vec::new();
                 while j < s.len() && s[j] != b']' {
+                    if parts.len() >= MAX_PENDING {
+                        parts.pop();
+                    }
                     match s[j] {
                         b'(' => {
                             let (bytes, next) = literal(s, j + 1);
@@ -631,6 +698,10 @@ fn content_text(s: &[u8], map: &CMap, out: &mut String) {
                     .position(|b| !matches!(b, b'-' | b'0'..=b'9' | b'.'))
                     .map_or(s.len(), |p| i + p);
                 if let Some(n) = std::str::from_utf8(&s[i..end]).ok().and_then(|t| t.parse().ok()) {
+                    // Only the last few are read (Td's).
+                    if numbers.len() >= MAX_PENDING {
+                        numbers.clear();
+                    }
                     numbers.push(n);
                 }
                 i = end.max(i + 1);
@@ -648,14 +719,24 @@ fn content_text(s: &[u8], map: &CMap, out: &mut String) {
                         if matches!(op, b"'" | b"\"") {
                             newline(&mut line, out);
                         }
+                        // What the line may still hold: `limit` less the
+                        // text already out.
+                        let room = limit.saturating_sub(out.len());
                         for p in pending.drain(..) {
                             if p == b" " {
                                 line.push(' ');
                             } else {
-                                map.decode(&p, &mut line);
+                                map.decode(&p, &mut line, room);
+                            }
+                            if line.len() >= room {
+                                break;
                             }
                         }
                         drew = true;
+                        if line.len() >= room {
+                            newline(&mut line, out);
+                            return;
+                        }
                     }
                     b"T*" => newline(&mut line, out),
                     b"Td" | b"TD" => {
@@ -851,7 +932,7 @@ mod tests {
         let mut map = CMap::default();
         map.read(b"begincmap\n2 beginbfchar\n<0003> <0048>\n<0004> <0069>\nendbfchar\n1 beginbfrange\n<0010> <0012> <0061>\nendbfrange\nendcmap");
         let mut out = String::new();
-        content_text(b"BT <00030004> Tj 10 0 Td [<0010>-400<00110012>] TJ ET", &map, &mut out);
+        content_text(b"BT <00030004> Tj 10 0 Td [<0010>-400<00110012>] TJ ET", &map, &mut out, MAX_PART_TEXT);
         assert_eq!(out, "Hi a bc");
     }
 
@@ -862,5 +943,76 @@ mod tests {
         assert!(text.contains("Original plan") && text.contains("Meet at noon"), "{text}");
         let image = extract(&with_attachment("photo.jpg", "image/jpeg", &[0xFF, 0xD8, 0xFF, 0xE0]));
         assert_eq!(image, "photo.jpg");
+    }
+
+    /// A ToUnicode map's ranges name at most `MAX_CMAP_ENTRIES` codes in
+    /// all, however many lines ask for more, and long texts are left out.
+    #[test]
+    fn font_maps_are_bounded() {
+        let mut cmap = String::from("begincmap\nbeginbfrange\n");
+        for k in 0..64u32 {
+            cmap.push_str(&format!("<{:08x}><{:08x}><0041>\n", k * 65_536, k * 65_536 + 65_535));
+        }
+        cmap.push_str(&format!("<0000><0010><{}>\nendbfrange\n", "0041".repeat(1000)));
+        let mut map = CMap::default();
+        map.read(cmap.as_bytes());
+        assert_eq!(map.one.len() + map.two.len(), MAX_CMAP_ENTRIES);
+        let mut long = CMap::default();
+        long.read(format!("beginbfchar\n<01> <{}>\nendbfchar\n", "0041".repeat(1000)).as_bytes());
+        assert!(long.one.is_empty());
+    }
+
+    /// One code standing for a long text, drawn millions of times, adds at
+    /// most `MAX_PART_TEXT` of it rather than dozens of times the stream.
+    #[test]
+    fn pdf_text_expansion_is_bounded() {
+        let mut map = CMap::default();
+        map.read(format!("beginbfchar\n<01> <{}>\nendbfchar\n", "4E2D".repeat(16)).as_bytes());
+        assert!(!map.one.is_empty());
+        let mut content = b"BT <".to_vec();
+        content.extend(b"01".repeat(4 << 20));
+        content.extend(b"> Tj ET");
+        let mut out = String::new();
+        content_text(&content, &map, &mut out, MAX_PART_TEXT);
+        assert!(out.len() <= MAX_PART_TEXT + 64, "{}", out.len());
+        // And strings piling up before any operator are kept to a few.
+        let mut out = String::new();
+        content_text(&b"(a)".repeat(1 << 20), &map, &mut out, MAX_PART_TEXT);
+        assert!(out.is_empty());
+    }
+
+    /// Zip entries sharing one file's data are read once, and a document
+    /// inflates to `MAX_DOCUMENT_INFLATED` at most.
+    #[test]
+    fn office_zip_bombs_are_bounded() {
+        let filler = "<a/>".repeat(1 << 20);
+        let mut z = zip(&[("ppt/slides/slide1.xml", &filler)]);
+        // The directory again, with many entries all naming the first file.
+        let end = z.len() - 22;
+        let offset = u32::from_le_bytes(z[end + 16..end + 20].try_into().unwrap()) as usize;
+        let entry = z[offset..end].to_vec();
+        z.truncate(offset);
+        let central_at = z.len() as u32;
+        let count = 3000u16;
+        for i in 0..count {
+            let mut e = entry.clone();
+            let name = format!("ppt/slides/slide{i:04}.xml");
+            e.truncate(46);
+            e[28..30].copy_from_slice(&(name.len() as u16).to_le_bytes());
+            e.extend(name.as_bytes());
+            z.extend(e);
+        }
+        let central_len = z.len() as u32 - central_at;
+        z.extend(0x0605_4b50u32.to_le_bytes());
+        z.extend([0, 0, 0, 0]);
+        z.extend(count.to_le_bytes());
+        z.extend(count.to_le_bytes());
+        z.extend(central_len.to_le_bytes());
+        z.extend(central_at.to_le_bytes());
+        z.extend(0u16.to_le_bytes());
+        let started = std::time::Instant::now();
+        assert_eq!(zip_entries(&z).len(), count as usize);
+        let _ = office_text(&z, POWERPOINT);
+        assert!(started.elapsed() < std::time::Duration::from_secs(5), "{:?}", started.elapsed());
     }
 }

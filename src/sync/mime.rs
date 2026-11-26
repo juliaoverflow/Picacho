@@ -1161,8 +1161,7 @@ pub fn details(raw: &[u8], decrypted: bool) -> Details {
     };
     let one = |name: &str| headers.get_first_value(name).unwrap_or_default();
     let arrival = arrival(&headers.get_all_values("Received"));
-    let encrypted = crate::manage::crypto::sender_encrypted(raw)
-        || crate::manage::crypto::encrypted_part(raw).is_some();
+    let encrypted = crate::manage::crypto::is_encrypted(raw);
     let security = match &arrival {
         _ if decrypted => Security::EndToEnd,
         _ if encrypted => Security::Undecrypted,

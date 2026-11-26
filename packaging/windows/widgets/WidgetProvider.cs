@@ -426,6 +426,7 @@ public sealed class WidgetProvider : IWidgetProvider
             {
                 var json = File.ReadAllText(path);
                 var snap = JsonSerializer.Deserialize<WidgetSnapshot>(json, JsonOptions) ?? new WidgetSnapshot();
+                Defang(snap);
                 // The widgets' words and dates in the language Picacho shows.
                 L.Use(snap.Language);
                 return snap;
@@ -436,6 +437,51 @@ public sealed class WidgetProvider : IWidgetProvider
             // Fall back to empty snapshot while a concurrent atomic rename finishes.
         }
         return new WidgetSnapshot();
+    }
+
+    /// <summary>
+    /// Adaptive Cards draw a TextBlock's text as Markdown, so a subject such as
+    /// "[Your invoice](https://…)" showed as a link to wherever the sender
+    /// chose. A word joiner between "]" and "(" leaves the text as it reads
+    /// but no longer a link; the rest of Markdown (bold, lists) can't lead anywhere.
+    /// </summary>
+    private static string Plain(string s) =>
+        string.IsNullOrEmpty(s) ? s : s.Replace("](", "]\u2060(");
+
+    /// <summary>Makes every text the snapshot took from mail or the server plain (<see cref="Plain"/>).</summary>
+    private static void Defang(WidgetSnapshot snap)
+    {
+        foreach (var a in snap.Accounts)
+        {
+            a.Name = Plain(a.Name);
+            a.Email = Plain(a.Email);
+        }
+        foreach (var m in snap.Messages)
+        {
+            m.Sender = Plain(m.Sender);
+            m.Subject = Plain(m.Subject);
+            m.Snippet = Plain(m.Snippet);
+        }
+        foreach (var e in snap.Events)
+        {
+            e.Title = Plain(e.Title);
+            e.Location = Plain(e.Location);
+        }
+        foreach (var p in snap.Packages)
+        {
+            p.Title = Plain(p.Title);
+            p.Carrier = Plain(p.Carrier);
+            p.Status = Plain(p.Status);
+            p.Expected = Plain(p.Expected);
+            p.AccountLabel = Plain(p.AccountLabel);
+        }
+        foreach (var r in snap.Receipts)
+        {
+            r.Merchant = Plain(r.Merchant);
+            r.Amount = Plain(r.Amount);
+            r.Order = Plain(r.Order);
+            r.AccountLabel = Plain(r.AccountLabel);
+        }
     }
 
     /// <summary>A day and short month, in the order the language writes them ("MMM d", "d. MMM").</summary>

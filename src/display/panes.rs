@@ -755,7 +755,18 @@ impl MailApp {
         if options.html
             && let Some(html) = &m.html
         {
-            let html = self.hide_codes_html(m, html);
+            let key = {
+                use std::hash::{Hash, Hasher};
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                (&m.id, html.len(), self.hidden_codes(m).as_slice()).hash(&mut h);
+                h.finish()
+            };
+            let cached = self.thumbnail_html.borrow().as_ref().filter(|(k, _)| *k == key).map(|(_, h)| h.clone());
+            let html = cached.unwrap_or_else(|| {
+                let made = Rc::new(self.hide_codes_html(m, html).into_owned());
+                *self.thumbnail_html.borrow_mut() = Some((key, made.clone()));
+                made
+            });
             self.html_view.update(cx, |view, cx| {
                 view.set_content(&html, &m.inline, options.block_remote, dark, self.clean_links, cx)
             });

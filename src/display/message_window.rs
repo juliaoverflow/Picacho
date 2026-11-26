@@ -22,7 +22,7 @@ pub(super) struct MessageWindow {
     /// The HTML as shown (quotes hidden, alias and codes masked), with what
     /// it was made from: made again on every frame, it was the whole body
     /// read and copied several times over for each move of the pointer.
-    shown_html: Option<(u64, String, bool)>,
+    shown_html: Option<(u64, Rc<String>, bool)>,
     _links: Subscription,
     _reveals: Subscription,
 }
@@ -53,8 +53,18 @@ impl MessageWindow {
                 } else {
                     url.clone()
                 };
-                if let Some(url) = crate::display::html::openable_url(&url) {
-                    cx.open_url(url.as_str());
+                if let Some(parsed) = crate::display::html::openable_url(&url) {
+                    // A link with a known trick (a lookalike name, plain
+                    // http…) gets the main window's warning, as the
+                    // reader's does, unless its site is trusted there.
+                    if !super::links::link_dangers(&parsed).is_empty()
+                        && let Some(app) = this.app.upgrade()
+                    {
+                        app.update(cx, |app, cx| app.open_email_link(url, cx));
+                        let _ = this.main.update(cx, |_, w, _| w.activate_window());
+                    } else {
+                        cx.open_url(parsed.as_str());
+                    }
                 }
             }
         });
@@ -191,16 +201,16 @@ impl Render for MessageWindow {
                 };
                 let masked = mask.as_ref().map(|k| k.apply(shown));
                 let shown = masked.as_deref().unwrap_or(shown);
-                let shown = crate::manage::local_ai::otp::mask_html(shown, &codes).into_owned();
+                let shown = Rc::new(crate::manage::local_ai::otp::mask_html(shown, &codes).into_owned());
                 self.shown_html = Some((key, shown, quotes));
             }
             let (_, shown, quotes) = self.shown_html.as_ref().expect("made above");
             has_quotes = *quotes;
-            let shown = shown.as_str();
+            let shown = shown.clone();
             let blocked = self.options.block_remote;
             let clean = self.clean_links(cx);
             self.html.update(cx, |view, cx| {
-                view.set_content(shown, &m.inline, blocked, dark, clean, cx)
+                view.set_content(&shown, &m.inline, blocked, dark, clean, cx)
             });
             body = body.child(self.html.clone());
         } else {
@@ -458,28 +468,31 @@ impl MailApp {
     /// Opens an email file (.eml or Outlook .msg) in a message window of its
     /// own, as when one is opened from the system's file manager.
     pub(super) fn open_eml_file(&mut self, path: &std::path::Path, w: &mut Window, cx: &mut Context<Self>) {
-        let parsed = std::fs::read(path)
-            .map_err(anyhow::Error::from)
-            .and_then(|raw| {
-                let raw = if crate::sync::msg::is_msg(&raw)
-                    || path.extension().is_some_and(|e| e.eq_ignore_ascii_case("msg"))
-                {
-                    crate::sync::msg::to_eml(&raw)?
-                } else {
-                    raw
-                };
-                let mut account = Account::new(Provider::Imap);
-                account.id = String::new();
-                let id = format!("file:{}", path.display());
-                crate::sync::mime::parse_message(&raw, &account, &id, Folder::Inbox, "", 0)
+        // Read and parsed off the UI thread: an email file can be large, and
+        // an Outlook .msg is converted first.
+        let path = path.to_path_buf();
+        cx.spawn_in(w, async move |this, cx| {
+            let file = path.clone();
+            let parsed = cx
+                .background_executor()
+                .spawn(async move {
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| read_email_file(&file)))
+                        .unwrap_or_else(|_| Err(anyhow::anyhow!(t!("ui-something-went-wrong-while-doing-this"))))
+                })
+                .await;
+            let _ = this.update_in(cx, |this, w, cx| match parsed {
+                Ok(mut mail) => {
+                    mail.unread = false;
+                    this.show_mail_window(mail, w, cx);
+                }
+                Err(e) => this.notice(
+                    t!("message-window-couldnt-open", path = path.display(), e = format!("{:#}", e)),
+                    true,
+                    cx,
+                ),
             });
-        match parsed {
-            Ok(mut mail) => {
-                mail.unread = false;
-                self.show_mail_window(mail, w, cx);
-            }
-            Err(e) => self.notice(t!("message-window-couldnt-open", path = path.display(), e = format!("{:#}", e)), true, cx),
-        }
+        })
+        .detach();
     }
 
     fn show_mail_window(&mut self, mail: Mail, w: &mut Window, cx: &mut Context<Self>) {
@@ -543,4 +556,18 @@ impl MailApp {
             );
         }
     }
+}
+
+/// An email file (.eml, or Outlook's .msg converted) read as a message.
+fn read_email_file(path: &std::path::Path) -> anyhow::Result<Mail> {
+    let raw = std::fs::read(path)?;
+    let raw = if crate::sync::msg::is_msg(&raw) || path.extension().is_some_and(|e| e.eq_ignore_ascii_case("msg")) {
+        crate::sync::msg::to_eml(&raw)?
+    } else {
+        raw
+    };
+    let mut account = Account::new(Provider::Imap);
+    account.id = String::new();
+    let id = format!("file:{}", path.display());
+    crate::sync::mime::parse_message(&raw, &account, &id, Folder::Inbox, "", 0)
 }

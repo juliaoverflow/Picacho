@@ -1,5 +1,5 @@
-//! OpenPGP for every account: your own keys and the keys of people you
-//! write to, kept in the system keychain; PGP/MIME messages (RFC 3156)
+//! OpenPGP for every account: your own keys, kept in the system keychain,
+//! and the keys of people you write to, kept in the database; PGP/MIME messages (RFC 3156)
 //! decrypted and their signatures checked when read; and messages signed
 //! and encrypted when sent.
 //!
@@ -98,6 +98,10 @@ pub struct Verdict {
     /// RFC 9788 §4.4.2: the protected From is for another address than the
     /// outer one, and no signature by a key for it vouches for it.
     pub from_mismatch: Option<FromMismatch>,
+    /// Inline PGP: the names of files shown with the message that neither
+    /// its signature nor its encryption covers (anyone could have added
+    /// them on the way, to a genuine signed or encrypted text).
+    pub uncovered: Vec<String>,
 }
 
 /// The two From fields of a message whose protected From doesn't match
@@ -123,13 +127,19 @@ impl Verdict {
     /// after it. `None` with neither.
     pub fn signature_line(&self) -> Option<(String, bool)> {
         let signed = (self.signature != Signature::None).then(|| self.signature.label());
-        let good = matches!(self.signature, Signature::Good(_)) && self.from_mismatch.is_none();
-        match (signed, &self.from_mismatch) {
-            (Some(s), Some(w)) => Some((format!("{s}. {}", w.label()), good)),
-            (Some(s), None) => Some((s, good)),
-            (None, Some(w)) => Some((w.label(), good)),
-            (None, None) => None,
+        let good = matches!(self.signature, Signature::Good(_))
+            && self.from_mismatch.is_none()
+            && self.uncovered.is_empty();
+        let mut warnings: Vec<String> = self.from_mismatch.iter().map(FromMismatch::label).collect();
+        if !self.uncovered.is_empty() {
+            warnings.push(if self.decrypted {
+                t!("manage-openpgp-files-not-encrypted", files = self.uncovered.join(", "))
+            } else {
+                t!("manage-openpgp-files-not-signed", files = self.uncovered.join(", "))
+            });
         }
+        let line = signed.into_iter().chain(warnings).collect::<Vec<_>>().join(". ");
+        (!line.is_empty()).then_some((line, good))
     }
 }
 
@@ -171,6 +181,61 @@ fn users(key: &SignedPublicKey) -> Vec<String> {
         .collect()
 }
 
+/// Whether `signature` is the key's own (made by its primary key): it names
+/// that key as its issuer, or names none (as some older signatures).
+fn by_primary(signature: &pgp::packet::Signature, key: &SignedPublicKey) -> bool {
+    let fingerprints = signature.issuer_fingerprint();
+    let ids = signature.issuer_key_id();
+    if fingerprints.is_empty() && ids.is_empty() {
+        return true;
+    }
+    fingerprints.iter().any(|f| **f == key.primary_key.fingerprint())
+        || ids.iter().any(|id| **id == key.primary_key.legacy_key_id())
+}
+
+/// Whether a self-signature certifies a user id (rather than revoking it).
+fn certifies(signature: &pgp::packet::Signature) -> bool {
+    use pgp::packet::SignatureType as T;
+    matches!(
+        signature.typ(),
+        Some(T::CertGeneric | T::CertPersona | T::CertCasual | T::CertPositive)
+    )
+}
+
+/// The user ids the key still has: those whose newest self-signature
+/// certifies them. One whose newest is a revocation (RFC 9580 §5.2.1.14,
+/// "this user id is no longer valid") isn't the key's any more: a message
+/// from that address isn't the key holder's to sign.
+fn live_users(key: &SignedPublicKey) -> Vec<String> {
+    use pgp::packet::SignatureType as T;
+    key.details
+        .users
+        .iter()
+        .filter(|u| {
+            let newest = u
+                .signatures
+                .iter()
+                .filter(|s| by_primary(s, key) && (certifies(s) || s.typ() == Some(T::CertRevocation)))
+                .max_by_key(|s| s.created().map(|t| t.as_secs()));
+            newest.is_none_or(certifies)
+        })
+        .map(|u| String::from_utf8_lossy(u.id.id()).into_owned())
+        .collect()
+}
+
+/// Whether a signature over a message may count at all: made with a hash
+/// still resistant to collisions (RFC 9580 §9.5: not MD5, SHA-1 or
+/// RIPEMD-160, with which one message's signature can be made to cover
+/// another), and not past its own expiration time (§5.2.3.18).
+fn acceptable_signature(signature: &pgp::packet::Signature) -> bool {
+    use pgp::crypto::hash::HashAlgorithm as H;
+    if matches!(signature.hash_alg(), None | Some(H::None | H::Md5 | H::Sha1 | H::Ripemd160)) {
+        return false;
+    }
+    let created = signature.created().map_or(0, |t| t.as_secs());
+    !past(created, signature.signature_expiration_time())
+}
+
 fn fingerprint(key: &impl KeyDetails) -> String {
     format!("{:X}", key.fingerprint())
         .chars()
@@ -181,7 +246,7 @@ fn fingerprint(key: &impl KeyDetails) -> String {
 /// Whether one of the key's user ids is `email`.
 fn has_address(key: &SignedPublicKey, email: &str) -> bool {
     let email = email.trim().to_lowercase();
-    users(key).iter().any(|u| {
+    live_users(key).iter().any(|u| {
         let u = u.to_lowercase();
         let address = match (u.rfind('<'), u.rfind('>')) {
             (Some(a), Some(b)) if a < b => &u[a + 1..b],
@@ -190,6 +255,59 @@ fn has_address(key: &SignedPublicKey, email: &str) -> bool {
         address == email
     })
 }
+
+/// Keys as parsed, by the SHA-256 of their armored text: lookups (one or
+/// more for every message read or downloaded) parsed every key in the
+/// keyring each time. Content-addressed, so a keyring changed in any way
+/// never reads a stale key; dropped whole when it grows past
+/// `PARSED_KEYS`, as keys a keyring no longer has accumulate.
+struct Parsed<K> {
+    keys: std::sync::LazyLock<std::sync::Mutex<ParsedKeys<K>>>,
+}
+/// Keys by the SHA-256 of their armored text; `None` for text that isn't one.
+type ParsedKeys<K> = std::collections::HashMap<[u8; 32], Option<std::sync::Arc<K>>>;
+const PARSED_KEYS: usize = 8192;
+static PARSED_PUBLIC: Parsed<SignedPublicKey> = Parsed { keys: std::sync::LazyLock::new(Default::default) };
+static PARSED_SECRET: Parsed<SignedSecretKey> = Parsed { keys: std::sync::LazyLock::new(Default::default) };
+impl<K> Parsed<K> {
+    fn get(&self, armored: &str, parse: impl FnOnce(&str) -> Option<K>) -> Option<std::sync::Arc<K>> {
+        use sha2::Digest as _;
+        let id: [u8; 32] = sha2::Sha256::digest(armored.as_bytes()).into();
+        if let Some(kept) = self.keys.lock().unwrap_or_else(|e| e.into_inner()).get(&id) {
+            return kept.clone();
+        }
+        let key = parse(armored).map(std::sync::Arc::new);
+        let mut keys = self.keys.lock().unwrap_or_else(|e| e.into_inner());
+        if keys.len() >= PARSED_KEYS {
+            keys.clear();
+        }
+        keys.insert(id, key.clone());
+        key
+    }
+}
+/// An armored public key as parsed (see `Parsed`).
+fn parsed_public(armored: &str) -> Option<std::sync::Arc<SignedPublicKey>> {
+    PARSED_PUBLIC.get(armored, |k| SignedPublicKey::from_string(k).ok().map(|(k, _)| k))
+}
+/// An armored secret key as parsed (see `Parsed`).
+fn parsed_secret(armored: &str) -> Option<std::sync::Arc<SignedSecretKey>> {
+    PARSED_SECRET.get(armored, |k| SignedSecretKey::from_string(k).ok().map(|(k, _)| k))
+}
+fn read_public(armored: &str) -> Option<SignedPublicKey> {
+    parsed_public(armored).map(|k| SignedPublicKey::clone(&k))
+}
+fn read_secret(armored: &str) -> Option<SignedSecretKey> {
+    parsed_secret(armored).map(|k| SignedSecretKey::clone(&k))
+}
+
+/// The most key data an Autocrypt or Autocrypt-Gossip header may carry:
+/// a key with a few user ids and subkeys is a few kilobytes, and anyone
+/// can send one, to be kept and saved.
+pub const AUTOCRYPT_KEY_LIMIT: usize = 64 * 1024;
+/// The most keys kept that only Autocrypt gave: each sender's header adds
+/// one, so forged senders could grow the keyring without end. The oldest
+/// go first.
+pub const AUTOCRYPT_KEYS: usize = 1000;
 
 impl Keyring {
     /// The keyring kept in the keychain, or an empty one.
@@ -202,14 +320,56 @@ impl Keyring {
             None => Self::default(),
         })
     }
+    /// Saves your own part (see `own_part`) to the keychain. Other
+    /// people's keys are kept in the database instead (`others_part`).
     #[cfg_attr(test, allow(dead_code))]
     pub fn save(&self) -> Result<()> {
-        store::write_secret_text(KEYRING, &serde_json::to_string(self)?)
+        store::write_secret_text(KEYRING, &serde_json::to_string(&self.own_part())?)
+    }
+    /// What the keychain keeps: your own keys and choices. Rewritten only
+    /// when they change: other people's keys, which every sender's
+    /// Autocrypt header can add to, were rewritten into it whole, in parts
+    /// of `store::PART` bytes, for each one.
+    pub fn own_part(&self) -> Keyring {
+        Keyring {
+            secret: self.secret.clone(),
+            prefer_mutual: self.prefer_mutual.clone(),
+            ..Keyring::default()
+        }
+    }
+    /// What the database keeps: other people's public keys, and what is
+    /// known of where they came from. Nothing in it is secret.
+    pub fn others_part(&self) -> Keyring {
+        Keyring {
+            public: self.public.clone(),
+            found: self.found.clone(),
+            verified: self.verified.clone(),
+            dnssec: self.dnssec.clone(),
+            autocrypt: self.autocrypt.clone(),
+            ..Keyring::default()
+        }
+    }
+    /// Your own part with `others` (see `others_part`) in place of whatever
+    /// of theirs it held.
+    pub fn with_others(self, others: Keyring) -> Keyring {
+        Keyring {
+            public: others.public,
+            found: others.found,
+            verified: others.verified,
+            dnssec: others.dnssec,
+            autocrypt: others.autocrypt,
+            ..self
+        }
+    }
+    /// Whether any of other people's part is here (a keychain entry an
+    /// older Picacho wrote, before it moved to the database).
+    pub fn has_others(&self) -> bool {
+        *self != self.own_part()
     }
     pub fn secret_keys(&self) -> Vec<SignedSecretKey> {
         self.secret
             .iter()
-            .filter_map(|k| SignedSecretKey::from_string(k).ok().map(|(k, _)| k))
+            .filter_map(|k| read_secret(k))
             .collect()
     }
     /// Everyone's public keys, your own included.
@@ -217,10 +377,14 @@ impl Keyring {
         let mut keys: Vec<SignedPublicKey> = self
             .public
             .iter()
-            .filter_map(|k| SignedPublicKey::from_string(k).ok().map(|(k, _)| k))
+            .filter_map(|k| read_public(k))
             .collect();
         keys.extend(self.secret_keys().into_iter().map(SignedPublicKey::from));
         keys
+    }
+    /// Other people's public keys as parsed, without copying them.
+    fn each_public(&self) -> impl Iterator<Item = std::sync::Arc<SignedPublicKey>> + '_ {
+        self.public.iter().filter_map(|k| parsed_public(k))
     }
     /// Every key, for Settings.
     pub fn list(&self) -> Vec<KeyInfo> {
@@ -243,7 +407,7 @@ impl Keyring {
         for k in self
             .public
             .iter()
-            .filter_map(|k| SignedPublicKey::from_string(k).ok().map(|(k, _)| k))
+            .filter_map(|k| read_public(k))
         {
             let fp = fingerprint(&k);
             out.push(KeyInfo {
@@ -303,7 +467,7 @@ impl Keyring {
                 let earlier = self
                     .public
                     .iter()
-                    .filter_map(|k| SignedPublicKey::from_string(k).ok().map(|(k, _)| k))
+                    .filter_map(|k| read_public(k))
                     .find(|k| fingerprint(k) == fp);
                 let key = match earlier {
                     Some(old) => merge_public(old, key),
@@ -342,21 +506,27 @@ impl Keyring {
             .find(|k| has_address(k, email) && k.verify_bindings().is_ok())
             .with_context(|| t!("manage-openpgp-no-usable-key-for-was-found", email = email))?;
         let fp = fingerprint(&key);
-        let kept = self.public.iter().any(|k| {
-            SignedPublicKey::from_string(k).is_ok_and(|(k, _)| {
-                let f = fingerprint(&k);
-                has_address(&k, email)
-                    && (!self.found.contains(&f) || (self.checked(&f) && f != fp))
-            })
+        let kept = self.each_public().any(|k| {
+            let f = fingerprint(&*k);
+            has_address(&k, email)
+                && (!self.found.contains(&f) || (self.checked(&f) && f != fp))
         });
         if kept {
             return Ok(false);
         }
+        // The same key kept already: merged with this copy, not replaced
+        // by it. A copy is anyone's to send (an Autocrypt header can carry
+        // an older one), and replacing would drop the revocations,
+        // expiry changes and subkeys only the kept copy has.
+        let key = match self.each_public().find(|k| fingerprint(&**k) == fp) {
+            Some(old) => merge_public((*old).clone(), key),
+            None => key,
+        };
         // An earlier found key for the address gives way to this one.
         let found = self.found.clone();
         self.public.retain(|k| {
-            SignedPublicKey::from_string(k).map_or(true, |(k, _)| {
-                let f = fingerprint(&k);
+            parsed_public(k).is_none_or(|k| {
+                let f = fingerprint(&*k);
                 f != fp && !(found.contains(&f) && has_address(&k, email))
             })
         });
@@ -366,15 +536,8 @@ impl Keyring {
             self.found.push(fp);
         }
         // Checks were of keys that may be gone now.
-        let kept: Vec<String> = self
-            .public
-            .iter()
-            .filter_map(|k| {
-                SignedPublicKey::from_string(k)
-                    .ok()
-                    .map(|(k, _)| fingerprint(&k))
-            })
-            .collect();
+        let kept: std::collections::HashSet<String> =
+            self.each_public().map(|k| fingerprint(&*k)).collect();
         self.verified.retain(|f| kept.contains(f));
         self.dnssec.retain(|f| kept.contains(f));
         self.autocrypt.retain(|f| kept.contains(f));
@@ -443,15 +606,10 @@ impl Keyring {
         self.dnssec.retain(|f| f != fp);
         self.autocrypt.retain(|f| f != fp);
         self.secret.retain(|k| {
-            SignedSecretKey::from_string(k)
-                .map(|(k, _)| fingerprint(&SignedPublicKey::from(k)) != fp)
-                .unwrap_or(true)
+            parsed_secret(k).is_none_or(|k| fingerprint(&SignedPublicKey::from(SignedSecretKey::clone(&k))) != fp)
         });
-        self.public.retain(|k| {
-            SignedPublicKey::from_string(k)
-                .map(|(k, _)| fingerprint(&k) != fp)
-                .unwrap_or(true)
-        });
+        self.public
+            .retain(|k| parsed_public(k).is_none_or(|k| fingerprint(&*k) != fp));
     }
     /// Your secret key for `email`, for signing.
     pub fn own_key(&self, email: &str) -> Option<SignedSecretKey> {
@@ -459,16 +617,20 @@ impl Keyring {
             .into_iter()
             .find(|k| has_address(&SignedPublicKey::from(k.clone()), email))
     }
-    /// A public key for `email`, for encrypting to them.
     /// The key to encrypt to for `email`: one its owner hasn't revoked
-    /// and that hasn't expired.
+    /// and that hasn't expired. Other people's keys first, then your own.
     pub fn key_for(&self, email: &str) -> Option<SignedPublicKey> {
-        self.public_keys()
-            .into_iter()
-            .find(|k| {
-                has_address(k, email)
-                    && k.details.revocation_signatures.is_empty()
-                    && !primary_expired(k)
+        let usable = |k: &SignedPublicKey| {
+            has_address(k, email) && k.details.revocation_signatures.is_empty() && !primary_expired(k)
+        };
+        self.each_public()
+            .find(|k| usable(k))
+            .map(|k| SignedPublicKey::clone(&k))
+            .or_else(|| {
+                self.secret_keys()
+                    .into_iter()
+                    .map(SignedPublicKey::from)
+                    .find(|k| usable(k))
             })
     }
 }
@@ -661,12 +823,42 @@ fn usable_subkeys(key: &SignedPublicKey) -> impl Iterator<Item = &pgp::composed:
             .filter(|s| s.typ() == Some(SignatureType::SubkeyBinding))
             .max_by_key(|s| s.created().map(|t| t.as_secs()));
         !sub.signatures.iter().any(|s| s.typ() == Some(SignatureType::SubkeyRevocation))
-            && sub.verify_bindings(&key.primary_key).is_ok()
+            && bound(key, sub)
             && binding.is_some_and(|b| {
                 !past(sub.key.created_at().as_secs(), b.key_expiration_time())
                     && b.key_flags().sign()
             })
     })
+}
+/// Whether `sub` is bound to `key` (its binding signatures check out),
+/// remembered by the SHA-256 of the primary key and the subkey with its
+/// signatures: each check is a signature verification, and every signature
+/// read checked its signer's bindings again. The answer depends on those
+/// bytes alone, so a changed key is checked anew; the memory is dropped
+/// whole past `PARSED_KEYS` entries.
+fn bound(key: &SignedPublicKey, sub: &pgp::composed::SignedPublicSubKey) -> bool {
+    use pgp::ser::Serialize as _;
+    use sha2::Digest as _;
+    static BOUND: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<[u8; 32], bool>>> =
+        std::sync::LazyLock::new(Default::default);
+    let (Ok(primary), Ok(subkey)) = (key.primary_key.to_bytes(), sub.to_bytes()) else {
+        return sub.verify_bindings(&key.primary_key).is_ok();
+    };
+    let mut hash = sha2::Sha256::new();
+    hash.update((primary.len() as u64).to_be_bytes());
+    hash.update(&primary);
+    hash.update(&subkey);
+    let id: [u8; 32] = hash.finalize().into();
+    if let Some(known) = BOUND.lock().unwrap_or_else(|e| e.into_inner()).get(&id) {
+        return *known;
+    }
+    let ok = sub.verify_bindings(&key.primary_key).is_ok();
+    let mut kept = BOUND.lock().unwrap_or_else(|e| e.into_inner());
+    if kept.len() >= PARSED_KEYS {
+        kept.clear();
+    }
+    kept.insert(id, ok);
+    ok
 }
 /// Whether a key made at `created` that lasts `lasts` (none, or zero:
 /// forever) has expired.
@@ -680,12 +872,23 @@ fn past(created: u32, lasts: Option<pgp::types::Duration>) -> bool {
 /// Whether the primary key has expired: its newest self-signature (on a
 /// user id, or directly on the key) says how long it lasts.
 fn primary_expired(key: &SignedPublicKey) -> bool {
+    // The newest self-signature that says how long the key lasts: a
+    // certification of a user id, or a direct-key signature. Not a
+    // revocation of a user id, which says nothing about it (and, newest,
+    // would otherwise make an expired key look current).
     let newest = key
         .details
         .users
         .iter()
         .flat_map(|u| u.signatures.iter())
-        .chain(key.details.direct_signatures.iter())
+        .filter(|s| certifies(s))
+        .chain(
+            key.details
+                .direct_signatures
+                .iter()
+                .filter(|s| s.typ() == Some(pgp::packet::SignatureType::Key)),
+        )
+        .filter(|s| by_primary(s, key))
         .max_by_key(|s| s.created().map(|t| t.as_secs()));
     newest.is_some_and(|s| past(key.primary_key.created_at().as_secs(), s.key_expiration_time()))
 }
@@ -710,7 +913,7 @@ fn from_address(raw: &[u8]) -> Option<String> {
 }
 
 fn signer_name(key: &SignedPublicKey) -> String {
-    users(key)
+    live_users(key)
         .into_iter()
         .next()
         .unwrap_or_else(|| fingerprint(key))
@@ -769,8 +972,7 @@ fn open_layer(raw: &[u8], ring: &Keyring, depth: &mut usize) -> Option<(Vec<u8>,
         // Every signed layer's signatures, each checked against the key it
         // names (see `nested::message_signature`); and, for RFC 9788
         // §4.4.1.2, the keys whose signature checked out.
-        let mut signature = nested::message_signature(&opened, &public, from.as_deref());
-        let signers = nested::message_signers(&opened, &public);
+        let (mut signature, signers) = nested::message_signature_and_signers(&opened, &public, from.as_deref());
         let outer = from_latin1(&outer);
         let mut full = outer.clone();
         full.extend_from_slice(&inner);
@@ -791,6 +993,7 @@ fn open_layer(raw: &[u8], ring: &Keyring, depth: &mut usize) -> Option<(Vec<u8>,
                     decrypted: true,
                     signature,
                     from_mismatch,
+                    uncovered: Vec::new(),
                 },
             ));
         }
@@ -802,6 +1005,7 @@ fn open_layer(raw: &[u8], ring: &Keyring, depth: &mut usize) -> Option<(Vec<u8>,
                 decrypted: true,
                 signature,
                 from_mismatch,
+                uncovered: Vec::new(),
             },
         ));
     }
@@ -817,6 +1021,7 @@ fn open_layer(raw: &[u8], ring: &Keyring, depth: &mut usize) -> Option<(Vec<u8>,
                     decrypted: false,
                     signature,
                     from_mismatch,
+                    uncovered: Vec::new(),
                 },
             ))
         }
@@ -873,21 +1078,26 @@ fn open_inline(raw: &[u8], ring: &Keyring, from: Option<&str>, depth: &mut usize
         return None;
     }
     let body = text_part.get_body().ok()?;
-    let readable = |text: &str, depth: usize| {
+    // The message shown, and the names of its files that its protection
+    // doesn't cover (see `inline::attachments`).
+    let readable = |text: &str,
+                    depth: usize,
+                    signed: &dyn Fn(&[u8], &[u8]) -> bool,
+                    sealed: &dyn Fn(&Message<'_>) -> bool| {
         let mut out = outer_headers(raw);
         let mut part = b"Content-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: 8bit\r\n\r\n".to_vec();
         part.extend_from_slice(text.replace("\r\n", "\n").replace('\n', "\r\n").as_bytes());
         let files = if parsed.subparts.is_empty() {
-            Vec::new()
+            inline::Files { parts: Vec::new(), uncovered: Vec::new() }
         } else {
-            inline::attachments(&parsed, text_part, &ring.secret_keys(), depth)
+            inline::attachments(&parsed, text_part, &ring.secret_keys(), depth, signed, sealed)
         };
-        if files.is_empty() {
+        if files.parts.is_empty() {
             out.extend_from_slice(&part);
         } else {
-            out.extend_from_slice(&inline::mixed(std::iter::once(part).chain(files).collect()));
+            out.extend_from_slice(&inline::mixed(std::iter::once(part).chain(files.parts).collect()));
         }
-        out
+        (out, files.uncovered)
     };
     if let Some(start) = body.find("-----BEGIN PGP SIGNED MESSAGE-----") {
         let end = body[start..].find("-----END PGP SIGNATURE-----")? + start + 27;
@@ -906,12 +1116,28 @@ fn open_inline(raw: &[u8], ring: &Keyring, from: Option<&str>, depth: &mut usize
             .or(verdicts.first())
             .cloned()
             .unwrap_or(Signature::UnknownKey);
+        // A file is covered by a signature beside it that says what the
+        // text's does: made by the same key, which counted.
+        let covers = |file: &[u8], sig: &[u8]| {
+            matches!(signature, Signature::Good(_) | Signature::OtherSender(_))
+                && inline::detached(sig).is_some_and(|s| {
+                    signers::verdict(&s, &public, from, |v| v.verifies(&s, file)) == signature
+                })
+        };
+        // An encrypted file is covered only if signed as the text is: this
+        // message isn't encrypted, so anyone could have added it.
+        let sealed = |m: &Message<'_>| {
+            matches!(signature, Signature::Good(_) | Signature::OtherSender(_))
+                && nested::message_signature(m, &public, from) == signature
+        };
         // Text around the signed block isn't covered by it: left out.
+        let (shown, uncovered) = readable(&signed, *depth, &covers, &sealed);
         return Some((
-            readable(&signed, *depth),
+            shown,
             Verdict {
                 decrypted: false,
                 signature,
+                uncovered,
                 ..Default::default()
             },
         ));
@@ -934,12 +1160,22 @@ fn open_inline(raw: &[u8], ring: &Keyring, from: Option<&str>, depth: &mut usize
             }
             inner
         };
-        let signature = nested::message_signature(&opened, &ring.public_keys(), from);
+        let public = ring.public_keys();
+        let signature = nested::message_signature(&opened, &public, from);
+        // Only files that were encrypted too are covered; under a signature,
+        // only those signed as the text is (anyone can encrypt a file to
+        // you and add it on the way).
+        let sealed = |m: &Message<'_>| match &signature {
+            Signature::Good(_) | Signature::OtherSender(_) => nested::message_signature(m, &public, from) == signature,
+            _ => true,
+        };
+        let (shown, uncovered) = readable(&String::from_utf8_lossy(&inner), *depth, &|_, _| false, &sealed);
         return Some((
-            readable(&String::from_utf8_lossy(&inner), *depth),
+            shown,
             Verdict {
                 decrypted: true,
                 signature,
+                uncovered,
                 ..Default::default()
             },
         ));
@@ -1026,6 +1262,21 @@ fn boundary() -> String {
 /// sender's address (whose key signs), `to` every recipient (each must have
 /// a key to encrypt). The sender's own key is always an encryption
 /// recipient too, so the copy in Sent stays readable.
+/// The addresses a message's To and Cc headers show, lowercase: not its
+/// Bcc recipients.
+fn shown_recipients(raw: &[u8]) -> std::collections::HashSet<String> {
+    use mailparse::MailHeaderMap as _;
+    let Ok((headers, _)) = mailparse::parse_headers(raw) else {
+        return Default::default();
+    };
+    ["To", "Cc"]
+        .iter()
+        .flat_map(|name| headers.get_all_values(name))
+        .flat_map(|list| crate::sync::smtp::recipients(&list).unwrap_or_default())
+        .map(|(_, address)| address.trim().to_lowercase())
+        .collect()
+}
+
 pub fn protect(
     raw: &[u8],
     from: &str,
@@ -1058,10 +1309,17 @@ pub fn protect(
     let (part, outer) = protected::compose(&part, &outer, how.encrypt, how.subject);
     // Encrypted to several people: each one's key goes inside, so they can
     // write to the others encrypted too (Autocrypt-Gossip, Autocrypt 1.1
-    // §3.6).
-    let part = if how.encrypt && to.len() > 1 {
-        let gossip: String = to
-            .iter()
+    // §3.6). Only those the message shows (To and Cc): `to` is everyone it
+    // goes to, Bcc too, whose addresses and keys would otherwise be
+    // handed to every other recipient.
+    let visible = shown_recipients(raw);
+    let gossip_to: Vec<&String> = to
+        .iter()
+        .filter(|addr| visible.contains(&addr.trim().to_lowercase()))
+        .collect();
+    let part = if how.encrypt && gossip_to.len() > 1 {
+        let gossip: String = gossip_to
+            .into_iter()
             .filter_map(|addr| {
                 use pgp::ser::Serialize as _;
                 let key = ring.key_for(addr)?;
@@ -1879,7 +2137,8 @@ mod tests {
         anas.import(&armored_public(&cy), "").unwrap();
         let to = ["bo@example.se".to_owned(), "cy@example.net".to_owned()];
         let how = Protect { sign: false, encrypt: true, ..Default::default() };
-        let sent = protect(MESSAGE, "ana@example.org", &to, how, &anas).unwrap();
+        let both: &[u8] = b"From: Ana <ana@example.org>\r\nTo: Bo <bo@example.se>\r\nCc: cy@example.net\r\nSubject: Plans\r\nMessage-ID: <1@example.org>\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: 7bit\r\n\r\nMeet at noon.\r\n";
+        let sent = protect(both, "ana@example.org", &to, how, &anas).unwrap();
         assert!(!String::from_utf8_lossy(&sent).contains("Autocrypt-Gossip"));
         let inner = payload(&sent, &cy);
         let gossip = crate::sync::keys::autocrypt_gossip(&inner, &to);
@@ -1889,6 +2148,13 @@ mod tests {
         // One recipient: nothing to gossip.
         let alone = protect(MESSAGE, "ana@example.org", &to[..1], how, &anas).unwrap();
         assert!(!String::from_utf8_lossy(&payload(&alone, &bo)).contains("Autocrypt-Gossip"));
+        // Cy in Bcc (in `to`, not the headers): neither Cy's address nor key
+        // goes to Bo, nor Bo's to Cy.
+        let hidden = protect(MESSAGE, "ana@example.org", &to, how, &anas).unwrap();
+        for reader in [&bo, &cy] {
+            let inner = String::from_utf8_lossy(&payload(&hidden, reader)).into_owned();
+            assert!(!inner.contains("Autocrypt-Gossip") && !inner.contains("cy@example.net"), "{inner}");
+        }
     }
 
     #[test]

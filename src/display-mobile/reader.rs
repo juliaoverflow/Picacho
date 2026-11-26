@@ -80,7 +80,7 @@ impl MailApp {
         ];
         // Suggested replies, under the others, for mail one answers.
         if !drafts_or_sent {
-            let smart = self.smart_replies(m);
+            let smart = self.smart_replies_for(m, cx);
             if !smart.replies.is_empty() {
                 reply_entries.push(Entry::Separator);
             }

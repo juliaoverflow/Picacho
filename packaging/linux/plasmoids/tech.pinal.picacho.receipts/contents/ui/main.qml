@@ -197,6 +197,7 @@ PlasmoidItem {
                             implicitHeight: 18
                         }
                         PlasmaComponents.Label {
+                            textFormat: Text.PlainText
                             text: root.headerTitle
                             font.bold: true
                             elide: Text.ElideRight
@@ -283,24 +284,15 @@ PlasmoidItem {
                         ColumnLayout {
                             Layout.fillWidth: true
                             spacing: 1
-                            RowLayout {
+                            PlasmaComponents.Label {
+                                textFormat: Text.PlainText
                                 Layout.fillWidth: true
-                                spacing: 5
-                                PlasmaComponents.Label {
-                                    Layout.fillWidth: true
-                                    text: modelData.merchant || word("receipt", "Receipt")
-                                    font.bold: true
-                                    elide: Text.ElideRight
-                                }
-                                PlasmaComponents.Label {
-                                    visible: !!modelData.refund
-                                    text: word("refund", "Refund")
-                                    font.pixelSize: 10
-                                    font.bold: true
-                                    color: root.accentColor
-                                }
+                                text: modelData.merchant || word("receipt", "Receipt")
+                                font.bold: true
+                                elide: Text.ElideRight
                             }
                             PlasmaComponents.Label {
+                                textFormat: Text.PlainText
                                 Layout.fillWidth: true
                                 text: root.detailText(modelData)
                                 font.pixelSize: 11
@@ -309,15 +301,30 @@ PlasmoidItem {
                             }
                         }
 
-                        PlasmaComponents.Label {
-                            text: modelData.amount || "—"
-                            font.bold: true
-                            color: modelData.refund ? root.accentColor : Kirigami.Theme.textColor
+                        // The amount, with "Refund" under a refund's.
+                        ColumnLayout {
+                            spacing: 1
+                            PlasmaComponents.Label {
+                                textFormat: Text.PlainText
+                                Layout.alignment: Qt.AlignRight
+                                text: modelData.amount || "—"
+                                font.bold: true
+                                color: modelData.refund ? root.accentColor : Kirigami.Theme.textColor
+                            }
+                            PlasmaComponents.Label {
+                                textFormat: Text.PlainText
+                                Layout.alignment: Qt.AlignRight
+                                visible: !!modelData.refund
+                                text: word("refund", "Refund")
+                                font.pixelSize: 10
+                                color: root.accentColor
+                            }
                         }
                     }
                 }
 
                 PlasmaComponents.Label {
+                    textFormat: Text.PlainText
                     anchors.centerIn: parent
                     visible: root.receipts.length === 0
                     opacity: 0.65

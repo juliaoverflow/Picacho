@@ -201,6 +201,7 @@ PlasmoidItem {
                             implicitHeight: 18
                         }
                         PlasmaComponents.Label {
+                            textFormat: Text.PlainText
                             text: root.headerTitle
                             font.bold: true
                             elide: Text.ElideRight
@@ -292,12 +293,14 @@ PlasmoidItem {
                             Layout.fillWidth: true
                             spacing: 6
                             PlasmaComponents.Label {
+                                textFormat: Text.PlainText
                                 Layout.fillWidth: true
                                 text: modelData.title || word("package", "Package")
                                 font.bold: true
                                 elide: Text.ElideRight
                             }
                             PlasmaComponents.Label {
+                                textFormat: Text.PlainText
                                 visible: !!(modelData.number && modelData.number.length > 0)
                                 text: modelData.number || ""
                                 font.pixelSize: 11
@@ -307,6 +310,7 @@ PlasmoidItem {
                         }
 
                         PlasmaComponents.Label {
+                            textFormat: Text.PlainText
                             Layout.fillWidth: true
                             text: root.detailText(modelData)
                             font.pixelSize: 11
@@ -334,6 +338,7 @@ PlasmoidItem {
                 }
 
                 PlasmaComponents.Label {
+                    textFormat: Text.PlainText
                     anchors.centerIn: parent
                     visible: root.packages.length === 0
                     opacity: 0.65

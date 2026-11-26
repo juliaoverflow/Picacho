@@ -956,6 +956,8 @@ enum Action {
     SetOutgoingLanguage(String),
     /// Show the tray icon while a window is open too.
     SetTrayIcon(bool),
+    /// Start in the background (no window) when the person signs in.
+    SetStartInBackground(bool),
     /// Turns Local AI on, or off (deleting its models).
     SetLocalAi(bool),
     /// Hides sign-in codes (downloading the model), or stops (deleting it).
@@ -1084,6 +1086,11 @@ enum Action {
     ToggleKerberos(String),
     /// The account being set up signs in with Kerberos instead of a password.
     ToggleSetupKerberos,
+    /// Allows or stops Basic sign-in (the password itself) for this
+    /// Exchange account (its id).
+    ToggleEwsBasic(String),
+    /// The Exchange account being set up may sign in with Basic.
+    ToggleSetupBasic,
     /// The Gmail or Outlook account being added uses its provider's API.
     ToggleSetupApi,
     /// Switches this Gmail or Outlook account (its id) between IMAP and its
@@ -1293,6 +1300,11 @@ const LOGIN_PAUSE: Duration = Duration::from_millis(1500);
 /// its emails say matched.
 type SearchFound = Rc<Vec<(usize, bool)>>;
 
+/// How many messages' invitations, delivery reports and attached-message
+/// previews the reader keeps found for the session; past it, they're
+/// found again as messages open.
+const READER_CACHE: usize = 2000;
+
 pub struct MailApp {
     backend: Arc<Backend>,
     accounts: Vec<Account>,
@@ -1449,6 +1461,12 @@ pub struct MailApp {
     incoming_starttls: bool,
     /// The account being set up signs in with Kerberos.
     setup_kerberos: bool,
+    /// The Exchange account being set up may sign in with Basic, which
+    /// sends the password itself.
+    setup_basic: bool,
+    /// The server offered only Basic sign-in when the account being set up
+    /// was tried, so the choice to allow it is shown.
+    setup_basic_offered: bool,
     /// The Gmail or Outlook account being set up uses its provider's API
     /// (the Gmail API, Microsoft Graph) instead of IMAP and SMTP.
     setup_api: bool,
@@ -1543,6 +1561,14 @@ pub struct MailApp {
     thread_open: bool,
     /// The open HTML email without its quoted history, worked out once.
     quote_cache: std::cell::RefCell<Option<(String, Option<Rc<String>>)>>,
+    /// The open message's HTML as the reader last prepared it (see
+    /// `reader_body`): its key, the HTML, whether it had quotes, whether
+    /// Find marked it, and how many it found.
+    prepared_html: std::cell::RefCell<Option<(u64, Rc<String>, bool, bool, usize)>>,
+    /// The open message's HTML as its thumbnail (beside the list) shows it,
+    /// by what it was made from (message, length, hidden codes): made once,
+    /// and known to the HTML view by its pointer after.
+    thumbnail_html: std::cell::RefCell<Option<(u64, Rc<String>)>>,
     /// The open plain email as Markdown: (message and quote state, text,
     /// whether it has quoted history).
     plain_cache: std::cell::RefCell<Option<(String, SharedString, bool)>>,
@@ -1707,14 +1733,20 @@ pub struct MailApp {
     /// a window is open too.
     background: bool,
     tray_icon: bool,
+    /// Picacho starts in the background when the person signs in (desktop).
+    start_in_background: bool,
     /// Its window closed and the background monitor checks mail now (see
     /// `retire`).
     retired: bool,
+    /// Picacho is closing (quitting, or its window going while it keeps
+    /// running in the background): the window is covered, saying so, until
+    /// it's gone. See `begin_closing`.
+    closing: Option<Closing>,
     /// Local AI and its sign-in code hiding (Settings → Local AI).
     local_ai: bool,
     hide_codes: bool,
     /// The sign-in code model, loaded while codes are hidden.
-    otp: Option<Rc<crate::manage::local_ai::otp::Detector>>,
+    otp: Option<Arc<crate::manage::local_ai::otp::Detector>>,
     /// Codes found per message, with the lengths of the subject and text
     /// they were found in.
     otp_found: std::cell::RefCell<HashMap<String, ai::Found>>,
@@ -1739,18 +1771,18 @@ pub struct MailApp {
     /// model (Settings → Local AI), once loaded; its download, as the
     /// sign-in code model's above.
     find_parcels: bool,
-    parcel_model: Option<Rc<crate::manage::local_ai::parcel::Confirmer>>,
+    parcel_model: Option<Arc<crate::manage::local_ai::parcel::Confirmer>>,
     parcel_busy: bool,
     parcel_error: Option<String>,
     parcel_progress: Arc<std::sync::atomic::AtomicU64>,
-    /// Parcels found per message for the reader, with the lengths of the
+    /// Parcels found per message for the reader, by the lengths of the
     /// subject and text they were found in and whether the model was used.
-    parcels_found: std::cell::RefCell<HashMap<String, summary::Found>>,
+    parcels_found: std::cell::RefCell<summary::Found>,
     /// Replies are suggested under received mail (Settings → Local AI),
     /// with the reply model once loaded; its download, as the sign-in code
     /// model's above.
     suggest_replies: bool,
-    reply_model: Option<Rc<crate::manage::local_ai::replies::Suggester>>,
+    reply_model: Option<Arc<crate::manage::local_ai::replies::Suggester>>,
     replies_busy: bool,
     replies_error: Option<String>,
     replies_progress: Arc<std::sync::atomic::AtomicU64>,
@@ -1758,7 +1790,7 @@ pub struct MailApp {
     /// suggestions found per message are for one revision).
     reply_history: crate::manage::local_ai::replies::History,
     reply_history_rev: u64,
-    replies_found: std::cell::RefCell<HashMap<String, ai::Suggested>>,
+    replies_found: std::cell::RefCell<ai::Suggested>,
     /// The open Summary (in place of the list and reader) of the open
     /// account, and the parcels it lists.
     summary_open: bool,
@@ -2145,6 +2177,7 @@ impl MailApp {
         let accent = Accent::from_key(&store.preference("accent").unwrap_or_default());
         let background = crate::manage::background::enabled(&store);
         let tray_icon = crate::manage::background::tray_while_open(&store);
+        let start_in_background = crate::manage::background::starts_at_login(&store);
         drop(store);
         let search = reworded(cx.new(|cx| {
             InputState::new(window, cx)
@@ -2224,6 +2257,8 @@ impl MailApp {
         subscriptions.extend(lock.subscribe(window, cx));
         #[cfg(target_os = "android")]
         crate::android::set_recents_private(lock.settings.enabled());
+        #[cfg(target_os = "ios")]
+        crate::ios::set_privacy_cover(lock.settings.enabled());
         if lock.locked {
             // Biometrics are asked for once the window is up and in front.
             cx.defer_in(window, |this: &mut Self, w, cx| {
@@ -2815,6 +2850,8 @@ impl MailApp {
             smtp_tls: None,
             incoming_starttls: false,
             setup_kerberos: false,
+            setup_basic: false,
+            setup_basic_offered: false,
             setup_api: false,
             setup_sso: false,
             sso_scope: String::new(),
@@ -2863,6 +2900,8 @@ impl MailApp {
             quotes_open: false,
             thread_open: false,
             quote_cache: Default::default(),
+            prepared_html: Default::default(),
+            thumbnail_html: Default::default(),
             plain_cache: Default::default(),
             _subscriptions: subscriptions,
             load_generation: 0,
@@ -2928,7 +2967,9 @@ impl MailApp {
             links: link_safety,
             background,
             tray_icon,
+            start_in_background,
             retired: false,
+            closing: None,
             local_ai,
             hide_codes,
             otp: None,
@@ -3201,12 +3242,208 @@ impl MailApp {
     }
     /// Quits Picacho (not just the window), unless a message is being sent.
     fn quit_app(&mut self, cx: &mut Context<Self>) {
+        if self.closing.is_some() {
+            return;
+        }
         if self.sending {
             self.notice(t!("ui-wait-for-the-current-message-to"), true, cx);
         } else {
             self.persist_draft(cx);
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
+            self.begin_closing(Closing::Quit, None, cx);
+            #[cfg(any(target_os = "android", target_os = "ios"))]
             cx.quit();
         }
+    }
+    /// The main window is asked to close (its close button, Close Window).
+    /// True to close it at once: other windows stay open (a message,
+    /// Settings), so Picacho isn't closing. Otherwise the closing cover is
+    /// shown and the window goes once it has been seen (`begin_closing`).
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    fn ask_to_close(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.closing.is_some() {
+            return false;
+        }
+        if self.sending {
+            self.notice(t!("ui-wait-for-the-current-message-to"), true, cx);
+            return false;
+        }
+        self.persist_draft(cx);
+        let handle = window.window_handle();
+        if cx
+            .windows()
+            .iter()
+            .any(|w| w.window_id() != handle.window_id())
+        {
+            return true;
+        }
+        let kind = if shell::hands_over(cx) {
+            Closing::Background
+        } else {
+            Closing::Quit
+        };
+        window.disable_focus(cx);
+        self.begin_closing(kind, Some(handle), cx);
+        false
+    }
+    /// Covers the window, saying Picacho is closing, then (once the cover
+    /// has faded in) saves what is waiting to be and tidies the cache, which
+    /// used to happen after the window had gone, and finally removes
+    /// `window` (the shell then quits, or hands over to the background
+    /// process) or, without one, quits.
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    fn begin_closing(
+        &mut self,
+        kind: Closing,
+        window: Option<AnyWindowHandle>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.closing.is_some() {
+            return;
+        }
+        self.closing = Some(kind);
+        // Nothing else open over the cover.
+        self.menu = None;
+        cx.notify();
+        let store = self.backend.store.clone();
+        cx.spawn(async move |_, cx| {
+            let started = std::time::Instant::now();
+            // Drawn first: tidying holds the cache, which drawing may read.
+            cx.background_executor()
+                .timer(CLOSING_FADE + Duration::from_millis(40))
+                .await;
+            cx.background_executor()
+                .spawn(async move {
+                    // Both again as the app quits, by then with nothing
+                    // left to do.
+                    store.flush();
+                    let _ = store.compact_on_quit();
+                })
+                .await;
+            if let Some(left) = CLOSING_SHOWN.checked_sub(started.elapsed()) {
+                cx.background_executor().timer(left).await;
+            }
+            cx.update(|cx| match window {
+                Some(window) => {
+                    if window.update(cx, |_, w, _| w.remove_window()).is_err() {
+                        cx.quit();
+                    }
+                }
+                None => cx.quit(),
+            });
+        })
+        .detach();
+    }
+    /// Draws the closing cover over `content` while Picacho closes.
+    fn with_closing_cover(
+        &mut self,
+        content: Stateful<Div>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        let Some(kind) = self.closing else {
+            return content;
+        };
+        // Nothing typed into the window while it goes (Quit from the tray
+        // doesn't come through it).
+        if window.focused(cx).is_some() {
+            window.disable_focus(cx);
+        }
+        let cover = self.closing_cover(kind, window);
+        self.keep_spinning(cx);
+        content.child(cover)
+    }
+    /// The window blurred behind a frosted veil, with what is happening.
+    fn closing_cover(&self, kind: Closing, window: &Window) -> AnyElement {
+        let c = self.colors();
+        let corners = window::window_corners(window);
+        let text = match kind {
+            Closing::Quit => t!("ui-closing-picacho"),
+            Closing::Background => t!("ui-moving-picacho-to-the-background"),
+        };
+        let still = STILL.with(|s| s.get());
+        // What the window showed, blurred (growing as the cover fades in),
+        // then the window's own background over it, translucent. Only the
+        // wgpu renderer (Linux) draws the blur; elsewhere the background is
+        // denser, the content showing through only as faint shapes.
+        let blur_at = move |t: f32| {
+            canvas(
+                |_, _, _| {},
+                move |bounds, _, window, _| {
+                    window.paint_backdrop_blur(bounds, corners, px(CLOSING_BLUR * t));
+                },
+            )
+            .size_full()
+        };
+        let blur = div().absolute().inset_0();
+        let blur = if still {
+            blur.child(blur_at(1.)).into_any_element()
+        } else {
+            blur.with_animation(
+                "closing-blur",
+                Animation::new(CLOSING_FADE).with_easing(ease_out_quint()),
+                move |d, t| d.child(blur_at(t)),
+            )
+            .into_any_element()
+        };
+        let veil_alpha = if cfg!(any(target_os = "linux", target_os = "freebsd")) {
+            0x80
+        } else {
+            0xd6
+        };
+        let veil = div()
+            .absolute()
+            .inset_0()
+            .rounded_tl(corners.top_left)
+            .rounded_tr(corners.top_right)
+            .rounded_bl(corners.bottom_left)
+            .rounded_br(corners.bottom_right)
+            .bg(rgba((c.bg << 8) | veil_alpha));
+        let cover = div()
+            .id("closing-cover")
+            .debug_selector(|| "closing-cover".into())
+            .occlude()
+            .on_mouse_down(MouseButton::Left, swallow_press)
+            .on_mouse_down(MouseButton::Right, swallow_press)
+            .absolute()
+            .inset_0()
+            .child(blur)
+            .child(veil)
+            .child(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .justify_center()
+                    .gap_4()
+                    .child(icon_el("logo", 44., c.accent))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(spinner(16., c.muted))
+                            .child(
+                                div()
+                                    .text_size(px(16.))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(rgb(c.text))
+                                    .child(text),
+                            ),
+                    ),
+            );
+        if still {
+            return cover.into_any_element();
+        }
+        cover
+            .with_animation(
+                "closing-cover",
+                Animation::new(CLOSING_FADE).with_easing(ease_out_quint()),
+                |d, t| d.opacity(t),
+            )
+            .into_any_element()
     }
     /// Shows the interface in `code` (empty: the system's language), in
     /// every window, from now on.
@@ -3242,6 +3479,10 @@ impl MailApp {
     fn set_background(&mut self, on: bool, cx: &mut Context<Self>) {
         use crate::manage::background::PREFERENCE;
         self.background = on;
+        // The background process quits at once without it.
+        if !on && self.start_in_background {
+            self.set_start_in_background(false, cx);
+        }
         // Read back at once (the shell reads it when the last window closes).
         self.backend
             .store
@@ -3287,6 +3528,50 @@ impl MailApp {
         let reduced = self.motion.reduced();
         Self::set_motion(reduced, cx);
         motion::set_email_preferences(reduced, self.contrast.more());
+    }
+    /// Starts Picacho in the background at sign-in, or no longer: the
+    /// system's login item is registered (or removed) off the window, and
+    /// put back as it was if that fails. Running in the background comes on
+    /// with it, as the background process needs it.
+    fn set_start_in_background(&mut self, on: bool, cx: &mut Context<Self>) {
+        use crate::manage::background::STARTUP_PREFERENCE;
+        if on && !self.background {
+            self.set_background(true, cx);
+        }
+        self.start_in_background = on;
+        self.backend
+            .store
+            .set_preference_soon(STARTUP_PREFERENCE, if on { "true" } else { "false" });
+        cx.notify();
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        {
+            let dir = self.backend.store.path.clone();
+            cx.spawn(async move |this, cx| {
+                let result = cx
+                    .background_executor()
+                    .spawn(async move { super::autostart::set(&dir, on) })
+                    .await;
+                if let Err(e) = result {
+                    let _ = this.update(cx, |this, cx| {
+                        // Changed again meanwhile: that change stands.
+                        if this.start_in_background != on {
+                            return;
+                        }
+                        this.start_in_background = !on;
+                        this.backend.store.set_preference_soon(
+                            STARTUP_PREFERENCE,
+                            if on { "false" } else { "true" },
+                        );
+                        this.notice(
+                            t!("settings-couldnt-change-starting-at-sign-in", error = e.to_string()),
+                            true,
+                            cx,
+                        );
+                    });
+                }
+            })
+            .detach();
+        }
     }
     fn set_tray_icon(&mut self, on: bool, cx: &mut Context<Self>) {
         use crate::manage::background::TRAY_PREFERENCE;
@@ -3711,8 +3996,7 @@ impl MailApp {
             return arrived;
         }
         if let Some(latest) = fresh.iter().max_by_key(|m| m.date) {
-            // A sign-in code in the subject isn't shown on the lock screen.
-            let subject = self.hide_codes(latest, &latest.subject);
+            let subject = self.announced_subject(latest);
             let ids: Vec<&str> = fresh.iter().map(|m| m.id.as_str()).collect();
             crate::display::notify::new_mail(
                 &a.email,
@@ -4595,6 +4879,66 @@ impl MailApp {
         })
         .detach();
     }
+    /// Writes the interface makes to the cache (an account's settings, the
+    /// app lock's), off the UI thread, one after another in the order asked:
+    /// a later change never lands before an earlier one, and the window
+    /// doesn't wait for the cache's writer, which a sync can hold a while.
+    /// `done` gets the outcome. In tests, at once (their executor doesn't
+    /// wait for other threads).
+    fn write_in_order<T: Send + 'static>(
+        &mut self,
+        cx: &mut Context<Self>,
+        job: impl FnOnce(&Backend) -> anyhow::Result<T> + Send + 'static,
+        done: impl FnOnce(&mut Self, anyhow::Result<T>, &mut Context<Self>) + 'static,
+    ) {
+        #[cfg(test)]
+        {
+            let result = job(&self.backend);
+            done(self, result, cx);
+        }
+        #[cfg(not(test))]
+        {
+            let rx = queue_write(self.backend.clone(), job);
+            cx.spawn(async move |this, cx| {
+                let result = rx
+                    .await
+                    .unwrap_or_else(|_| Err(anyhow::anyhow!(t!("ui-something-went-wrong-while-doing-this"))));
+                let _ = this.update(cx, |this, cx| {
+                    done(this, result, cx);
+                    cx.notify();
+                });
+            })
+            .detach();
+        }
+    }
+    /// As `write_in_order`, with the window for `done`.
+    fn write_in_order_in<T: Send + 'static>(
+        &mut self,
+        w: &mut Window,
+        cx: &mut Context<Self>,
+        job: impl FnOnce(&Backend) -> anyhow::Result<T> + Send + 'static,
+        done: impl FnOnce(&mut Self, anyhow::Result<T>, &mut Window, &mut Context<Self>) + 'static,
+    ) {
+        #[cfg(test)]
+        {
+            let result = job(&self.backend);
+            done(self, result, w, cx);
+        }
+        #[cfg(not(test))]
+        {
+            let rx = queue_write(self.backend.clone(), job);
+            cx.spawn_in(w, async move |this, cx| {
+                let result = rx
+                    .await
+                    .unwrap_or_else(|_| Err(anyhow::anyhow!(t!("ui-something-went-wrong-while-doing-this"))));
+                let _ = this.update_in(cx, |this, w, cx| {
+                    done(this, result, w, cx);
+                    cx.notify();
+                });
+            })
+            .detach();
+        }
+    }
     /// Like `task`, for jobs that build a message list: they run one at a
     /// time on a thread of their own (see `views::on_list_thread`).
     fn list_task<T: Send + 'static>(
@@ -5034,6 +5378,8 @@ impl MailApp {
         self.task(
             cx,
             move |b| {
+                // With the drafts saved or discarded just before.
+                composer::wait_for_draft_writes(None);
                 let mut drafts = Vec::new();
                 for id in &ids {
                     drafts.extend(b.store.drafts(id)?);
@@ -5123,7 +5469,7 @@ impl MailApp {
     }
     /// Opens what a tapped notification tells of: its mailbox, and the
     /// message in it once listed. Menus and Settings over the mail close.
-    fn open_notified(
+    pub(super) fn open_notified(
         &mut self,
         target: crate::display::notify::Target,
         w: &mut Window,
@@ -5133,6 +5479,12 @@ impl MailApp {
             || self.retired
             || !self.accounts.iter().any(|a| a.id == target.account)
         {
+            return;
+        }
+        if self.lock.locked {
+            if self.lock.deferred.len() < 256 {
+                self.lock.deferred.push(applock::Deferred::Open(target));
+            }
             return;
         }
         // A button whose press opened Picacho (Reply, from Android's
@@ -5231,6 +5583,14 @@ impl MailApp {
         }
         self.html_view.update(cx, |view, cx| view.clear(cx));
         self.forget_bodies(&id);
+        // Attachments previewed in the message left: their pictures go
+        // (from memory, and the window's atlas, `textures`).
+        let left: Vec<(String, usize)> = self.image_previews.keys().filter(|(m, _)| *m != id).cloned().collect();
+        for key in left {
+            if let Some(image) = self.image_previews.remove(&key) {
+                crate::display::textures::retire_image(image);
+            }
+        }
         // The previous message's source, as Show Raw read it (the source
         // whole, its headers and HTML, laid out in lines): only shown for
         // the open message, so not kept past it.
@@ -5252,26 +5612,42 @@ impl MailApp {
         self.anim += 1;
         self.read_generation += 1;
         self.reader_scroll.set_offset(point(px(0.), px(0.)));
-        // The list holds messages without bodies; show the cached body at
-        // once (also offline) while the message is read below.
-        if let Some(full) = self
-            .messages
-            .iter()
-            .any(|m| m.id == id && m.body.is_none())
-            .then(|| self.backend.store.message(&id).ok().flatten())
-            .flatten()
-            .filter(|m| m.body.is_some())
-            && let Some(m) = self.messages.iter_mut().find(|m| m.id == id)
-        {
-            *m = self
-                .backend
-                .with_readable(vec![Mail {
-                    unread: m.unread,
-                    starred: m.starred,
-                    folder: m.folder,
-                    ..full
-                }])
-                .remove(0);
+        // The list holds messages without bodies; show the cached body as
+        // soon as it's read (also offline), while the message is read
+        // below. Read off the UI thread: a large message's row (its HTML)
+        // and its decryption could hold up the click.
+        if self.messages.iter().any(|m| m.id == id && m.body.is_none()) {
+            let wanted = id.clone();
+            self.task(
+                cx,
+                {
+                    let wanted = wanted.clone();
+                    move |b| {
+                        Ok(b.store
+                            .message(&wanted)
+                            .ok()
+                            .flatten()
+                            .filter(|m| m.body.is_some())
+                            .map(|full| b.with_readable(vec![full]).remove(0)))
+                    }
+                },
+                move |this, result: anyhow::Result<Option<Mail>>, cx| {
+                    let Ok(Some(full)) = result else { return };
+                    if this.selected.as_ref() != Some(&wanted) {
+                        return;
+                    }
+                    // Unless the read below came first.
+                    if let Some(m) = this.messages.iter_mut().find(|m| m.id == wanted && m.body.is_none()) {
+                        *m = Mail {
+                            unread: m.unread,
+                            starred: m.starred,
+                            folder: m.folder,
+                            ..full
+                        };
+                        cx.notify();
+                    }
+                },
+            );
         }
         let Some(m) = self.selected_mail() else {
             return;
@@ -6081,6 +6457,8 @@ impl MailApp {
         self.provider = Provider::Imap;
         self.oauth = false;
         self.setup_kerberos = false;
+        self.setup_basic = false;
+        self.setup_basic_offered = false;
         self.setup_api = false;
         self.setup_sso = false;
         self.sso_scope.clear();
@@ -6393,6 +6771,7 @@ impl MailApp {
             }
         };
         a.service = self.service;
+        a.ews_basic = self.setup_basic && a.ews() && !a.oauth && !a.kerberos && a.sso.is_none();
         a.email = if a.service == Service::Pinal {
             String::new()
         } else {
@@ -6507,6 +6886,11 @@ impl MailApp {
                     // whether the token step or the mail server refused.
                     Err(e) => {
                         this.sign_in_retry = this.backend.can_retry_sign_in();
+                        // An Exchange server that takes only Basic: the
+                        // choice to allow it is shown, for trying again.
+                        if e.downcast_ref::<crate::sync::ews::BasicOnly>().is_some() {
+                            this.setup_basic_offered = true;
+                        }
                         this.notice(format!("{e:#}"), true, cx)
                     }
                 }
@@ -6863,9 +7247,9 @@ impl MailApp {
                     this.task(
                         cx,
                         move |b| {
-                            let bytes = b.attachment(&account, &m, a.part)?;
-                            std::fs::write(&path, &bytes)?;
-                            b.note_saved_attachment(&m, a.part, &path, &bytes);
+                            let written = b.attachment_to(&account, &m, a.part, &path)?;
+                            crate::manage::backend::opened::mark_from_internet(&path);
+                            b.note_saved_attachment(&m, a.part, &path, &written);
                             Ok(())
                         },
                         |this, result, cx| match result {
@@ -6969,7 +7353,10 @@ impl MailApp {
             }
             Action::DeleteDraft(id) => {
                 let account = self.drafts.iter().find(|d| d.id == id).map(|d| d.account.clone());
-                let _ = self.backend.discard_draft(&id);
+                // After its saves, in order (`composer::queue_draft_write`).
+                let backend = self.backend.clone();
+                let gone = id.clone();
+                drop(composer::queue_draft_write(move || backend.discard_draft(&gone)));
                 self.drop_composer_for_draft(&id, cx);
                 self.load_drafts(cx);
                 if let Some(account) = account {
@@ -7314,6 +7701,35 @@ impl MailApp {
             Action::ToggleSetupSso => {
                 self.setup_sso = !self.setup_sso;
                 self.setup_kerberos &= !self.setup_sso;
+            }
+            Action::ToggleSetupBasic => self.setup_basic = !self.setup_basic,
+            Action::ToggleEwsBasic(id) => {
+                let Some(a) = self.accounts.iter().find(|a| a.id == id).cloned() else {
+                    return;
+                };
+                let on = !a.ews_basic;
+                self.task(
+                    cx,
+                    move |b| b.set_ews_basic(&a, on),
+                    move |this, result, cx| match result {
+                        Ok(next) => {
+                            if let Some(a) = this.accounts.iter_mut().find(|a| a.id == next.id) {
+                                *a = next;
+                            }
+                            this.notice(
+                                if on {
+                                    t!("ui-signed-in-with-basic-sign-in")
+                                } else {
+                                    t!("ui-basic-sign-in-is-off")
+                                },
+                                false,
+                                cx,
+                            );
+                            this.refresh(cx);
+                        }
+                        Err(e) => this.notice(format!("{e:#}"), true, cx),
+                    },
+                );
             }
             Action::ToggleApi(id) => {
                 let Some(a) = self.accounts.iter().find(|a| a.id == id).cloned() else {
@@ -7717,6 +8133,7 @@ impl MailApp {
             Action::SetLanguage(code) => self.set_language(code, w, cx),
             Action::SetOutgoingLanguage(code) => self.set_outgoing_language(code, cx),
             Action::SetTrayIcon(on) => self.set_tray_icon(on, cx),
+            Action::SetStartInBackground(on) => self.set_start_in_background(on, cx),
             Action::SetMotion(m) => {
                 self.motion = m;
                 self.backend.store.set_preference_soon(motion::Motion::PREFERENCE, m.key());
@@ -8218,12 +8635,35 @@ impl MailApp {
         let push = a.sync.proton_push != sync.proton_push;
         let subscribed = a.sync.subscribed_only != sync.subscribed_only;
         a.sync = sync;
-        if let Err(e) = self.backend.store.save_account(a) {
-            self.notice(format!("{e:#}"), true, cx);
-            return;
-        }
-        let offline = a.sync.offline_days;
         let account = a.clone();
+        let saved = account.clone();
+        // What changes with the settings follows once they're saved.
+        self.write_in_order_in(
+            w,
+            cx,
+            move |b| b.store.save_account(&saved),
+            move |this, result, w, cx| {
+                if let Err(e) = result {
+                    this.notice(format!("{e:#}"), true, cx);
+                    return;
+                }
+                this.sync_settings_saved(id, account, window, events, push, subscribed, w, cx);
+            },
+        );
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn sync_settings_saved(
+        &mut self,
+        id: String,
+        account: Account,
+        window: bool,
+        events: Option<String>,
+        push: bool,
+        subscribed: bool,
+        w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let offline = account.sync.offline_days;
         // A new sync window applies at the next sync; run it now for the open account.
         if window && self.account.as_ref() == Some(&id) {
             self.open_mailbox(Some(id), self.mailbox(), w, cx);
@@ -8469,9 +8909,16 @@ impl MailApp {
             return;
         };
         edit(a);
-        if let Err(e) = self.backend.store.save_account(a) {
-            self.notice(format!("{e:#}"), true, cx);
-        }
+        let saved = a.clone();
+        self.write_in_order(
+            cx,
+            move |b| b.store.save_account(&saved),
+            |this, result, cx| {
+                if let Err(e) = result {
+                    this.notice(format!("{e:#}"), true, cx);
+                }
+            },
+        );
         cx.notify();
     }
     /// Asks the account's server how much of its storage is used.
@@ -8542,9 +8989,16 @@ impl MailApp {
         let Some(a) = self.accounts.iter().find(|a| a.id == id) else {
             return;
         };
-        if let Err(e) = self.backend.store.save_account(a) {
-            self.notice(format!("{e:#}"), true, cx);
-        }
+        let saved = a.clone();
+        self.write_in_order(
+            cx,
+            move |b| b.store.save_account(&saved),
+            |this, result, cx| {
+                if let Err(e) = result {
+                    this.notice(format!("{e:#}"), true, cx);
+                }
+            },
+        );
     }
     /// Applies a sign-in name being typed (see `login_pending`): saves it
     /// and signs the account's connections out, so the next sign in with it.
@@ -8748,6 +9202,11 @@ impl MailApp {
         cx: &mut Context<Self>,
     ) -> impl Fn(&ClickEvent, &mut Window, &mut App) + 'static {
         cx.listener(|this, _: &ClickEvent, w, cx| {
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
+            if this.ask_to_close(w, cx) {
+                w.remove_window();
+            }
+            #[cfg(any(target_os = "android", target_os = "ios"))]
             if this.sending {
                 this.notice(t!("ui-wait-for-the-current-message-to"), true, cx);
             } else {
@@ -10618,6 +11077,22 @@ impl MailApp {
         }
         let kerberos = self.setup_kerberos && ((self.manual && (imap_or_pop || self.provider == Provider::Ews)) || exchange);
         let ews_sso = self.setup_sso && self.provider == Provider::Ews && (exchange || self.manual);
+        // Basic sign-in, once the server turned out to offer nothing else
+        // (or already chosen): the person decides to send the password.
+        if (exchange || (self.manual && self.provider == Provider::Ews))
+            && !kerberos
+            && !ews_sso
+            && (self.setup_basic_offered || self.setup_basic)
+        {
+            content = content.child(self.switch_setting(
+                t!("ui-allow-basic-sign-in"),
+                t!("ui-basic-sign-in-sends-your-password"),
+                "setup-basic".into(),
+                self.setup_basic,
+                Action::ToggleSetupBasic,
+                cx,
+            ));
+        }
         let sso = (self.setup_sso && imap_or_pop && self.service == Service::Other) || ews_sso;
         if sso && !self.manual && !ews_sso {
             // Found from the domain: say so, with the service it uses.
@@ -11930,7 +12405,9 @@ impl Render for MailApp {
         self.apply_pending_place(window, cx);
         self.apply_pending_new_alias(window, cx);
         self.apply_pending_listed(cx);
-        if let Some(link) = self.pending_link.take() {
+        if !self.lock.locked
+            && let Some(link) = self.pending_link.take()
+        {
             match link.strip_prefix("open:") {
                 Some(id) => self.open_message_window(id.to_owned(), window, cx),
                 None => self.compose_mailto(&link, window, cx),
@@ -11949,18 +12426,30 @@ impl Render for MailApp {
         }
         SPINNING.with(|s| s.set(false));
         if self.lock.locked {
-            return self.lock_screen(window, cx);
+            let screen = self.lock_screen(window, cx);
+            return self.with_closing_cover(screen, window, cx);
         }
         if self.lock.obscured {
-            return self.privacy_cover(window);
+            let cover = self.privacy_cover(window);
+            return self.with_closing_cover(cover, window, cx);
         }
         let root = if self.mobile.on {
             self.mobile_root(window, cx)
         } else {
             self.root(window, cx)
         };
+        let root = self.with_closing_cover(root, window, cx);
         // The email's images, once the reader no longer paints it.
         self.html_view.update(cx, |view, _| view.release(window));
+        // Pictures previewed, or pasted into drafts, no longer shown.
+        crate::display::textures::release(window, cx);
+        self.keep_spinning(cx);
+        root
+    }
+}
+impl MailApp {
+    /// Draws again in a moment while a spinner is shown, to turn it.
+    fn keep_spinning(&mut self, cx: &mut Context<Self>) {
         if SPINNING.with(|s| s.get()) && !self.spin_scheduled {
             self.spin_scheduled = true;
             cx.spawn(async move |this, cx| {
@@ -11972,7 +12461,6 @@ impl Render for MailApp {
             })
             .detach();
         }
-        root
     }
 }
 impl MailApp {
@@ -12008,7 +12496,8 @@ impl MailApp {
             .text_color(rgb(c.text))
             .font_family(".SystemUIFont")
             .text_size(px(14.))
-            .map(|d| self.app_actions(d, cx))
+            // None while closing: the window is going.
+            .map(|d| if self.closing.is_none() { self.app_actions(d, cx) } else { d })
             .when(self.onboarding, |d| d.child(self.onboarding(window, cx)))
             .when(!self.onboarding, |d| self.main(d, window, cx))
             .map(|d| self.track_resize(d, cx))
@@ -12036,7 +12525,14 @@ impl MailApp {
             .on_action(cx.listener(|this, _: &CloseWindow, w, cx| {
                 if this.modal.is_some() {
                     this.close(w, cx);
-                } else if !this.sending {
+                    return;
+                }
+                #[cfg(not(any(target_os = "android", target_os = "ios")))]
+                if this.ask_to_close(w, cx) {
+                    w.remove_window();
+                }
+                #[cfg(any(target_os = "android", target_os = "ios"))]
+                if !this.sending {
                     this.persist_draft(cx);
                     w.remove_window();
                 }
@@ -12522,6 +13018,24 @@ impl MailKindsRead {
 /// each frame redraws the whole window, so a vsync spinner kept the CPU busy
 /// for as long as a sync or download ran.
 const SPIN_STEP: Duration = Duration::from_millis(70);
+/// How long the closing cover takes to fade in.
+const CLOSING_FADE: Duration = Duration::from_millis(160);
+/// How much the closing cover blurs the window: the Gaussian's standard
+/// deviation, in logical pixels.
+const CLOSING_BLUR: f32 = 14.;
+/// The least time the closing cover shows, so it's seen rather than a
+/// flicker when there's nothing to wait for.
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+const CLOSING_SHOWN: Duration = Duration::from_millis(450);
+/// What the closing cover says (see `MailApp::begin_closing`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(any(target_os = "android", target_os = "ios"), allow(dead_code))]
+enum Closing {
+    /// Picacho quits.
+    Quit,
+    /// The window closes and Picacho keeps running in the background.
+    Background,
+}
 const SPIN_STEPS: u128 = 14;
 /// The indexes of `messages` that `keep` keeps, in order. With `parallel`
 /// and many messages, they are checked on several threads at once, each a
@@ -12983,13 +13497,15 @@ pub fn new_backend(store: Arc<Store>) -> Arc<Backend> {
             sender,
             subject,
         } => {
-            // With codes hidden, a pushed subject that may hold one isn't
-            // shown (on the lock screen): there is no message here yet for
-            // the code model to read, as other new mail's subjects are.
-            let subject = if crate::manage::local_ai::otp_enabled(&settings)
-                && crate::manage::mail_kinds::might_be_code(subject, "")
-            {
-                t!("ui-sign-in-code")
+            // With codes hidden, a pushed subject never shows one (on the
+            // lock screen): those the model finds in it, or, where it can't
+            // load, every string shaped like a code, are hidden.
+            let masked;
+            let subject = if crate::manage::local_ai::otp_enabled(&settings) {
+                let detector = crate::manage::local_ai::otp_detector(&settings).ok();
+                let codes = crate::manage::local_ai::otp::codes_to_hide(detector.as_ref(), subject, "");
+                masked = crate::manage::local_ai::otp::mask(subject, &codes).into_owned();
+                masked.as_str()
             } else {
                 subject
             };
@@ -13184,6 +13700,13 @@ fn open_main_window(
             *view_slot.borrow_mut() = Some(view.downgrade());
             { let focus = view.read(cx).focus.clone(); focus.focus(window, cx); }
             let close_view = view.downgrade();
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
+            window.on_window_should_close(cx, move |window, cx| {
+                close_view
+                    .update(cx, |this, cx| this.ask_to_close(window, cx))
+                    .unwrap_or(true)
+            });
+            #[cfg(any(target_os = "android", target_os = "ios"))]
             window.on_window_should_close(cx, move |_, cx| {
                 close_view
                     .update(cx, |this, cx| {
@@ -14531,6 +15054,39 @@ mod tests {
         // Saved: the shell reads them when the window closes, and the next
         // window starts from them.
         assert!(!background::enabled(&store) && background::tray_while_open(&store));
+        // Starting at sign-in: off by default, and it brings running in the
+        // background back, which the background process needs.
+        assert!(cx.debug_bounds("start-in-background").is_some());
+        view.read_with(cx, |this, _| assert!(!this.start_in_background));
+        act(&view, Action::SetStartInBackground(true), cx);
+        view.read_with(cx, |this, _| assert!(this.start_in_background && this.background));
+        store.flush();
+        assert!(background::enabled(&store) && background::starts_at_login(&store));
+        // Turning the background off turns it off too.
+        act(&view, Action::SetBackground(false), cx);
+        view.read_with(cx, |this, _| assert!(!this.start_in_background && !this.background));
+        store.flush();
+        assert!(!background::starts_at_login(&store));
+        act(&view, Action::SetStartInBackground(true), cx);
+        store.flush();
+        // Without the background it doesn't count, whatever was saved.
+        let _ = store.set_preference(background::PREFERENCE, "false");
+        assert!(!background::starts_at_login(&store));
+    }
+
+    #[gpui::test]
+    fn closing_covers_the_window(cx: &mut TestAppContext) {
+        let (view, cx, _store) = two_accounts(cx);
+        frame(cx);
+        assert!(cx.debug_bounds("closing-cover").is_none());
+        for kind in [Closing::Quit, Closing::Background] {
+            view.update(cx, |this, cx| {
+                this.closing = Some(kind);
+                cx.notify();
+            });
+            frame(cx);
+            assert!(cx.debug_bounds("closing-cover").is_some(), "{kind:?}");
+        }
     }
 
     #[gpui::test]
@@ -14954,3 +15510,37 @@ mod save_name_tests {
     }
 }
 
+/// The thread `MailApp::write_in_order` runs writes on, in the order queued.
+#[cfg_attr(test, allow(dead_code))]
+fn queue_write<T: Send + 'static>(
+    backend: Arc<Backend>,
+    job: impl FnOnce(&Backend) -> anyhow::Result<T> + Send + 'static,
+) -> futures::channel::oneshot::Receiver<anyhow::Result<T>> {
+    type Write = Box<dyn FnOnce() + Send>;
+    static WRITES: std::sync::OnceLock<std::sync::Mutex<std::sync::mpsc::Sender<Write>>> = std::sync::OnceLock::new();
+    let (tx, rx) = futures::channel::oneshot::channel();
+    let write: Write = Box::new(move || {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job(&backend)))
+            .unwrap_or_else(|_| Err(anyhow::anyhow!(t!("ui-something-went-wrong-while-doing-this"))));
+        let _ = tx.send(result);
+    });
+    let writes = WRITES.get_or_init(|| {
+        let (sender, receiver) = std::sync::mpsc::channel::<Write>();
+        let started = std::thread::Builder::new()
+            .name("picacho-ui-writes".into())
+            .spawn(move || {
+                for write in receiver {
+                    write();
+                }
+            });
+        if let Err(e) = started {
+            eprintln!("Picacho: the interface's writes run where they're made: {e}");
+        }
+        std::sync::Mutex::new(sender)
+    });
+    if let Err(std::sync::mpsc::SendError(write)) = writes.lock().unwrap_or_else(|e| e.into_inner()).send(write) {
+        // No thread to take it: written here.
+        write();
+    }
+    rx
+}

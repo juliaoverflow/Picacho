@@ -736,7 +736,7 @@ fn streaming_answers_are_read_one_envelope_at_a_time() -> Result<()> {
 #[test]
 fn autodiscover_follows_redirects_and_asks_soap_where_pox_is_off() -> Result<()> {
     let mut fake = Fake::new("secret");
-    fake.redirect_addr = Some(("ana@old.example".into(), "qa@corp.example".into()));
+    fake.redirect_addr = Some(("ana@old.example".into(), "qa@corp.old.example".into()));
     let (server, fake) = serve(fake);
     let base = server.base.clone();
     let well_known = move |domain: &str| match domain {
@@ -753,6 +753,16 @@ fn autodiscover_follows_redirects_and_asks_soap_where_pox_is_off() -> Result<()>
     let refused = autodiscover_with("ana@old.example", &wrong, tls(), &Places { well_known: &well_known, fallbacks: &|_, _| Vec::new() }).unwrap_err();
     assert!(refused.downcast_ref::<AccessFailure>().is_some());
     drop(fake);
+    // Answers send the question, and the password, on only within the
+    // address's domain or to Microsoft's cloud.
+    assert!(autodiscover_vouched("corp.old.example", "old.example"));
+    assert!(autodiscover_vouched("mail.contoso.com", "sales.contoso.com"));
+    assert!(autodiscover_vouched("contoso.mail.onmicrosoft.com", "contoso.com"));
+    assert!(autodiscover_vouched("autodiscover-s.outlook.com", "contoso.com"));
+    assert!(!autodiscover_vouched("attacker.example", "contoso.com"));
+    assert!(!autodiscover_vouched("contoso.com.evil.net", "contoso.com"));
+    assert!(!autodiscover_vouched("other.co.uk", "contoso.co.uk"));
+    assert!(!autodiscover_vouched("10.0.0.5", "contoso.com"));
     // Unauthenticated redirects stay within the domain, over https.
     assert_eq!(redirect_target("https://mail.corp.example/autodiscover/autodiscover.xml", "corp.example").as_deref(), Some("https://mail.corp.example/autodiscover/autodiscover.xml"));
     assert_eq!(redirect_target("http://mail.corp.example/autodiscover/autodiscover.xml", "corp.example"), None);
@@ -762,6 +772,27 @@ fn autodiscover_follows_redirects_and_asks_soap_where_pox_is_off() -> Result<()>
     assert_eq!(pox_answer(pox), Found::Server("https://ad.corp.example/autodiscover/autodiscover.xml".into()));
     let soap = r#"<s:Envelope xmlns:s="x"><s:Body><GetUserSettingsResponseMessage xmlns="a"><Response><UserResponses><UserResponse><ErrorCode>RedirectAddress</ErrorCode><RedirectTarget>bo@corp.example</RedirectTarget></UserResponse></UserResponses></Response></GetUserSettingsResponseMessage></s:Body></s:Envelope>"#;
     assert_eq!(soap_answer(soap), Found::Address("bo@corp.example".into()));
+    Ok(())
+}
+
+/// An answer sending the question to an address in another domain isn't
+/// followed: the password isn't sent to that domain's servers.
+#[test]
+fn autodiscover_keeps_the_password_in_the_domain() -> Result<()> {
+    let mut fake = Fake::new("secret");
+    fake.redirect_addr = Some(("ana@old.example".into(), "ana@attacker.example".into()));
+    let (server, fake) = serve(fake);
+    let base = server.base.clone();
+    let well_known = move |domain: &str| match domain {
+        "old.example" => vec![format!("{base}/autodiscover/autodiscover.xml")],
+        _ => vec![format!("{base}/elsewhere/autodiscover/autodiscover.xml")],
+    };
+    let auth = Auth::Ntlm(ntlm::Identity::new("CORP\\qa", "secret"));
+    let found = autodiscover_with("ana@old.example", &auth, tls(), &Places { well_known: &well_known, fallbacks: &|_, _| Vec::new() })?;
+    assert_eq!(found, None);
+    let elsewhere = server.seen.lock().unwrap().iter().any(|r| r.path.starts_with("/elsewhere/"));
+    assert!(!elsewhere, "the password went to another domain's server");
+    drop(fake);
     Ok(())
 }
 
@@ -799,5 +830,32 @@ fn signs_in_with_an_organizations_token() -> Result<()> {
     assert!(s.reload_folders()?.iter().any(|f| f.name == "Inbox"));
     let wrong = Session::open(&url, "qa@corp.example", Auth::Bearer("old".into()), tls())?.reload_folders().unwrap_err();
     assert!(wrong.downcast_ref::<AccessFailure>().is_some());
+    Ok(())
+}
+
+#[test]
+fn basic_sign_in_is_never_a_silent_fallback() -> Result<()> {
+    // A server that offers only Basic, counting the requests that carry it.
+    let basic = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let seen = basic.clone();
+    let server = test_server::start_raw(move |r: &Request| -> FullAnswer {
+        if r.authorization.starts_with("Basic ") {
+            seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        (401, "text/plain".into(), Vec::new(), vec![("WWW-Authenticate".into(), "Basic realm=\"corp\"".into())])
+    });
+    let url = format!("{}/EWS/Exchange.asmx", server.base);
+    // NTLM is refused there, saying the server takes only Basic; the
+    // password isn't sent.
+    let ntlm = session(&server, "secret").reload_folders().unwrap_err();
+    assert!(ntlm.downcast_ref::<BasicOnly>().is_some(), "{ntlm:#}");
+    // Chosen Basic goes over HTTPS only: this server is plain HTTP.
+    let chosen = Auth::Basic { user: "CORP\\qa".into(), password: "secret".into() };
+    let plain = Session::open(&url, "qa@corp.example", chosen.clone(), tls())?.reload_folders().unwrap_err();
+    assert!(plain.downcast_ref::<BasicOnly>().is_none(), "{plain:#}");
+    // Autodiscover never sends Basic, whatever the account chose.
+    let binding = Binding::default();
+    assert!(post(&reqwest::blocking::Client::new(), &url, &chosen, "text/xml", b"", &binding, Reach::Autodiscover).is_err());
+    assert_eq!(basic.load(std::sync::atomic::Ordering::Relaxed), 0);
     Ok(())
 }

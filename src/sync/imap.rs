@@ -154,7 +154,9 @@ pub(crate) fn imap_login_interruptible(
     };
     let session = if a.kerberos {
         // Kerberos only: never a password, and never another mechanism.
-        match Mechanism::choose(&sasl::KERBEROS_ORDER, offered.iter().map(String::as_str)) {
+        // Bound to the TLS channel (GS2-KRB5-PLUS) where there is one, as
+        // SMTP and ManageSieve do.
+        match Mechanism::choose_bound(&sasl::KERBEROS_ORDER, offered.iter().map(String::as_str), !binding.is_empty()) {
             Some(mechanism) => authenticate(client, mechanism, credentials(a.login(), "")),
             None => bail!(
                 t!("sync-imap-doesnt-offer-kerberos-sign-in-auth", host = a.incoming_host)

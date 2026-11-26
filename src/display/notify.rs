@@ -334,7 +334,16 @@ pub fn new_mail(
             .map(|m| (*m).to_owned())
             .collect();
     }
-    let buttons: &[(&str, &str)] = if messages.len() > 1 { &quick_several() } else { &quick_one() };
+    // Hiding mail outside Picacho (often with the app lock on): no buttons
+    // to archive or delete mail unseen, from a locked phone's lock screen or
+    // a computer's notification center, past the app lock.
+    let buttons: &[(&str, &str)] = if crate::manage::applock::hiding() {
+        &[]
+    } else if messages.len() > 1 {
+        &quick_several()
+    } else {
+        &quick_one()
+    };
     show_with(
         format!("mail:{account}"),
         title,

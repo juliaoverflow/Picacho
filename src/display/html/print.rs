@@ -309,9 +309,9 @@ fn temp_pdf(title: &str, pdf_bytes: &[u8]) -> Result<std::path::PathBuf> {
         .chars()
         .filter(|c| c.is_ascii_alphanumeric())
         .collect();
-    let dir = std::env::temp_dir()
-        .join(format!("picacho-{user}"))
-        .join("print");
+    let parent = std::env::temp_dir().join(format!("picacho-{user}"));
+    #[cfg_attr(not(unix), allow(unused_mut))]
+    let mut dir = parent.join("print");
     #[cfg(unix)]
     {
         use std::os::unix::fs::DirBuilderExt as _;
@@ -319,6 +319,14 @@ fn temp_pdf(title: &str, pdf_bytes: &[u8]) -> Result<std::path::PathBuf> {
             .recursive(true)
             .mode(0o700)
             .create(&dir)?;
+        // A folder that was already there keeps whoever made it and its
+        // permissions: in a temporary folder all users share, another user
+        // could have made it first, open to them. Then a fresh folder of a
+        // name nobody could know ahead is used (made new, or not at all).
+        if !private_dir(&parent) || !private_dir(&dir) {
+            dir = std::env::temp_dir().join(format!("picacho-{user}-{}", uuid::Uuid::new_v4().simple()));
+            std::fs::DirBuilder::new().mode(0o700).create(&dir)?;
+        }
     }
     #[cfg(not(unix))]
     std::fs::create_dir_all(&dir)?;
@@ -348,6 +356,20 @@ fn temp_pdf(title: &str, pdf_bytes: &[u8]) -> Result<std::path::PathBuf> {
     let path = sub.join(name);
     std::fs::write(&path, pdf_bytes)?;
     Ok(path)
+}
+
+/// Whether `dir` is a folder (not a link to one) of this user's that no
+/// other user can read, write or enter.
+#[cfg(unix)]
+#[cfg_attr(any(target_os = "android", target_os = "ios"), allow(dead_code))]
+fn private_dir(dir: &std::path::Path) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    unsafe extern "C" {
+        fn geteuid() -> u32;
+    }
+    // SAFETY: geteuid takes nothing and can't fail.
+    let me = unsafe { geteuid() };
+    std::fs::symlink_metadata(dir).is_ok_and(|m| m.is_dir() && m.uid() == me && m.mode() & 0o077 == 0)
 }
 
 /// How a message was handed over for printing.
@@ -496,6 +518,26 @@ mod tests {
     use super::*;
     use crate::manage::model::InlineParts;
     use std::sync::Arc;
+
+    /// Only a folder of this user's, closed to others and not a link, is
+    /// taken for printed mail.
+    #[cfg(unix)]
+    #[test]
+    fn print_folders_must_be_private() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let base = std::env::temp_dir().join(format!("picacho-print-test-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir(&base).unwrap();
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(private_dir(&base));
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(!private_dir(&base));
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let link = base.with_extension("link");
+        std::os::unix::fs::symlink(&base, &link).unwrap();
+        assert!(!private_dir(&link));
+        let _ = std::fs::remove_file(&link);
+        let _ = std::fs::remove_dir_all(&base);
+    }
 
     #[test]
     fn html_with_unicode_and_inline_image_makes_valid_vector_pdf() -> Result<()> {

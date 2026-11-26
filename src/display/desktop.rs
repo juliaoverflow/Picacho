@@ -64,6 +64,7 @@ fn install() -> std::io::Result<()> {
          {}\
          Exec={} %U\n\
          Icon={APP_ID}\n\
+         StartupNotify=true\n\
          StartupWMClass={APP_ID}\n\
          Terminal=false\n\
          Categories=Network;Email;\n\
@@ -241,7 +242,7 @@ fn plasmoid_words(id: &str) -> Option<fn() -> (&'static str, &'static str)> {
 /// Writes `bytes` to `path` unless it already holds them, so launchers do
 /// not reload on every start.
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
-fn write_if_changed(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+pub(super) fn write_if_changed(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     if std::fs::read(path).is_ok_and(|old| old == bytes) {
         return Ok(());
     }
@@ -256,7 +257,7 @@ fn write_if_changed(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()>
 
 /// Quotes a path for a desktop entry's Exec key.
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
-fn exec_quote(path: &str) -> String {
+pub(super) fn exec_quote(path: &str) -> String {
     let mut out = String::from("\"");
     for ch in path.chars() {
         match ch {

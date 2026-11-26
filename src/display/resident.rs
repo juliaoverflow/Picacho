@@ -100,8 +100,9 @@ struct State {
 
 impl State {
     /// Stops checking, lets go of the socket and, for `Open`, starts the
-    /// window's process. The caller exits after.
-    fn finish(self, command: TrayCommand) {
+    /// window's process, calling `before_spawn` just before (or once done,
+    /// without one). The caller exits after.
+    fn finish(self, command: TrayCommand, before_spawn: impl FnOnce()) {
         self.monitor.stop_and_wait(CHECK_WAIT);
         self.store.flush();
         instance::release(&self.socket);
@@ -118,9 +119,15 @@ impl State {
             }
             let args: Vec<std::ffi::OsString> =
                 vec![DATA_DIR_FLAG.into(), self.dir.into_os_string()];
-            if let Err(e) = spawn(&args) {
+            // A launch's token, so the window comes forward and the
+            // launcher stops showing Picacho as starting once it's open.
+            let activation = instance::take_activation();
+            before_spawn();
+            if let Err(e) = spawn(&args, activation.as_deref()) {
                 eprintln!("Picacho: could not open the mail window: {e}");
             }
+        } else {
+            before_spawn();
         }
     }
 }
@@ -133,11 +140,18 @@ fn event_loop(
     commands: UnboundedSender<TrayCommand>,
     mut requests: futures::channel::mpsc::UnboundedReceiver<TrayCommand>,
 ) -> anyhow::Result<()> {
-    let tray = tray::create(commands);
+    // Started at sign-in, this may come before the panel's tray.
+    let tray = tray::create_patient(commands);
     let command = futures::executor::block_on(requests.next()).unwrap_or(TrayCommand::Quit);
-    // The icon goes first: the window may show one of its own.
-    drop(tray);
-    state.finish(command);
+    // Opening can take a moment (a check under way finishes first): the
+    // icon pulses meanwhile, so the click is seen to have done something.
+    if command != TrayCommand::Quit
+        && let Some(tray) = &tray
+    {
+        tray.opening();
+    }
+    // The icon goes before the window starts: it may show one of its own.
+    state.finish(command, move || drop(tray));
     Ok(())
 }
 
@@ -199,7 +213,7 @@ fn event_loop(
             // The icon goes first: the window may show one of its own.
             drop(tray.take());
             if let Some(state) = state.take() {
-                state.finish(command);
+                state.finish(command, || {});
             }
             std::process::exit(0);
         }
@@ -207,20 +221,34 @@ fn event_loop(
 }
 
 /// Starts Picacho again as a process of its own with `args`: the window's
-/// or this one's. It outlives the process starting it.
-fn spawn(args: &[OsString]) -> std::io::Result<()> {
+/// or this one's. It outlives the process starting it. `activation` is the
+/// desktop's activation token for the window it opens (see `instance`).
+fn spawn(args: &[OsString], activation: Option<&str>) -> std::io::Result<()> {
     use std::process::{Command, Stdio};
+    const TOKEN: &str = "XDG_ACTIVATION_TOKEN";
     let exe = std::env::current_exe()?;
     // In a Flatpak, a child ends with the sandbox of the process that
     // started it; the portal starts it in a sandbox of its own instead.
     let mut command = if std::env::var_os("FLATPAK_ID").is_some() {
         let mut command = Command::new("flatpak-spawn");
+        if let Some(token) = activation {
+            command.arg(format!("--env={TOKEN}={token}"));
+        }
         command.arg(exe);
         command
     } else {
-        Command::new(exe)
+        let mut command = Command::new(exe);
+        if let Some(token) = activation {
+            command.env(TOKEN, token);
+        }
+        command
     };
+    // Startup tokens this process inherited belong to a launch long done.
+    if activation.is_none() {
+        command.env_remove(TOKEN);
+    }
     command
+        .env_remove("DESKTOP_STARTUP_ID")
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::null());
@@ -242,5 +270,5 @@ fn spawn(args: &[OsString]) -> std::io::Result<()> {
 
 /// Starts the background process for `dir`, as the window's process quits.
 pub(super) fn start(dir: &Path) -> std::io::Result<()> {
-    spawn(&[FLAG.into(), dir.as_os_str().to_owned()])
+    spawn(&[FLAG.into(), dir.as_os_str().to_owned()], None)
 }

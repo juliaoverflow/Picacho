@@ -29,7 +29,7 @@ public final class InboxWidgetProvider extends AppWidgetProvider {
     @Override
     public void onReceive(Context context, Intent intent) {
         super.onReceive(context, intent);
-        if (WidgetStore.ACTION_REFRESH.equals(intent.getAction())) {
+        if (WidgetStore.isRefresh(context, intent)) {
             WidgetStore.refreshFromStoreAsync(context, this);
         }
     }
@@ -40,7 +40,11 @@ public final class InboxWidgetProvider extends AppWidgetProvider {
     }
 
     static void updateAll(Context context, AppWidgetManager manager, int[] appWidgetIds) {
-        WidgetStore.Snapshot snap = WidgetStore.load(context);
+        updateAll(context, manager, appWidgetIds, WidgetStore.load(context));
+    }
+
+    static void updateAll(
+            Context context, AppWidgetManager manager, int[] appWidgetIds, WidgetStore.Snapshot snap) {
         for (int id : appWidgetIds) {
             updateOne(context, manager, id, snap);
         }
@@ -99,8 +103,7 @@ public final class InboxWidgetProvider extends AppWidgetProvider {
                 R.id.widget_inbox_compose,
                 WidgetStore.openIntent(context, 20_000 + appWidgetId, WidgetStore.composeUri(accountId)));
 
-        Intent refreshIntent = new Intent(context, InboxWidgetProvider.class)
-                .setAction(WidgetStore.ACTION_REFRESH);
+        Intent refreshIntent = WidgetStore.refreshIntent(context, InboxWidgetProvider.class);
         PendingIntent refreshPending = PendingIntent.getBroadcast(
                 context,
                 30_000 + appWidgetId,

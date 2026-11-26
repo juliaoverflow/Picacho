@@ -16,7 +16,7 @@ pub(super) const CHUNK: usize = 8 * 1024 * 1024;
 /// Parts fetched in one request up to this size; larger ones in pieces.
 const PART_IN_ONE: usize = 16 * 1024 * 1024;
 /// The largest attachment downloaded from a message too large to keep.
-const MAX_PART: usize = 1024 * 1024 * 1024;
+pub(super) const MAX_PART: usize = 1024 * 1024 * 1024;
 
 impl Backend {
     /// Where a download in progress keeps what has arrived.
@@ -61,22 +61,24 @@ impl Backend {
         let dir = path.parent().with_context(|| t!("manage-large-invalid-download-folder"))?;
         std::fs::create_dir_all(dir)?;
         self.remove_stale_partials();
-        let mut have = std::fs::read(&path).unwrap_or_default();
+        // What arrived before, by its length alone: the pieces stay in the
+        // file, not held in memory as well, until the whole is read back.
+        let mut have = std::fs::metadata(&path).map_or(0, |meta| meta.len() as usize);
         // A piece from another generation, or past the message, is no use.
-        if have.len() > m.size as usize && m.size > 0 {
-            have.clear();
+        if have > m.size as usize && m.size > 0 {
+            have = 0;
         }
         let mut file = std::fs::OpenOptions::new()
             .create(true)
             .write(true)
-            .truncate(have.is_empty())
-            .append(!have.is_empty())
+            .truncate(have == 0)
+            .append(have > 0)
             .open(&path)?;
         loop {
-            let piece = fetch_range(&mut c.session, m.uid, have.len(), CHUNK)?;
+            let piece = fetch_range(&mut c.session, m.uid, have, CHUNK)?;
             // Checked before it is kept: a piece past the limit is neither
             // written nor held.
-            if have.len() + piece.len() > MAX_DOWNLOAD {
+            if have + piece.len() > MAX_DOWNLOAD {
                 // It will never finish: what was kept of it goes now, not
                 // after a week.
                 drop(file);
@@ -85,15 +87,16 @@ impl Backend {
             }
             file.write_all(&piece)?;
             file.flush()?;
-            have.extend_from_slice(&piece);
+            have += piece.len();
             if piece.len() < CHUNK {
                 break;
             }
         }
-        ensure!(!have.is_empty(), t!("manage-large-message-no-longer-exists-on-the"));
+        ensure!(have > 0, t!("manage-large-message-no-longer-exists-on-the"));
         drop(file);
+        let whole = std::fs::read(&path)?;
         let _ = std::fs::remove_file(&path);
-        Ok(have)
+        Ok(whole)
     }
     /// A message too large to download whole, read from its parts: the
     /// headers, the first plain and HTML text, and a list of attachments
@@ -214,6 +217,20 @@ impl Backend {
         m: &Mail,
         attachment: &Attachment,
     ) -> Result<Vec<u8>> {
+        let mut out = Vec::new();
+        self.fetch_attachment_into(c, m, attachment, &mut out)?;
+        Ok(out)
+    }
+    /// `fetch_attachment`, written to `out` as it arrives: a large one is
+    /// decoded piece by piece and passed on, so only a piece (not the whole
+    /// attachment) is in memory at once. Returns the decoded size.
+    pub(super) fn fetch_attachment_into(
+        &self,
+        c: &mut Connection,
+        m: &Mail,
+        attachment: &Attachment,
+        out: &mut dyn std::io::Write,
+    ) -> Result<u64> {
         let ext = c.extensions()?;
         let leaf = Leaf {
             section: attachment.section.clone(),
@@ -224,7 +241,9 @@ impl Backend {
             ..Leaf::default()
         };
         if attachment.size <= PART_IN_ONE {
-            return fetch_part(&mut c.session, &ext, m.uid, &leaf, PART_IN_ONE * 2);
+            let bytes = fetch_part(&mut c.session, &ext, m.uid, &leaf, PART_IN_ONE * 2)?;
+            out.write_all(&bytes)?;
+            return Ok(bytes.len() as u64);
         }
         ensure!(
             attachment.size <= MAX_PART,
@@ -236,11 +255,17 @@ impl Backend {
                 .all(|b| b.is_ascii_digit() || b == b'.'),
             t!("manage-large-invalid-imap-section")
         );
-        // Base64 (nearly every large attachment) is decoded piece by piece
-        // as it arrives, so only the decoded file is held, not the encoded
-        // part as well, and copies of it, as decoding it whole needed.
+        // Base64 (nearly every large attachment), quoted-printable and the
+        // encodings that need none are decoded piece by piece as they
+        // arrive and written on; any other is decoded whole.
         let mut base64 = leaf.encoding.eq_ignore_ascii_case("base64").then(Base64Stream::default);
+        let mut qp = leaf.encoding.eq_ignore_ascii_case("quoted-printable").then(QpStream::default);
+        let identity = matches!(
+            leaf.encoding.trim().to_ascii_lowercase().as_str(),
+            "" | "7bit" | "8bit" | "binary"
+        );
         let mut raw = Vec::new();
+        let mut written: u64 = 0;
         let mut offset = 0;
         loop {
             let rows = uid_fetch_rows(
@@ -259,17 +284,49 @@ impl Backend {
             match &mut base64 {
                 Some(stream) => {
                     stream.feed(&piece)?;
-                    ensure!(stream.out.len() <= MAX_PART, t!("manage-large-this-attachment-is-too-large"));
+                    written += stream.out.len() as u64;
+                    ensure!(written <= MAX_PART as u64, t!("manage-large-this-attachment-is-too-large"));
+                    out.write_all(&stream.out)?;
+                    stream.out.clear();
                 }
-                None => raw.extend_from_slice(&piece),
+                None if identity => {
+                    // Not encoded: as large as the file, which may be no
+                    // larger than `MAX_PART`.
+                    written += piece.len() as u64;
+                    ensure!(written <= MAX_PART as u64, t!("manage-large-this-attachment-is-too-large"));
+                    out.write_all(&piece)?;
+                }
+                None => match &mut qp {
+                    Some(stream) => {
+                        let decoded = stream.feed(&piece)?;
+                        written += decoded.len() as u64;
+                        ensure!(written <= MAX_PART as u64, t!("manage-large-this-attachment-is-too-large"));
+                        out.write_all(&decoded)?;
+                    }
+                    None => raw.extend_from_slice(&piece),
+                },
             }
             if done {
                 break;
             }
         }
         match base64 {
-            Some(stream) => stream.finish(),
-            None => decode_part(&raw, &leaf.encoding),
+            Some(stream) => {
+                let rest = stream.finish()?;
+                out.write_all(&rest)?;
+                Ok(written + rest.len() as u64)
+            }
+            None if identity => Ok(written),
+            None if qp.is_some() => {
+                let rest = qp.map(QpStream::finish).transpose()?.unwrap_or_default();
+                out.write_all(&rest)?;
+                Ok(written + rest.len() as u64)
+            }
+            None => {
+                let decoded = decode_part(&raw, &leaf.encoding)?;
+                out.write_all(&decoded)?;
+                Ok(decoded.len() as u64)
+            }
         }
     }
 }
@@ -325,6 +382,39 @@ impl Base64Stream {
     }
 }
 
+/// Quoted-printable decoded as it arrives, in pieces: whole lines are
+/// decoded as they come (an escape, `=XX`, or a soft line break never
+/// spans lines), the rest kept for the next piece. A piece without line
+/// breaks past `CHUNK` is decoded up to an escape it would cut in two.
+#[derive(Default)]
+struct QpStream {
+    pending: Vec<u8>,
+}
+
+impl QpStream {
+    fn feed(&mut self, piece: &[u8]) -> Result<Vec<u8>> {
+        self.pending.extend_from_slice(piece);
+        let len = self.pending.len();
+        let cut = match memchr::memrchr(b'\n', &self.pending) {
+            Some(at) => at + 1,
+            None if len > CHUNK => (len.saturating_sub(2)..len).find(|&i| self.pending[i] == b'=').unwrap_or(len),
+            None => 0,
+        };
+        if cut == 0 {
+            return Ok(Vec::new());
+        }
+        let decoded = decode_part(&self.pending[..cut], "quoted-printable")?;
+        self.pending.drain(..cut);
+        Ok(decoded)
+    }
+    fn finish(self) -> Result<Vec<u8>> {
+        if self.pending.is_empty() {
+            return Ok(Vec::new());
+        }
+        decode_part(&self.pending, "quoted-printable")
+    }
+}
+
 /// Removes the files in `dir` that `wanted` picks and were last changed
 /// longer than `age` ago.
 pub(super) fn remove_older_than(
@@ -366,6 +456,24 @@ fn decode_text(bytes: &[u8], leaf: &Leaf) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Quoted-printable decoded in pieces split anywhere (inside escapes,
+    /// soft line breaks and line breaks) comes out as decoding it whole.
+    #[test]
+    fn quoted_printable_decodes_in_pieces_as_whole() -> Result<()> {
+        let text = "Caf=C3=A9 au lait, cr=C3=A8me br=C3=BBl=C3=A9e and a very long line that =\r\nwraps softly =3D still one line.\r\nTrailing spaces   \r\nLast=\r\n line, no break at the end=21";
+        let whole = decode_part(text.as_bytes(), "quoted-printable")?;
+        for size in [1, 2, 3, 5, 17, 1000] {
+            let mut s = QpStream::default();
+            let mut out = Vec::new();
+            for piece in text.as_bytes().chunks(size) {
+                out.extend(s.feed(piece)?);
+            }
+            out.extend(s.finish()?);
+            assert_eq!(out, whole, "pieces of {size}");
+        }
+        Ok(())
+    }
 
     /// Decoded in pieces split anywhere (inside groups, inside line breaks),
     /// a part comes out as decoding it whole does.

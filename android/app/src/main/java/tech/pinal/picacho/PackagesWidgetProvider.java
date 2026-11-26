@@ -28,7 +28,7 @@ public final class PackagesWidgetProvider extends AppWidgetProvider {
     @Override
     public void onReceive(Context context, Intent intent) {
         super.onReceive(context, intent);
-        if (WidgetStore.ACTION_REFRESH.equals(intent.getAction())) {
+        if (WidgetStore.isRefresh(context, intent)) {
             WidgetStore.refreshFromStoreAsync(context, this);
         }
     }
@@ -39,7 +39,11 @@ public final class PackagesWidgetProvider extends AppWidgetProvider {
     }
 
     static void updateAll(Context context, AppWidgetManager manager, int[] appWidgetIds) {
-        WidgetStore.Snapshot snap = WidgetStore.load(context);
+        updateAll(context, manager, appWidgetIds, WidgetStore.load(context));
+    }
+
+    static void updateAll(
+            Context context, AppWidgetManager manager, int[] appWidgetIds, WidgetStore.Snapshot snap) {
         for (int id : appWidgetIds) {
             updateOne(context, manager, id, snap);
         }
@@ -86,8 +90,7 @@ public final class PackagesWidgetProvider extends AppWidgetProvider {
             views.setViewVisibility(R.id.widget_pkg_view_all, View.GONE);
         }
 
-        Intent refreshIntent = new Intent(context, PackagesWidgetProvider.class)
-                .setAction(WidgetStore.ACTION_REFRESH);
+        Intent refreshIntent = WidgetStore.refreshIntent(context, PackagesWidgetProvider.class);
         PendingIntent refreshPending = PendingIntent.getBroadcast(
                 context,
                 95_000 + appWidgetId,

@@ -142,26 +142,96 @@ fn file_name(part: &ParsedMail) -> Option<String> {
 
 // --- Reading -----------------------------------------------------------------
 
+/// The files of an inline PGP message, as parts of the message shown,
+/// and the names of those its protection doesn't cover.
+pub(super) struct Files {
+    pub parts: Vec<Vec<u8>>,
+    pub uncovered: Vec<String>,
+}
+
 /// The attachments of an inline PGP message `parsed` whose text is
 /// `text`, as parts of the message shown: each encrypted file (`.pgp`,
 /// `.gpg`, or armored) decrypted with `secret` where it can be, named
 /// without that extension; the rest as they came. Parts that aren't files
 /// (a list's footer) are left out, as they were before.
-pub(super) fn attachments(parsed: &ParsedMail, text: &ParsedMail, secret: &[SignedSecretKey], depth: usize) -> Vec<Vec<u8>> {
+///
+/// Inline PGP protects each file on its own, if at all, so each is
+/// checked: one that decrypted is covered, as is one with a detached
+/// signature beside it (`name.sig`, or `name.asc`) that `signed` accepts
+/// (given the file and the signature), and that signature itself. Any
+/// other is listed in `uncovered`: it may have been added on the way.
+pub(super) fn attachments(
+    parsed: &ParsedMail,
+    text: &ParsedMail,
+    secret: &[SignedSecretKey],
+    depth: usize,
+    signed: &dyn Fn(&[u8], &[u8]) -> bool,
+    sealed: &dyn Fn(&Message<'_>) -> bool,
+) -> Files {
     let mut leaves = Vec::new();
     crate::sync::mime::collect_leaves(parsed, &mut leaves);
-    leaves
+    let files: Vec<&ParsedMail> = leaves
         .into_iter()
         .filter(|leaf| !std::ptr::eq(*leaf, text))
         .filter(|leaf| {
             leaf.get_content_disposition().disposition == DispositionType::Attachment || file_name(leaf).is_some()
         })
-        .map(|leaf| opened(leaf, secret, depth).unwrap_or_else(|| leaf.raw_bytes.to_vec()))
-        .collect()
+        .collect();
+    let mut covered = vec![false; files.len()];
+    let mut parts = Vec::with_capacity(files.len());
+    for (i, leaf) in files.iter().enumerate() {
+        if let Some((part, covers)) = opened(leaf, secret, depth, sealed) {
+            covered[i] = covers;
+            parts.push(part);
+            continue;
+        }
+        parts.push(leaf.raw_bytes.to_vec());
+        let Some(name) = file_name(leaf) else { continue };
+        let Ok(body) = leaf.get_body_raw() else { continue };
+        for ext in [".sig", ".asc"] {
+            let sig_name = format!("{name}{ext}");
+            let found = files.iter().position(|f| file_name(f).is_some_and(|n| n.eq_ignore_ascii_case(&sig_name)));
+            if let Some(j) = found
+                && j != i
+                && files[j].get_body_raw().is_ok_and(|sig| signed(&body, &sig))
+            {
+                covered[i] = true;
+                covered[j] = true;
+                break;
+            }
+        }
+    }
+    let uncovered = files
+        .iter()
+        .zip(&covered)
+        .filter(|(_, c)| !**c)
+        .map(|(f, _)| file_name(f).unwrap_or_else(|| t!("manage-openpgp-an-unnamed-file").into()))
+        .collect();
+    Files { parts, uncovered }
 }
 
-/// An encrypted file as the part it decrypts to, if it does.
-fn opened(leaf: &ParsedMail, secret: &[SignedSecretKey], mut depth: usize) -> Option<Vec<u8>> {
+/// The detached signature in `bytes`, binary or armored.
+pub(super) fn detached(bytes: &[u8]) -> Option<pgp::packet::Signature> {
+    use pgp::composed::Deserializable as _;
+    let signature = if bytes.trim_ascii_start().starts_with(b"-----BEGIN PGP SIGNATURE-----") {
+        DetachedSignature::from_string(std::str::from_utf8(bytes).ok()?).ok()?.0
+    } else {
+        DetachedSignature::from_bytes(bytes).ok()?
+    };
+    Some(signature.signature)
+}
+
+/// An encrypted file as the part it decrypts to, if it does, and whether
+/// the message's protection covers it (`sealed`, given the file's
+/// decrypted message, read to its end: signed as the text was). Anyone can
+/// encrypt a file to you: under a good signature, one the signer didn't
+/// sign may have been added on the way.
+fn opened(
+    leaf: &ParsedMail,
+    secret: &[SignedSecretKey],
+    mut depth: usize,
+    sealed: &dyn Fn(&Message<'_>) -> bool,
+) -> Option<(Vec<u8>, bool)> {
     if secret.is_empty() {
         return None;
     }
@@ -191,8 +261,9 @@ fn opened(leaf: &ParsedMail, secret: &[SignedSecretKey], mut depth: usize) -> Op
         }
         inner
     };
+    let covers = sealed(&message);
     let kind = crate::sync::smtp::content_type(std::path::Path::new(&stem));
-    Some(Attachment::new(stem).body(inner, kind).formatted())
+    Some((Attachment::new(stem).body(inner, kind).formatted(), covers))
 }
 
 #[cfg(test)]

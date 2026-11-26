@@ -189,6 +189,7 @@ PlasmoidItem {
                 implicitWidth: Math.max(height, badgeText.implicitWidth + 8)
                 implicitHeight: 16
                 PlasmaComponents.Label {
+                    textFormat: Text.PlainText
                     id: badgeText
                     anchors.centerIn: parent
                     text: root.unreadCount > 999 ? "999+" : String(root.unreadCount)
@@ -231,6 +232,7 @@ PlasmoidItem {
                             implicitHeight: 18
                         }
                         PlasmaComponents.Label {
+                            textFormat: Text.PlainText
                             text: root.headerTitle
                             font.bold: true
                             elide: Text.ElideRight
@@ -243,6 +245,7 @@ PlasmoidItem {
                             implicitWidth: Math.max(height, headerBadge.implicitWidth + 10)
                             implicitHeight: 18
                             PlasmaComponents.Label {
+                                textFormat: Text.PlainText
                                 id: headerBadge
                                 anchors.centerIn: parent
                                 text: root.unreadCount > 999 ? "999+" : String(root.unreadCount)
@@ -326,6 +329,7 @@ PlasmoidItem {
                                 Layout.fillWidth: true
                                 spacing: 4
                                 PlasmaComponents.Label {
+                                    textFormat: Text.PlainText
                                     Layout.fillWidth: true
                                     text: modelData.sender || word("unknown-sender", "(Unknown sender)")
                                     font.bold: !!modelData.unread
@@ -333,6 +337,7 @@ PlasmoidItem {
                                     elide: Text.ElideRight
                                 }
                                 PlasmaComponents.Label {
+                                    textFormat: Text.PlainText
                                     text: root.formatShortDate(modelData.date)
                                     font.pixelSize: 11
                                     opacity: 0.65
@@ -340,6 +345,7 @@ PlasmoidItem {
                             }
 
                             PlasmaComponents.Label {
+                                textFormat: Text.PlainText
                                 Layout.fillWidth: true
                                 text: modelData.subject || word("no-subject", "(No subject)")
                                 font.bold: !!modelData.unread
@@ -348,6 +354,7 @@ PlasmoidItem {
                             }
 
                             PlasmaComponents.Label {
+                                textFormat: Text.PlainText
                                 visible: !!(modelData.snippet && modelData.snippet.length > 0)
                                 Layout.fillWidth: true
                                 text: modelData.snippet || ""
@@ -360,6 +367,7 @@ PlasmoidItem {
                 }
 
                 PlasmaComponents.Label {
+                    textFormat: Text.PlainText
                     anchors.centerIn: parent
                     visible: msgList.count === 0
                     opacity: 0.65

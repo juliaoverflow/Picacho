@@ -1568,6 +1568,30 @@ impl Backend {
             .organizer
             .clone()
             .with_context(|| t!("manage-calendar-this-invitation-doesnt-say-who-to"))?;
+        // An invitation for an event already in the calendar (not Exchange's,
+        // which answers only its own copy) can be written by anyone who
+        // knows its UID. It must name the organizer the calendar has. Its
+        // version is taken only when the organizer's domain vouches for the
+        // mail; otherwise your answer goes on the calendar's own copy, and
+        // declining, which takes the event out, is refused.
+        let mut take_version = true;
+        if self.calendar_server().is_some()
+            && !self.exchange_calendar()?
+            && let Some(kept) = self.stored_event(&event.uid)
+        {
+            match &kept.event.organizer {
+                Some(o) => ensure!(
+                    organizer_may_change(&kept.event, &event, &m.from),
+                    t!("manage-calendar-this-update-is-from-not-the", from = m.from, email = o.email)
+                ),
+                None => bail!(t!("manage-calendar-this-update-would-replace-your-own")),
+            }
+            let verdict = self.dmarc_verdict(a, m)?;
+            take_version = verdict.as_deref() == Some("pass");
+            if status == PartStat::Declined {
+                vouched_for(m, verdict)?;
+            }
+        }
         let reply = ical::reply(&event, &me, &my_name, status)?;
         let raw = imip_message(
             &me,
@@ -1584,7 +1608,7 @@ impl Backend {
         if self.calendar_server().is_none() {
             return Ok(None);
         }
-        Ok(self.file_answer(&event, &me, status).err().map(|e| {
+        Ok(self.file_answer(&event, &me, status, take_version).err().map(|e| {
             t!(
                 "manage-calendar-the-answer-was-sent-but-the",
                 error = format!("{:#}", e)
@@ -1594,8 +1618,9 @@ impl Backend {
     /// Puts your answer to an invitation in the calendar: declined, it goes
     /// (only that occurrence, where the invitation is for one: RFC 5546
     /// §3.2.3, a REPLY with a RECURRENCE-ID answers just it); otherwise it
-    /// is saved with your answer in it.
-    pub(super) fn file_answer(&self, event: &Event, me: &str, status: PartStat) -> Result<()> {
+    /// is saved with your answer in it: the invitation's version of it when
+    /// `take_version`, else the calendar's own copy, where it has one.
+    pub(super) fn file_answer(&self, event: &Event, me: &str, status: PartStat, take_version: bool) -> Result<()> {
         // Exchange put the invitation in the calendar itself: it is
         // answered there (the reply already went by mail).
         if let Some(server) = self.calendar_server()
@@ -1626,7 +1651,16 @@ impl Backend {
             (PartStat::Declined, Some(at)) => self.cancel_occurrence(&event.uid, at),
             (PartStat::Declined, None) => self.delete_event(&event.uid),
             _ => {
-                let mut kept = event.clone();
+                let mut kept = match self.stored_event(&event.uid).filter(|_| !take_version) {
+                    None => event.clone(),
+                    Some(stored) => match event.recurrence_id {
+                        None => stored.event,
+                        Some(at) => ical::occurrences(&stored.event, &stored.overrides, at, at + 1)
+                            .into_iter()
+                            .find(|o| o.recurrence_id == Some(at))
+                            .with_context(|| t!("manage-calendar-the-event-this-answers-isnt-in"))?,
+                    },
+                };
                 for at in &mut kept.attendees {
                     if at.email.eq_ignore_ascii_case(me) {
                         at.status = Some(status);
@@ -1709,6 +1743,7 @@ impl Backend {
         let mut stored = self
             .stored_event(&answer.uid)
             .with_context(|| t!("manage-calendar-the-event-this-answers-isnt-in"))?;
+        self.require_vouched(a, m)?;
         let target = match answer.recurrence_id {
             Some(at) => stored
                 .overrides
@@ -1778,6 +1813,15 @@ impl Backend {
         let mut stored = self
             .stored_event(&proposed.uid)
             .with_context(|| t!("manage-calendar-the-event-this-proposal-is-for"))?;
+        // Only a guest proposes a time (RFC 5546 §3.2.7): accepting one
+        // moves the event and tells everyone invited.
+        let invited = |attendees: &[ical::Attendee]| attendees.iter().any(|a| a.email.eq_ignore_ascii_case(&guest));
+        ensure!(
+            !guest.is_empty()
+                && (invited(&stored.event.attendees) || stored.overrides.iter().any(|o| invited(&o.attendees))),
+            t!("manage-calendar-this-proposal-isnt-from-a-guest", from = m.from)
+        );
+        self.require_vouched(a, m)?;
         let length = proposed.end - proposed.start;
         match proposed.recurrence_id {
             // One repeat moves.
@@ -1957,6 +2001,11 @@ impl Backend {
                 event.sequence >= kept.event.sequence,
                 t!("manage-calendar-this-update-is-older-than-the")
             );
+            // The organizer is the one the calendar has, not whoever the
+            // update names: anyone can write an update naming themselves,
+            // or no one, for an event whose UID they know; and the mail
+            // must be theirs, as their domain vouches.
+            self.require_organizer(a, m, &kept, &event)?;
         }
         if let Some(answer) = self.invitation_answer(&event.uid) {
             for g in &mut event.attendees {
@@ -2036,6 +2085,9 @@ impl Backend {
             })?
             .email
             .clone();
+        // The event goes to whoever the From names: only to a guest who
+        // really asked.
+        self.require_vouched(a, m)?;
         let me = stored
             .event
             .organizer
@@ -2076,13 +2128,12 @@ impl Backend {
         let mut stored = self
             .stored_event(&first.uid)
             .with_context(|| t!("manage-calendar-the-event-this-adds-to-isnt"))?;
+        // From the organizer the calendar has, not whoever the mail names.
         ensure!(
-            first
-                .organizer
-                .as_ref()
-                .is_none_or(|o| o.email.eq_ignore_ascii_case(&m.from)),
+            organizer_may_change(&stored.event, first, &m.from),
             t!("manage-calendar-this-addition-isnt-from-the-events")
         );
+        self.require_vouched(a, m)?;
         for added in &cal.events {
             if !stored.event.rdates.contains(&added.start) {
                 stored.event.rdates.push(added.start);
@@ -2123,17 +2174,14 @@ impl Backend {
             .invitation(a, m)?
             .with_context(|| t!("manage-calendar-this-message-has-no-invitation"))?;
         for e in cal.events.iter().filter(|e| e.cancelled) {
-            // Only the organizer cancels (RFC 5546 §3.2.5).
-            if let (Some(kept), Some(organizer)) = (self.stored_event(&e.uid), &e.organizer) {
+            // Only the organizer cancels (RFC 5546 §3.2.5): the one the
+            // calendar has, whether or not the cancellation names one.
+            if let Some(kept) = self.stored_event(&e.uid) {
                 ensure!(
-                    m.from.eq_ignore_ascii_case(&organizer.email)
-                        && kept
-                            .event
-                            .organizer
-                            .as_ref()
-                            .is_none_or(|o| o.email.eq_ignore_ascii_case(&organizer.email)),
+                    organizer_may_change(&kept.event, e, &m.from),
                     t!("manage-calendar-this-cancellation-isnt-from-the-events")
                 );
+                self.require_vouched(a, m)?;
             }
             // One occurrence cancelled: only it goes, not the series.
             if let Some(at) = e.recurrence_id {
@@ -2495,6 +2543,105 @@ fn wrap(b64: &str) -> String {
         .map(|c| String::from_utf8_lossy(c).into_owned())
         .collect::<Vec<_>>()
         .join("\r\n")
+}
+
+impl Backend {
+    /// What DMARC (RFC 7489) says of `m`'s From address: `pass` when its
+    /// domain vouches for the message, else `fail`, `none` (the domain asks
+    /// nothing)… `None` when it couldn't be checked. Checked now: the
+    /// domain's records are looked up in DNS.
+    fn dmarc_verdict(&self, a: &Account, m: &Mail) -> Result<Option<String>> {
+        #[cfg(test)]
+        {
+            let _ = a;
+            let pass = self.test_dmarc_pass.iter().any(|s| s.eq_ignore_ascii_case(&m.from));
+            Ok(Some(if pass { "pass" } else { "none" }.into()))
+        }
+        #[cfg(not(test))]
+        {
+            let raw = self.original(a, m)?;
+            let mut details = crate::sync::mime::details(&raw, false);
+            crate::sync::auth::check(&raw, &mut details);
+            Ok(details.dmarc)
+        }
+    }
+
+    /// Mail that changes what's in the calendar, or has Picacho send it on,
+    /// must be from who its From says: anyone can write an organizer's or a
+    /// guest's address there. Only mail its domain vouches for (DMARC pass)
+    /// does; the rest is refused, saying why.
+    fn require_vouched(&self, a: &Account, m: &Mail) -> Result<()> {
+        vouched_for(m, self.dmarc_verdict(a, m)?)
+    }
+
+    /// Mail about `incoming`, an event already in the calendar as `kept`,
+    /// may change it: from `kept`'s own organizer (`organizer_may_change`),
+    /// vouched for by its domain (`require_vouched`).
+    fn require_organizer(&self, a: &Account, m: &Mail, kept: &Stored, incoming: &Event) -> Result<()> {
+        match &kept.event.organizer {
+            Some(organizer) => ensure!(
+                organizer_may_change(&kept.event, incoming, &m.from),
+                t!(
+                    "manage-calendar-this-update-is-from-not-the",
+                    from = m.from,
+                    email = organizer.email
+                )
+            ),
+            None => bail!(t!("manage-calendar-this-update-would-replace-your-own")),
+        }
+        self.require_vouched(a, m)
+    }
+
+    /// Whether the calendar is Exchange's (Web Services or Graph): it files
+    /// invitations itself, and an answer only answers its own copy.
+    fn exchange_calendar(&self) -> Result<bool> {
+        let Some(server) = self.calendar_server() else {
+            return Ok(false);
+        };
+        Ok(self.calendar_ews(&server)?.is_some() || self.calendar_graph(&server)?.is_some())
+    }
+
+    /// Adds an event an email carries (an invitation or a published event,
+    /// added by hand). One already in the calendar is only replaced by mail
+    /// from its organizer, vouched for (`require_organizer`).
+    pub fn add_event_from_mail(&self, a: &Account, m: &Mail, event: Event) -> Result<Stored> {
+        if let Some(kept) = self.stored_event(&event.uid) {
+            ensure!(
+                kept.event.organizer.is_some(),
+                t!("manage-calendar-this-event-is-already-in-your-calendar")
+            );
+            self.require_organizer(a, m, &kept, &event)?;
+        }
+        self.save_event(event, None)
+    }
+}
+
+/// `Ok` when `verdict`, DMARC's for `m`, is a pass; else why not.
+fn vouched_for(m: &Mail, verdict: Option<String>) -> Result<()> {
+    ensure!(
+        verdict.as_deref() == Some("pass"),
+        t!(
+            "manage-calendar-sender-isnt-vouched-for",
+            from = m.from,
+            result = verdict.unwrap_or_else(|| "not checked".into())
+        )
+    );
+    Ok(())
+}
+
+/// Whether a message from `from` may change or cancel `kept`, an event in
+/// the calendar, as `incoming` says: only `kept`'s own organizer may (RFC
+/// 5546 §2.1.5, §3.2.5), and `incoming` may name no other. An event with no
+/// organizer, one of your own, isn't changed by mail at all.
+fn organizer_may_change(kept: &Event, incoming: &Event, from: &str) -> bool {
+    let Some(organizer) = &kept.organizer else {
+        return false;
+    };
+    from.eq_ignore_ascii_case(&organizer.email)
+        && incoming
+            .organizer
+            .as_ref()
+            .is_none_or(|o| o.email.eq_ignore_ascii_case(&organizer.email))
 }
 
 #[cfg(test)]
@@ -2870,14 +3017,14 @@ mod tests {
             source: String::new(),
             ..all[0].clone()
         };
-        b.file_answer(&one(second), "qa@example.com", PartStat::Declined)?;
+        b.file_answer(&one(second), "qa@example.com", PartStat::Declined, true)?;
         let after = b.agenda(0, 2_000_000_000);
         assert_eq!(after.len(), 3, "only that occurrence went");
         assert!(after.iter().all(|e| e.start != second));
         assert!(kept.lock().unwrap().contains("EXDATE:20261109T090000Z"), "{}", kept.lock().unwrap());
         // The third accepted tentatively: its own, the series as it was.
         let third = all[2].recurrence_id.unwrap();
-        b.file_answer(&one(third), "qa@example.com", PartStat::Tentative)?;
+        b.file_answer(&one(third), "qa@example.com", PartStat::Tentative, true)?;
         let stored = b.stored_event("weekly").unwrap();
         assert_eq!(stored.event.recurrence, "FREQ=WEEKLY;COUNT=4");
         assert_eq!(stored.overrides.len(), 1);
@@ -2885,6 +3032,15 @@ mod tests {
         assert_eq!(b.agenda(0, 2_000_000_000).len(), 3);
         let put = kept.lock().unwrap().clone();
         assert!(put.contains("RECURRENCE-ID:20261116T090000Z"), "{put}");
+        // An answer to an invitation its organizer's domain didn't vouch
+        // for: it goes on the calendar's own copy, whatever the mail said.
+        let fourth = all[3].recurrence_id.unwrap();
+        let rewritten = Event { summary: "Somewhere else".into(), location: "https://evil.example".into(), ..one(fourth) };
+        b.file_answer(&rewritten, "qa@example.com", PartStat::Accepted, false)?;
+        let stored = b.stored_event("weekly").unwrap();
+        let own = stored.overrides.iter().find(|o| o.recurrence_id == Some(fourth)).unwrap();
+        assert_eq!((own.summary.as_str(), own.location.as_str()), ("Weekly", ""));
+        assert_eq!(own.attendees[0].status, Some(PartStat::Accepted));
         drop(server);
         drop(b);
         std::fs::remove_dir_all(path)?;
@@ -2912,6 +3068,8 @@ mod tests {
             password: "secret".into(),
             ..Default::default()
         });
+        // Ana's domain vouches for her mail (DMARC); no one else's does yet.
+        b.test_dmarc_pass = vec!["ana@example.org".into()];
         let mut a = Account::new(Provider::Pop3);
         a.email = "qa@example.com".into();
         a.name = "QA".into();
@@ -3006,6 +3164,41 @@ mod tests {
             b.invitation_changed(&b.stored_event("party").unwrap().event)
                 .is_none()
         );
+        // Someone who knows the event's UID can't rewrite or cancel it by
+        // naming themselves as its organizer, or no organizer at all.
+        let mut moved = party.clone();
+        moved.summary = "Moved".into();
+        moved.sequence = 9;
+        for organizer in [None, Some(guest("mallory@evil.example"))] {
+            moved.organizer = organizer;
+            let update = mail("u1", "mallory@evil.example", &ical::request(&moved, &[], false))?;
+            assert!(b.take_update(&a, &update).is_err());
+            let cancel = mail("x1", "mallory@evil.example", &ical::request(&moved, &[], true))?;
+            assert!(b.remove_cancelled(&a, &cancel).is_err());
+            assert_eq!(b.stored_event("party").unwrap().event.summary, "Party");
+        }
+        // Nor accept a time for the event as if a guest had proposed it.
+        let forged = ical::counter(&party, "mallory@evil.example", "", party.start + 7200, party.end + 7200, "")?;
+        assert!(b.accept_counter(&a, &mail("c2", "mallory@evil.example", &forged)?).is_err());
+        assert_eq!(b.stored_event("party").unwrap().event.start, party.start);
+        // Nor add it again from mail, over the one in the calendar.
+        assert!(b.add_event_from_mail(&a, &mail("p1", "mallory@evil.example", "")?, moved.clone()).is_err());
+        // The right address in From isn't enough: its domain must vouch for
+        // the mail (DMARC), or anyone could write it there.
+        moved.organizer = party.organizer.clone();
+        let update = mail("u2", "qa@example.com", &ical::request(&moved, &[], false))?;
+        let refused = b.take_update(&a, &update).unwrap_err();
+        assert!(format!("{refused:#}").contains("DMARC"), "{refused:#}");
+        let cancel = mail("x2", "qa@example.com", &ical::request(&moved, &[], true))?;
+        assert!(b.remove_cancelled(&a, &cancel).is_err());
+        let bo = mail("r3", "bo@example.se", &yes.replace("ana@example.org", "bo@example.se"))?;
+        assert!(b.apply_reply(&a, &bo).is_err());
+        assert!(b.accept_counter(&a, &proposal).is_err());
+        assert_eq!(b.stored_event("party").unwrap().event.summary, "Party");
+        // Vouched for, the organizer's update is taken.
+        b.test_dmarc_pass.push("qa@example.com".into());
+        b.take_update(&a, &update)?;
+        assert_eq!(b.stored_event("party").unwrap().event.summary, "Moved");
         drop(server);
         drop(b);
         std::fs::remove_dir_all(path)?;

@@ -1,7 +1,7 @@
 //! Finding the key that made a signature: by the Issuer Fingerprint
 //! subpacket (RFC 9580 §5.2.3.35), else by the Issuer Key ID subpacket
 //! (§5.2.3.12), else, for a signature that names no issuer, every key.
-use super::{Signature, good_from, unrevoked, usable_subkeys};
+use super::{Signature, acceptable_signature, good_from, unrevoked, usable_subkeys};
 use pgp::composed::SignedPublicKey;
 use pgp::packet::{PublicKey, PublicSubkey};
 
@@ -45,6 +45,43 @@ pub(super) struct Signers<'k> {
 /// expired is unknown, not a failure, as what it signed may well predate
 /// that.
 pub(super) fn signers<'k>(signature: &pgp::packet::Signature, public: &'k [SignedPublicKey]) -> Signers<'k> {
+    // RFC 9580 §5.2.3.35: the fingerprint names the key exactly; the key
+    // ID (§5.2.3.12), 64 bits of it, only hints, and many signatures by
+    // older apps carry nothing else.
+    // A key ID that matches where the fingerprint doesn't is another key
+    // with the same 64 bits, not the signer.
+    let fingerprints = signature.issuer_fingerprint();
+    let ids = signature.issuer_key_id();
+    let names = |v: Verifier<'_>| {
+        if fingerprints.is_empty() {
+            ids.iter().any(|id| **id == v.as_dyn().legacy_key_id())
+        } else {
+            fingerprints.iter().any(|f| **f == v.as_dyn().fingerprint())
+        }
+    };
+    // The keys it names first, by their key material alone; only theirs
+    // are then checked as still good, which verifies their bindings (a
+    // signature check each): over a keyring of a thousand Autocrypt keys,
+    // checking every key's for every signature took seconds.
+    let mut named = Vec::new();
+    for key in public {
+        let primary = names(Verifier::Primary(&key.primary_key));
+        let subkey = key.public_subkeys.iter().any(|sub| names(Verifier::Subkey(&sub.key)));
+        if !(primary || subkey) || unrevoked(std::slice::from_ref(key)).next().is_none() {
+            continue;
+        }
+        if primary {
+            named.push((key, Verifier::Primary(&key.primary_key)));
+        }
+        if subkey {
+            for sub in usable_subkeys(key).filter(|sub| names(Verifier::Subkey(&sub.key))) {
+                named.push((key, Verifier::Subkey(&sub.key)));
+            }
+        }
+    }
+    if !named.is_empty() {
+        return Signers { keys: named, named: true };
+    }
     let mut all = Vec::new();
     for key in unrevoked(public) {
         all.push((key, Verifier::Primary(&key.primary_key)));
@@ -52,29 +89,7 @@ pub(super) fn signers<'k>(signature: &pgp::packet::Signature, public: &'k [Signe
             all.push((key, Verifier::Subkey(&sub.key)));
         }
     }
-    // RFC 9580 §5.2.3.35: the fingerprint names the key exactly; the key
-    // ID (§5.2.3.12), 64 bits of it, only hints, and many signatures by
-    // older apps carry nothing else.
-    // A key ID that matches where the fingerprint doesn't is another key
-    // with the same 64 bits, not the signer.
-    let fingerprints = signature.issuer_fingerprint();
-    let named: Vec<_> = if fingerprints.is_empty() {
-        let ids = signature.issuer_key_id();
-        all.iter()
-            .copied()
-            .filter(|(_, v)| ids.iter().any(|id| **id == v.as_dyn().legacy_key_id()))
-            .collect()
-    } else {
-        all.iter()
-            .copied()
-            .filter(|(_, v)| fingerprints.iter().any(|f| **f == v.as_dyn().fingerprint()))
-            .collect()
-    };
-    if named.is_empty() {
-        Signers { keys: all, named: false }
-    } else {
-        Signers { keys: named, named: true }
-    }
+    Signers { keys: all, named: false }
 }
 
 /// The verdict on `signature`, made from `public` (see `signers`), where
@@ -88,16 +103,31 @@ pub(super) fn verdict(
     from: Option<&str>,
     verifies: impl Fn(Verifier<'_>) -> bool,
 ) -> Signature {
-    let signers = signers(signature, public);
-    for (key, verifier) in &signers.keys {
-        if verifies(*verifier) {
-            return good_from(key, from);
-        }
+    // Made with a broken hash, or expired: whoever's it is, it can't vouch
+    // for this message.
+    if !acceptable_signature(signature) {
+        return Signature::Bad;
     }
-    if signers.named {
-        Signature::Bad
-    } else {
-        Signature::UnknownKey
+    let signers = signers(signature, public);
+    let made_by = signers.keys.iter().find(|(_, verifier)| verifies(*verifier)).map(|(key, _)| *key);
+    judged(signature, &signers, made_by, from)
+}
+
+/// The verdict on `signature`, its candidate `signers` checked: `made_by`
+/// is the first of their keys that made it, if any (see `verdict`).
+pub(super) fn judged(
+    signature: &pgp::packet::Signature,
+    signers: &Signers<'_>,
+    made_by: Option<&SignedPublicKey>,
+    from: Option<&str>,
+) -> Signature {
+    if !acceptable_signature(signature) {
+        return Signature::Bad;
+    }
+    match made_by {
+        Some(key) => good_from(key, from),
+        None if signers.named => Signature::Bad,
+        None => Signature::UnknownKey,
     }
 }
 
@@ -172,6 +202,54 @@ mod tests {
         assert_eq!(check(&by_id, changed, &ring, None), Signature::Bad);
         assert_eq!(check(&anonymous, changed, &ring, None), Signature::UnknownKey);
         assert_eq!(check(&by_fingerprint, CONTENT, &public(&[&cy]), None), Signature::UnknownKey);
+    }
+
+    /// A signature made with a broken hash (SHA-1, MD5, RIPEMD-160), or past
+    /// its own expiration time, isn't good, whoever made it. (pgp accepts
+    /// SHA-1 from RSA keys; Ed25519's it refuses itself.)
+    #[test]
+    fn weak_and_expired_signatures_are_not_good() {
+        use pgp::composed::{EncryptionCaps, KeyType, SecretKeyParamsBuilder};
+        let mut params = SecretKeyParamsBuilder::default();
+        params
+            .key_type(KeyType::Rsa(2048))
+            .can_certify(true)
+            .can_sign(true)
+            .can_encrypt(EncryptionCaps::None)
+            .primary_user_id("Ana <ana@example.org>".into());
+        let ana = params.build().unwrap().generate(rand08::thread_rng()).unwrap();
+        let ring = public(&[&ana]);
+        let key = &ana.primary_key;
+        let made = |hash: HashAlgorithm, created: u32, lasts: Option<u32>| {
+            let mut hashed = vec![
+                Subpacket::regular(SubpacketData::SignatureCreationTime(Timestamp::from_secs(created))).unwrap(),
+                Subpacket::regular(SubpacketData::IssuerFingerprint(key.fingerprint())).unwrap(),
+            ];
+            if let Some(lasts) = lasts {
+                hashed.push(
+                    Subpacket::regular(SubpacketData::SignatureExpirationTime(pgp::types::Duration::from_secs(lasts)))
+                        .unwrap(),
+                );
+            }
+            DetachedSignature::sign_binary_data_with_subpackets(
+                rand08::thread_rng(),
+                key,
+                &Password::empty(),
+                hash,
+                CONTENT,
+                SubpacketConfig::UserDefined { hashed, unhashed: vec![] },
+            )
+            .unwrap()
+            .to_armored_string(ArmorOptions::default())
+            .unwrap()
+        };
+        let now = Timestamp::now().as_secs();
+        let good = Signature::Good("Ana <ana@example.org>".into());
+        assert_eq!(check(&made(HashAlgorithm::Sha256, now, None), CONTENT, &ring, None), good);
+        assert_eq!(check(&made(HashAlgorithm::Sha256, now, Some(3600)), CONTENT, &ring, None), good);
+        assert_eq!(check(&made(HashAlgorithm::Sha1, now, None), CONTENT, &ring, None), Signature::Bad);
+        // Made two hours ago, good for one.
+        assert_eq!(check(&made(HashAlgorithm::Sha256, now - 7200, Some(3600)), CONTENT, &ring, None), Signature::Bad);
     }
 
     /// A key ID that matches where the fingerprint names another key is a

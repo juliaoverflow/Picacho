@@ -43,6 +43,9 @@ pub const PREFERENCE: &str = "background";
 /// The preference that shows the tray icon while a window is open too. While
 /// Picacho runs in the background the icon always shows.
 pub const TRAY_PREFERENCE: &str = "tray_icon";
+/// The preference that starts Picacho in the background (no window) when
+/// the person signs in to their computer (desktop). Off unless turned on.
+pub const STARTUP_PREFERENCE: &str = "start_in_background";
 
 pub fn enabled(store: &super::store::Store) -> bool {
     store.preference(PREFERENCE).as_deref() != Some("false")
@@ -50,6 +53,13 @@ pub fn enabled(store: &super::store::Store) -> bool {
 
 pub fn tray_while_open(store: &super::store::Store) -> bool {
     store.preference(TRAY_PREFERENCE).as_deref() == Some("true")
+}
+
+/// Whether Picacho starts in the background at sign-in. Only while it may
+/// run in the background at all: the background process quits at once
+/// otherwise.
+pub fn starts_at_login(store: &super::store::Store) -> bool {
+    enabled(store) && store.preference(STARTUP_PREFERENCE).as_deref() == Some("true")
 }
 
 /// How often the monitor looks for checks that are due, as the window does.
@@ -231,6 +241,9 @@ pub fn check_once(backend: Arc<Backend>, announce: &Announce, cancel: Arc<Atomic
     };
     let backend = &shared.backend;
     let store = &backend.store;
+    // Hide mail outside Picacho, as set now: this process (a phone's
+    // background check) may have shown no window that loaded it.
+    super::applock::load_hiding(store);
     let accounts = store.accounts().unwrap_or_default();
     // Unread inbox mail already in the cache was seen in the window (or
     // announced) before; only what arrives now is new.
@@ -318,7 +331,9 @@ fn arrived(
         return;
     }
     if let Some(latest) = fresh.iter().max_by_key(|m| m.date) {
-        let subject = codes.hide(store, &latest.subject);
+        // The preview gives the model the message's context, as the window
+        // has; only the subject is shown.
+        let subject = codes.hide(store, &latest.subject, &latest.snippet);
         let ids: Vec<&str> = fresh.iter().map(|m| m.id.as_str()).collect();
         announce(Announcement::NewMail {
             account: &a.email,
@@ -359,6 +374,11 @@ fn run(shared: &Shared, wake: mpsc::Sender<Wake>, woken: mpsc::Receiver<Wake>, a
     let mut codes = Codes::default();
     let mut later = Later::default();
     loop {
+        // Hide mail outside Picacho, as set now, before anything is
+        // announced: the background process, and a phone's service, show
+        // no window that would have loaded it, and Settings may change it
+        // in another process meanwhile.
+        super::applock::load_hiding(store);
         let accounts = store.accounts().unwrap_or_default();
         let present = |id: &String| accounts.iter().any(|a| &a.id == id);
         known.retain(|id, _| present(id));
@@ -577,7 +597,7 @@ fn wake_snoozed(
                 let Some(latest) = woken.iter().max_by_key(|s| s.until) else {
                     continue;
                 };
-                let subject = codes.hide(&backend.store, &latest.subject);
+                let subject = codes.hide(&backend.store, &latest.subject, "");
                 announce(Announcement::BackFromSnooze {
                     account: &a.email,
                     account_id: &a.id,
@@ -688,28 +708,31 @@ fn fresh_mail<'a>(known: &mut HashSet<String>, messages: &'a [Mail]) -> Vec<&'a 
 }
 
 /// Sign-in codes kept out of announcements while Local AI hides them, as
-/// the window keeps them off the lock screen. The model loads on the first
-/// announcement that needs it and is freed with the monitor.
+/// the window keeps them off the lock screen: those the model finds, or,
+/// where it can't load (not installed yet, or damaged), every string shaped
+/// like a code. A notification has no Show code to click. The model loads
+/// on the first announcement that needs it, is tried again a minute after
+/// it couldn't load (it may have been installed since), and is freed with
+/// the monitor.
 #[derive(Default)]
 struct Codes {
-    detector: Option<Result<otp::Detector, ()>>,
+    detector: Option<otp::Detector>,
+    tried: Option<Instant>,
 }
 
 impl Codes {
-    fn hide(&mut self, store: &super::store::Store, subject: &str) -> String {
+    /// `subject` as announced, its codes hidden; `body` (the message's
+    /// preview, not shown) gives the model its context.
+    fn hide(&mut self, store: &super::store::Store, subject: &str, body: &str) -> String {
         if !local_ai::otp_enabled(store) {
             self.detector = None;
             return subject.to_owned();
         }
-        let detector = self
-            .detector
-            .get_or_insert_with(|| local_ai::otp_detector(store).map_err(|_| ()));
-        match detector {
-            Ok(detector) => otp::mask(subject, &detector.codes(subject, "")).into_owned(),
-            // Without the model a code can't be told apart; leave the
-            // subject out rather than show one.
-            Err(()) => t!("manage-background-new-message").to_owned(),
+        if self.detector.is_none() && self.tried.is_none_or(|t| t.elapsed() > Duration::from_secs(60)) {
+            self.tried = Some(Instant::now());
+            self.detector = local_ai::otp_detector(store).ok();
         }
+        otp::mask(subject, &otp::codes_to_hide(self.detector.as_ref(), subject, body)).into_owned()
     }
 }
 

@@ -216,7 +216,10 @@ pub fn recurrence(rrule: &str, start: i64) -> Option<Value> {
     let range = if let Some(count) = parts.get("COUNT").and_then(|c| c.parse::<i64>().ok()) {
         json!({"type": "numbered", "startDate": start_date, "numberOfOccurrences": count})
     } else if let Some(until) = parts.get("UNTIL") {
-        let date = chrono::NaiveDate::parse_from_str(&until[..until.len().min(8)], "%Y%m%d").ok()?;
+        // The first eight characters (a date), by characters: a byte slice
+        // through a non-ASCII one panicked.
+        let day: String = until.chars().take(8).collect();
+        let date = chrono::NaiveDate::parse_from_str(&day, "%Y%m%d").ok()?;
         json!({"type": "endDate", "startDate": start_date, "endDate": date.format("%Y-%m-%d").to_string()})
     } else {
         json!({"type": "noEnd", "startDate": start_date})
@@ -614,18 +617,31 @@ impl Session {
 
     /// As `all_pages`, sending `headers` with each page's request.
     pub fn all_pages_with(&self, first: &str, most: usize, headers: &[(&str, &str)]) -> Result<Vec<Value>> {
+        /// As `all_pages`: no page asked for twice, nor without end.
+        const MAX_PAGES: usize = 1000;
         let mut out = Vec::new();
         let mut next = Some(Self::p(first));
+        let mut seen = std::collections::HashSet::new();
         while let Some(path) = next.take() {
+            if seen.len() >= MAX_PAGES || !seen.insert(path.clone()) {
+                break;
+            }
             let mut builder = self.rest.request(reqwest::Method::GET, &path)?;
             for (k, v) in headers {
                 builder = builder.header(*k, *v);
             }
             let response = self.rest.send(builder)?;
-            let v: Value = response.json().context("Microsoft 365 sent something other than JSON")?;
-            out.extend(v["value"].as_array().cloned().unwrap_or_default());
+            // Read within the limit any answer has (`rest`), not without end.
+            let v: Value = crate::sync::rest::bounded_json(response)
+                .context("Microsoft 365 sent something other than JSON")?;
+            let page = v["value"].as_array().cloned().unwrap_or_default();
+            let empty = page.is_empty();
+            out.extend(page);
             if out.len() >= most {
                 out.truncate(most);
+                break;
+            }
+            if empty {
                 break;
             }
             next = v["@odata.nextLink"].as_str().map(str::to_owned);

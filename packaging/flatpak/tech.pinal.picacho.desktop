@@ -5,6 +5,7 @@ GenericName=Email Client
 Comment=Fast, native email for every inbox you have
 Exec=picacho %U
 Icon=tech.pinal.picacho
+StartupNotify=true
 StartupWMClass=tech.pinal.picacho
 Terminal=false
 Categories=Network;Email;

@@ -62,14 +62,14 @@ fn android_main(app: android_activity::AndroidApp) {
         log::error!("no internal data directory");
         return;
     };
-    let opened = {
+    {
         let mut process = process();
         process.ui = true;
         // The window checks mail from here on; the monitor's watches end
         // before the window's begin.
         process.monitor = None;
-        process.backend(&path)
-    };
+    }
+    let opened = open_backend(&path);
     // Starts (or stops) the service that keeps checking once the activity
     // is gone.
     let started = |backend: &Arc<Backend>| {
@@ -98,7 +98,7 @@ fn android_main(app: android_activity::AndroidApp) {
             log::error!("could not open the mail store at {}: {e:#}", path.display());
             let dir = path.clone();
             display::run_recovery_on(gpui_app, path, e, move || {
-                let backend = process().backend(&dir)?;
+                let backend = open_backend(&dir)?;
                 started(&backend);
                 Ok(backend)
             });
@@ -128,10 +128,12 @@ fn init_logging() {
 
 /// The activity's window has run in this process (it can't again).
 static UI_STARTED: AtomicBool = AtomicBool::new(false);
-/// This side set up ndk-context (for the keychain) in a process the service
-/// started; android-activity sets it up itself, once, when an activity is
-/// created, so it is released first (`beforeActivity`).
-static CONTEXT_OURS: AtomicBool = AtomicBool::new(false);
+/// Serializes `Native.attach` (the activity's main thread and a widget's or
+/// the service's thread may each be first) and its use of ndk-context.
+static ATTACH: Mutex<()> = Mutex::new(());
+/// Serializes opening the store, without holding `PROCESS` (which the UI
+/// thread takes in `beforeActivity`) while it opens.
+static OPENING: Mutex<()> = Mutex::new(());
 /// Moves on with each `serviceStarted` and `serviceStopped`: a service start
 /// whose thread runs after the service stopped finds it moved on, and
 /// starts no monitor for a service that's gone.
@@ -161,22 +163,31 @@ fn process() -> MutexGuard<'static, Process> {
     PROCESS.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// The process's backend, opened now if no one has yet. The store opens
+/// (which may take a while: an encrypted one's key from the keychain, a
+/// migration) without `PROCESS` held, so the activity's `beforeActivity`,
+/// on the UI thread, never waits for it.
+fn open_backend(path: &Path) -> anyhow::Result<Arc<Backend>> {
+    let _opening = OPENING.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(backend) = process().backend.clone() {
+        return Ok(backend);
+    }
+    let backend = display::new_backend(Arc::new(Store::open(path)?));
+    process().install(backend.clone());
+    Ok(backend)
+}
+
 impl Process {
-    fn backend(&mut self, path: &Path) -> anyhow::Result<Arc<Backend>> {
-        if let Some(backend) = &self.backend {
-            return Ok(backend.clone());
-        }
-        let backend = display::new_backend(Arc::new(Store::open(path)?));
+    fn install(&mut self, backend: Arc<Backend>) {
         self.backend = Some(backend.clone());
         // Notifications and widgets in the language Picacho shows.
         set_language("", false);
         // Notification buttons pressed while the activity's window isn't up
         // act here; taps and Reply open the activity themselves (Notifier).
         display::notify::set_background(display::notify::Background {
-            backend: backend.clone(),
+            backend,
             open: None,
         });
-        Ok(backend)
     }
 
     /// Starts the monitor when the service runs without a window and
@@ -910,6 +921,7 @@ pub extern "system" fn Java_tech_pinal_picacho_Native_attach<'caller>(
 ) {
     init_logging();
     native(env, |env| {
+        let _attaching = ATTACH.lock().unwrap_or_else(|e| e.into_inner());
         if JAVA.get().is_some() {
             return Ok(());
         }
@@ -955,8 +967,51 @@ pub extern "system" fn Java_tech_pinal_picacho_Native_attach<'caller>(
             package,
         };
         let _ = JAVA.set(java);
+        if let Some(java) = JAVA.get() {
+            prime_context_users(java);
+        }
         Ok(())
     });
+}
+
+/// Opens what needs the app's context through ndk-context (the keychain's
+/// store, which keeps its own reference to the context once made, and the
+/// system's DNS settings, read once), with the context set for just that,
+/// then released: before anything else of Picacho's runs in the process
+/// (the first `Native.attach`, under `ATTACH`), and before an activity,
+/// whose android-activity sets ndk-context up itself and must find it
+/// unset. Nothing reads ndk-context afterwards (but the activity's own
+/// code, from its context), so no thread races with its setting or
+/// release, and a refresh started without the activity (a widget's, in a
+/// process started cold) can't find it unset and panic in the keychain,
+/// poisoning its locks for the process's life.
+fn prime_context_users(java: &Java) {
+    if UI_STARTED.load(Ordering::SeqCst) {
+        // android-activity's context is set: nothing of ours to set.
+        let _ = crate::manage::store::secret_entry("picacho-prime");
+        let _ = crate::sync::auth::system_conf();
+        return;
+    }
+    // Safety: the first attach of the process, under `ATTACH`; no activity
+    // has started (android-activity hasn't set it), and no other thread
+    // of Picacho's runs yet to read it. The context is a global reference
+    // kept for the process's life (`JAVA`). Released below, before any
+    // activity's onCreate goes on (it waits for `ATTACH`).
+    unsafe {
+        ndk_context::initialize_android_context(java.vm.get_raw().cast(), java.context.as_obj().as_raw().cast());
+    }
+    let primed = std::panic::catch_unwind(|| {
+        if let Err(e) = crate::manage::store::secret_entry("picacho-prime") {
+            log::warn!("the keychain couldn't be opened: {e:#}");
+        }
+        let _ = crate::sync::auth::system_conf();
+    });
+    if primed.is_err() {
+        log::error!("opening the keychain panicked");
+    }
+    // Safety: set just above by this thread, under `ATTACH`; nothing else
+    // read it meanwhile.
+    unsafe { ndk_context::release_android_context() };
 }
 
 /// `Native.beforeActivity()`: the first activity of this process is about to
@@ -968,17 +1023,24 @@ pub extern "system" fn Java_tech_pinal_picacho_Native_beforeActivity<'caller>(
     _class: JClass<'caller>,
 ) {
     native(env, |_| {
-        let mut process = process();
-        process.ui = true;
-        // Stopped, and waited for (briefly), before the context it may be
-        // using in a keychain call is released under it.
-        if let Some(monitor) = process.monitor.take() {
-            monitor.stop_and_wait(std::time::Duration::from_secs(1));
-        }
-        if CONTEXT_OURS.swap(false, Ordering::SeqCst) {
-            // Safety: set by `start_service_monitor`, and nothing else
-            // released it.
-            unsafe { ndk_context::release_android_context() };
+        // Briefly: the store opens without `PROCESS` (`open_backend`).
+        let monitor = {
+            let mut process = process();
+            process.ui = true;
+            process.monitor.take()
+        };
+        // Stopped off the UI thread: waiting for a scheduled message being
+        // sent (up to minutes) here would freeze the activity's start. The
+        // window shares this process's backend, which sends each scheduled
+        // message once (`Backend::scheduled_sending`), so it needn't wait.
+        // ndk-context isn't the monitor's (`prime_context_users`).
+        if let Some(monitor) = monitor {
+            let stopped = std::thread::Builder::new()
+                .name("picacho-monitor-stop".into())
+                .spawn(move || monitor.stop_and_wait(std::time::Duration::from_secs(1)));
+            if let Err(e) = stopped {
+                log::warn!("the background check couldn't be stopped apart: {e}");
+            }
         }
         Ok(())
     });
@@ -1007,38 +1069,28 @@ pub extern "system" fn Java_tech_pinal_picacho_Native_serviceStarted<'caller>(
 }
 
 fn start_service_monitor(path: &Path, run: u64) {
-    let mut process = process();
-    if SERVICE_RUNS.load(Ordering::SeqCst) != run {
-        // Stopped (or started again) since: that one decides.
-        return;
-    }
-    process.service = true;
-    if process.ui {
-        // The window checks while it runs; the monitor starts once it's gone.
-        return;
-    }
-    // The keychain finds the app through ndk-context, which only an
-    // activity sets up.
-    if !UI_STARTED.load(Ordering::SeqCst)
-        && !CONTEXT_OURS.load(Ordering::SeqCst)
-        && let Some(java) = JAVA.get()
     {
-        // Safety: no activity has run in this process, so android-activity
-        // hasn't set it; it's released before one does (`beforeActivity`).
-        // The context is a global reference kept for the process's life.
-        unsafe {
-            ndk_context::initialize_android_context(
-                java.vm.get_raw().cast(),
-                java.context.as_obj().as_raw().cast(),
-            );
+        let mut process = process();
+        if SERVICE_RUNS.load(Ordering::SeqCst) != run {
+            // Stopped (or started again) since: that one decides.
+            return;
         }
-        CONTEXT_OURS.store(true, Ordering::SeqCst);
+        process.service = true;
+        if process.ui {
+            // The window checks while it runs; the monitor starts once it's gone.
+            return;
+        }
     }
-    if let Err(e) = process.backend(path) {
+    // Opened without `PROCESS` held (`open_backend`); the keychain it may
+    // need was opened at attach (`prime_context_users`).
+    if let Err(e) = open_backend(path) {
         log::error!("could not open the mail store at {}: {e:#}", path.display());
         return;
     }
-    process.reconcile();
+    let mut process = process();
+    if SERVICE_RUNS.load(Ordering::SeqCst) == run && !process.ui {
+        process.reconcile();
+    }
 }
 
 /// `Native.serviceStopped()`: `MailService` ended (turned off, or stopped

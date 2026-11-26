@@ -27,13 +27,17 @@ public final class CalendarWidgetProvider extends AppWidgetProvider {
     @Override
     public void onReceive(Context context, Intent intent) {
         super.onReceive(context, intent);
-        if (WidgetStore.ACTION_REFRESH.equals(intent.getAction())) {
+        if (WidgetStore.isRefresh(context, intent)) {
             WidgetStore.refreshFromStoreAsync(context, this);
         }
     }
 
     static void updateAll(Context context, AppWidgetManager manager, int[] appWidgetIds) {
-        WidgetStore.Snapshot snap = WidgetStore.load(context);
+        updateAll(context, manager, appWidgetIds, WidgetStore.load(context));
+    }
+
+    static void updateAll(
+            Context context, AppWidgetManager manager, int[] appWidgetIds, WidgetStore.Snapshot snap) {
         for (int id : appWidgetIds) {
             updateOne(context, manager, id, snap);
         }
@@ -68,8 +72,7 @@ public final class CalendarWidgetProvider extends AppWidgetProvider {
         views.setOnClickPendingIntent(R.id.widget_cal_header, openCalendar);
         views.setOnClickPendingIntent(R.id.widget_cal_empty, openCalendar);
 
-        Intent refreshIntent = new Intent(context, CalendarWidgetProvider.class)
-                .setAction(WidgetStore.ACTION_REFRESH);
+        Intent refreshIntent = WidgetStore.refreshIntent(context, CalendarWidgetProvider.class);
         PendingIntent refreshPending = PendingIntent.getBroadcast(
                 context,
                 75_000 + appWidgetId,

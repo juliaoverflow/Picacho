@@ -184,6 +184,10 @@ settings-signed-in-through-in-the-browser = Signed in through { $issuer }.
 
 settings-sign-in-with-kerberos = Sign in with Kerberos
 
+settings-allow-basic-sign-in = Allow Basic sign-in
+
+settings-basic-sign-in-sends-your-password = Sends your password itself to the Exchange server, over HTTPS. Only for servers that offer nothing else.
+
 settings-require-encryption-in-transit = Require encryption in transit
 
 settings-give-up-on-delivery-after = Give up on delivery after
@@ -339,6 +343,16 @@ settings-check-for-mail-in-the-background = Check for mail in the background
 settings-keep-running-in-the-background = Keep running in the background
 
 settings-show-tray-icon-while-open = Show tray icon while open
+
+settings-start-in-the-background-at-sign-in = Start in the background when you sign in
+
+settings-picacho-starts-with-your-computer = Picacho starts with your computer, without a window, and keeps checking for mail.
+
+settings-autostart-reason = Start Picacho in the background when you sign in, to keep checking for mail.
+
+settings-autostart-not-allowed = Starting Picacho when you sign in wasn't allowed.
+
+settings-couldnt-change-starting-at-sign-in = Couldn't change starting at sign-in: { $error }
 
 settings-exit-full-size = @Exit full size
 

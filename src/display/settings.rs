@@ -1344,6 +1344,19 @@ impl MailApp {
                     ))
                 },
             )
+            .when(
+                a.provider == Provider::Ews && !a.oauth && !a.kerberos && a.sso.is_none(),
+                |rows| {
+                    rows.row(self.switch_setting(
+                        t!("settings-allow-basic-sign-in"),
+                        t!("settings-basic-sign-in-sends-your-password"),
+                        format!("ews-basic-{}", a.id),
+                        a.ews_basic,
+                        Action::ToggleEwsBasic(a.id.clone()),
+                        cx,
+                    ))
+                },
+            )
             .when(self.encrypted.contains(&a.id), |rows| {
                 let locked = self.locked.contains(&a.id);
                 rows.row(self.setting_row(
@@ -2117,6 +2130,14 @@ impl MailApp {
                 cx,
             )
             .debug_selector(|| "tray-icon".into());
+        let startup = self
+            .switch(
+                "start-in-background".into(),
+                self.start_in_background,
+                Action::SetStartInBackground(!self.start_in_background),
+                cx,
+            )
+            .debug_selector(|| "start-in-background".into());
         Rows::new()
             .row(self.toggle_row(
                 t!("settings-keep-running-in-the-background"),
@@ -2124,6 +2145,11 @@ impl MailApp {
                 background,
             ))
             .row(self.toggle_row(t!("settings-show-tray-icon-while-open"), "", tray))
+            .row(self.toggle_row(
+                t!("settings-start-in-the-background-at-sign-in"),
+                t!("settings-picacho-starts-with-your-computer"),
+                startup,
+            ))
     }
     /// Moves Settings between a dialog, the full main window and a window
     /// of its own, keeping the page and everything on it.

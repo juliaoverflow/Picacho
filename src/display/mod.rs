@@ -20,6 +20,9 @@ pub mod resident;
 /// The tray icon while Picacho runs in the background.
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 mod tray;
+/// Starting Picacho in the background when the person signs in.
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+mod autostart;
 /// Proton's human verification window (a process of its own).
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub mod verify;
@@ -30,3 +33,5 @@ pub mod windows;
 pub(crate) mod open_with;
 
 mod html;
+/// Pictures no longer shown, released from the windows' atlases.
+mod textures;

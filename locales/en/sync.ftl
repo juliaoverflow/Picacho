@@ -1857,6 +1857,10 @@ sync-ews-couldnt-reach-the-exchange-server = Couldn't reach the Exchange server 
 
 sync-ews-exchange-didnt-accept-the-sign-in = Exchange didn't accept the sign-in. Check the user name (DOMAIN\name or name@domain) and password.
 
+sync-ews-this-server-accepts-only-basic-sign-in = This Exchange server accepts only Basic sign-in, which sends your password itself instead of proof of it. If you trust the server, turn on “Allow Basic sign-in” and try again.
+
+sync-ews-basic-sign-in-is-only-sent-over-https = Basic sign-in sends your password itself, so Picacho uses it only with the account's own Exchange server over HTTPS.
+
 sync-ews-exchange-wont-hold-the-stream-open = Exchange (or something on the way to it) keeps ending the wait for new mail at once; the inbox is checked every half minute instead.
 
 sync-ews-exchange-answered = Exchange answered { $status }: { $message }

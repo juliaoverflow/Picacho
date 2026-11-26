@@ -290,13 +290,19 @@ impl Session {
     }
     /// Up to `most` ids, page after page.
     pub fn list_all(&self, label: Option<&str>, query: &str, most: usize) -> Result<Vec<String>> {
+        /// The most pages asked for: a server answering with empty pages,
+        /// each naming another, would otherwise be asked for ever.
+        const MAX_PAGES: usize = 1000;
         let mut out = Vec::new();
-        let mut page = None;
-        loop {
+        let mut page: Option<String> = None;
+        let mut tokens = std::collections::HashSet::new();
+        for _ in 0..MAX_PAGES {
             let (ids, next) = self.list(label, query, page.as_deref(), (most - out.len()).min(500))?;
+            let empty = ids.is_empty();
             out.extend(ids);
             match next {
-                Some(n) if out.len() < most => page = Some(n),
+                // A page token seen before, or a page of nothing: no further.
+                Some(n) if out.len() < most && !empty && tokens.insert(n.clone()) => page = Some(n),
                 _ => break,
             }
         }

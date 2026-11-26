@@ -65,6 +65,8 @@ tools-preview = Preview
 
 tools-open = Open
 
+tools-programs-arent-opened = This attachment is a program or script, which could harm your computer, so it's shown in its folder instead of opened. Open it there only if you trust the sender.
+
 tools-quick-look = Quick Look
 
 tools-open-with = Open With…
@@ -86,6 +88,8 @@ tools-svg-image-size-is-invalid = SVG image size is invalid
 tools-couldnt-encode-svg-preview = Couldn't encode SVG preview: { $error }
 
 tools-cant-preview-this-image = Can't preview this image: { $error }
+
+tools-this-picture-is-too-large-to-preview = This picture is too large to preview. Open it instead.
 
 tools-sips-couldnt-convert-image = sips couldn't convert image
 

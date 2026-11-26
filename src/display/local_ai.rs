@@ -8,9 +8,57 @@ use super::*;
 use crate::manage::local_ai::{self, otp, replies};
 use std::borrow::Cow;
 
-/// Replies suggested for a message, with the lengths of the subject and
-/// text and the history revision they were suggested for.
-pub(super) type Suggested = ((usize, usize, u64), Rc<replies::Suggestions>);
+/// Replies suggested per message, by the lengths of the subject and text
+/// and the history revision they were suggested for.
+pub(super) type Suggested = Inferred<(usize, usize, u64), replies::Suggestions>;
+
+/// What a model found per message (by message id), with what it was worked
+/// out from (`K`: lengths of the text, a revision); and the messages it is
+/// still working on, off the window's thread. Drawing finds what is there
+/// and starts what is missing; a result arrives only if it is still wanted
+/// (`finish`), so one started before `clear` is dropped.
+pub(super) struct Inferred<K, V> {
+    found: HashMap<String, (K, Rc<V>)>,
+    running: HashMap<String, K>,
+}
+impl<K, V> Default for Inferred<K, V> {
+    fn default() -> Self {
+        Self { found: HashMap::new(), running: HashMap::new() }
+    }
+}
+impl<K: PartialEq + Clone, V> Inferred<K, V> {
+    /// What was found in message `id` from `key`.
+    pub(super) fn get(&self, id: &str, key: &K) -> Option<Rc<V>> {
+        self.found.get(id).filter(|(k, _)| k == key).map(|(_, v)| v.clone())
+    }
+    /// Notes that the model starts on message `id` from `key`: false where
+    /// it already is.
+    pub(super) fn start(&mut self, id: &str, key: &K) -> bool {
+        if self.running.get(id) == Some(key) {
+            return false;
+        }
+        self.running.insert(id.to_owned(), key.clone());
+        true
+    }
+    /// Keeps what the model found in message `id` from `key`, if that is
+    /// still what was asked for. False where it no longer is.
+    pub(super) fn finish(&mut self, id: &str, key: K, value: V) -> bool {
+        if self.running.get(id) != Some(&key) {
+            return false;
+        }
+        self.running.remove(id);
+        if self.found.len() >= FOUND_CACHE {
+            self.found.clear();
+        }
+        self.found.insert(id.to_owned(), (key, Rc::new(value)));
+        true
+    }
+    /// Forgets what was found, and what is still being worked out.
+    pub(super) fn clear(&mut self) {
+        self.found.clear();
+        self.running.clear();
+    }
+}
 
 /// Codes found in messages, kept per message until what was looked at
 /// changes; cleared past this many.
@@ -23,10 +71,14 @@ impl MailApp {
     /// The sign-in codes the model finds in received mail `m`'s subject and
     /// body (or its preview, before the body is downloaded). None while the
     /// feature is off or its model isn't loaded.
+    ///
+    /// Worked out while drawing, unlike suggested replies and parcels: a
+    /// code must never show unmasked while the model is still looking, and
+    /// the code model is a single small layer over a message's candidates.
     pub(super) fn found_codes(&self, m: &Mail) -> Rc<Vec<String>> {
-        let Some(detector) = &self.otp else {
+        if !self.hide_codes {
             return Rc::default();
-        };
+        }
         // Only received mail: not what was written here.
         if matches!(m.folder, Folder::Sent | Folder::Drafts) {
             return Rc::default();
@@ -38,7 +90,14 @@ impl MailApp {
         {
             return codes.clone();
         }
-        let codes = Rc::new(detector.codes(&m.subject, body));
+        let codes = Rc::new(match &self.otp {
+            Some(detector) => detector.codes(&m.subject, body),
+            // Codes are hidden but the model isn't loaded (still installing,
+            // or it couldn't load): which is the code can't be told, so
+            // every string shaped like one is hidden until it is, or until
+            // Show code is clicked. Loading the model forgets these.
+            None => otp::candidates(&format!("{}\n{body}", m.subject)),
+        });
         let mut found = self.otp_found.borrow_mut();
         if found.len() >= FOUND_CACHE {
             found.clear();
@@ -56,6 +115,49 @@ impl MailApp {
     /// `text` from `m` (its subject, preview or body) with its codes hidden.
     pub(super) fn hide_codes<'a>(&self, m: &Mail, text: &'a str) -> Cow<'a, str> {
         let codes = self.hidden_codes(m);
+        if codes.is_empty() {
+            return text.into();
+        }
+        otp::mask(text, &codes)
+    }
+    /// `m`'s subject as a new-mail notification shows it (on the lock
+    /// screen), its codes hidden: those the model finds, or, while it isn't
+    /// loaded, every string shaped like a code (`found_codes`). Whether or
+    /// not they were shown in the app: a notification has no Show code to
+    /// click. As the background monitor and the widgets do.
+    pub(super) fn announced_subject<'a>(&self, m: &'a Mail) -> Cow<'a, str> {
+        let codes = self.found_codes(m);
+        if codes.is_empty() {
+            return m.subject.as_str().into();
+        }
+        otp::mask(&m.subject, &codes)
+    }
+    /// `text` standing for a message where the message itself isn't at hand
+    /// (a Summary or Receipts row's subject), with its codes hidden: those
+    /// the model finds in it alone, or, before the model is loaded, every
+    /// string shaped like one. Such rows have no Show code; the message,
+    /// opened, does.
+    pub(super) fn hide_codes_in<'a>(&self, text: &'a str) -> Cow<'a, str> {
+        if !self.hide_codes {
+            return text.into();
+        }
+        let Some(detector) = &self.otp else {
+            return otp::mask_all(text);
+        };
+        // Kept with the messages' codes (forgotten with them), under a key
+        // no message id has.
+        let id = format!("\0text\0{text}");
+        let key = (text.len(), 0);
+        let cached = self.otp_found.borrow().get(&id).filter(|(k, _)| *k == key).map(|(_, c)| c.clone());
+        let codes = cached.unwrap_or_else(|| {
+            let codes = Rc::new(detector.codes(text, ""));
+            let mut found = self.otp_found.borrow_mut();
+            if found.len() >= FOUND_CACHE {
+                found.clear();
+            }
+            found.insert(id, (key, codes.clone()));
+            codes
+        });
         if codes.is_empty() {
             return text.into();
         }
@@ -129,6 +231,12 @@ impl MailApp {
                 ..full
             })
             .unwrap_or(m);
+        // Before the model has read it, which string is the code isn't
+        // known (`found_codes` hides every one shaped like a code).
+        if self.otp.is_none() {
+            self.notice(t!("local-ai-the-code-model-isnt-ready"), true, cx);
+            return;
+        }
         let Some(code) = self.found_codes(&m).first().cloned() else {
             return;
         };
@@ -167,10 +275,41 @@ impl MailApp {
     /// for mail written here, from senders who don't read replies, mailing
     /// lists, sign-in codes, receipts and package updates, and where the
     /// model finds the message wants no reply.
+    /// Only what the model already found: `smart_replies_for` starts it on
+    /// a message it hasn't read.
     pub(super) fn smart_replies(&self, m: &Mail) -> Rc<replies::Suggestions> {
-        let Some(model) = self.reply_model.as_ref().filter(|_| self.suggest_replies) else {
+        match self.replies_wanted(m) {
+            Some((_, key)) => self.replies_found.borrow().get(&m.id, &key).unwrap_or_default(),
+            None => Rc::default(),
+        }
+    }
+    /// `smart_replies`, starting the model off the window's thread where it
+    /// hasn't read `m` yet: the suggestions appear once it has.
+    pub(super) fn smart_replies_for(&self, m: &Mail, cx: &Context<Self>) -> Rc<replies::Suggestions> {
+        let Some((model, key)) = self.replies_wanted(m) else {
             return Rc::default();
         };
+        if let Some(found) = self.replies_found.borrow().get(&m.id, &key) {
+            return found;
+        }
+        if !self.replies_found.borrow_mut().start(&m.id, &key) {
+            return Rc::default();
+        }
+        let id = m.id.clone();
+        let subject = m.subject.clone();
+        let body = m.body.clone().unwrap_or_else(|| m.snippet.clone());
+        let history = self.reply_history.clone();
+        self.infer(
+            cx,
+            move || model.suggest(&subject, &body, &history, replies::fallback_language(), replies::MAX_SUGGESTIONS),
+            move |this, found| this.replies_found.borrow_mut().finish(&id, key, found.unwrap_or_default()),
+        );
+        Rc::default()
+    }
+    /// For `smart_replies`: the model and what its suggestions for `m` are
+    /// worked out from, or None where none are suggested at all.
+    fn replies_wanted(&self, m: &Mail) -> Option<(Arc<replies::Suggester>, (usize, usize, u64))> {
+        let model = self.reply_model.as_ref().filter(|_| self.suggest_replies)?;
         let kinds = self.mail_kinds.as_deref();
         if matches!(m.folder, Folder::Sent | Folder::Drafts)
             || replies::wants_no_reply(&m.from, &m.list_unsubscribe)
@@ -178,28 +317,33 @@ impl MailApp {
             || crate::manage::mail_kinds::Kinds::package(kinds, m)
             || crate::manage::mail_kinds::Kinds::receipt(kinds, m)
         {
-            return Rc::default();
+            return None;
         }
         let body = m.body.as_deref().unwrap_or(&m.snippet);
-        let key = (m.subject.len(), body.len(), self.reply_history_rev);
-        if let Some((k, found)) = self.replies_found.borrow().get(&m.id)
-            && *k == key
-        {
-            return found.clone();
-        }
-        let found = Rc::new(model.suggest(
-            &m.subject,
-            body,
-            &self.reply_history,
-            replies::fallback_language(),
-            replies::MAX_SUGGESTIONS,
-        ));
-        let mut cache = self.replies_found.borrow_mut();
-        if cache.len() >= FOUND_CACHE {
-            cache.clear();
-        }
-        cache.insert(m.id.clone(), (key, found.clone()));
-        found
+        Some((model.clone(), (m.subject.len(), body.len(), self.reply_history_rev)))
+    }
+
+    /// Runs a model's `work` off the window's thread, then `done` with what
+    /// it found (None if it failed), redrawing when `done` says what it
+    /// found is kept. For what drawing finds missing: it has only `&self`.
+    pub(super) fn infer<T: Send + 'static>(
+        &self,
+        cx: &Context<Self>,
+        work: impl FnOnce() -> T + Send + 'static,
+        done: impl FnOnce(&mut Self, Option<T>) -> bool + 'static,
+    ) {
+        cx.spawn(async move |this, cx| {
+            let found = cx
+                .background_executor()
+                .spawn(async move { std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)).ok() })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if done(this, found) {
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
     }
 
     /// Answers the open message with its suggested reply `intent`, and
@@ -260,7 +404,7 @@ impl MailApp {
     fn load_replies(&mut self, cx: &mut Context<Self>) {
         match local_ai::reply_suggester(&self.backend.store) {
             Ok(model) => {
-                self.reply_model = Some(Rc::new(model));
+                self.reply_model = Some(Arc::new(model));
                 self.replies_error = None;
             }
             Err(e) => {
@@ -334,7 +478,7 @@ impl MailApp {
     fn load_otp(&mut self, cx: &mut Context<Self>) {
         match local_ai::otp_detector(&self.backend.store) {
             Ok(detector) => {
-                self.otp = Some(Rc::new(detector));
+                self.otp = Some(Arc::new(detector));
                 self.model_error = None;
             }
             Err(e) => {
@@ -365,10 +509,10 @@ impl MailApp {
                         let _ = local_ai::OTP.remove(&this.backend.store);
                     }
                     Ok(()) => this.load_otp(cx),
-                    Err(e) => {
-                        this.model_error = Some(format!("{e:#}"));
-                        this.set_hide_codes(false, cx);
-                    }
+                    // Codes stay hidden, every string shaped like one, until
+                    // the model is there: the error says why, with a retry,
+                    // and the next start tries again.
+                    Err(e) => this.model_error = Some(format!("{e:#}")),
                 }
                 cx.notify();
             },
@@ -472,7 +616,7 @@ impl MailApp {
     fn load_parcels(&mut self, cx: &mut Context<Self>) {
         match local_ai::parcel_confirmer(&self.backend.store) {
             Ok(model) => {
-                self.parcel_model = Some(Rc::new(model));
+                self.parcel_model = Some(Arc::new(model));
                 self.parcel_error = None;
             }
             Err(e) => {

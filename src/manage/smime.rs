@@ -753,7 +753,16 @@ fn take_protected_headers(outer: Vec<u8>, payload: &mut Vec<u8>) -> Vec<u8> {
     }
     let latin1 = |b: &[u8]| -> String { b.iter().map(|&c| c as char).collect() };
     let text = latin1(payload);
-    let at = text.find("\r\n\r\n").map_or(text.len(), |i| i + 2);
+    // The header section ends at the first empty line, CRLF or bare LF, as
+    // mailparse (and `kind` above) reads it: looking for CRLF alone, a
+    // payload with bare LF line ends had its body's lines taken for
+    // header fields (a "From:" line in the body shown as the sender).
+    let crlf = text.find("\r\n\r\n").map(|i| i + 2);
+    let lf = text.find("\n\n").map(|i| i + 1);
+    let at = match (crlf, lf) {
+        (Some(a), Some(b)) => a.min(b),
+        (a, b) => a.or(b).unwrap_or(text.len()),
+    };
     let (head, body) = text.split_at(at);
     let inner = header_fields(head);
     let shown = |n: &str| INNER_HEADERS.contains(&n) && n != "from";
@@ -940,8 +949,16 @@ fn legacy_provider() -> bool {
     })
 }
 
-fn trusted_store() -> Result<openssl::x509::store::X509Store> {
-    Ok(trusted_builder()?.build())
+/// The system's trusted authorities, built once: rebuilt for every S/MIME
+/// message read, a store of a few hundred roots (and OpenSSL's default
+/// paths read from disk) each time.
+fn trusted_store() -> Result<std::sync::Arc<openssl::x509::store::X509Store>> {
+    static STORE: std::sync::OnceLock<std::sync::Arc<openssl::x509::store::X509Store>> = std::sync::OnceLock::new();
+    if let Some(store) = STORE.get() {
+        return Ok(store.clone());
+    }
+    let built = std::sync::Arc::new(trusted_builder()?.build());
+    Ok(STORE.get_or_init(|| built).clone())
 }
 
 /// The system's trusted authorities, in a store still to be built.
@@ -977,6 +994,31 @@ pub struct CrlCheck {
 }
 
 impl CrlCheck {
+    /// `store` with the system's authorities, kept while the lists are the
+    /// same files, unchanged: read again from disk for every message, and
+    /// twice where the first reading failed.
+    fn cached_store(&self) -> Result<std::sync::Arc<openssl::x509::store::X509Store>> {
+        type Key = Vec<(std::path::PathBuf, u64, Option<std::time::SystemTime>)>;
+        type Kept = Option<(Key, std::sync::Arc<openssl::x509::store::X509Store>)>;
+        static KEPT: std::sync::Mutex<Kept> = std::sync::Mutex::new(None);
+        let key: Key = self
+            .files
+            .iter()
+            .map(|f| {
+                let meta = std::fs::metadata(f).ok();
+                (f.clone(), meta.as_ref().map_or(0, |m| m.len()), meta.and_then(|m| m.modified().ok()))
+            })
+            .collect();
+        let mut kept = KEPT.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((k, store)) = kept.as_ref()
+            && *k == key
+        {
+            return Ok(store.clone());
+        }
+        let store = std::sync::Arc::new(self.store(trusted_builder()?)?);
+        *kept = Some((key, store.clone()));
+        Ok(store)
+    }
     /// A store with `builder`'s authorities and these lists, checking the
     /// signer's certificate against them (X509_V_FLAG_CRL_CHECK).
     fn store(&self, mut builder: X509StoreBuilder) -> Result<openssl::x509::store::X509Store> {
@@ -1042,7 +1084,7 @@ pub fn open_checking_revocation(
     crls: &CrlCheck,
 ) -> Result<Option<(Vec<u8>, Verdict, Option<X509>)>> {
     let store = trusted_store()?;
-    let crls = crls.store(trusted_builder()?)?;
+    let crls = crls.cached_store()?;
     Ok(open_checked(raw, certs, &store, Some(&crls)))
 }
 
@@ -1146,9 +1188,11 @@ fn open_checked(
         };
         if let Some(found) = found {
             let (signature, cert) = overall(&found, raw);
-            // A layer that failed stays failed: an inner signature that
-            // checks out doesn't hide that an outer one didn't.
-            if verdict.signature != Signature::Bad {
+            // The worst layer's verdict stands: an inner signature that
+            // checks out doesn't hide that an outer one failed, was made
+            // with a revoked certificate, someone else's or one no
+            // authority vouches for (see `severity`).
+            if severity(&signature) >= severity(&verdict.signature) {
                 verdict.signature = signature;
                 signer = cert;
             }
@@ -1161,12 +1205,15 @@ fn open_checked(
     }
     // RFC 9788 §4.4: the protected From is vouched for by a signer whose
     // certificate (one that checked out) names that address.
+    // Only a certificate an authority vouches for: anyone can make a
+    // self-signed one (Untrusted) for any address, and add its signature
+    // beside a good one to vouch for a From of their choosing.
     verdict.from_mismatch = crate::manage::openpgp::from_mismatch(&outer, &current, |address| {
         let address = address.to_lowercase();
-        verdict.signers.iter().any(|s| {
-            matches!(s.result, SignerResult::Good | SignerResult::Untrusted)
-                && s.address.to_lowercase() == address
-        })
+        verdict
+            .signers
+            .iter()
+            .any(|s| s.result == SignerResult::Good && s.address.to_lowercase() == address)
     });
     let mut readable = take_protected_headers(outer, &mut current);
     readable.extend_from_slice(b"MIME-Version: 1.0\r\n");
@@ -1234,6 +1281,21 @@ fn inflate(packed: &[u8], limit: usize) -> Option<Vec<u8>> {
 /// invalid; Revoked if any certificate is; otherwise the best of the rest, so a good signature beside one
 /// that couldn't be checked shows as good. The certificate is that best
 /// signer's, preferring one for the address the message is from.
+/// How much a verdict warns, for combining a message's layers: the one
+/// that warns most stands (a bad signature over a revoked one, over another
+/// sender's, over one no authority vouches for, over a good one).
+fn severity(signature: &Signature) -> u8 {
+    match signature {
+        Signature::None => 0,
+        Signature::Good(_) => 1,
+        Signature::Unverified => 2,
+        Signature::Untrusted(_) => 3,
+        Signature::OtherSender(_) => 4,
+        Signature::Revoked(_) => 5,
+        Signature::Bad => 6,
+    }
+}
+
 fn overall(signers: &[(Signer, Option<X509>)], raw: &[u8]) -> (Signature, Option<X509>) {
     if signers.iter().any(|(s, _)| s.result == SignerResult::Bad) {
         let cert = signers
@@ -1281,21 +1343,28 @@ fn overall(signers: &[(Signer, Option<X509>)], raw: &[u8]) -> (Signature, Option
 
 /// The certificate a SignerInfo names (RFC 5652 §5.3 SignerIdentifier),
 /// from the message's own or those already known.
-fn signer_certificate(signer_info: &der::Tlv<'_>, message: &[X509], known: &[X509]) -> Option<X509> {
+fn signer_certificate(signer_info: &der::Tlv<'_>, candidates: &[(&X509, Option<Vec<u8>>)]) -> Option<X509> {
     let id = der::signer_id(signer_info).ok()?;
-    message.iter().chain(known).find_map(|cert| {
+    candidates.iter().find_map(|(cert, encoded)| {
         let matches = match id {
             der::SignerId::SubjectKeyId(key_id) => {
                 cert.subject_key_id().is_some_and(|k| k.as_slice() == key_id)
             }
             der::SignerId::IssuerAndSerial { issuer, serial } => {
-                let encoded = cert.to_der().ok()?;
-                der::issuer_and_serial(&encoded).ok() == Some((issuer, serial))
+                der::issuer_and_serial(encoded.as_deref()?).ok() == Some((issuer, serial))
             }
         };
-        matches.then(|| cert.clone())
+        matches.then(|| (*cert).clone())
     })
 }
+
+/// The most signatures of one SignedData checked, and certificates it
+/// carries read: each signature is checked over the whole content (up to
+/// tens of megabytes, copied and hashed for each), and matched against
+/// every certificate, so a small message naming thousands of either could
+/// take minutes. Real mail has one signer, rarely a few.
+const MAX_SIGNERS: usize = 16;
+const MAX_CERTIFICATES: usize = 64;
 
 /// Checks each signature of a DER SignedData on its own, the content
 /// (`detached`, or the one inside) and certificates kept, and with `crls`
@@ -1317,11 +1386,15 @@ fn check_signers(
         .certificates()
         .ok()?
         .into_iter()
+        .take(MAX_CERTIFICATES)
         .filter_map(|c| X509::from_der(c).ok())
         .collect();
+    // Each certificate encoded once, not once for every signer.
+    let candidates: Vec<(&X509, Option<Vec<u8>>)> =
+        message.iter().chain(known).map(|c| (c, c.to_der().ok())).collect();
     let mut out = Vec::new();
-    for signer_info in &signed.signer_infos {
-        let cert = signer_certificate(signer_info, &message, known);
+    for signer_info in signed.signer_infos.iter().take(MAX_SIGNERS) {
+        let cert = signer_certificate(signer_info, &candidates);
         let address = cert
             .as_ref()
             .and_then(|c| emails(c).into_iter().next())
@@ -1357,7 +1430,7 @@ fn note_certificates(verdict: &mut Verdict, der: &[u8], signers: &[(Signer, Opti
     if let Ok(signed) = der::SignedData::parse(der)
         && let Ok(certificates) = signed.certificates()
     {
-        for c in certificates {
+        for c in certificates.into_iter().take(MAX_CERTIFICATES) {
             if !verdict.carried.iter().any(|k| k.as_slice() == c) {
                 verdict.carried.push(c.to_vec());
             }
@@ -2553,5 +2626,28 @@ mod tests {
         let before = plain.clone();
         assert_eq!(take_protected_headers(outer.clone(), &mut plain), outer);
         assert_eq!(plain, before);
+        // Bare LF line ends: the header section ends at the first empty
+        // line, and a "From:" or "Subject:" line in the body stays body.
+        let mut bare = b"Content-Type: text/plain; hp=\"cipher\"\nSubject: Real\n\nSubject: Injected\nFrom: Bank <alerts@bank.example>\n".to_vec();
+        let kept = String::from_utf8(take_protected_headers(outer.clone(), &mut bare)).unwrap();
+        assert!(kept.contains("Subject: Real") && !kept.contains("Injected") && !kept.contains("bank"), "{kept}");
+        assert!(String::from_utf8_lossy(&bare).contains("Subject: Injected"));
+    }
+
+    /// Layers' verdicts: the one that warns most stands, whichever layer.
+    #[test]
+    fn the_worst_layer_stands() {
+        let order = [
+            Signature::None,
+            Signature::Good("a".into()),
+            Signature::Unverified,
+            Signature::Untrusted("a".into()),
+            Signature::OtherSender("a".into()),
+            Signature::Revoked("a".into()),
+            Signature::Bad,
+        ];
+        for pair in order.windows(2) {
+            assert!(severity(&pair[0]) < severity(&pair[1]), "{pair:?}");
+        }
     }
 }

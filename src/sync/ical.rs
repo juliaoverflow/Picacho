@@ -1451,18 +1451,22 @@ fn parse_lines(lines: Vec<String>) -> Calendar {
             "END" => {
                 let kind = value.to_ascii_uppercase();
                 // Only plain reminders are edited as `alarms`; others (an
-                // email or sound alarm, repeats) are kept whole.
-                let block = source.get(alarm_at..).unwrap_or_default();
-                let simple = kept_lines(
-                    &[vec![String::new()], block.to_vec(), vec![line.clone(), String::new()]].concat(),
-                )
-                .is_empty();
+                // email or sound alarm, repeats) are kept whole. Looked at
+                // for a VALARM's end alone: for every END (outside a VALARM,
+                // from the start of the source) it copied and scanned all
+                // the event's lines, squaring a long one's.
                 if kind == "VALARM"
                     && let Some(Some(t)) = alarm.take()
                     && event.is_some()
-                    && simple
                 {
-                    triggers.push(t);
+                    let block = source.get(alarm_at..).unwrap_or_default();
+                    let simple = kept_lines(
+                        &[vec![String::new()], block.to_vec(), vec![line.clone(), String::new()]].concat(),
+                    )
+                    .is_empty();
+                    if simple {
+                        triggers.push(t);
+                    }
                 }
                 if (kind == "VEVENT" || kind == "VTODO")
                     && depth.len() == 2

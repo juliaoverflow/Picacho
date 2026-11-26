@@ -201,7 +201,8 @@ impl MailApp {
                         this.snoozed.insert(account_id.clone(), list);
                         if !woken.is_empty() {
                             let text = match woken.as_slice() {
-                                [one] => t!("later-back-from-snooze", subject = one.subject),
+                                // A toast has no Show code to click.
+                                [one] => t!("later-back-from-snooze", subject = this.hide_codes_in(&one.subject)),
                                 many => {
                                     t!("later-snoozed-messages-are-back-in-the", count = many.len())
                                 }

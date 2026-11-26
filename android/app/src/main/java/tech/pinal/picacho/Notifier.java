@@ -97,11 +97,17 @@ final class Notifier {
                 PendingIntent pending = "reply".equals(parts[0])
                         ? open(context, requestCode, parts[2])
                         : quick(context, requestCode, id, parts[2]);
-                builder.addAction(new Notification.Action.Builder(
-                                Icon.createWithResource(context, R.drawable.ic_notification),
-                                parts[1],
-                                pending)
-                        .build());
+                Notification.Action.Builder action = new Notification.Action.Builder(
+                        Icon.createWithResource(context, R.drawable.ic_notification),
+                        parts[1],
+                        pending);
+                // Not from a locked phone's lock screen without unlocking
+                // it: anyone holding it could otherwise archive or delete
+                // mail (as iOS's buttons ask, Notifications.swift).
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                    action.setAuthenticationRequired(true);
+                }
+                builder.addAction(action.build());
             }
         }
         Notification notification = builder.build();

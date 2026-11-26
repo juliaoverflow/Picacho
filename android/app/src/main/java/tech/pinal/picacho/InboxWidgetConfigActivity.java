@@ -52,6 +52,15 @@ public final class InboxWidgetConfigActivity extends Activity {
         // Show the "unread only" toggle only when configuring the Inbox widget.
         AppWidgetManager manager = AppWidgetManager.getInstance(this);
         AppWidgetProviderInfo info = manager != null ? manager.getAppWidgetInfo(appWidgetId) : null;
+        // Only one of Picacho's own widgets: the activity is exported (the
+        // launcher starts it), and anyone could otherwise start it with any
+        // widget id to see the accounts listed, or set a widget's choice.
+        if (info == null
+                || info.provider == null
+                || !getPackageName().equals(info.provider.getPackageName())) {
+            finish();
+            return;
+        }
         String providerClass =
                 (info != null && info.provider != null) ? info.provider.getClassName() : "";
         boolean isInbox = InboxWidgetProvider.class.getName().equals(providerClass);

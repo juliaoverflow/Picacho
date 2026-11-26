@@ -219,3 +219,17 @@ fn pictures_take_the_size_they_are_dragged_to() {
     assert_eq!(to_html(&doc), "<div>a<img src=\"file:x.png\" alt=\"\" width=\"120\" height=\"80\" style=\"border:0\">b</div>");
     assert!(!doc.set_image_size(Pos::new(0, 0), 1., 1.));
 }
+
+/// Pasted from a web page: nothing that would load from its server when
+/// the draft (or the sent message) is shown; the text and its look stay.
+#[test]
+fn pasted_html_loads_nothing_from_elsewhere() {
+    let html = r#"<html><head><style>@import url(https://track.example/a.css); p { color: red }</style></head><body><style>.x { background: url('https://track.example/b.png') }</style><table background="https://track.example/c.png"><tr><td style="background-image: url(https://track.example/d.png); color: blue">Hello <b>there</b></td></tr></table><p style="background: url(data:image/png;base64,AAAA)">inline</p></body></html>"#;
+    let out = to_html(&super::html::parse_pasted(html));
+    assert!(!out.contains("track.example"), "{out}");
+    assert!(out.contains("Hello") && out.contains("color:blue"), "{out}");
+    assert!(out.contains("data:image/png"), "{out}");
+    // HTML from elsewhere keeps them (drafts, quoted replies).
+    let kept = to_html(&parse(html, false));
+    assert!(kept.contains("track.example"), "{kept}");
+}

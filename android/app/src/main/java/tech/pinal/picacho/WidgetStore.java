@@ -25,6 +25,9 @@ import java.util.Date;
 import java.util.List;
 import java.util.Locale;
 import java.util.TimeZone;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicBoolean;
 import org.json.JSONArray;
 import org.json.JSONObject;
 
@@ -484,29 +487,31 @@ public final class WidgetStore {
         if (manager == null) {
             return;
         }
+        // The snapshot read once for all of them (each read and parsed it).
+        Snapshot snap = load(app);
         int[] inboxIds = manager.getAppWidgetIds(new ComponentName(app, InboxWidgetProvider.class));
         if (inboxIds.length > 0) {
             manager.notifyAppWidgetViewDataChanged(inboxIds, R.id.widget_inbox_list);
-            InboxWidgetProvider.updateAll(app, manager, inboxIds);
+            InboxWidgetProvider.updateAll(app, manager, inboxIds, snap);
         }
         int[] unreadIds = manager.getAppWidgetIds(new ComponentName(app, UnreadWidgetProvider.class));
         if (unreadIds.length > 0) {
-            UnreadWidgetProvider.updateAll(app, manager, unreadIds);
+            UnreadWidgetProvider.updateAll(app, manager, unreadIds, snap);
         }
         int[] calIds = manager.getAppWidgetIds(new ComponentName(app, CalendarWidgetProvider.class));
         if (calIds.length > 0) {
             manager.notifyAppWidgetViewDataChanged(calIds, R.id.widget_cal_list);
-            CalendarWidgetProvider.updateAll(app, manager, calIds);
+            CalendarWidgetProvider.updateAll(app, manager, calIds, snap);
         }
         int[] pkgIds = manager.getAppWidgetIds(new ComponentName(app, PackagesWidgetProvider.class));
         if (pkgIds.length > 0) {
             manager.notifyAppWidgetViewDataChanged(pkgIds, R.id.widget_pkg_list);
-            PackagesWidgetProvider.updateAll(app, manager, pkgIds);
+            PackagesWidgetProvider.updateAll(app, manager, pkgIds, snap);
         }
         int[] rcptIds = manager.getAppWidgetIds(new ComponentName(app, ReceiptsWidgetProvider.class));
         if (rcptIds.length > 0) {
             manager.notifyAppWidgetViewDataChanged(rcptIds, R.id.widget_rcpt_list);
-            ReceiptsWidgetProvider.updateAll(app, manager, rcptIds);
+            ReceiptsWidgetProvider.updateAll(app, manager, rcptIds, snap);
         }
     }
 
@@ -516,8 +521,14 @@ public final class WidgetStore {
      */
     static void refreshFromStoreAsync(Context context, BroadcastReceiver receiver) {
         Context app = context.getApplicationContext();
+        // One refresh at a time, and at most one more waiting: taps (or
+        // broadcasts) in a burst run one after another, not a thread each.
+        if (!REFRESH_WAITING.compareAndSet(false, true)) {
+            return;
+        }
         BroadcastReceiver.PendingResult pending = receiver != null ? receiver.goAsync() : null;
-        new Thread(() -> {
+        REFRESHER.execute(() -> {
+            REFRESH_WAITING.set(false);
             try {
                 Native.attach(app);
                 Native.refreshWidgets(new File(app.getFilesDir(), "picacho").getPath());
@@ -529,7 +540,46 @@ public final class WidgetStore {
                     pending.finish();
                 }
             }
-        }, "picacho-widget-refresh").start();
+        });
+    }
+
+    /** The thread widget refreshes run on, one after another. */
+    private static final ExecutorService REFRESHER = Executors.newSingleThreadExecutor(runnable -> {
+        Thread thread = new Thread(runnable, "picacho-widget-refresh");
+        thread.setDaemon(true);
+        return thread;
+    });
+    /** A refresh is queued and hasn't started: another needn't be. */
+    private static final AtomicBoolean REFRESH_WAITING = new AtomicBoolean(false);
+
+    /**
+     * A widget's Refresh button: an explicit broadcast to {@code provider}
+     * carrying the widgets' key, which {@link #isRefresh} asks for. The
+     * providers are exported (the launcher must reach them), so anyone
+     * could send them a refresh otherwise.
+     */
+    static Intent refreshIntent(Context context, Class<?> provider) {
+        return new Intent(context, provider)
+                .setAction(ACTION_REFRESH)
+                .putExtra(EXTRA_KEY, key(context));
+    }
+
+    /** Whether {@code intent} is a Refresh from Picacho's own widget. */
+    static boolean isRefresh(Context context, Intent intent) {
+        if (intent == null || !ACTION_REFRESH.equals(intent.getAction())) {
+            return false;
+        }
+        String given;
+        try {
+            given = intent.getStringExtra(EXTRA_KEY);
+        } catch (RuntimeException e) {
+            // A malformed extra from elsewhere.
+            return false;
+        }
+        return given != null
+                && MessageDigest.isEqual(
+                        given.getBytes(StandardCharsets.UTF_8),
+                        key(context).getBytes(StandardCharsets.UTF_8));
     }
 
     static boolean isDark(Context context) {

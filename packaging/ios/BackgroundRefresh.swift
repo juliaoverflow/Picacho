@@ -10,6 +10,7 @@
 
 import BackgroundTasks
 import Foundation
+import UIKit
 
 enum PicachoBackground {
     /// The task's identifier, as Info.plist's BGTaskSchedulerPermittedIdentifiers
@@ -54,12 +55,37 @@ enum PicachoBackground {
     }
 
     /// Asks to be woken, if checking in the background is on (and stops
-    /// asking if it's off). Called as Picacho leaves the screen.
+    /// asking if it's off). Called as Picacho leaves the screen: off the
+    /// main thread, as reading the setting may open the store (an
+    /// encrypted one's key from the Keychain), with a little background
+    /// time asked for so it finishes before Picacho is suspended.
     static func schedule() {
-        if picacho_ios_background_enabled() {
-            submit()
-        } else {
-            cancel()
+        let work = {
+            if picacho_ios_background_enabled() {
+                submit()
+            } else {
+                cancel()
+            }
+        }
+        // A refresh's own handler (`run`) is off the main thread already.
+        guard Thread.isMainThread else {
+            work()
+            return
+        }
+        let app = UIApplication.shared
+        var task = UIBackgroundTaskIdentifier.invalid
+        task = app.beginBackgroundTask(withName: "picacho-schedule") {
+            app.endBackgroundTask(task)
+            task = .invalid
+        }
+        DispatchQueue.global(qos: .utility).async {
+            work()
+            DispatchQueue.main.async {
+                if task != .invalid {
+                    app.endBackgroundTask(task)
+                    task = .invalid
+                }
+            }
         }
     }
 

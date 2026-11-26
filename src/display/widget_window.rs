@@ -880,19 +880,7 @@ impl DesktopWidgetWindow {
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .text_color(rgb(c.text))
                                     .child(r.merchant.clone()),
-                            )
-                            .when(refund, |d| {
-                                d.child(
-                                    div()
-                                        .flex_shrink_0()
-                                        .px_1()
-                                        .rounded(px(4.))
-                                        .bg(rgb(c.soft))
-                                        .text_size(px(10.))
-                                        .text_color(rgb(c.accent))
-                                        .child(t!("widget-window-refund")),
-                                )
-                            }),
+                            ),
                     )
                     .child(
                         div()
@@ -903,12 +891,22 @@ impl DesktopWidgetWindow {
                     ),
             )
             .child(
+                // The amount, with "Refund" under a refund's.
                 div()
                     .flex_shrink_0()
-                    .text_xs()
-                    .font_weight(FontWeight::SEMIBOLD)
+                    .flex()
+                    .flex_col()
+                    .items_end()
                     .text_color(rgb(if refund { c.accent } else { c.text }))
-                    .child(r.amount.clone()),
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(r.amount.clone()),
+                    )
+                    .when(refund, |d| {
+                        d.child(div().text_size(px(10.)).child(t!("widget-window-refund")))
+                    }),
             )
             .into_any_element()
     }

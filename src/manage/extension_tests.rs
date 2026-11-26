@@ -2445,6 +2445,100 @@ fn large_messages_list_attachments_by_their_decoded_size() -> Result<()> {
     Ok(())
 }
 
+/// A large attachment of a message too large to keep downloads in pieces
+/// (`BODY.PEEK[2]<offset.length>`), each decoded and written to the file as
+/// it arrives: base64 split anywhere, and quoted-printable, come out whole.
+#[test]
+fn large_attachments_download_in_pieces_to_their_file() -> Result<()> {
+    use base64::Engine as _;
+    let data: Vec<u8> = (0..17_000_000u32).map(|i| (i.wrapping_mul(2654435761) >> 13) as u8).collect();
+    let encoded: Vec<u8> = base64::engine::general_purpose::STANDARD
+        .encode(&data)
+        .as_bytes()
+        .chunks(76)
+        .flat_map(|l| l.iter().copied().chain(*b"\r\n"))
+        .collect();
+    // Quoted-printable text with escapes and soft line breaks, as long.
+    let line = "Caf=C3=A9 cr=C3=A8me =3D one soft break here =\r\nand the rest of the line.\r\n";
+    let qp_source: Vec<u8> = line.repeat(26_000_000 / line.len() + 1).into_bytes();
+    let qp_plain = crate::sync::transport::decode_part(&qp_source, "quoted-printable")?;
+    let (cert, acceptor) = tls_fixture()?;
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let port = listener.local_addr()?.port();
+    let parts = [encoded.clone(), qp_source.clone()];
+    let server = std::thread::spawn(move || {
+        let mut pieces = 0;
+        'connections: while let Some(mut p) = Peer::accept(&listener, &acceptor) {
+            while let Some((tag, command, _)) = p.command() {
+                let upper = command.to_ascii_uppercase();
+                if upper.starts_with("LOGIN") {
+                } else if upper == "CAPABILITY" {
+                    p.send("* CAPABILITY IMAP4rev1\r\n");
+                } else if upper.starts_with("LIST") {
+                    p.send("* LIST () \"/\" INBOX\r\n");
+                } else if upper.starts_with("SELECT") || upper.starts_with("EXAMINE") {
+                    p.send("* 1 EXISTS\r\n* OK [UIDVALIDITY 42] stable\r\n");
+                } else if let Some(rest) = upper.split("BODY.PEEK[").nth(1) {
+                    let section: usize = rest[..1].parse().unwrap();
+                    let (offset, length) = rest[3..].trim_end_matches(">)").split_once('.').unwrap();
+                    let (offset, length): (usize, usize) = (offset.parse().unwrap(), length.parse().unwrap());
+                    let part = &parts[section - 2];
+                    let piece = &part[offset.min(part.len())..(offset + length).min(part.len())];
+                    pieces += 1;
+                    p.send(&format!("* 1 FETCH (UID 7 BODY[{section}]<{offset}> {{{}}}\r\n", piece.len()));
+                    p.send_bytes(piece);
+                    p.send(")\r\n");
+                } else if upper == "LOGOUT" {
+                    p.send(&format!("* BYE\r\n{tag} OK done\r\n"));
+                    break 'connections;
+                } else {
+                    panic!("Unexpected IMAP command: {command}");
+                }
+                p.ok(&tag);
+            }
+        }
+        pieces
+    });
+    let (b, mut a, path) = backend(&cert)?;
+    a.incoming_port = port;
+    let mut m = Mail {
+        id: format!("{}:INBOX:42:7", a.id),
+        account: a.id.clone(),
+        folder: Folder::Inbox,
+        remote_folder: "INBOX".into(),
+        uid: 7,
+        size: 60_000_000,
+        partial: true,
+        ..Mail::default()
+    };
+    let attachment = |part: usize, name: &str, size: usize, encoding: &str| Attachment {
+        name: name.into(),
+        size,
+        mime: "application/octet-stream".into(),
+        part,
+        section: part.to_string(),
+        encoding: encoding.into(),
+    };
+    m.set_attachments(vec![
+        attachment(2, "data.bin", data.len(), "base64"),
+        attachment(3, "notes.txt", qp_plain.len(), "quoted-printable"),
+    ]);
+    b.store.save_messages(std::slice::from_ref(&m))?;
+    let file = path.join("data.bin");
+    let written = b.attachment_to(&a, &m, 2, &file)?;
+    assert_eq!(written.size, data.len() as u64);
+    assert!(std::fs::read(&file)? == data, "base64 decoded whole");
+    let notes = path.join("notes.txt");
+    b.attachment_to(&a, &m, 3, &notes)?;
+    assert!(std::fs::read(&notes)? == qp_plain, "quoted-printable decoded whole");
+    b.disconnect(&a.id);
+    let pieces = server.join().unwrap();
+    assert!(pieces >= 6, "fetched in pieces: {pieces}");
+    drop(b);
+    std::fs::remove_dir_all(path)?;
+    Ok(())
+}
+
 /// RFC 4314 §3: a mailbox's access list is read (GETACL), changed (SETACL,
 /// DELETEACL) and its grantable rights listed (LISTRIGHTS); rights that
 /// aren't letters are refused before anything is sent.

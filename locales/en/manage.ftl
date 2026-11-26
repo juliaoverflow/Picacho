@@ -214,8 +214,6 @@ manage-backend-cant-request-delivery-receipts = { $host } can't request delivery
 
 manage-background-its-account-was-removed = Its account was removed.
 
-manage-background-new-message = New message
-
 # src/manage/calendar.rs
 
 manage-calendar-the-calendar-servers-password-is-missing = The calendar server's password is missing. Set it up again.
@@ -283,11 +281,19 @@ manage-calendar-this-message-proposes-no-time = This message proposes no time.
 
 manage-calendar-this-proposal-is-for-but-came = This proposal is for { $guest }, but came from { $from }.
 
+manage-calendar-this-proposal-isnt-from-a-guest = This proposal, from { $from }, isn't from a guest of the event; it wasn't applied.
+
 manage-calendar-the-event-this-proposal-is-for = The event this proposal is for isn't in your calendar.
 
 manage-calendar-the-proposal-doesnt-say-who-its = The proposal doesn't say who it's from.
 
 manage-calendar-this-update-is-from-not-the = This update is from { $from }, not the event's organizer { $email }; it wasn't applied.
+
+manage-calendar-sender-isnt-vouched-for = { $from }'s domain doesn't vouch for this message (DMARC: { $result }), so it could be from anyone. Your calendar wasn't changed.
+
+manage-calendar-this-event-is-already-in-your-calendar = This event is already in your calendar.
+
+manage-calendar-this-update-would-replace-your-own = This update is for an event of your own, not one you were invited to; it wasn't applied.
 
 manage-calendar-this-update-is-older-than-the = This update is older than the event in your calendar; it wasn't applied.
 
@@ -671,6 +677,8 @@ manage-model-kerberos-sign-in-is-for-imap = Kerberos sign-in is for IMAP and POP
 
 manage-model-kerberos-sign-in-isnt-available-on = Kerberos sign-in isn't available on phones and tablets.
 
+manage-model-basic-sign-in-is-for-exchange = Basic sign-in is for Exchange accounts that sign in with a password.
+
 manage-model-other = Other
 
 manage-model-api-token = API token
@@ -772,6 +780,12 @@ manage-openpgp-that-setup-code-doesnt-open-it = That setup code doesn't open it.
 manage-openpgp-warning-the-sender-inside-the-message = Warning: the sender inside the message ({ $protected }) isn't the sender shown ({ $outer }), and no signature proves it
 
 manage-openpgp-not-signed = Not signed
+
+manage-openpgp-files-not-signed = Warning: the signature doesn't cover these files, which anyone could have added: { $files }
+
+manage-openpgp-files-not-encrypted = Warning: these files weren't encrypted with the message, and anyone could have added them: { $files }
+
+manage-openpgp-an-unnamed-file = an unnamed file
 
 manage-openpgp-signed-by = Signed by { $who }
 
@@ -1041,6 +1055,12 @@ manage-store-couldnt-replace-the-local-database = Couldn't replace the local dat
 
 manage-store-couldnt-open-the-local-database-again = Couldn't open the local database again
 
+manage-sealed-files-couldnt-encrypt-a-file = Couldn't encrypt a draft's file.
+
+manage-sealed-files-an-encrypted-file-is-damaged = A draft's encrypted file is damaged and can't be read.
+
+manage-sealed-files-this-file-is-encrypted-with-a-key = This draft's file is encrypted with the local database's key, which is no longer here.
+
 manage-store-the-server-did-not-supply-a = The server did not supply a valid UIDVALIDITY
 
 manage-store-invalid-mailbox-snapshot = Invalid mailbox snapshot
@@ -1136,8 +1156,6 @@ manage-widgets-package = Package
 manage-widgets-refund = Refund
 
 manage-widgets-purchase = Purchase
-
-manage-widgets-new-message = New message
 
 manage-widgets-no-title = (No title)
 

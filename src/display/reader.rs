@@ -613,27 +613,65 @@ impl MailApp {
             if options.html
                 && let Some(html) = &m.html
             {
-                let hidden = self.html_without_quotes(m, html);
-                has_quotes = hidden.is_some();
-                let shown = match &hidden {
-                    Some(hidden) if !self.quotes_open => hidden.as_str(),
-                    _ => html.as_str(),
+                // Prepared once for what it's shown with (quotes, alias,
+                // hidden codes, Find): every frame (a hover, a scroll, a
+                // spinner) otherwise copied and scanned the whole HTML again.
+                let query = self.find_query(cx);
+                let key = {
+                    use std::hash::{Hash, Hasher};
+                    let mut h = std::collections::hash_map::DefaultHasher::new();
+                    (
+                        &m.id,
+                        html.len(),
+                        self.quotes_open,
+                        mask.as_ref().map(|k| (&k.address, &k.alias)),
+                        self.hidden_codes(m).as_slice(),
+                        &query,
+                        self.find.current,
+                    )
+                        .hash(&mut h);
+                    h.finish()
                 };
-                let masked = mask.as_ref().map(|k| k.apply(shown));
-                let shown = masked.as_deref().unwrap_or(shown);
-                let shown = self.hide_codes_html(m, shown);
-                let marked = self.find_marked(shown.as_ref(), false, cx);
-                let shown = marked.as_deref().unwrap_or(shown.as_ref());
+                let cached = self
+                    .prepared_html
+                    .borrow()
+                    .as_ref()
+                    .filter(|(k, ..)| *k == key)
+                    .map(|(_, shown, quotes, marked, count)| (shown.clone(), *quotes, *marked, *count));
+                let (shown, quotes, marked) = match cached {
+                    Some((shown, quotes, marked, count)) => {
+                        self.find.count.set(count);
+                        (shown, quotes, marked)
+                    }
+                    None => {
+                        let hidden = self.html_without_quotes(m, html);
+                        let quotes = hidden.is_some();
+                        let shown = match &hidden {
+                            Some(hidden) if !self.quotes_open => hidden.as_str(),
+                            _ => html.as_str(),
+                        };
+                        let masked = mask.as_ref().map(|k| k.apply(shown));
+                        let shown = masked.as_deref().unwrap_or(shown);
+                        let shown = self.hide_codes_html(m, shown);
+                        let found = self.find_marked(shown.as_ref(), false, cx);
+                        let marked = found.is_some();
+                        let shown = Rc::new(found.unwrap_or_else(|| shown.into_owned()));
+                        *self.prepared_html.borrow_mut() =
+                            Some((key, shown.clone(), quotes, marked, self.find.count.get()));
+                        (shown, quotes, marked)
+                    }
+                };
+                has_quotes = quotes;
                 self.html_view.update(cx, |view, cx| {
-                    view.set_content(shown, &m.inline, options.block_remote, dark, self.clean_links, cx)
+                    view.set_content(&shown, &m.inline, options.block_remote, dark, self.clean_links, cx)
                 });
-                if marked.is_some() {
+                if marked {
                     self.reveal_find(cx);
                 }
                 content = content.child(self.html_view.clone());
             } else if let Some(text) = find_plain {
                 has_quotes = false;
-                let marked = self.find_marked(&text, true, cx).unwrap_or_default();
+                let marked = Rc::new(self.find_marked(&text, true, cx).unwrap_or_default());
                 self.html_view.update(cx, |view, cx| {
                     view.set_content(&marked, &m.inline, options.block_remote, dark, self.clean_links, cx)
                 });
@@ -866,15 +904,27 @@ impl MailApp {
             return;
         }
         // Until its source is downloaded there's nothing to read; it is
-        // looked at again once there is.
-        let Some(report) = self.backend.delivery_report(m) else {
+        // looked at again once there is (asked of the index alone, cheaply).
+        if !self.backend.store.has_source(&m.id).unwrap_or(false) {
             return;
-        };
-        let found = report.is_some();
-        self.delivery_reports.insert(m.id.clone(), report);
-        if found {
-            cx.notify();
         }
+        if self.delivery_reports.len() >= super::READER_CACHE {
+            self.delivery_reports.clear();
+        }
+        // Read off the UI thread: its source is inflated (up to tens of
+        // megabytes) and parsed. Marked meanwhile, so it's read once.
+        self.delivery_reports.insert(m.id.clone(), None);
+        let (id, mail) = (m.id.clone(), m.clone());
+        self.task(
+            cx,
+            move |b| Ok(b.delivery_report(&mail)),
+            move |this, result: anyhow::Result<Option<Option<crate::sync::dsn::DeliveryReport>>>, cx| {
+                if let Ok(Some(Some(report))) = result {
+                    this.delivery_reports.insert(id, Some(report));
+                    cx.notify();
+                }
+            },
+        );
     }
     /// What a delivery report says of each recipient, above its text: who,
     /// what happened, the status code, and the server's words, muted.
@@ -1894,7 +1944,7 @@ impl MailApp {
         if matches!(m.folder, Folder::Drafts | Folder::Sent) {
             return None;
         }
-        let smart = self.smart_replies(m);
+        let smart = self.smart_replies_for(m, cx);
         if smart.replies.is_empty() {
             return None;
         }

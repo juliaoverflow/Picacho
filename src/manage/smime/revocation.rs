@@ -31,7 +31,7 @@ pub fn checked_url(url: &str) -> Result<url::Url> {
         t!("manage-smime-revocation-revocation-is-fetched-over-http-only", scheme = parsed.scheme())
     );
     ensure!(parsed.host().is_some(), t!("manage-smime-revocation-names-no-server", url = format!("{:?}", url)));
-    if crate::sync::public_net::names_local_address(&parsed) {
+    if crate::sync::public_net::reaches_inside(&parsed) {
         bail!(t!("manage-smime-revocation-is-on-a-local-network", url = format!("{:?}", url)));
     }
     Ok(parsed)

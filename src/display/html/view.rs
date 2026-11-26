@@ -75,7 +75,9 @@ struct Thumbnail {
 }
 
 pub struct HtmlView {
-    source: String,
+    /// The HTML shown, shared with whoever prepared it: the same one handed
+    /// in again (every frame) is known by its pointer, without comparing.
+    source: std::rc::Rc<String>,
     /// Whether the renderer failed on `source`.
     failed: bool,
     /// The message parts `source` refers to by `cid:` address.
@@ -153,7 +155,7 @@ impl HtmlView {
         })
         .detach();
         Self {
-            source: String::new(),
+            source: Default::default(),
             failed: false,
             inline: Default::default(),
             blocked: true,
@@ -209,6 +211,12 @@ impl HtmlView {
     pub fn text_zoom(&self) -> f32 {
         self.text_zoom
     }
+    /// How many documents it has started (or cleared), and whether the
+    /// HTML it shows is `html` itself (the same one, not a copy).
+    #[cfg(test)]
+    pub fn started(&self, html: &std::rc::Rc<String>) -> (u64, bool) {
+        (self.generation, std::rc::Rc::ptr_eq(&self.source, html))
+    }
     #[cfg(test)]
     pub fn has_document(&self) -> bool {
         self.worker.is_some()
@@ -223,7 +231,7 @@ impl HtmlView {
         // Dropping the sender ends the thread and cancels its resources.
         self.worker = None;
         self.generation += 1;
-        self.source = String::new();
+        self.source = Default::default();
         // The message's inline images can be large; don't keep them past it.
         self.inline = Default::default();
         self.failed = false;
@@ -252,30 +260,35 @@ impl HtmlView {
     /// they arrive when the message has been read, which shows it again.
     pub fn set_content(
         &mut self,
-        html: &str,
+        source: &std::rc::Rc<String>,
         inline: &Arc<InlineParts>,
         blocked: bool,
         dark: bool,
         clean_links: bool,
         cx: &mut Context<Self>,
     ) {
-        // Called on every reader render: compare cheaply before scanning
-        // the HTML for its color scheme.
+        // Called on every render: the HTML prepared once and handed in
+        // again is the same one (its pointer); only HTML made anew is
+        // compared, before scanning it for its color scheme.
         if self.worker.is_some()
             && self.dark == dark
             && self.blocked == blocked
             && self.clean_links == clean_links
-            && self.source.len() == html.len()
             && (Arc::ptr_eq(&self.inline, inline) || self.inline == *inline)
-            && self.source == html
+            && (std::rc::Rc::ptr_eq(&self.source, source)
+                || (self.source.len() == source.len() && self.source == *source))
         {
+            // The same HTML made anew: kept, so the next frame's (if it is
+            // this one again) is known by its pointer.
+            self.source = source.clone();
             return;
         }
+        let html = source.as_str();
         let tone = Tone::for_email(html, dark);
         self.dark = dark;
         self.clear(cx);
         self.accessible = None;
-        self.source = html.into();
+        self.source = source.clone();
         self.inline = inline.clone();
         self.blocked = blocked;
         self.clean_links = clean_links;

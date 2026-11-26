@@ -343,9 +343,10 @@ pub fn unsubscribe(
                 bail!(t!("manage-subscriptions-the-senders-request-to-unsubscribe-couldnt"));
             }
             // The sender chose the address: it, and wherever it redirects,
-            // must be on the internet, not this computer or its network.
+            // must be on the internet, not this computer or its network,
+            // whether it's reached directly or through a proxy.
             let target = url::Url::parse(url).with_context(|| t!("manage-subscriptions-the-senders-unsubscribe-address-isnt-valid"))?;
-            if crate::sync::public_net::names_local_address(&target) {
+            if crate::sync::public_net::reaches_inside(&target) {
                 bail!(t!("manage-subscriptions-the-senders-unsubscribe-address-is-on"));
             }
             // Redirects by hand: a client follows 301, 302 and 303 as a GET,
@@ -382,7 +383,7 @@ pub fn unsubscribe(
                     if next.scheme() != "https" {
                         bail!(t!("manage-subscriptions-the-sender-redirected-the-request-to"));
                     }
-                    if crate::sync::public_net::names_local_address(&next) {
+                    if crate::sync::public_net::reaches_inside(&next) {
                         bail!(t!("manage-subscriptions-the-sender-redirected-the-request-to-2"));
                     }
                     at = next;

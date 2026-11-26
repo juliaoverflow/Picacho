@@ -38,11 +38,15 @@ use std::sync::{Arc, Mutex, OnceLock};
 use tokio::sync::{mpsc, watch};
 use zeroize::Zeroizing;
 
-/// A build-time setting, which the same variable at run time overrides.
+/// A build-time setting, which the same variable at run time overrides in
+/// development builds.
 macro_rules! setting {
     ($name:literal) => {
+        // The environment overrides what was built in only in development
+        // builds (see `oauth::setting`).
         std::env::var($name)
             .ok()
+            .filter(|_| cfg!(debug_assertions))
             .or_else(|| option_env!($name).map(str::to_owned))
             .map(|v| v.trim().to_owned())
             .filter(|v| !v.is_empty())

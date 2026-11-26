@@ -43,6 +43,10 @@ pub struct Rest {
     service: &'static str,
     /// Sent with every request (Graph's `Prefer: IdType="ImmutableId"`).
     headers: Vec<(&'static str, String)>,
+    /// The TLS settings the client was made with (the system's roots and
+    /// any the account trusts), for clients of other hosts the API names
+    /// (Graph's upload sessions).
+    pub tls: native_tls::TlsConnector,
 }
 
 impl Rest {
@@ -52,7 +56,7 @@ impl Rest {
                 .context(t!("sync-rest-your-sign-in-expired-reconnect-the")));
         }
         let http = reqwest::blocking::Client::builder()
-            .use_preconfigured_tls(tls)
+            .use_preconfigured_tls(tls.clone())
             .timeout(REQUEST_TIMEOUT)
             .connect_timeout(Duration::from_secs(12))
             // The token goes to the API's own host only.
@@ -66,6 +70,7 @@ impl Rest {
             token: token.to_owned(),
             service,
             headers: Vec::new(),
+            tls,
         })
     }
     /// Sends `name: value` with every request.
@@ -216,6 +221,10 @@ fn read_bytes(response: reqwest::blocking::Response) -> Result<Vec<u8>> {
 }
 fn read_text(response: reqwest::blocking::Response) -> Result<String> {
     Ok(String::from_utf8_lossy(&read_bytes(response)?).into_owned())
+}
+/// A response's JSON, read up to the size any answer may be.
+pub fn bounded_json(response: reqwest::blocking::Response) -> Result<Value> {
+    read_json(response)
 }
 fn read_json(response: reqwest::blocking::Response) -> Result<Value> {
     let bytes = read_bytes(response)?;

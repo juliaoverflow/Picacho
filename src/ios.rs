@@ -261,14 +261,46 @@ pub fn verify(url: &str, cancel: &AtomicBool) -> anyhow::Result<Option<(String, 
 struct Done {
     call: extern "C" fn(*mut c_void, bool),
     context: *mut c_void,
+    called: bool,
 }
 // Safety: the Swift side's context is an object retained for this call,
 // which it releases on whichever thread calls it.
 unsafe impl Send for Done {}
 impl Done {
-    fn finish(self, ok: bool) {
+    fn new(call: extern "C" fn(*mut c_void, bool), context: *mut c_void) -> Self {
+        Self { call, context, called: false }
+    }
+    fn finish(mut self, ok: bool) {
+        self.called = true;
         (self.call)(self.context, ok);
     }
+}
+impl Drop for Done {
+    /// Never finished (a thread that couldn't be started took it along):
+    /// called now, unsuccessful, so the Swift side's completion runs and
+    /// its retained context is released.
+    fn drop(&mut self) {
+        if !self.called {
+            self.called = true;
+            (self.call)(self.context, false);
+        }
+    }
+}
+
+/// Whether the app lock is on, so the window is covered as Picacho leaves
+/// the screen (main.m's `sceneWillResignActive:`), before iOS takes the
+/// app switcher's picture of it: GPUI's own cover may not be drawn by then.
+static PRIVACY_COVER: AtomicBool = AtomicBool::new(false);
+
+/// Sets whether the window is covered as Picacho leaves the screen.
+pub fn set_privacy_cover(on: bool) {
+    PRIVACY_COVER.store(on, Ordering::Relaxed);
+}
+
+/// For main.m: cover the window now that Picacho leaves the screen.
+#[unsafe(no_mangle)]
+pub extern "C" fn picacho_ios_privacy_cover() -> bool {
+    PRIVACY_COVER.load(Ordering::Relaxed)
 }
 
 /// `len` UTF-8 bytes at `ptr` (null for none).
@@ -323,10 +355,7 @@ pub unsafe extern "C" fn picacho_ios_notification_action(
     context: *mut c_void,
 ) {
     init();
-    let done = Done {
-        call: done,
-        context,
-    };
+    let done = Done::new(done, context);
     // Safety: as the caller promises.
     let (target, action) = unsafe { (text(target, target_len), text(action, action_len)) };
     let (Some(json), Some(action)) = (target, action) else {
@@ -382,10 +411,7 @@ pub extern "C" fn picacho_ios_background_refresh(
     context: *mut c_void,
 ) {
     init();
-    let done = Done {
-        call: done,
-        context,
-    };
+    let done = Done::new(done, context);
     let cancel = Arc::new(AtomicBool::new(false));
     {
         let mut refreshing = REFRESHING.lock().unwrap_or_else(|e| e.into_inner());
@@ -414,6 +440,8 @@ pub extern "C" fn picacho_ios_background_refresh(
             done.finish(ok);
         });
     if let Err(e) = spawned {
+        // Its `done` went with the closure, and was called (unsuccessful)
+        // as it was dropped.
         log::error!("could not check mail in the background: {e}");
         *REFRESHING.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }

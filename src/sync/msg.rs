@@ -145,6 +145,11 @@ impl<'a> CompoundFile<'a> {
         let num_difat = u32_le(raw, 72)?;
 
         // Collect FAT sector numbers from header DIFAT (109 entries at offset 76) + DIFAT chain.
+        // Every FAT sector is a sector of the file, so a well-formed file
+        // never names more of them than it has sectors: a DIFAT chain
+        // looping back on itself (or naming one sector over and over) would
+        // otherwise make a few-kilobyte file stand for a FAT of gigabytes.
+        let max_sectors = raw.len() / sector_size;
         let mut fat_sectors = Vec::new();
         for i in 0..109 {
             let s = u32_le(raw, 76 + i * 4)?;
@@ -154,10 +159,12 @@ impl<'a> CompoundFile<'a> {
         }
         let entries_per_sector = sector_size / 4;
         let mut difat_hops = 0u32;
+        let mut seen_difat = std::collections::HashSet::new();
         while difat_sector != ENDOFCHAIN
             && difat_sector != FREESECT
             && difat_hops < num_difat.min(4096)
         {
+            ensure!(seen_difat.insert(difat_sector), t!("sync-msg-this-msg-file-couldnt-be-read"));
             let slice = sector_slice(raw, sector_size, difat_sector)?;
             for i in 0..entries_per_sector.saturating_sub(1) {
                 let s = u32_le(slice, i * 4)?;
@@ -165,12 +172,22 @@ impl<'a> CompoundFile<'a> {
                     fat_sectors.push(s);
                 }
             }
+            ensure!(
+                fat_sectors.len() <= max_sectors,
+                t!("sync-msg-this-msg-file-couldnt-be-read")
+            );
             difat_sector = u32_le(slice, (entries_per_sector - 1) * 4)?;
             difat_hops += 1;
         }
+        ensure!(
+            fat_sectors.len() <= max_sectors,
+            t!("sync-msg-this-msg-file-couldnt-be-read")
+        );
 
-        // Build FAT table.
-        let mut fat = Vec::with_capacity(fat_sectors.len().saturating_mul(entries_per_sector));
+        // Build FAT table (at most the file's size: see `max_sectors`).
+        let mut fat = Vec::new();
+        fat.try_reserve_exact(fat_sectors.len().saturating_mul(entries_per_sector))
+            .map_err(|_| anyhow::anyhow!(t!("sync-msg-this-msg-file-couldnt-be-read")))?;
         for &sec in &fat_sectors {
             let slice = sector_slice(raw, sector_size, sec)?;
             for i in 0..entries_per_sector {
@@ -1430,5 +1447,30 @@ mod tests {
         let mini = vec![0u8; 64 * 2];
         let out = read_mini_chain(&mini, 64, &[0, 0], 0, MAX_STREAM_BYTES).unwrap();
         assert_eq!(out.len(), 64);
+    }
+
+    /// A DIFAT sector naming itself as the next one is refused, rather than
+    /// read 4096 times into a FAT of gigabytes (an 8 KiB file, 16 GiB).
+    #[test]
+    fn looping_difat_is_refused() {
+        let sector = 4096;
+        let mut raw = vec![0u8; sector * 2];
+        raw[..8].copy_from_slice(&CFBF_MAGIC);
+        raw[26..28].copy_from_slice(&4u16.to_le_bytes());
+        raw[30..32].copy_from_slice(&12u16.to_le_bytes());
+        raw[32..34].copy_from_slice(&6u16.to_le_bytes());
+        raw[68..72].copy_from_slice(&0u32.to_le_bytes()); // first DIFAT sector: 0
+        raw[72..76].copy_from_slice(&4096u32.to_le_bytes());
+        for i in 0..109 {
+            raw[76 + i * 4..80 + i * 4].copy_from_slice(&FREESECT.to_le_bytes());
+        }
+        // Sector 0: 1023 FAT sector numbers, then itself as the next DIFAT sector.
+        let difat = &mut raw[sector..];
+        for i in 0..1023 {
+            difat[i * 4..i * 4 + 4].copy_from_slice(&0u32.to_le_bytes());
+        }
+        difat[1023 * 4..1024 * 4].copy_from_slice(&0u32.to_le_bytes());
+        assert!(CompoundFile::parse(&raw).is_err());
+        assert!(to_eml(&raw).is_err());
     }
 }

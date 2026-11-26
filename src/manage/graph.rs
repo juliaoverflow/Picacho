@@ -175,10 +175,10 @@ impl Backend {
 
     /// A row for a listed message: the cached one with its flags, folder
     /// and labels brought up to date, or a new one from the listing.
-    pub(super) fn graph_mail(&self, a: &Account, folders: &[MailFolder], m: &Message) -> Result<Mail> {
+    pub(super) fn graph_mail(&self, a: &Account, folders: &[MailFolder], m: &Message, pre: Option<&Prefetched>) -> Result<Mail> {
         let id = row_id(a, &m.id);
         let (folder, remote) = location(m, folders);
-        let mut mail = match self.store.message(&id)? {
+        let mut mail = match Prefetched::cached(pre, &self.store, &id)? {
             Some(cached) => cached,
             None => Mail {
                 id,
@@ -284,8 +284,9 @@ impl Backend {
             }
             listed.truncate(limit);
             let mut rows = Vec::with_capacity(listed.len());
+            let pre = Prefetched::new(&self.store, listed.iter().map(|m| row_id(a, &m.id)).collect())?;
             for m in &listed {
-                rows.push(self.graph_mail(a, &folders, m)?);
+                rows.push(self.graph_mail(a, &folders, m, Some(&pre))?);
             }
             let oldest = listed.iter().map(|m| m.received).filter(|&t| t > 0).min().unwrap_or(i64::MIN);
             let listed_ids: HashSet<&str> = rows.iter().map(|m| m.id.as_str()).collect();
@@ -299,8 +300,9 @@ impl Backend {
             if !unlisted.is_empty() {
                 let current = s.messages(&ids(a, &unlisted))?;
                 let still: HashSet<String> = current.iter().map(|m| row_id(a, &m.id)).collect();
+                let pre = Prefetched::new(&self.store, current.iter().map(|m| row_id(a, &m.id)).collect())?;
                 for m in &current {
-                    rows.push(self.graph_mail(a, &folders, m)?);
+                    rows.push(self.graph_mail(a, &folders, m, Some(&pre))?);
                 }
                 let gone: Vec<String> = unlisted.iter().map(|m| m.id.clone()).filter(|id| !still.contains(id)).collect();
                 if !gone.is_empty() {
@@ -338,8 +340,8 @@ impl Backend {
                 }
                 let (page, more) = self.graph_page(s, &listing, since, next.as_deref(), 250)?;
                 for m in &page {
-                    if added.len() < batch.max(1) && self.store.message(&row_id(a, &m.id))?.is_none() {
-                        added.push(self.graph_mail(a, &folders, m)?);
+                    if added.len() < batch.max(1) && !self.store.has_message(&row_id(a, &m.id))? {
+                        added.push(self.graph_mail(a, &folders, m, None)?);
                     }
                 }
                 match more {
@@ -366,11 +368,17 @@ impl Backend {
 
     /// Downloads one message's source and caches it.
     pub(super) fn download_graph(&self, a: &Account, m: &Mail) -> Result<Vec<u8>> {
+        let raw = self.fetch_graph_raw(a, m)?;
+        self.store.save_raw(&m.id, &raw)?;
+        Ok(raw)
+    }
+
+    /// One message's source, as Microsoft has it, not yet kept.
+    fn fetch_graph_raw(&self, a: &Account, m: &Mail) -> Result<Vec<u8>> {
         let id = graph_id(a, m).with_context(|| t!("manage-gmail-this-message-isnt-from-this-gmail"))?;
         let raw = self.with_graph(a, |s| s.raw(id))?;
         ensure!(raw.len() <= large::MAX_DOWNLOAD, t!("manage-proton-message-exceeds-the-download-limit"));
         self.note_traffic(a, raw.len());
-        self.store.save_raw(&m.id, &raw)?;
         Ok(raw)
     }
 
@@ -381,7 +389,8 @@ impl Backend {
             if stored > 0 && self.someone_waiting(&a.id) {
                 break;
             }
-            let raw = match self.download_graph(a, &m) {
+            // Kept once (`keep_source`), not compressed and written twice.
+            let raw = match self.fetch_graph_raw(a, &m) {
                 Ok(raw) => raw,
                 Err(e) if not_found(&e) => {
                     self.store.delete_ids(&a.id, std::slice::from_ref(&m.id))?;
@@ -485,8 +494,9 @@ impl Backend {
             };
             let found = s.search(&folder, query.trim(), SEARCH_MOST)?;
             let mut out = ServerResults { total: found.len(), ..Default::default() };
+            let pre = Prefetched::new(&self.store, found.iter().take(limit).map(|m| row_id(a, &m.id)).collect())?;
             for m in found.iter().take(limit) {
-                out.mails.push(self.graph_mail(a, &folders, m)?);
+                out.mails.push(self.graph_mail(a, &folders, m, Some(&pre))?);
             }
             self.store.save_messages(&out.mails)?;
             out.mails.sort_by(Mail::newest_first);

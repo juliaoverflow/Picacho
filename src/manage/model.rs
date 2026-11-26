@@ -449,6 +449,11 @@ pub struct Account {
     /// `incoming_host`.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub ews_url: String,
+    /// Exchange: sign in with Basic (the name and password themselves,
+    /// over TLS) instead of NTLM. Only where the server offers nothing
+    /// else, and only as the person chose; never a silent fallback.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ews_basic: bool,
 }
 /// Where an account's single sign-on happens and how Picacho is known there.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -603,6 +608,7 @@ impl Account {
             sso: None,
             api: false,
             ews_url: String::new(),
+            ews_basic: false,
         }
     }
     /// An Exchange account's server as typed: its whole EWS address
@@ -771,6 +777,10 @@ impl Account {
         anyhow::ensure!(
             !self.kerberos || !cfg!(any(target_os = "android", target_os = "ios")),
             t!("manage-model-kerberos-sign-in-isnt-available-on")
+        );
+        anyhow::ensure!(
+            !self.ews_basic || (self.ews() && !self.oauth && !self.kerberos && self.sso.is_none()),
+            t!("manage-model-basic-sign-in-is-for-exchange")
         );
         anyhow::ensure!(
             self.reply_to.trim().is_empty()
@@ -1759,7 +1769,8 @@ impl Draft {
         }
         for path in &self.attachments {
             h.update(path.to_string_lossy().as_bytes());
-            let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+            // The contents' size, the same sealed or not (`sealed_files`).
+            let size = crate::manage::sealed_files::len(path).unwrap_or(0);
             h.update(size.to_le_bytes());
         }
         h.finalize().iter().map(|b| format!("{b:02x}")).collect()
@@ -1975,6 +1986,25 @@ mod tests {
         // A scope the account names is used as given.
         a.sso.as_mut().unwrap().scope = "https://other.example/EWS.AccessAsUser.All".into();
         assert_eq!(a.sso_scope(), "https://other.example/EWS.AccessAsUser.All");
+    }
+    #[test]
+    fn basic_sign_in_is_only_for_exchange_password_accounts() {
+        let mut a = Service::Exchange.account("ana@corp.example").unwrap();
+        a.ews_basic = true;
+        assert!(a.validate().is_ok());
+        let mut kerberos = a.clone();
+        kerberos.kerberos = true;
+        assert!(kerberos.validate().is_err());
+        let mut imap = Account::new(Provider::Imap);
+        imap.email = "ana@example.com".into();
+        imap.incoming_host = "mail.example.com".into();
+        imap.smtp_host = "mail.example.com".into();
+        imap.ews_basic = true;
+        assert!(imap.validate().is_err());
+        // Saved accounts from before read without it, and it stays off.
+        let old: Account = serde_json::from_str(&serde_json::to_string(&Service::Exchange.account("ana@corp.example").unwrap()).unwrap()).unwrap();
+        assert!(!old.ews_basic);
+        assert!(!serde_json::to_string(&old).unwrap().contains("ews_basic"));
     }
     #[test]
     fn kerberos_is_only_for_imap_and_pop3_password_accounts() {

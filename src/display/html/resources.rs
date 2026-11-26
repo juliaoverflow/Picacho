@@ -38,28 +38,31 @@ const MAX_IMAGE_PIXELS: u64 = 40_000_000;
 const MAX_TOTAL_PIXELS: u64 = 160_000_000;
 type Fetch = (Request, Box<dyn NetHandler>);
 
-/// Whether `bytes` may be handed over: anything not a raster image (CSS,
-/// fonts, SVG), or one within the limits above, its pixels then counted
-/// in `used`. Only the image's header is read.
-fn admit(bytes: &[u8], used: &AtomicU64) -> bool {
-    let Some((width, height)) = image::ImageReader::new(std::io::Cursor::new(bytes))
+/// What of `bytes` may be handed over, if anything: CSS and fonts as they
+/// are; an SVG as `svg_guard::resource` lets it through (inflated if gzip,
+/// refused if it names a file or a remote picture, which Blitz's SVG
+/// parser would load past this provider); a raster image within the limits
+/// above, its pixels then counted in `used`. Only the image's header is read.
+fn admit<'a>(bytes: &'a [u8], used: &AtomicU64) -> Option<std::borrow::Cow<'a, [u8]>> {
+    let bytes = super::svg_guard::resource(bytes)?;
+    let Some((width, height)) = image::ImageReader::new(std::io::Cursor::new(&bytes))
         .with_guessed_format()
         .ok()
         .filter(|r| r.format().is_some())
         .and_then(|r| r.into_dimensions().ok())
     else {
-        return true;
+        return Some(bytes);
     };
     let pixels = u64::from(width) * u64::from(height);
     if pixels > MAX_IMAGE_PIXELS {
-        return false;
+        return None;
     }
     let before = used.fetch_add(pixels, Ordering::AcqRel);
     if before + pixels > MAX_TOTAL_PIXELS {
         used.fetch_sub(pixels, Ordering::AcqRel);
-        return false;
+        return None;
     }
-    true
+    Some(bytes)
 }
 
 pub struct Resources {
@@ -119,16 +122,17 @@ impl Resources {
         use std::hash::{BuildHasher, BuildHasherDefault, DefaultHasher};
         let hash = BuildHasherDefault::<DefaultHasher>::default().hash_one(url);
         let mut served = self.served.lock().unwrap_or_else(|e| e.into_inner());
-        let admitted = match served.get(&hash) {
-            Some(&admitted) => admitted,
+        match served.get(&hash) {
+            // Let through before (its pixels counted then): as handed over then.
+            Some(true) => super::svg_guard::resource(bytes).map(|b| b.into_owned()).unwrap_or_default(),
+            Some(false) => Vec::new(),
             None => {
-                let admitted = admit(bytes, &self.pixels);
-                served.insert(hash, admitted);
+                let admitted = admit(bytes, &self.pixels).map(|b| b.into_owned());
+                served.insert(hash, admitted.is_some());
                 self.changed.store(true, Ordering::Release);
-                admitted
+                admitted.unwrap_or_default()
             }
-        };
-        if admitted { bytes.to_vec() } else { Vec::new() }
+        }
     }
     /// The fetchers' queue, started now if it isn't yet: `FETCHERS` threads
     /// per document sharing one HTTP client, bounded concurrency, no work on
@@ -247,7 +251,16 @@ fn fetch_all(
                     .read_to_end(&mut bytes)
                     .ok()?;
                 used = (bytes.len() as u64).min(limit);
-                (bytes.len() as u64 <= limit && admit(&bytes, pixels)).then_some((resolved, bytes))
+                if bytes.len() as u64 > limit {
+                    return None;
+                }
+                // As fetched, unless `admit` hands over something else (an
+                // SVGZ inflated): no copy of every image.
+                let replaced = match admit(&bytes, pixels)? {
+                    std::borrow::Cow::Borrowed(_) => None,
+                    std::borrow::Cow::Owned(other) => Some(other),
+                };
+                Some((resolved, replaced.unwrap_or(bytes)))
             })();
             fetched.fetch_sub(limit - used, Ordering::AcqRel);
             result
@@ -488,13 +501,13 @@ mod tests {
             out
         };
         let used = AtomicU64::new(0);
-        assert!(admit(b"body { color: red }", &used));
-        assert!(admit(&png(600, 400), &used));
+        assert!(admit(b"body { color: red }", &used).is_some());
+        assert!(admit(&png(600, 400), &used).is_some());
         assert_eq!(used.load(Ordering::Relaxed), 240_000);
         // 50 million pixels: 200 MB decoded, from a file of some kilobytes.
-        assert!(!admit(&png(10_000, 5_000), &used));
+        assert!(admit(&png(10_000, 5_000), &used).is_none());
         used.store(MAX_TOTAL_PIXELS - 100, Ordering::Relaxed);
-        assert!(!admit(&png(20, 20), &used));
+        assert!(admit(&png(20, 20), &used).is_none());
         assert_eq!(used.load(Ordering::Relaxed), MAX_TOTAL_PIXELS - 100);
     }
 

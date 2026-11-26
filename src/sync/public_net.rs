@@ -57,15 +57,91 @@ pub(crate) fn public_ip(ip: std::net::IpAddr) -> bool {
     }
 }
 
+/// The proxies requests go through, as reqwest finds them (`HTTP_PROXY`
+/// and the like, or the system's settings on macOS and Windows), and the
+/// proxies' own names: a corporate proxy is on the local network, and is
+/// looked up and reached there.
+struct Proxies {
+    matcher: hyper_util::client::proxy::matcher::Matcher,
+    hosts: std::collections::HashSet<String>,
+}
+fn proxies() -> &'static Proxies {
+    static PROXIES: std::sync::OnceLock<Proxies> = std::sync::OnceLock::new();
+    PROXIES.get_or_init(|| {
+        let matcher = hyper_util::client::proxy::matcher::Matcher::from_system();
+        let hosts = ["http://example.com/", "https://example.com/"]
+            .into_iter()
+            .filter_map(|u| matcher.intercept(&http::Uri::from_static(u)))
+            .filter_map(|i| i.uri().host().map(|h| h.trim_matches(['[', ']']).to_ascii_lowercase()))
+            .collect();
+        Proxies { matcher, hosts }
+    })
+}
+
+/// Whether a request to `url` would reach this computer or its network:
+/// its host is such an address (`names_local_address`), or the request goes
+/// through a proxy, which looks the name up itself (so `PublicOnly` never
+/// sees it), and the name leads there here. A name only the proxy can look
+/// up goes on, as it does for email images (`display::html::resources`).
+pub(crate) fn reaches_inside(url: &url::Url) -> bool {
+    if names_local_address(url) {
+        return true;
+    }
+    if cfg!(test) {
+        return false;
+    }
+    let Some(url::Host::Domain(name)) = url.host() else {
+        return false;
+    };
+    let proxies = proxies();
+    // The proxy itself, at any port: `PublicOnly` lets its name reach the
+    // local network, to connect through it.
+    if proxies.hosts.contains(&name.to_ascii_lowercase()) {
+        return true;
+    }
+    let proxied = url
+        .as_str()
+        .parse::<http::Uri>()
+        .is_ok_and(|uri| proxies.matcher.intercept(&uri).is_some());
+    if !proxied {
+        // Straight there: `PublicOnly` checks the name as it connects.
+        return false;
+    }
+    use std::net::ToSocketAddrs as _;
+    // Every address: with a public one and a private one, the proxy may
+    // well connect to the private one.
+    (name, 0)
+        .to_socket_addrs()
+        .is_ok_and(|mut found| found.any(|a| !public_ip(a.ip())))
+}
+
+/// Redirects for fetches from addresses strangers chose (an email's domain,
+/// a policy's host): at most `max`, each to https (any scheme in tests,
+/// whose servers are plain http) and not to this computer or its network
+/// (`reaches_inside`). With `PublicOnly` as the client's resolver.
+pub(crate) fn public_redirects(max: usize) -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(move |attempt| {
+        let url = attempt.url();
+        if attempt.previous().len() >= max || (url.scheme() != "https" && !cfg!(test)) || reaches_inside(url) {
+            attempt.stop()
+        } else {
+            attempt.follow()
+        }
+    })
+}
+
 /// Looks names up as the system does, keeping only addresses on the
 /// internet (`public_ip`; any address in tests, whose servers are on this
 /// computer): a name that leads to this computer or its network fails as if
 /// it didn't exist. Checked as reqwest connects, so a name can't answer
-/// with a public address when checked and a private one when used.
+/// with a public address when checked and a private one when used. The
+/// proxies' own names are looked up as they are; what goes through a proxy
+/// is checked before it's sent (`reaches_inside`).
 pub(crate) struct PublicOnly;
 impl reqwest::dns::Resolve for PublicOnly {
     fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
         let host = name.as_str().to_owned();
+        let proxy = proxies().hosts.contains(&host.to_ascii_lowercase());
         Box::pin(async move {
             use std::net::ToSocketAddrs as _;
             let found = tokio::task::spawn_blocking(move || {
@@ -74,7 +150,7 @@ impl reqwest::dns::Resolve for PublicOnly {
             .await??;
             let public: Vec<std::net::SocketAddr> = found
                 .into_iter()
-                .filter(|a| cfg!(test) || public_ip(a.ip()))
+                .filter(|a| cfg!(test) || proxy || public_ip(a.ip()))
                 .collect();
             if public.is_empty() {
                 return Err(t!("sync-public-net-the-address-leads-to-a-local").into());

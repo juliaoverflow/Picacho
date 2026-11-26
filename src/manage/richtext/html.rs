@@ -60,8 +60,29 @@ fn safe_src(url: &str, files: bool) -> bool {
         || (lower.starts_with("data:image/") && !lower.starts_with("data:image/svg"))
 }
 
-/// An element's attributes without handlers and unsafe values.
-fn clean_attrs(tag: &str, attrs: &[html5ever::Attribute], files: bool) -> Vec<(String, String)> {
+/// Whether CSS `css` loads anything from elsewhere: an `@import`, or a
+/// `url(…)` that isn't a picture inside it (`data:`) or the message's own
+/// (`cid:`). Pasted from a web page, such a style would fetch from the
+/// page's server as the draft is shown, and from every recipient's app.
+fn loads_remote(css: &str) -> bool {
+    let v: String = css
+        .chars()
+        .filter(|c| !c.is_whitespace() && !c.is_control())
+        .collect::<String>()
+        .to_ascii_lowercase()
+        .replace("\\", "");
+    if v.contains("@import") || v.contains("image-set(") {
+        return true;
+    }
+    v.match_indices("url(").any(|(at, _)| {
+        let rest = v[at + 4..].trim_start_matches(['"', '\'']);
+        !(rest.starts_with("data:") || rest.starts_with("cid:"))
+    })
+}
+
+/// An element's attributes without handlers and unsafe values; `local`
+/// (pasted HTML) without anything loaded from elsewhere either.
+fn clean_attrs(tag: &str, attrs: &[html5ever::Attribute], files: bool, local: bool) -> Vec<(String, String)> {
     let mut out = Vec::new();
     for a in attrs {
         let name = a.name.local.to_string().to_ascii_lowercase();
@@ -76,11 +97,12 @@ fn clean_attrs(tag: &str, attrs: &[html5ever::Attribute], files: bool) -> Vec<(S
         match name.as_str() {
             "href" if !safe_href(&value) => continue,
             "src" if tag != "img" || !safe_src(&value, files) => continue,
-            "background" | "lowsrc" | "dynsrc" if css::unsafe_value(&value) || !safe_src(&value, false) => continue,
+            "background" | "lowsrc" | "dynsrc" if local || css::unsafe_value(&value) || !safe_src(&value, false) => continue,
             "style" => {
                 let kept: Vec<(String, String)> = css::declarations(&value)
                     .into_iter()
                     .filter(|(n, v)| !css::unsafe_value(v) && !css::unsafe_value(n))
+                    .filter(|(_, v)| !(local && loads_remote(v)))
                     .collect();
                 if !kept.is_empty() {
                     out.push((name, css::style_attr(&kept)));
@@ -103,6 +125,8 @@ struct Builder {
     /// The element inline text outside any block goes in.
     root: Option<El>,
     files: bool,
+    /// Pasted: nothing loaded from elsewhere (`loads_remote`).
+    local: bool,
 }
 
 /// A space that collapses (HTML white space), kept apart from typed
@@ -279,7 +303,7 @@ fn walk(node: &Handle, b: &mut Builder, path: &mut Vec<El>, style: &Rc<Style>, p
             let tag = name.local.to_string().to_ascii_lowercase();
             if tag == "style" {
                 let css = flat_text(node);
-                if !css.trim().is_empty() && !css::unsafe_value(&css) {
+                if !css.trim().is_empty() && !css::unsafe_value(&css) && !(b.local && loads_remote(&css)) {
                     b.sheets.push(css.replace("</", "<\\/"));
                 }
                 return;
@@ -295,7 +319,7 @@ fn walk(node: &Handle, b: &mut Builder, path: &mut Vec<El>, style: &Rc<Style>, p
                 }
                 return;
             }
-            let attrs = clean_attrs(&tag, &attrs.borrow(), b.files);
+            let attrs = clean_attrs(&tag, &attrs.borrow(), b.files, b.local);
             match tag.as_str() {
                 "html" | "body" => {
                     for child in children().iter() {
@@ -463,8 +487,20 @@ fn inline_style(tag: &str, attrs: &[(String, String)], parent: &Style) -> Style 
 /// draft's own `file:` pictures through (Picacho's saved drafts), never
 /// for HTML from elsewhere.
 pub fn parse(html: &str, files: bool) -> Doc {
+    parse_with(html, files, false)
+}
+
+/// As `parse`, for HTML pasted from elsewhere (a web page): without the
+/// styles, backgrounds and style sheets that would load from its server
+/// (`loads_remote`), which would tell it whenever the draft or the sent
+/// message is shown.
+pub fn parse_pasted(html: &str) -> Doc {
+    parse_with(html, false, true)
+}
+
+fn parse_with(html: &str, files: bool, local: bool) -> Doc {
     let dom = html5ever::parse_document(RcDom::default(), Default::default()).one(html);
-    let mut b = Builder { blocks: vec![], current: None, sheets: vec![], root: None, files };
+    let mut b = Builder { blocks: vec![], current: None, sheets: vec![], root: None, files, local };
     // The head's style sheets.
     let mut stack = vec![dom.document.clone()];
     let mut body = None;
@@ -474,7 +510,7 @@ pub fn parse(html: &str, files: bool) -> Doc {
                 for child in n.children.borrow().iter() {
                     if tag_of(child).as_deref() == Some("style") {
                         let css = flat_text(child);
-                        if !css.trim().is_empty() && !css::unsafe_value(&css) {
+                        if !css.trim().is_empty() && !css::unsafe_value(&css) && !(local && loads_remote(&css)) {
                             b.sheets.push(css.replace("</", "<\\/"));
                         }
                     }
@@ -496,7 +532,7 @@ pub fn parse(html: &str, files: bool) -> Doc {
     // holds everything.
     let mut path = Vec::new();
     if let NodeData::Element { attrs, .. } = &body.data {
-        let mut kept = clean_attrs("div", &attrs.borrow(), files);
+        let mut kept = clean_attrs("div", &attrs.borrow(), files, local);
         let mut style: Vec<(String, String)> = Vec::new();
         kept.retain(|(n, v)| match n.as_str() {
             "style" => {

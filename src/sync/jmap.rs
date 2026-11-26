@@ -1623,9 +1623,30 @@ impl Session {
     pub fn download(&self, blob: &str, name: &str, kind: &str, limit: usize) -> Result<Vec<u8>> {
         self.download_in(&self.account_id.clone(), blob, name, kind, limit)
     }
+    /// As `download`, written to `out` as it arrives (see `download_into`).
+    pub fn download_to(&self, blob: &str, name: &str, kind: &str, limit: usize, out: &mut dyn std::io::Write) -> Result<u64> {
+        self.download_into(&self.account_id.clone(), blob, name, kind, limit, out)
+    }
     /// As `download`, from another of the sign-in's accounts (contacts'
     /// or calendars', which may not be the mail account).
     pub fn download_in(&self, account: &str, blob: &str, name: &str, kind: &str, limit: usize) -> Result<Vec<u8>> {
+        let mut bytes = Vec::new();
+        self.download_into(account, blob, name, kind, limit, &mut bytes)?;
+        Ok(bytes)
+    }
+    /// As `download_in`, written to `out` as it arrives rather than held
+    /// whole in memory (an attachment saved or opened, which may be
+    /// large). Returns its size. What was written before a failure stays
+    /// in `out`; the caller drops it.
+    pub fn download_into(
+        &self,
+        account: &str,
+        blob: &str,
+        name: &str,
+        kind: &str,
+        limit: usize,
+        out: &mut dyn std::io::Write,
+    ) -> Result<u64> {
         let url = expand_template(
             &self.download_url,
             &[("accountId", account), ("blobId", blob), ("name", name), ("type", kind)],
@@ -1649,14 +1670,22 @@ impl Session {
         {
             bail!(t!("sync-jmap-message-exceeds-the-download-limit"));
         }
-        let mut bytes = Vec::new();
         use std::io::Read;
-        response
-            .take(limit as u64 + 1)
-            .read_to_end(&mut bytes)
-            .map_err(|e| anyhow::Error::new(e).context(t!("sync-jmap-jmap-download-failed")))?;
-        ensure!(bytes.len() <= limit, t!("sync-jmap-message-exceeds-the-download-limit"));
-        Ok(bytes)
+        let mut response = response.take(limit as u64 + 1);
+        let mut buffer = vec![0u8; 256 * 1024];
+        let mut written: u64 = 0;
+        loop {
+            let n = response
+                .read(&mut buffer)
+                .map_err(|e| anyhow::Error::new(e).context(t!("sync-jmap-jmap-download-failed")))?;
+            if n == 0 {
+                break;
+            }
+            written += n as u64;
+            ensure!(written <= limit as u64, t!("sync-jmap-message-exceeds-the-download-limit"));
+            out.write_all(&buffer[..n])?;
+        }
+        Ok(written)
     }
     /// GETs a download, following redirects (a CDN's, or a presigned
     /// address) over https, at most five. Credentials go only to the

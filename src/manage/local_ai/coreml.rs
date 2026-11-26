@@ -63,14 +63,21 @@ fn copy_dir(from: &Path, to: &Path) -> Result<()> {
 pub struct CoreMlModel {
     model: Retained<MLModel>,
     dim: usize,
+    /// Predictions are made one at a time, whichever thread asks.
+    one_at_a_time: std::sync::Mutex<()>,
 }
+// The model is shared with the threads inference runs on. Its Objective-C
+// object is reference-counted atomically, isn't changed after loading, and
+// is only used for predictions, which `one_at_a_time` makes one at a time.
+unsafe impl Send for CoreMlModel {}
+unsafe impl Sync for CoreMlModel {}
 
 impl CoreMlModel {
     pub fn load(compiled: &Path, dim: usize) -> Result<Self> {
         let model = autoreleasepool(|_| {
             unsafe { MLModel::modelWithContentsOfURL_error(&url(compiled)) }.map_err(error)
         })?;
-        Ok(Self { model, dim })
+        Ok(Self { model, dim, one_at_a_time: std::sync::Mutex::new(()) })
     }
 
     /// The probability for one sparse feature vector of (index, value).
@@ -81,6 +88,7 @@ impl CoreMlModel {
     /// arrays until the thread ended: tens of kilobytes each, for every code
     /// candidate in every message shown.
     pub fn score(&self, x: &[(usize, f32)]) -> Result<f32> {
+        let _one = self.one_at_a_time.lock().unwrap_or_else(|e| e.into_inner());
         autoreleasepool(|_| self.score_in_pool(x))
     }
 

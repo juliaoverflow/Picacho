@@ -121,6 +121,12 @@ impl DatabaseKey {
         Ok(Self(key))
     }
 
+    /// The key for the files kept encrypted beside the database while it
+    /// is (`sealed_files`), derived from this one.
+    pub fn file_key(&self) -> Zeroizing<[u8; 32]> {
+        crate::manage::crypto::hkdf(self.0.as_ref(), crate::manage::sealed_files::KEY_INFO)
+    }
+
     /// The key as SQLCipher takes it, raw rather than a passphrase:
     /// `x'…'`, for `PRAGMA key` and `ATTACH … KEY`.
     pub fn sql_literal(&self) -> Zeroizing<String> {

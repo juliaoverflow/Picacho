@@ -574,7 +574,9 @@ impl MailApp {
                     let d = &composer.read(cx).draft;
                     (d.id.clone(), d.account.clone())
                 };
-                let _ = self.backend.discard_draft(&id);
+                // After its saves, in order (`queue_draft_write`).
+                let backend = self.backend.clone();
+                drop(super::composer::queue_draft_write(move || backend.discard_draft(&id)));
                 self.close_composer(&composer, cx);
                 self.refresh_drafts(cx);
                 self.sync_drafts_soon(&account, cx);
@@ -634,7 +636,11 @@ impl MailApp {
         let id = a.id.clone();
         self.task(
             cx,
-            move |b| b.sync_drafts(&a),
+            move |b| {
+                // With the drafts saved just before.
+                super::composer::wait_for_draft_writes(None);
+                b.sync_drafts(&a)
+            },
             move |this, result, cx| {
                 this.draft_syncs.remove(&id);
                 this.account_result(&id, IssueSource::Sync(Folder::Drafts.key().into()), &result);
@@ -708,10 +714,17 @@ impl MailApp {
         }
     }
 
-    /// Saves every open draft now, on this thread: before quitting.
+    /// Saves every open draft before quitting, and waits for every draft
+    /// write queued (`composer::queue_draft_write`) to be done: the app
+    /// ends right after. At most `QUIT_WAIT`: a cache held longer than that
+    /// (by a sync) doesn't keep Picacho from quitting.
     pub(super) fn persist_draft(&mut self, cx: &mut App) {
+        const QUIT_WAIT: Duration = Duration::from_secs(10);
         for composer in self.composers.clone() {
             composer.update(cx, |c, cx| c.save_now(cx));
+        }
+        if !super::composer::wait_for_draft_writes(Some(QUIT_WAIT)) {
+            eprintln!("Picacho: quitting before every draft was saved");
         }
     }
 
@@ -832,7 +845,12 @@ impl MailApp {
         let account_id = a.id.clone();
         self.task(
             cx,
-            move |b| b.send_noting(&a, &draft),
+            move |b| {
+                // Its saves first: sending discards the draft, and a save
+                // landing after would bring it back.
+                super::composer::wait_for_draft_writes(None);
+                b.send_noting(&a, &draft)
+            },
             move |this, result, cx| {
                 let gone = result
                     .as_ref()
@@ -943,7 +961,10 @@ impl MailApp {
         );
         self.task(
             cx,
-            |b| b.store.scheduled_drafts(),
+            |b| {
+                super::composer::wait_for_draft_writes(None);
+                b.store.scheduled_drafts()
+            },
             move |this, result, cx| {
                 let Ok(drafts) = result else {
                     return;
@@ -982,7 +1003,10 @@ impl MailApp {
         self.scheduled_sending.insert(id.clone());
         self.task(
             cx,
-            move |b| b.send_scheduled(&a, &d.id),
+            move |b| {
+                super::composer::wait_for_draft_writes(None);
+                b.send_scheduled(&a, &d.id)
+            },
             move |this, result, cx| {
                 this.scheduled_sending.remove(&id);
                 match result {
@@ -1125,7 +1149,9 @@ impl MailApp {
                         let d = &composer.read(cx).draft;
                         (d.id.clone(), d.account.clone())
                     };
-                    let _ = this.backend.discard_draft(&id);
+                    // After its saves, in order (`queue_draft_write`).
+                    let backend = this.backend.clone();
+                    drop(super::composer::queue_draft_write(move || backend.discard_draft(&id)));
                     this.close_composer(&composer, cx);
                     this.refresh_drafts(cx);
                     this.sync_drafts_soon(&account, cx);

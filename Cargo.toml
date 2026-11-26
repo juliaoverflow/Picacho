@@ -432,8 +432,9 @@ ksni = { version = "0.3", features = ["blocking"] }
 # memory small (manage/memory.rs).
 libc = "0.2"
 # The desktop portal's print dialog (Print) and Open With dialog (OpenURI
-# with `ask`), also inside Flatpak; the version GPUI already uses.
-ashpd = { version = "0.13", default-features = false, features = ["async-io", "open_uri", "print"] }
+# with `ask`), also inside Flatpak, and its Background request, which starts
+# Picacho at sign-in from inside Flatpak; the version GPUI already uses.
+ashpd = { version = "0.13", default-features = false, features = ["async-io", "background", "open_uri", "print"] }
 
 [patch.crates-io]
 # Patched crates, one folder each with its patches and README:
@@ -442,20 +443,23 @@ ashpd = { version = "0.13", default-features = false, features = ["async-io", "o
 # An email's unresolvable image or link address no longer panics; text in
 # padded inline blocks and centered cells is hit (selected, clicked) where shown;
 # blocks directly in a table (columns restacked for phones) are laid out.
-# TEMPORARY: the local fix/blitz-table-block-children branch (with its email
-# legacy attributes and media device pixel ratio patches) until it is merged;
-# then back to the git dependency and `cargo update -p blitz-dom -p blitz-paint`.
+# TEMPORARY: the fix/blitz-table-block-children branch (with its email
+# legacy attributes and media device pixel ratio patches), pinned to a
+# published commit, until it is merged; then back to the vendor-split-dev
+# git dependency and `cargo update -p blitz-dom -p blitz-paint`. Never a
+# `path` outside this repository: CI couldn't build it, and releases would
+# come from an unpublished local tree (`scripts/check-patches.sh`).
 # The HTML reader needs blitz-dom's `set_media_device_pixel_ratio` (0007).
-blitz-dom = { path = "../Picacho-Patches/blitz-dom/crate" }
+blitz-dom = { git = "https://github.com/juliaoverflow/Picacho-Patches", rev = "3b4f2483c853eed387097614296206ea0fdfab4f" }
 # Inline boxes paint gradient backgrounds (emails' dark styles); SVG images
 # are drawn in layers the dark recoloring recognizes (`is_image_layer`).
-blitz-paint = { path = "../Picacho-Patches/blitz-paint/crate" }
+blitz-paint = { git = "https://github.com/juliaoverflow/Picacho-Patches", rev = "3b4f2483c853eed387097614296206ea0fdfab4f" }
 # prefers-reduced-motion and prefers-contrast media queries (Media Queries 5
 # §11.3, §11.4), which blitz-dom's `set_media_preferences` sets.
-# TEMPORARY, as blitz-dom above: the local fix/blitz-table-block-children
-# branch until it is merged; then the git dependency like stylo_derive's.
-stylo = { path = "../Picacho-Patches/stylo/crate" }
-stylo_atoms = { path = "../Picacho-Patches/stylo_atoms/crate" }
+# TEMPORARY, as blitz-dom above: the fix/blitz-table-block-children
+# branch, pinned, until it is merged; then the git dependency like stylo_derive's.
+stylo = { git = "https://github.com/juliaoverflow/Picacho-Patches", rev = "3b4f2483c853eed387097614296206ea0fdfab4f" }
+stylo_atoms = { git = "https://github.com/juliaoverflow/Picacho-Patches", rev = "3b4f2483c853eed387097614296206ea0fdfab4f" }
 # ToCss error inference with GPUI's log/serde feature.
 stylo_derive = { git = "https://github.com/pinaltech/Picacho-Patches", branch = "vendor-split-dev" }
 # Parses Gmail's X-GM-MSGID and thread ids, OBJECTID, PREVIEW, SAVEDATE,
@@ -463,16 +467,21 @@ stylo_derive = { git = "https://github.com/pinaltech/Picacho-Patches", branch = 
 imap-proto = { git = "https://github.com/pinaltech/Picacho-Patches", branch = "vendor-split-dev" }
 # Maximized windows' content is no longer a resize edge.
 gpui-component = { git = "https://github.com/pinaltech/Picacho-Patches", branch = "vendor-split-dev" }
+# Backdrop blur (`Window::paint_backdrop_blur`), drawn by the wgpu renderer
+# (Linux), for the closing cover. TEMPORARY, as blitz-dom above: the
+# feat/gpui-backdrop-blur branch, pinned, until it is merged.
+gpui-pre = { git = "https://github.com/juliaoverflow/Picacho-Patches", rev = "382f207c209d1fcb3946cfb0aee492df2172d36a" }
+gpui-pre-wgpu = { git = "https://github.com/juliaoverflow/Picacho-Patches", rev = "382f207c209d1fcb3946cfb0aee492df2172d36a" }
 
 # Proton push notifications: Android messaging tokens registered against
 # their Firebase installation (see the folder's README). A [patch] only
 # applies from the top-level workspace, so it must be here rather than in
 # protected_email_bridge.
-# TEMPORARY, as blitz above: the local branch's gpui-mobile, with its
+# TEMPORARY, as blitz above: that branch's gpui-mobile, pinned, with its
 # password keyboard (patch 0003, `KeyboardType::Password`), until merged;
 # then this section goes and `cargo update -p gpui-mobile`.
 [patch."https://github.com/pinaltech/Picacho-Patches"]
-gpui-mobile = { path = "../Picacho-Patches/gpui-mobile/crate" }
+gpui-mobile = { git = "https://github.com/juliaoverflow/Picacho-Patches", rev = "3b4f2483c853eed387097614296206ea0fdfab4f" }
 
 [patch."https://github.com/agusibrahim/fcm_receiver.rs"]
 fcm_receiver_rs = { git = "https://github.com/pinaltech/Picacho-Patches", branch = "vendor-split-dev" }

@@ -116,6 +116,25 @@ struct Checker {
     authenticator: MessageAuthenticator,
     cache: Cache,
 }
+/// The system's DNS configuration (its name servers and options), read
+/// once. On Android, hickory reads it through the app's context
+/// (ndk-context), which Picacho sets only while it reads this and opens the
+/// keychain, before anything else runs (`android::attach`): read later,
+/// from a thread while the context is being set or released, would be a
+/// data race. Every resolver here starts from this.
+pub(crate) fn system_conf() -> Option<(
+    mail_auth::hickory_resolver::config::ResolverConfig,
+    mail_auth::hickory_resolver::config::ResolverOpts,
+)> {
+    type Conf = (
+        mail_auth::hickory_resolver::config::ResolverConfig,
+        mail_auth::hickory_resolver::config::ResolverOpts,
+    );
+    static CONF: OnceLock<Option<Conf>> = OnceLock::new();
+    CONF.get_or_init(|| mail_auth::hickory_resolver::system_conf::read_system_conf().ok())
+        .clone()
+}
+
 /// The resolver and its runtime; None when the system's DNS settings can't
 /// be read.
 fn checker() -> Option<&'static Checker> {
@@ -132,8 +151,7 @@ fn checker() -> Option<&'static Checker> {
                 .build()
                 .ok()?;
             let authenticator = runtime.block_on(async {
-                let (config, mut options) =
-                    mail_auth::hickory_resolver::system_conf::read_system_conf().ok()?;
+                let (config, mut options) = system_conf()?;
                 // A slow server delays only the details panel, briefly.
                 options.timeout = Duration::from_secs(4);
                 options.attempts = 2;
@@ -460,8 +478,7 @@ fn validating() -> Option<&'static mail_auth::hickory_resolver::TokioResolver> {
         .get_or_init(|| {
             let checker = checker()?;
             let _entered = checker.runtime.enter();
-            let (config, mut options) =
-                mail_auth::hickory_resolver::system_conf::read_system_conf().ok()?;
+            let (config, mut options) = system_conf()?;
             options.timeout = Duration::from_secs(4);
             options.attempts = 2;
             options.validate = true;

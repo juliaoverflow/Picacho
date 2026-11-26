@@ -30,6 +30,8 @@ fn icon_rgba(size: u32) -> Option<Vec<u8>> {
 }
 
 pub(super) use platform::{Tray, create, relabel};
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+pub(super) use platform::create_patient;
 
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
 mod platform {
@@ -40,6 +42,18 @@ mod platform {
     /// ends it when dropped.
     pub(in crate::display) struct Tray {
         handle: ksni::blocking::Handle<Sni>,
+    }
+
+    impl Tray {
+        /// Shows that Picacho's window is opening: the icon pulses (KDE
+        /// Plasma draws items that need attention so) until it goes. Off the
+        /// caller's thread: the bus must never hold up opening the window.
+        pub(in crate::display) fn opening(&self) {
+            let handle = self.handle.clone();
+            std::thread::spawn(move || {
+                handle.update(|sni| sni.opening = true);
+            });
+        }
     }
 
     impl Drop for Tray {
@@ -68,12 +82,35 @@ mod platform {
     pub(in crate::display) struct Sni {
         commands: UnboundedSender<TrayCommand>,
         icons: Vec<ksni::Icon>,
+        /// The window is opening (see `Tray::opening`).
+        opening: bool,
     }
 
     impl Sni {
         fn send(&self, command: TrayCommand) {
             let _ = self.commands.unbounded_send(command);
         }
+        /// Opens the window (or the widget) with the activation token the
+        /// tray gave this click, so it comes to the front on Wayland.
+        fn open(&self, command: TrayCommand) {
+            if let Some(token) = click_token() {
+                crate::display::instance::offer_activation(token);
+            }
+            self.send(command);
+        }
+    }
+
+    /// The tray's activation token for the click being handled. KDE Plasma
+    /// sends it just before the click; others may send it a moment after,
+    /// or never.
+    fn click_token() -> Option<String> {
+        for _ in 0..25 {
+            if let Some(token) = ksni::current_xdg_activation_token() {
+                return Some(token);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        None
     }
 
     impl ksni::Tray for Sni {
@@ -86,6 +123,16 @@ mod platform {
         fn icon_pixmap(&self) -> Vec<ksni::Icon> {
             self.icons.clone()
         }
+        fn status(&self) -> ksni::Status {
+            if self.opening {
+                ksni::Status::NeedsAttention
+            } else {
+                ksni::Status::Active
+            }
+        }
+        fn attention_icon_pixmap(&self) -> Vec<ksni::Icon> {
+            self.icons.clone()
+        }
         fn tool_tip(&self) -> ksni::ToolTip {
             ksni::ToolTip {
                 title: TOOLTIP.into(),
@@ -93,20 +140,20 @@ mod platform {
             }
         }
         fn activate(&mut self, _x: i32, _y: i32) {
-            self.send(TrayCommand::Open);
+            self.open(TrayCommand::Open);
         }
         fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
             use ksni::menu::{MenuItem, StandardItem};
             vec![
                 StandardItem {
                     label: t!("tray-open-picacho").into(),
-                    activate: Box::new(|this: &mut Self| this.send(TrayCommand::Open)),
+                    activate: Box::new(|this: &mut Self| this.open(TrayCommand::Open)),
                     ..Default::default()
                 }
                 .into(),
                 StandardItem {
                     label: t!("tray-desktop-widget").into(),
-                    activate: Box::new(|this: &mut Self| this.send(TrayCommand::Widget)),
+                    activate: Box::new(|this: &mut Self| this.open(TrayCommand::Widget)),
                     ..Default::default()
                 }
                 .into(),
@@ -125,6 +172,19 @@ mod platform {
     /// Registers the icon with the desktop's tray. Talks to the session
     /// bus, so it runs off the main thread (see `shell`).
     pub(in crate::display) fn create(commands: UnboundedSender<TrayCommand>) -> Option<Tray> {
+        spawn(commands, false)
+    }
+
+    /// As `create`, for the background process, which may start with the
+    /// session (Settings → General), before the panel's tray is up: the
+    /// icon then appears once a tray does, rather than never.
+    pub(in crate::display) fn create_patient(
+        commands: UnboundedSender<TrayCommand>,
+    ) -> Option<Tray> {
+        spawn(commands, true)
+    }
+
+    fn spawn(commands: UnboundedSender<TrayCommand>, patient: bool) -> Option<Tray> {
         let icons = [32, 64]
             .into_iter()
             .filter_map(|size| {
@@ -140,12 +200,20 @@ mod platform {
                 })
             })
             .collect();
-        let tray = Sni { commands, icons };
+        let tray = Sni {
+            commands,
+            icons,
+            opening: false,
+        };
         // A sandbox may not own the well-known name the specification
         // asks for; trays find the icon without it.
         let sandboxed =
             std::env::var_os("FLATPAK_ID").is_some() || std::env::var_os("SNAP").is_some();
-        match tray.disable_dbus_name(sandboxed).spawn() {
+        match tray
+            .disable_dbus_name(sandboxed)
+            .assume_sni_available(patient)
+            .spawn()
+        {
             Ok(handle) => {
                 *SHOWN.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle.clone());
                 Some(Tray { handle })

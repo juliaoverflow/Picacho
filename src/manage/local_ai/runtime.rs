@@ -4,8 +4,9 @@ use anyhow::{Context, Result, ensure};
 use std::path::Path;
 
 /// Scores one sparse feature vector of (index, value): the probability the
-/// model gives the positive class.
-pub trait Scorer {
+/// model gives the positive class. Shared with the threads inference runs
+/// on, away from the window's.
+pub trait Scorer: Send + Sync {
     fn score(&self, x: &[(usize, f32)]) -> Result<f32>;
 }
 

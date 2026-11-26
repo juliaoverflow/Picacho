@@ -535,7 +535,7 @@ async fn windows(options: PublicKeyCredentialRequestOptions, cancel: &AtomicBool
         Win10::default().perform_auth(origin, options, WAIT.as_millis() as u32)
     });
     let signed = tokio::select! {
-        done = hello => done.map_err(|e| anyhow!(t!("sync-fido-windows-hello-stopped-unexpectedly", error = e)))??,
+        done = hello => done.map_err(|e| anyhow!(t!("sync-fido-windows-hello-stopped-unexpectedly", error = e.to_string())))??,
         () = cancelled(cancel) => return Err(WebauthnCError::Cancelled.into()),
     };
     let client_data = signed.response.client_data_json.clone();

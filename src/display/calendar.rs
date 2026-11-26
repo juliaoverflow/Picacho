@@ -198,6 +198,11 @@ impl MailApp {
         if self.invitations.contains_key(&m.id) || m.body.is_none() {
             return;
         }
+        // What was found per message, for the session: bounded, as the
+        // other caches of the reader are.
+        if self.invitations.len() >= super::READER_CACHE {
+            self.invitations.clear();
+        }
         // Calendar parts are attachments, or the message says it's an invitation.
         let likely = m.attachments().iter().any(|a| {
             a.mime.eq_ignore_ascii_case("text/calendar")
@@ -685,9 +690,15 @@ impl MailApp {
                 else {
                     return;
                 };
+                let Some(m) = self.messages.iter().find(|m| m.id == id).cloned() else {
+                    return;
+                };
+                let Some(a) = self.account_of(&m) else { return };
                 self.task(
                     cx,
-                    move |b| b.save_event(event, None),
+                    // One already in the calendar is replaced only by mail
+                    // from its organizer, vouched for by their domain.
+                    move |b| b.add_event_from_mail(&a, &m, event),
                     |this, r, cx| match r {
                         Ok(_) => this.notice(t!("calendar-added-to-your-calendar"), false, cx),
                         Err(e) => this.notice(format!("{e:#}"), true, cx),

@@ -16,11 +16,14 @@ use std::{
 };
 
 /// A value set when the app was built, which the same environment variable
-/// overrides at run time (for development against other registrations).
+/// overrides at run time in development builds only (for testing against
+/// other registrations and servers). A release build ignores it: anything
+/// that can set the app's environment could otherwise send its sign-ins,
+/// tokens and mail to servers of its choosing.
 fn setting(name: &str, built: Option<&'static str>) -> String {
     std::env::var(name)
         .ok()
-        .filter(|v| !v.is_empty())
+        .filter(|v| cfg!(debug_assertions) && !v.is_empty())
         .or(built.map(Into::into))
         .unwrap_or_default()
 }

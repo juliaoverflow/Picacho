@@ -4,6 +4,7 @@ mod document;
 mod pdf_scene;
 pub mod print;
 mod resources;
+pub(crate) mod svg_guard;
 #[cfg(test)]
 mod rendering_tests;
 #[cfg(test)]

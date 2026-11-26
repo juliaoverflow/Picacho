@@ -290,12 +290,26 @@ public final class PicachoActivity extends GpuiInputActivity {
             Native.launch(widgetUri);
         }
         if (intent != null && !intent.getBooleanExtra(HANDLED, false)) {
-            for (String request : Shared.requests(context, intent)) {
-                Native.launch(request);
-            }
             intent.putExtra(HANDLED, true);
+            // Copying shared files may take long (large files, another
+            // app's slow provider): off the UI thread, one share at a time,
+            // each handed to Rust once copied.
+            android.content.Context app = context.getApplicationContext();
+            Intent shared = new Intent(intent);
+            SHARES.execute(() -> {
+                for (String request : Shared.requests(app, shared)) {
+                    Native.launch(request);
+                }
+            });
         }
     }
+    /** The thread shares are copied on, one after another. */
+    private static final java.util.concurrent.ExecutorService SHARES =
+            java.util.concurrent.Executors.newSingleThreadExecutor(runnable -> {
+                Thread thread = new Thread(runnable, "picacho-shared");
+                thread.setDaemon(true);
+                return thread;
+            });
     /** Marks an intent whose share or link was handed to Rust already. */
     private static final String HANDLED = "tech.pinal.picacho.HANDLED";
 

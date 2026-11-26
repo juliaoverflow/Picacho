@@ -50,6 +50,8 @@ public final class GpuiPathPicker extends Activity {
     private static volatile String[] result;
 
     private boolean delivered;
+    /** The picker's activity started (see {@link #openFiles}). */
+    private static volatile boolean started;
 
     /**
      * Shows the picker and waits for it (never call on the UI thread): the
@@ -60,8 +62,18 @@ public final class GpuiPathPicker extends Activity {
             CountDownLatch latch = new CountDownLatch(1);
             done = latch;
             result = null;
+            started = false;
             activity.startActivity(new Intent(activity, GpuiPathPicker.class)
                     .putExtra(EXTRA_MULTIPLE, multiple));
+            // Android may not start the activity (from the background, say):
+            // then nothing would ever answer, and every later pick would
+            // wait behind this one. Once it has started, the person may take
+            // as long as they like (as SaveFile).
+            if (!latch.await(10, java.util.concurrent.TimeUnit.SECONDS) && !started) {
+                // Should it start after all, it answers no one.
+                done = null;
+                return null;
+            }
             latch.await();
             return result;
         }
@@ -70,6 +82,7 @@ public final class GpuiPathPicker extends Activity {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        started = true;
         if (savedInstanceState != null) {
             // Recreated while the picker is open: its result still comes here.
             return;

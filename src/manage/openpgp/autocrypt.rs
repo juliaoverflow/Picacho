@@ -239,18 +239,57 @@ impl Keyring {
     /// As `add_found`, for a key from an Autocrypt or Autocrypt-Gossip
     /// header (Autocrypt 1.1 §2.3, §2.4): marked as Autocrypt's, so
     /// `reset_peer` can forget it, unless it was already kept from a lookup.
+    ///
+    /// Nothing vouches for such a header: anyone can send mail as
+    /// `email` with their own key in it. So it never replaces a usable key
+    /// a lookup found (WKD, DNS, a keyserver), only refreshes that same
+    /// key; it can replace only an earlier Autocrypt key, as Autocrypt
+    /// 1.1 §2.3 has it. Key data over `AUTOCRYPT_KEY_LIMIT` isn't taken,
+    /// and past `AUTOCRYPT_KEYS` keys Autocrypt alone gave, the oldest go.
     pub fn add_autocrypt(&mut self, email: &str, data: &[u8]) -> Result<bool> {
+        anyhow::ensure!(
+            data.len() <= super::AUTOCRYPT_KEY_LIMIT,
+            t!("manage-openpgp-no-usable-key-for-was-found", email = email)
+        );
         let before = self.found_fingerprint(email);
+        // Whether or not the looked-up key is still usable: one expired
+        // or revoked must not let any sender's header take its place (a
+        // lookup can; a header can't vouch for itself).
+        if let Some(kept) = &before
+            && !self.autocrypt.contains(kept)
+            && key_fingerprint(data).as_deref() != Some(kept.as_str())
+        {
+            return Ok(false);
+        }
         let added = self.add_found(email, data)?;
         if added
             && let Some(fp) = self.found_fingerprint(email)
         {
             // The same key kept from a lookup is only refreshed, unmarked.
             if before.as_deref() != Some(fp.as_str()) && !self.autocrypt.contains(&fp) {
-                self.autocrypt.push(fp);
+                self.autocrypt.push(fp.clone());
             }
+            self.forget_oldest_autocrypt(&fp);
         }
         Ok(added)
+    }
+    /// Forgets the oldest keys only Autocrypt gave, past `AUTOCRYPT_KEYS`,
+    /// never `keep` (the one just added) nor one compared with its owner.
+    fn forget_oldest_autocrypt(&mut self, keep: &str) {
+        let over = self.autocrypt.len().saturating_sub(super::AUTOCRYPT_KEYS);
+        if over == 0 {
+            return;
+        }
+        let oldest: Vec<String> = self
+            .autocrypt
+            .iter()
+            .filter(|f| *f != keep && !self.checked(f))
+            .take(over)
+            .cloned()
+            .collect();
+        for fp in oldest {
+            self.remove(&fp);
+        }
     }
     /// Forgets the key Autocrypt gave for `email` (Autocrypt 1.1 §2.3 peer
     /// state is the caller's): only a key known solely from Autocrypt
@@ -268,11 +307,9 @@ impl Keyring {
     }
     /// The fingerprint of the found key kept for `email`, if there is one.
     pub(super) fn found_fingerprint(&self, email: &str) -> Option<String> {
-        self.public
-            .iter()
-            .filter_map(|k| SignedPublicKey::from_string(k).ok().map(|(k, _)| k))
+        self.each_public()
             .filter(|k| has_address(k, email))
-            .map(|k| fingerprint(&k))
+            .map(|k| fingerprint(&*k))
             .find(|f| self.found.contains(f))
     }
 }
@@ -541,5 +578,117 @@ mod tests {
         let fp = ring.list()[0].fingerprint.clone();
         ring.remove(&fp);
         assert!(ring.dnssec.is_empty());
+    }
+
+    /// Anyone can send mail as someone with their own key in an Autocrypt
+    /// header: it never replaces a usable key a lookup found, only
+    /// refreshes that same key, and replaces only an earlier Autocrypt key.
+    #[test]
+    fn autocrypt_never_replaces_a_key_a_lookup_found() {
+        let ana = public_bytes("Ana <ana@example.org>");
+        let forged = public_bytes("Ana <ana@example.org>");
+        let fp = key_fingerprint(&ana).unwrap();
+        for source in [Source::Wkd, Source::KeysOpenpgpOrg, Source::Dane { dnssec_validated: false }] {
+            let mut ring = Keyring::default();
+            ring.add_found_from("ana@example.org", &ana, source).unwrap();
+            let before = ring.clone();
+            assert!(!ring.add_autocrypt("ana@example.org", &forged).unwrap(), "{source:?}");
+            assert_eq!(ring, before, "{source:?}");
+            // The same key again is only refreshed.
+            assert!(ring.add_autocrypt("ana@example.org", &ana).unwrap(), "{source:?}");
+            assert_eq!(ring.found_fingerprint("ana@example.org"), Some(fp.clone()));
+            assert!(ring.autocrypt.is_empty());
+        }
+        // An Autocrypt key gives way to a newer one, as Autocrypt has it.
+        let mut ring = Keyring::default();
+        ring.add_autocrypt("ana@example.org", &ana).unwrap();
+        assert!(ring.add_autocrypt("ana@example.org", &forged).unwrap());
+        assert_eq!(ring.found_fingerprint("ana@example.org"), key_fingerprint(&forged));
+        assert_eq!(ring.autocrypt, [key_fingerprint(&forged).unwrap()]);
+        assert_eq!(ring.public.len(), 1);
+    }
+
+    /// A revoked key stays revoked: an older copy (in anyone's Autocrypt
+    /// header) is merged into it, not put in its place; and while revoked
+    /// (no longer usable), a header's other key still can't replace it.
+    #[test]
+    fn revocations_survive_older_copies() {
+        use pgp::ser::Serialize as _;
+        let secret = super::super::test_key("Ana <ana@example.org>", "");
+        let older = SignedPublicKey::from(secret.clone()).to_bytes().unwrap();
+        let revoked = super::super::keys::revocation_certificate(
+            &secret,
+            super::super::keys::RevocationReason::Compromised,
+            "",
+        )
+        .unwrap();
+        let fp = key_fingerprint(&older).unwrap();
+        for source in [Source::Wkd, Source::KeysOpenpgpOrg] {
+            let mut ring = Keyring::default();
+            ring.add_found_from("ana@example.org", revoked.as_bytes(), source).unwrap();
+            assert!(ring.key_for("ana@example.org").is_none(), "revoked: not usable");
+            let _ = ring.add_autocrypt("ana@example.org", &older);
+            let _ = ring.add_found("ana@example.org", &older);
+            let kept = ring.each_public().find(|k| fingerprint(&**k) == fp).unwrap();
+            assert!(!kept.details.revocation_signatures.is_empty(), "{source:?}: revocation dropped");
+            assert!(ring.key_for("ana@example.org").is_none(), "{source:?}");
+            // Another key in a header doesn't take the revoked one's place.
+            let forged = public_bytes("Ana <ana@example.org>");
+            assert!(!ring.add_autocrypt("ana@example.org", &forged).unwrap(), "{source:?}");
+            assert_eq!(ring.found_fingerprint("ana@example.org"), Some(fp.clone()));
+        }
+    }
+
+    /// Key data past the limit isn't taken; past `AUTOCRYPT_KEYS` keys
+    /// only Autocrypt gave, the oldest go, never one compared with its
+    /// owner nor the one just added.
+    #[test]
+    fn autocrypt_keys_are_bounded() {
+        let mut ring = Keyring::default();
+        let mut big = public_bytes("Ana <ana@example.org>");
+        big.resize(super::super::AUTOCRYPT_KEY_LIMIT + 1, 0);
+        assert!(ring.add_autocrypt("ana@example.org", &big).is_err());
+        assert_eq!(ring, Keyring::default());
+
+        let ana = public_bytes("Ana <ana@example.org>");
+        let bo = public_bytes("Bo <bo@example.se>");
+        let (ana_fp, bo_fp) = (key_fingerprint(&ana).unwrap(), key_fingerprint(&bo).unwrap());
+        let mut ring = Keyring::default();
+        ring.add_autocrypt("ana@example.org", &ana).unwrap();
+        ring.verify(&ana_fp);
+        ring.add_autocrypt("bo@example.se", &bo).unwrap();
+        // As if many senders' headers had come between: fingerprints alone
+        // (`add_found` drops marks of keys it doesn't have, so they are
+        // forgotten here directly).
+        ring.autocrypt.pop();
+        ring.autocrypt.extend((0..super::super::AUTOCRYPT_KEYS).map(|i| format!("{i:040X}")));
+        ring.autocrypt.push(bo_fp.clone());
+        ring.forget_oldest_autocrypt(&bo_fp);
+        assert_eq!(ring.autocrypt.len(), super::super::AUTOCRYPT_KEYS);
+        assert_eq!(ring.autocrypt[0], ana_fp, "checked: kept");
+        assert_eq!(ring.autocrypt[1], format!("{:040X}", 2), "the two oldest others went");
+        assert_eq!(ring.autocrypt.last(), Some(&bo_fp));
+        assert!(ring.key_for("bo@example.se").is_some() && ring.key_for("ana@example.org").is_some());
+    }
+
+    /// The keychain keeps only your own keys and choices; other people's
+    /// keys go to the database, and the two make the keyring again.
+    #[test]
+    fn keyring_splits_into_own_and_others() {
+        let mut ring = Keyring::default();
+        ring.secret.push(
+            super::super::test_key("Ana <ana@example.org>", "")
+                .to_armored_string(Default::default())
+                .unwrap(),
+        );
+        ring.set_prefers_mutual("ana@example.org", true);
+        assert!(!ring.has_others());
+        ring.add_found_from("bo@example.se", &public_bytes("Bo <bo@example.se>"), Source::Dane { dnssec_validated: true })
+            .unwrap();
+        assert!(ring.has_others());
+        let (own, others) = (ring.own_part(), ring.others_part());
+        assert!(own.public.is_empty() && own.found.is_empty() && own.dnssec.is_empty());
+        assert!(others.secret.is_empty() && others.prefer_mutual.is_empty());
+        assert_eq!(own.with_others(others), ring);
     }
 }

@@ -37,7 +37,11 @@ public final class UnreadWidgetProvider extends AppWidgetProvider {
     }
 
     static void updateAll(Context context, AppWidgetManager manager, int[] appWidgetIds) {
-        WidgetStore.Snapshot snap = WidgetStore.load(context);
+        updateAll(context, manager, appWidgetIds, WidgetStore.load(context));
+    }
+
+    static void updateAll(
+            Context context, AppWidgetManager manager, int[] appWidgetIds, WidgetStore.Snapshot snap) {
         for (int id : appWidgetIds) {
             updateOne(context, manager, id, snap);
         }

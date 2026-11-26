@@ -118,6 +118,16 @@ pub(super) struct LockUi {
     pub(super) obscured: bool,
     encrypted: bool,
     encryption_error: Option<String>,
+    /// Notifications tapped, and their buttons pressed, while locked: acted
+    /// on once unlocked, not behind the lock screen (a reply's composer
+    /// is a window of its own; Archive and Delete change mail).
+    pub(super) deferred: Vec<Deferred>,
+}
+
+/// What a notification asked for while Picacho was locked.
+pub(super) enum Deferred {
+    Open(crate::display::notify::Target),
+    Quick(crate::display::notify::Target, String),
 }
 
 impl LockUi {
@@ -148,6 +158,7 @@ impl LockUi {
             encryption_error: None,
             hide_contents: applock::hides_contents(store),
             obscured: false,
+            deferred: Vec::new(),
         }
     }
 
@@ -240,14 +251,19 @@ impl MailApp {
     }
 
     fn save_lock_settings(&mut self, settings: LockSettings, cx: &mut Context<Self>) {
-        match settings.save(&self.backend.store) {
-            Ok(()) => self.lock.settings = settings,
-            Err(e) => self.notice(
-                t!("applock-couldnt-save-the-app-locks-settings", e = format!("{:#}", e)),
-                true,
-                cx,
-            ),
-        }
+        let saved = settings.clone();
+        self.write_in_order(
+            cx,
+            move |b| saved.save(&b.store),
+            move |this, result, cx| match result {
+                Ok(()) => this.lock.settings = settings,
+                Err(e) => this.notice(
+                    t!("applock-couldnt-save-the-app-locks-settings", e = format!("{:#}", e)),
+                    true,
+                    cx,
+                ),
+            },
+        );
     }
 
     /// Locks Picacho now (when the lock is on).
@@ -299,6 +315,14 @@ impl MailApp {
         cx.set_global(Covered(false));
         cx.refresh_windows();
         self.focus.focus(w, cx);
+        // What notifications asked for meanwhile; what Picacho was opened
+        // with is taken as it draws again (`take_launch_requests`).
+        for deferred in std::mem::take(&mut self.lock.deferred) {
+            match deferred {
+                Deferred::Open(target) => self.open_notified(target, w, cx),
+                Deferred::Quick(target, action) => self.quick_action(target, &action, w, cx),
+            }
+        }
         cx.notify();
     }
 
@@ -419,6 +443,9 @@ impl MailApp {
     pub(super) fn sync_platform_privacy(&self) {
         #[cfg(target_os = "android")]
         crate::android::set_recents_private(self.lock.settings.enabled());
+        // iOS: the window is covered natively as Picacho leaves the screen.
+        #[cfg(target_os = "ios")]
+        crate::ios::set_privacy_cover(self.lock.settings.enabled());
     }
 
     /// The main window came to the front (`active`) or left it.
@@ -519,11 +546,12 @@ impl MailApp {
         self.lock.form_error = None;
         let before = self.lock.settings.clone();
         let biometrics = self.lock.biometry.is_some();
+        let store = self.backend.store.clone();
         let work = cx.background_spawn(async move {
             if form != LockForm::Enable && !before.verify(&current) {
                 anyhow::bail!(t!("applock-that-isnt-the-current-passcode"));
             }
-            Ok(match form {
+            let settings = match form {
                 LockForm::Disable => LockSettings {
                     after: before.after,
                     ..LockSettings::default()
@@ -538,16 +566,16 @@ impl MailApp {
                     passcode: Some(PasscodeHash::new(&new_code)?),
                     ..before
                 },
-            })
+            };
+            // Saved here too, off the UI thread.
+            settings.save(&store)?;
+            Ok(settings)
         });
         cx.spawn_in(w, async move |this, cx| {
             let result = work.await;
             let _ = this.update_in(cx, |this, w, cx| {
                 this.lock.saving = false;
-                match result.and_then(|settings| {
-                    settings.save(&this.backend.store)?;
-                    Ok(settings)
-                }) {
+                match result {
                     Ok(settings) => {
                         this.lock.settings = settings;
                         this.sync_platform_privacy();
@@ -585,12 +613,18 @@ impl MailApp {
         self.lock.encryption_error = None;
         // Its own thread rather than the executor's: copying a large
         // database takes a while, and holds the cache meanwhile.
-        let store = self.backend.store.clone();
+        let backend = self.backend.clone();
         let (tx, rx) = futures::channel::oneshot::channel();
         let started = std::thread::Builder::new()
             .name(t!("applock-encrypt-database").into())
             .spawn(move || {
-                let _ = tx.send(store.set_encrypted(on));
+                let result = backend.store.set_encrypted(on);
+                // Decrypted copies of opened attachments lie outside the
+                // database: gone, written again when opened.
+                if on && result.is_ok() {
+                    backend.forget_opened_attachments();
+                }
+                let _ = tx.send(result);
             });
         if let Err(e) = started {
             self.lock.encrypting = false;

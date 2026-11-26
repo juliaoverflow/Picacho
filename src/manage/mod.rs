@@ -43,5 +43,7 @@ pub mod tracking;
 pub mod widgets;
 /// The optional encrypted database: its key and the keychain entry it's in.
 pub mod vault;
+/// Files beside the database kept encrypted while it is (drafts' attachments).
+pub mod sealed_files;
 
 pub mod reading;

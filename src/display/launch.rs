@@ -39,12 +39,22 @@ pub fn request(arg: &str) -> Option<String> {
         return Some(arg.to_owned());
     }
     if let Some(target) = arg.strip_prefix(NOTIFICATION) {
-        // Opens a message, or starts a reply to it, at most.
+        // Opens a message, or starts a reply to it, at most: anyone who can
+        // start Picacho (any program, a link) may ask for this, so never a
+        // button that changes mail (Archive, Delete, Mark as Read), which
+        // notifications' own buttons do where they're pressed.
         return serde_json::from_str::<super::notify::Target>(target)
-            .is_ok()
-            .then(|| arg.to_owned());
+            .ok()
+            .filter(|t| matches!(t.action.as_deref(), None | Some("reply")))
+            .map(|_| arg.to_owned());
     }
     if let Some(path) = arg.strip_prefix("attach:") {
+        // A phone's Share sheet. On a computer, anyone who can start
+        // Picacho could otherwise have any file of yours attached to a
+        // message unseen.
+        if !cfg!(any(target_os = "android", target_os = "ios")) {
+            return None;
+        }
         let path = Path::new(path);
         return path.is_file().then(|| format!("attach:{}", path.display()));
     }
@@ -199,6 +209,25 @@ mod tests {
         assert_eq!(request("https://example.com"), None);
         assert_eq!(request("mailto:a@b\nc"), None);
         assert!(request(r#"notification:{"account":"a","mailbox":"x"}"#).is_none(), "not a target");
+        // A notification target opens or replies, never changes mail.
+        let target = |action: Option<&str>| {
+            format!(
+                "{NOTIFICATION}{}",
+                serde_json::to_string(&super::super::notify::Target {
+                    account: "a".into(),
+                    mailbox: crate::manage::model::Folder::Inbox.into(),
+                    message: Some("m".into()),
+                    messages: vec![],
+                    action: action.map(str::to_owned),
+                })
+                .unwrap()
+            )
+        };
+        assert!(request(&target(None)).is_some());
+        assert!(request(&target(Some("reply"))).is_some());
+        for action in ["trash", "archive", "read", "delete"] {
+            assert!(request(&target(Some(action))).is_none(), "{action}");
+        }
         let dir = std::env::temp_dir().join(format!("picacho-launch-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let eml = dir.join("note.eml");
@@ -214,6 +243,12 @@ mod tests {
         assert_eq!(request(&msg_req).as_deref(), Some(msg_req.as_str()));
         assert_eq!(request(dir.join("missing.eml").to_str().unwrap()), None);
         assert_eq!(request(dir.join("missing.msg").to_str().unwrap()), None);
+        // Files are attached from a phone's Share sheet only.
+        let attach = format!("attach:{}", eml.display());
+        assert_eq!(
+            request(&attach).is_some(),
+            cfg!(any(target_os = "android", target_os = "ios"))
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

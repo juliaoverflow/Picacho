@@ -479,7 +479,28 @@ pub fn encrypted_part(raw: &[u8]) -> Option<(String, String)> {
 /// Whether `raw` is encrypted in any form Picacho knows (PGP/MIME, S/MIME,
 /// inline PGP): its text is ciphertext, read only when opened.
 pub fn is_encrypted(raw: &[u8]) -> bool {
-    sender_encrypted(raw) || encrypted_part(raw).is_some()
+    sender_encrypted(raw) || encrypted_part(raw).is_some() || inline_pgp_in_parts(raw)
+}
+
+/// Whether `raw` is inline PGP with files: a multipart message whose first
+/// plain-text part is an armored encrypted message (its files `.pgp` beside
+/// it). `sender_encrypted` reads the top-level body alone, which here is
+/// the multipart's preamble: a reply to such mail went out unencrypted.
+pub fn inline_pgp_in_parts(raw: &[u8]) -> bool {
+    let raw = &raw[..raw.len().min(MAX_MESSAGE)];
+    let Ok(parsed) = mailparse::parse_mail(raw) else {
+        return false;
+    };
+    if !parsed.ctype.mimetype.to_ascii_lowercase().starts_with("multipart/") {
+        return false;
+    }
+    let mut leaves = Vec::new();
+    crate::sync::mime::collect_leaves(&parsed, &mut leaves);
+    leaves
+        .into_iter()
+        .find(|p| p.ctype.mimetype.eq_ignore_ascii_case("text/plain"))
+        .and_then(|p| p.get_body().ok())
+        .is_some_and(|body| body.trim_start().starts_with("-----BEGIN PGP MESSAGE-----"))
 }
 
 /// Mirrors Stalwart's test for mail its sender already encrypted.

@@ -433,7 +433,9 @@ impl<T: Read + Write> PopSession<T> {
             }
         }
         let (count, _) = self.stat()?;
-        let mut out = Vec::with_capacity(count as usize);
+        // The count is the server's word: reserved only up to a few
+        // thousand, so a false one can't ask for gigabytes at once.
+        let mut out = Vec::with_capacity((count as usize).min(4096));
         let mut seen: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
         for number in 1..=count {
             let header = match self.top(number, max_header)? {
@@ -634,7 +636,9 @@ pub(crate) fn pop_login(
     }
     if a.kerberos {
         // Kerberos only: never a password, and never another mechanism.
-        let mechanism = Mechanism::choose(&sasl::KERBEROS_ORDER, offered.iter().copied())
+        // Bound to the TLS channel (GS2-KRB5-PLUS) where there is one, as
+        // SMTP and ManageSieve do.
+        let mechanism = Mechanism::choose_bound(&sasl::KERBEROS_ORDER, offered.iter().copied(), !binding.is_empty())
             .with_context(|| {
                 t!("sync-pop-doesnt-offer-kerberos-sign-in-sasl", host = a.incoming_host)
             })?;

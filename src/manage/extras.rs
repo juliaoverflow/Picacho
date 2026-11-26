@@ -231,7 +231,8 @@ impl Backend {
                 .filter(|n| !n.is_empty() && n != "." && n != "..")
                 .unwrap_or_else(|| format!("attachment-{}", i + 1));
             let path = dir.join(distinct_name(&name, &mut used));
-            std::fs::write(&path, bytes)?;
+            // Sealed while the database is encrypted (`sealed_files`).
+            crate::manage::sealed_files::write(&path, bytes)?;
             out.push(path);
             Ok(())
         };
@@ -287,7 +288,7 @@ impl Backend {
             stem
         };
         let path = dir.join(format!("{stem}.eml"));
-        std::fs::write(&path, plain)?;
+        crate::manage::sealed_files::write(&path, &plain)?;
         Ok(path)
     }
     /// Where the account's filter server is: ManageSieve on the incoming

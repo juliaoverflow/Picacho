@@ -424,10 +424,11 @@ impl Backend {
         folders: &[proton::Folder],
         s: &Session,
         m: &MessageMetadata,
+        pre: Option<&Prefetched>,
     ) -> Result<Mail> {
         let id = row_id(a, &m.id);
         let (folder, remote) = location(&m.label_ids, folders);
-        let mut mail = match self.store.message(&id)? {
+        let mut mail = match Prefetched::cached(pre, &self.store, &id)? {
             Some(cached) => cached,
             None => Mail {
                 id,
@@ -525,8 +526,9 @@ impl Backend {
                 complete = false;
             }
             let mut rows = Vec::with_capacity(listed.len());
+            let pre = Prefetched::new(&self.store, listed.iter().map(|m| row_id(a, &m.id)).collect())?;
             for m in &listed {
-                rows.push(self.proton_mail(a, &folders, s, m)?);
+                rows.push(self.proton_mail(a, &folders, s, m, Some(&pre))?);
             }
             // What the cache has here that Proton didn't list: within the
             // listed range (or anywhere, when the whole mailbox was listed),
@@ -555,8 +557,9 @@ impl Backend {
                 let current = s.metadata(&ids(a, &unlisted))?;
                 let still: std::collections::HashSet<String> =
                     current.iter().map(|m| row_id(a, &m.id)).collect();
+                let pre = Prefetched::new(&self.store, current.iter().map(|m| row_id(a, &m.id)).collect())?;
                 for m in &current {
-                    rows.push(self.proton_mail(a, &folders, s, m)?);
+                    rows.push(self.proton_mail(a, &folders, s, m, Some(&pre))?);
                 }
                 let gone: Vec<String> = unlisted
                     .iter()
@@ -616,8 +619,8 @@ impl Backend {
                         ended = true;
                         continue;
                     }
-                    if self.store.message(&row_id(a, &m.id))?.is_none() {
-                        added.push(self.proton_mail(a, &folders, s, m)?);
+                    if !self.store.has_message(&row_id(a, &m.id))? {
+                        added.push(self.proton_mail(a, &folders, s, m, None)?);
                     }
                 }
                 if last || ended || added.len() >= batch.min(PAGE) {
@@ -849,8 +852,10 @@ impl Backend {
             let folders = s.folders();
             let label = label_for(&folders, mailbox)?;
             let mut out = ServerResults::default();
-            for m in s.list_all(&label, SEARCH_MOST)? {
-                let row = self.proton_mail(a, &folders, s, &m)?;
+            let listed = s.list_all(&label, SEARCH_MOST)?;
+            let pre = Prefetched::new(&self.store, listed.iter().map(|m| row_id(a, &m.id)).collect())?;
+            for m in listed {
+                let row = self.proton_mail(a, &folders, s, &m, Some(&pre))?;
                 if search.matches(&row) {
                     out.total += 1;
                     if out.mails.len() < limit {

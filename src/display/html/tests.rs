@@ -826,3 +826,31 @@ fn screen_readers_get_the_emails_paragraphs_and_its_links() {
         ]
     );
 }
+
+/// An email's `<svg>` can't have usvg read a file (or, on Windows, a UNC
+/// path over SMB) by naming it in an `<image>`: the name is taken away
+/// before the first layout. A picture inside the email stays.
+#[test]
+fn svg_images_naming_files_are_not_loaded() {
+    let path = std::env::temp_dir().join(format!("picacho-svg-{}.png", std::process::id()));
+    let mut png = Vec::new();
+    image::RgbaImage::new(2, 2)
+        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .unwrap();
+    std::fs::write(&path, &png).unwrap();
+    use base64::Engine as _;
+    let inline = base64::engine::general_purpose::STANDARD.encode(&png);
+    let html = format!(
+        r#"<p>x</p><svg width="10" height="10"><image id="file" href="{}" width="2" height="2"/><image id="unc" xlink:href="\\host\share\x.png"/><image id="inside" href="data:image/png;base64,{inline}"/></svg>"#,
+        path.display()
+    );
+    let mut email = EmailDocument::new(&html, true);
+    let _ = std::fs::remove_file(&path);
+    for (id, kept) in [("file", false), ("unc", false), ("inside", true)] {
+        let node = email.doc.query_selector(&format!("#{id}")).unwrap().unwrap();
+        let element = email.doc.get_node(node).unwrap().element_data().unwrap();
+        let has_href = element.attrs().iter().any(|a| &*a.name.local == "href");
+        assert_eq!(has_href, kept, "{id}");
+    }
+    email.layout(400);
+}

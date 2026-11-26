@@ -161,11 +161,13 @@ PlasmoidItem {
                             implicitHeight: 18
                         }
                         PlasmaComponents.Label {
+                            textFormat: Text.PlainText
                             text: word("calendar", "Calendar")
                             font.bold: true
                             Layout.fillWidth: true
                         }
                         PlasmaComponents.Label {
+                            textFormat: Text.PlainText
                             text: Qt.formatDate(new Date(), "ddd, MMM d")
                             font.pixelSize: 11
                             opacity: 0.65
@@ -229,12 +231,14 @@ PlasmoidItem {
                             Layout.fillWidth: true
                             spacing: 1
                             PlasmaComponents.Label {
+                                textFormat: Text.PlainText
                                 Layout.fillWidth: true
                                 text: modelData.title || word("no-title", "(No title)")
                                 font.bold: true
                                 elide: Text.ElideRight
                             }
                             PlasmaComponents.Label {
+                                textFormat: Text.PlainText
                                 Layout.fillWidth: true
                                 text: root.formatEventTime(modelData)
                                 font.pixelSize: 11
@@ -242,6 +246,7 @@ PlasmoidItem {
                                 elide: Text.ElideRight
                             }
                             PlasmaComponents.Label {
+                                textFormat: Text.PlainText
                                 visible: !!(modelData.location && modelData.location.length > 0)
                                 Layout.fillWidth: true
                                 text: modelData.location || ""
@@ -254,6 +259,7 @@ PlasmoidItem {
                 }
 
                 PlasmaComponents.Label {
+                    textFormat: Text.PlainText
                     anchors.centerIn: parent
                     visible: eventList.count === 0
                     opacity: 0.65

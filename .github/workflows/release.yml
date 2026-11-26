@@ -66,6 +66,8 @@ jobs:
         with:
           ref: ${{ inputs.channel || github.sha }}
           fetch-depth: 0
+      - name: Crates come from this repository or a published source
+        run: sh scripts/check-patches.sh
       - id: version
         run: |
           sha=$(git rev-parse HEAD)

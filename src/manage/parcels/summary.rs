@@ -422,9 +422,14 @@ pub fn summarize_at(found: Vec<(Parcel, Sighting)>, now: i64) -> Vec<Tracked> {
     // 3. The same product, continued by a later message: the oldest
     // message first, with the parcel it fits that was expected the day it
     // came, or else the oldest it fits (first ordered, first delivered).
+    // Groups before `start` are known to be continued by none. A merge
+    // changes one group and removes another, so only that group can make
+    // an earlier one continued: the scan goes on from there, not from the
+    // first group again (which, merge after merge, made it cubic).
+    let mut start = 0;
     loop {
         let mut pair = None;
-        for b in 0..groups.len() {
+        for b in start..groups.len() {
             let fits: Vec<usize> = (0..groups.len())
                 .filter(|&a| a != b && continues(&groups[a], &groups[b]))
                 .collect();
@@ -448,6 +453,11 @@ pub fn summarize_at(found: Vec<(Parcel, Sighting)>, now: i64) -> Vec<Tracked> {
         let mut all = std::mem::take(&mut groups[a].members);
         all.extend(taken.members);
         groups[a] = describe(&found, all, at);
+        // Every group before `b` was continued by none; now the merged one
+        // may continue some of them, or itself be continued.
+        start = (0..b)
+            .find(|&e| e == a || (e != a && continues(&groups[a], &groups[e])))
+            .unwrap_or(b);
     }
     // 4. A carrier's parcel, and a shop's delivery of an order, that only
     // fit each other.
@@ -461,14 +471,16 @@ pub fn summarize_at(found: Vec<(Parcel, Sighting)>, now: i64) -> Vec<Tracked> {
                 d >= t.last - 86_400 && d <= t.last + CARRIER_TO_SHOP
             })
     };
+    // How many parcels fit each delivery, counted once (counted again for
+    // every parcel, it was cubic).
+    let fitted: Vec<usize> = (0..groups.len())
+        .map(|o| (0..groups.len()).filter(|&u| fits(&groups[u], &groups[o])).count())
+        .collect();
     let mut pairs: Vec<(usize, usize)> = Vec::new();
     for t in 0..groups.len() {
         let mut fit = (0..groups.len()).filter(|&o| fits(&groups[t], &groups[o]));
         if let (Some(o), None) = (fit.next(), fit.next())
-            && (0..groups.len())
-                .filter(|&u| fits(&groups[u], &groups[o]))
-                .count()
-                == 1
+            && fitted[o] == 1
         {
             pairs.push((t, o));
         }

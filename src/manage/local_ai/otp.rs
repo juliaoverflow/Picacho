@@ -136,8 +136,13 @@ impl Text {
         self.chars.get(i).copied()
     }
 
-    /// (start, end) of each candidate, in characters.
+    /// (start, end) of each candidate, in characters: the first
+    /// `MAX_CANDIDATES`, which is what the model scores.
     fn candidates(&self) -> Vec<(usize, usize)> {
+        self.candidates_within(MAX_CANDIDATES)
+    }
+    /// (start, end) of each candidate, in characters, the first `most`.
+    fn candidates_within(&self, most: usize) -> Vec<(usize, usize)> {
         let text: String = self.chars.iter().collect();
         // Byte offset of each character, to turn matches into characters.
         let starts: Vec<usize> = text.char_indices().map(|(i, _)| i).collect();
@@ -188,7 +193,7 @@ impl Text {
                 continue;
             }
             out.push((s, e));
-            if out.len() == MAX_CANDIDATES {
+            if out.len() == most {
                 break;
             }
         }
@@ -457,6 +462,73 @@ fn ascii_digit(c: char) -> char {
         .unwrap_or(c)
 }
 
+/// Every string in `text` shaped like a sign-in code, whether or not the
+/// model would take it for one (it only ever scores these), longest first:
+/// what is hidden where a code must never show (notifications, widgets) or
+/// before the model has read the message. No model is needed.
+pub fn candidates(text: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    // All of it, however long and however many: read in pieces of whole
+    // lines within what one reading takes (a line longer than that, at a
+    // space), every candidate of each.
+    for piece in pieces(text, MAX_TEXT / 2) {
+        let t = Text::new(piece, "");
+        for (s, e) in t.candidates_within(usize::MAX) {
+            let code = t.slice(s, e);
+            if !out.contains(&code) {
+                out.push(code);
+            }
+        }
+    }
+    out.sort_by_key(|c| std::cmp::Reverse(c.chars().count()));
+    out
+}
+
+/// `text` cut into pieces of at most about `most` characters, at line
+/// breaks, or at spaces within a line longer than that (a candidate never
+/// spans either).
+fn pieces(text: &str, most: usize) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut rest = text;
+    while rest.chars().count() > most {
+        let limit = rest.char_indices().nth(most).map_or(rest.len(), |(i, _)| i);
+        let cut = rest[..limit]
+            .rfind('\n')
+            .or_else(|| rest[..limit].rfind(char::is_whitespace))
+            .map_or(limit, |i| i + rest[i..].chars().next().map_or(1, char::len_utf8));
+        out.push(&rest[..cut]);
+        rest = &rest[cut..];
+    }
+    out.push(rest);
+    out
+}
+
+/// The codes to hide in a message's `subject` and `body` (its text or
+/// preview) where there is no Show code to click (notifications, widgets):
+/// those the model finds when it is loaded, else every string shaped like
+/// a code in either (`candidates`).
+pub fn codes_to_hide(detector: Option<&Detector>, subject: &str, body: &str) -> Vec<String> {
+    match detector {
+        Some(detector) => detector.codes(subject, body),
+        None => {
+            let mut codes = candidates(subject);
+            for code in candidates(body) {
+                if !codes.contains(&code) {
+                    codes.push(code);
+                }
+            }
+            codes.sort_by_key(|c| std::cmp::Reverse(c.chars().count()));
+            codes
+        }
+    }
+}
+
+/// `text` with every string shaped like a sign-in code hidden (see
+/// `candidates`).
+pub fn mask_all(text: &str) -> Cow<'_, str> {
+    mask(text, &candidates(text))
+}
+
 /// `code` with its letters and digits replaced by bullets; separators stay.
 fn bullets(code: &str) -> String {
     code.chars()
@@ -545,6 +617,38 @@ mod tests {
 
     /// The candidates, features, vectors and scores the training code
     /// computed for its examples come out the same here.
+    /// Outside the app: the model's codes when it is loaded, else every
+    /// string shaped like a code, in the subject and the preview alike.
+    #[test]
+    fn codes_to_hide_use_the_model_else_the_pattern() {
+        let detector = Detector::new(Box::new(model()), super::super::OTP.threshold);
+        let (subject, body) = ("Your order #839201 has shipped", "Order #839201 is on its way.");
+        assert!(codes_to_hide(Some(&detector), subject, body).is_empty());
+        assert_eq!(codes_to_hide(None, subject, body), ["839201"]);
+        let (subject, body) = ("Acme sign-in", "Your verification code is 482913. It expires in 10 minutes.");
+        assert_eq!(codes_to_hide(Some(&detector), subject, body), ["482913"]);
+        assert!(codes_to_hide(None, subject, body).contains(&"482913".to_owned()));
+    }
+
+    /// Where a code must never show, every string shaped like one is
+    /// hidden without the model: however long the text, however many there
+    /// are, and across lines cut at any character (a no-break space too).
+    #[test]
+    fn every_code_shaped_string_is_hidden_without_the_model() {
+        assert_eq!(mask_all("482913 is your Acme verification code"), "•••••• is your Acme verification code");
+        assert_eq!(mask_all("Your order #839201 has shipped"), "Your order #•••••• has shipped");
+        assert_eq!(mask_all("Lunch on Friday?"), "Lunch on Friday?");
+        let mut long = String::new();
+        for i in 0..3000u32 {
+            long.push_str(&format!("Line {i}\u{a0}code {}\n", 100_000 + i));
+        }
+        long.push_str(&"word ".repeat(9000));
+        long.push_str("last 987654");
+        let hidden = mask_all(&long);
+        assert!(!hidden.contains("100000") && !hidden.contains("102999") && !hidden.contains("987654"));
+        assert!(candidates(&long).len() > MAX_CANDIDATES);
+    }
+
     #[test]
     fn matches_the_training_code() {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("models/otp/parity.json");

@@ -51,17 +51,24 @@ final class AppLock {
 
     /**
      * Called from Rust: keeps Picacho's picture out of Recents while the app
-     * lock is on (Android 13 and later); screenshots still work.
+     * lock is on. Android 13 and later leave it out alone, and screenshots
+     * still work; before that, only a secure window (FLAG_SECURE) keeps it
+     * out, which stops screenshots of Picacho too while the lock is on.
      */
     static void setRecentsPrivate(boolean on) {
-        if (Build.VERSION.SDK_INT < 33) {
-            return;
-        }
         PicachoActivity activity = PicachoActivity.current();
         if (activity == null) {
             return;
         }
-        activity.runOnUiThread(() -> recentsScreenshot(activity, !on));
+        activity.runOnUiThread(() -> {
+            if (Build.VERSION.SDK_INT >= 33) {
+                recentsScreenshot(activity, !on);
+            } else if (on) {
+                activity.getWindow().addFlags(android.view.WindowManager.LayoutParams.FLAG_SECURE);
+            } else {
+                activity.getWindow().clearFlags(android.view.WindowManager.LayoutParams.FLAG_SECURE);
+            }
+        });
     }
 
     @TargetApi(33)

@@ -186,7 +186,7 @@ remove it from `project.yml`; only that feature goes.
 
 ### Built-in sign-in
 
-Browser sign-in uses Picacho's own registration with each provider. Set these when building (the same variables at run time override them, for development):
+Browser sign-in uses Picacho's own registration with each provider. Set these when building (in development builds, the same variables at run time override them; release builds ignore them at run time):
 
 | Variable                                                   | Used for                                                                                                                                          |
 | ---------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -209,7 +209,7 @@ Without a Fastmail client, Fastmail asks for an API token. Other JMAP servers si
 
 Proton Mail without Bridge (Direct) identifies the app to Proton's API as `<platform>-<token>@<version>` (`x-pm-appversion`), from `PICACHO_PROTON_APP_TOKEN` and `PICACHO_PROTON_APP_VERSION`. Direct is offered only when at least one of them is set; the other then defaults to `picacho` or Picacho's own version. `<platform>` is the system Picacho was built for (`linux`, `macos` or `windows`); `PICACHO_PROTON_APP_PLATFORM_OVERRIDE` names another, such as `linux` on a Windows build. It doesn't make Direct available by itself. Without either of the first two, Proton Mail connects through Proton Mail Bridge alone. Unlike the variables above, these are only read at build time.
 
-A Proton Direct account can also receive Proton's push notifications as Proton's Android app does (its **Push notifications** setting). Picacho keeps one connection open to Firebase Cloud Messaging, and Proton sends each notification down it, encrypted to a device key only this installation holds; nothing is polled. One registration serves every such account: its token, the device key and the pushes already shown are kept in the system keychain, so restarting Picacho (or Android's mail service) reuses them. The Firebase project comes from `PICACHO_PROTON_FCM_API_KEY`, `PICACHO_PROTON_FCM_APP_ID` and `PICACHO_PROTON_FCM_PROJECT_ID` (all three needed for the setting to be offered), and for projects restricted to an Android app, `PICACHO_PROTON_FCM_PACKAGE` and `PICACHO_PROTON_FCM_CERT_SHA1` (the signing certificate's SHA-1, with or without colons); `PICACHO_PROTON_FCM_SENDER_ID` defaults to the project number in the app id, and `PICACHO_PROTON_FCM_VAPID_KEY` is optional. These are read at build time, and the same variables at run time override them. Registering the device with Proton (`POST /core/v4/devices`) can identify the app differently from every other request: `PICACHO_PROTON_PUSH_APP_TOKEN`, `PICACHO_PROTON_PUSH_APP_VERSION` and `PICACHO_PROTON_PUSH_APP_PLATFORM` (read at build time) replace the token, version and platform for that request alone, each one unset being the general one. Proton registers devices only for sessions that identify as its Android app (`PICACHO_PROTON_APP_PLATFORM_OVERRIDE=android`, `PICACHO_PROTON_APP_TOKEN=mail`). Failures (a registration Proton refused, a push that couldn't be opened) are logged to standard error, or Android's log; what a push says never is.
+A Proton Direct account can also receive Proton's push notifications as Proton's Android app does (its **Push notifications** setting). Picacho keeps one connection open to Firebase Cloud Messaging, and Proton sends each notification down it, encrypted to a device key only this installation holds; nothing is polled. One registration serves every such account: its token, the device key and the pushes already shown are kept in the system keychain, so restarting Picacho (or Android's mail service) reuses them. The Firebase project comes from `PICACHO_PROTON_FCM_API_KEY`, `PICACHO_PROTON_FCM_APP_ID` and `PICACHO_PROTON_FCM_PROJECT_ID` (all three needed for the setting to be offered), and for projects restricted to an Android app, `PICACHO_PROTON_FCM_PACKAGE` and `PICACHO_PROTON_FCM_CERT_SHA1` (the signing certificate's SHA-1, with or without colons); `PICACHO_PROTON_FCM_SENDER_ID` defaults to the project number in the app id, and `PICACHO_PROTON_FCM_VAPID_KEY` is optional. These are read at build time, and in development builds the same variables at run time override them. Registering the device with Proton (`POST /core/v4/devices`) can identify the app differently from every other request: `PICACHO_PROTON_PUSH_APP_TOKEN`, `PICACHO_PROTON_PUSH_APP_VERSION` and `PICACHO_PROTON_PUSH_APP_PLATFORM` (read at build time) replace the token, version and platform for that request alone, each one unset being the general one. Proton registers devices only for sessions that identify as its Android app (`PICACHO_PROTON_APP_PLATFORM_OVERRIDE=android`, `PICACHO_PROTON_APP_TOKEN=mail`). Failures (a registration Proton refused, a push that couldn't be opened) are logged to standard error, or Android's log; what a push says never is.
 
 ## Features
 
@@ -249,13 +249,19 @@ Beyond reading, writing and organizing mail, Picacho has:
   - *OpenPGP:* import your key and others' keys (`.asc`). Picacho also finds
     people's keys by itself: on their domain (WKD), on keys.openpgp.org, and
     in the Autocrypt headers their mail apps send. A key you imported never
-    gets replaced. Your signed mail carries your key the same way.
+    gets replaced, and an Autocrypt header (which anyone can forge) never
+    replaces a key found on the domain or a keyserver. Your signed mail
+    carries your key the same way.
+  - Your own keys are kept in the system keychain; other people's keys
+    are kept in Picacho's database.
   - *S/MIME:* import your certificate (`.p12`/`.pfx`). Others'
     certificates are kept from the signed mail they send you, or imported
     (`.pem`, `.crt`, `.cer`). Signatures are checked against your system's
     trusted authorities.
   - Mail encrypted to you opens when read and stays encrypted on disk. The
-    message details say who signed it, or that it was changed.
+    message details say who signed it, or that it was changed, and name
+    any attachments of an inline PGP message that its signature or
+    encryption doesn't cover.
   - The composer's **Sign** and **Encrypt** buttons sign with your key and
     encrypt to each recipient and yourself. Picacho looks up missing keys
     before sending, and says when one it found hasn't been checked. To

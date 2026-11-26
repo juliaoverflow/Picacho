@@ -189,10 +189,12 @@ impl MailApp {
     /// (`Backend::move_to_account`). The unified mailboxes take each
     /// message into its own account's.
     pub(super) fn drop_mail(&mut self, account: &str, mailbox: &Mailbox, d: &MailDrag, cx: &mut Context<Self>) {
+        // A set: a drag of thousands, checked against every listed message.
+        let ids: HashSet<&String> = d.ids.iter().collect();
         let dragged: Vec<Mail> = self
             .messages
             .iter()
-            .filter(|m| d.ids.contains(&m.id))
+            .filter(|m| ids.contains(&m.id))
             .cloned()
             .collect();
         if dragged.is_empty() {
@@ -749,13 +751,6 @@ impl MailApp {
                 .gap_y_1()
                 .text_size(px(12.))
                 .text_color(rgb(c.muted))
-                .when(searching_text, |d| {
-                    d.child(spinner(11., c.muted)).child(t!("organize-searching-message-text"))
-                })
-                .when(!searching_text && asking_servers, |d| {
-                    d.child(spinner(11., c.muted))
-                        .child(t!("organize-asking-the-server-about-mail-not"))
-                })
                 .when(!saved, |d| {
                     d.child(self.link(
                         "save-search",
@@ -771,6 +766,25 @@ impl MailApp {
                         Action::Organize(OrgAction::SearchEverywhere),
                         cx,
                     ))
+                })
+                // What is still being looked up goes after the links, in
+                // whatever room is left (basis 0, so it never wraps the row
+                // or moves the links while typing), cut short if need be.
+                .when(searching_text || asking_servers, |d| {
+                    d.child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .items_center()
+                            .gap_1p5()
+                            .child(div().flex_none().child(spinner(11., c.muted)))
+                            .child(div().min_w_0().truncate().child(if searching_text {
+                                t!("organize-searching-message-text")
+                            } else {
+                                t!("organize-asking-the-server-about-mail-not")
+                            })),
+                    )
                 })
                 .into_any_element(),
         )

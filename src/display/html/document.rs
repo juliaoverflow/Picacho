@@ -380,6 +380,8 @@ impl EmailDocument {
             screen_scale: 1.,
             preferences: None,
         };
+        // Before the first layout, which hands `<svg>` elements to usvg.
+        email.remove_svg_file_images();
         if blocked {
             email.prepare_blocked_images();
         }
@@ -406,6 +408,35 @@ impl EmailDocument {
             stack.extend(node.children.iter().rev().copied());
         }
         out
+    }
+    /// Takes from the email's `<svg>` elements' pictures (`<image>`,
+    /// `<feImage>`) every address but a picture inside the email (see
+    /// `svg_guard`): Blitz has usvg read them with its default options,
+    /// which read any path named from disk, a Windows UNC path over the
+    /// network, past the resource provider and with remote content blocked.
+    fn remove_svg_file_images(&mut self) {
+        let mut refused: Vec<(NodeId, QualName)> = Vec::new();
+        for id in self.elements() {
+            let Some(element) = self.doc.get_node(id).and_then(|n| n.element_data()) else {
+                continue;
+            };
+            let local = &*element.name.local;
+            if !(local.eq_ignore_ascii_case("image") || local.eq_ignore_ascii_case("feimage")) {
+                continue;
+            }
+            for attr in element.attrs() {
+                if &*attr.name.local == "href" && !super::svg_guard::href_allowed(&attr.value, 0) {
+                    refused.push((id, attr.name.clone()));
+                }
+            }
+        }
+        if refused.is_empty() {
+            return;
+        }
+        let mut mutator = self.doc.mutate();
+        for (id, name) in refused {
+            mutator.clear_attribute(id, name);
+        }
     }
     /// Marks the blocks whose lines hold only images (see `READER_CSS`):
     /// table cells in "almost standards" mode, any block in quirks mode.

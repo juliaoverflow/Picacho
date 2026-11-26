@@ -132,6 +132,10 @@ ui-notes = Notes
 
 ui-wait-for-the-current-message-to = Wait for the current message to finish sending.
 
+ui-closing-picacho = Closing Picacho…
+
+ui-moving-picacho-to-the-background = Moving Picacho to the background…
+
 ui-results-on-this-computer = Results on This Computer
 
 ui-refresh = Refresh
@@ -376,6 +380,10 @@ ui-attachment-saved = Attachment saved
 
 ui-signed-in-with-kerberos = Signed in with Kerberos
 
+ui-signed-in-with-basic-sign-in = Signed in with Basic sign-in
+
+ui-basic-sign-in-is-off = Basic sign-in is off. Picacho signs in with NTLM again.
+
 ui-signing-in-with-your-password-again = Signing in with your password again
 
 ui-enter-your-password-or-recovery-key = Enter your password or recovery key.
@@ -578,6 +586,10 @@ ui-client-id-if-your-administrator-gave = Client ID, if your administrator gave 
 
 ui-sign-in-with-kerberos = Sign in with Kerberos
 
+ui-allow-basic-sign-in = Allow Basic sign-in
+
+ui-basic-sign-in-sends-your-password = This server accepts only Basic sign-in, which sends your password itself (over HTTPS). Turn this on only if you trust the server.
+
 ui-for-organizations-whose-mail-servers-use = For organizations whose mail servers use Kerberos: Picacho uses the ticket this computer already has (kinit, or your domain sign-in) and no password.
 
 ui-some-jmap-services-such-as-fastmail = Some JMAP services, such as Fastmail, want an API token with mail access as the password.
@@ -741,8 +753,6 @@ ui-mb = { $mb } MB
 ui-sent-as = Sent as { $alias }
 
 ui-detached = Detached
-
-ui-sign-in-code = Sign-in code
 
 ui-beta-build = Beta Build
 

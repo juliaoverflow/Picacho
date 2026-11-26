@@ -271,6 +271,52 @@ struct Pending {
     stage: Stage,
 }
 
+/// Where other people's OpenPGP keys are kept (see `Backend::keyring`).
+const OPENPGP_KEYS: &str = "openpgp:keys";
+
+/// How many messages' verification results are kept (see `Recent`).
+const VERDICTS: usize = 1024;
+
+/// What was found in the messages read most recently, by id: at most
+/// `VERDICTS`, the oldest read going first. A message no longer here is
+/// checked again when its details are asked for. The background process
+/// runs for days, and S/MIME results carry certificate chains.
+pub(crate) struct Recent<V> {
+    found: HashMap<String, V>,
+    order: std::collections::VecDeque<String>,
+}
+
+impl<V: Clone> Recent<V> {
+    fn new() -> Self {
+        Self { found: HashMap::new(), order: std::collections::VecDeque::new() }
+    }
+    fn insert(&mut self, id: String, value: V) {
+        if self.found.insert(id.clone(), value).is_some() {
+            self.order.retain(|m| *m != id);
+        }
+        self.order.push_back(id);
+        while self.order.len() > VERDICTS {
+            if let Some(oldest) = self.order.pop_front() {
+                self.found.remove(&oldest);
+            }
+        }
+    }
+    fn get(&self, id: &str) -> Option<&V> {
+        self.found.get(id)
+    }
+    pub(crate) fn get_mut(&mut self, id: &str) -> Option<&mut V> {
+        self.found.get_mut(id)
+    }
+    fn retain(&mut self, keep: impl Fn(&str) -> bool) {
+        self.found.retain(|m, _| keep(m));
+        self.order.retain(|m| keep(m));
+    }
+    fn clear(&mut self) {
+        self.found.clear();
+        self.order.clear();
+    }
+}
+
 /// The saved text of the calendar's events, and the events read from it.
 type CalendarCache = (Arc<str>, Arc<Vec<crate::sync::caldav::Stored>>);
 
@@ -290,11 +336,11 @@ pub struct Backend {
     keyring: Mutex<Option<Arc<crate::manage::openpgp::Keyring>>>,
     /// What OpenPGP found in messages read with it, by id: decrypted, and
     /// whose signature. Memory only.
-    verdicts: Mutex<HashMap<String, crate::manage::openpgp::Verdict>>,
+    verdicts: Mutex<Recent<crate::manage::openpgp::Verdict>>,
     /// Your S/MIME certificates (`smime.rs`), read from the keychain once.
     certificates: Mutex<Option<Arc<crate::manage::smime::Certificates>>>,
     /// What S/MIME found in messages read with it, by id. Memory only.
-    smime_verdicts: Mutex<HashMap<String, crate::manage::smime::Verdict>>,
+    smime_verdicts: Mutex<Recent<crate::manage::smime::Verdict>>,
     /// The calendar's events as last read, with the saved text they were
     /// read from: the calendar and invitations ask for them as they draw,
     /// and every event was parsed again for each.
@@ -358,6 +404,10 @@ pub struct Backend {
     test_certificate: Option<Vec<u8>>,
     #[cfg(test)]
     test_secret: Option<Secret>,
+    /// Senders whose mail tests take as passing DMARC (`dmarc_verdict`),
+    /// which otherwise looks their domains up in DNS.
+    #[cfg(test)]
+    test_dmarc_pass: Vec<String>,
 }
 /// See `Backend::wait_for`.
 struct Waiting<'a> {
@@ -385,9 +435,9 @@ impl Backend {
             readable: Mutex::new(HashMap::new()),
             readable_order: Mutex::default(),
             keyring: Mutex::new(None),
-            verdicts: Mutex::new(HashMap::new()),
+            verdicts: Mutex::new(Recent::new()),
             certificates: Mutex::new(None),
-            smime_verdicts: Mutex::new(HashMap::new()),
+            smime_verdicts: Mutex::new(Recent::new()),
             calendar_cache: Mutex::new(None),
             connections: Mutex::new(HashMap::new()),
             limits: Mutex::new(Limits::default()),
@@ -416,6 +466,8 @@ impl Backend {
             test_certificate: None,
             #[cfg(test)]
             test_secret: None,
+            #[cfg(test)]
+            test_dmarc_pass: Vec::new(),
         }
     }
     /// Notes that someone is waiting for `id`'s connection until the
@@ -975,8 +1027,8 @@ impl Backend {
         // Message ids begin with their account's.
         let mine = format!("{id}:");
         self.readable_order.lock().unwrap().retain(|m| !m.starts_with(&mine));
-        self.verdicts.lock().unwrap().retain(|m, _| !m.starts_with(&mine));
-        self.smime_verdicts.lock().unwrap().retain(|m, _| !m.starts_with(&mine));
+        self.verdicts.lock().unwrap().retain(|m| !m.starts_with(&mine));
+        self.smime_verdicts.lock().unwrap().retain(|m| !m.starts_with(&mine));
         // A missing/inaccessible keychain must not prevent removing local mail.
         let _ = store::secret_entry(id).and_then(|e| e.delete_credential().map_err(Into::into));
         // The account's mail, perhaps most of the cache: its space given back.
@@ -1005,6 +1057,26 @@ impl Backend {
                     .is_ok_and(|s| !s.password.is_empty()),
                 t!("manage-backend-this-account-has-no-saved-password")
             );
+        }
+        // The connections signed in the old way are replaced.
+        self.disconnect(&next.id);
+        self.stop_watching(&next.id);
+        self.store.save_account(&next)?;
+        Ok(next)
+    }
+    /// Allows (on) or stops (off) an Exchange account's Basic sign-in,
+    /// which sends the password itself to the server. Turning it on signs
+    /// in that way first and keeps nothing if that fails.
+    pub fn set_ews_basic(&self, account: &Account, on: bool) -> Result<Account> {
+        let mut next = account.clone();
+        next.ews_basic = on;
+        next.validate()?;
+        self.ews.lock().unwrap().remove(&next.id);
+        let lock = self.account_lock(&next.id);
+        let _operation = lock.lock().unwrap();
+        if on {
+            let mut secret = self.credentials(&next)?;
+            self.check_login(&next, &mut secret)?;
         }
         // The connections signed in the old way are replaced.
         self.disconnect(&next.id);
@@ -1212,25 +1284,58 @@ impl Backend {
             Ok((crate::manage::crypto::Protection::Pinal, _))
         )
     }
-    /// Your OpenPGP keyring, read from the keychain the first time.
+    /// Your OpenPGP keyring, read the first time: your own keys from the
+    /// keychain, other people's from the database (see
+    /// `Keyring::own_part`). A keychain entry that still holds other
+    /// people's keys, as an older Picacho kept them, moves them over.
     pub fn keyring(&self) -> Arc<crate::manage::openpgp::Keyring> {
+        use crate::manage::openpgp::Keyring;
         let mut kept = self.keyring.lock().unwrap();
         if let Some(ring) = &*kept {
             return ring.clone();
         }
         #[cfg(test)]
-        let ring = crate::manage::openpgp::Keyring::default();
+        let own = Keyring::default();
         #[cfg(not(test))]
-        let ring = crate::manage::openpgp::Keyring::load().unwrap_or_default();
+        let own = Keyring::load().unwrap_or_default();
+        let stored = self
+            .store
+            .preference(OPENPGP_KEYS)
+            .and_then(|json| serde_json::from_str::<Keyring>(&json).ok());
+        let ring = match stored {
+            Some(others) => own.clone().with_others(others),
+            None => own.clone(),
+        };
+        if own.has_others() {
+            // Moved: into the database first, so a move cut short loses
+            // nothing.
+            let moved = serde_json::to_string(&ring.others_part())
+                .map_err(anyhow::Error::from)
+                .and_then(|json| self.store.set_preference(OPENPGP_KEYS, &json));
+            #[cfg(not(test))]
+            if moved.is_ok() {
+                let _ = ring.save();
+            }
+            let _ = moved;
+        }
         let ring = Arc::new(ring);
         *kept = Some(ring.clone());
         ring
     }
-    /// Replaces the keyring, in the keychain and here. Messages read with
-    /// the old one are read again with this one when next opened.
+    /// Replaces the keyring, here and where it is kept: your own part in
+    /// the keychain, rewritten only when it changed, other people's in
+    /// the database. Messages read with the old one are read again with
+    /// this one when next opened.
     pub fn set_keyring(&self, ring: crate::manage::openpgp::Keyring) -> Result<()> {
+        let before = self.keyring();
+        if before.others_part() != ring.others_part() {
+            self.store
+                .set_preference(OPENPGP_KEYS, &serde_json::to_string(&ring.others_part())?)?;
+        }
         #[cfg(not(test))]
-        ring.save()?;
+        if before.own_part() != ring.own_part() {
+            ring.save()?;
+        }
         *self.keyring.lock().unwrap() = Some(Arc::new(ring));
         self.verdicts.lock().unwrap().clear();
         Ok(())
@@ -2718,13 +2823,15 @@ impl Backend {
     /// attachments, preview, and the headers a message list may not carry.
     /// Encrypted mail stays ciphertext on disk.
     fn keep_source(&self, a: &Account, m: &Mail, raw: &[u8]) -> Result<()> {
-        self.store.save_raw(&m.id, raw)?;
         // Any kind (S/MIME and inline PGP too, whose ciphertext was read
         // for a preview and an attachment list).
         if crate::manage::crypto::is_encrypted(raw) {
-            return Ok(());
+            return self.store.save_raw(&m.id, raw);
         }
-        if let Ok(mut parsed) = parse_message(raw, a, &m.id, m.folder, &m.remote_folder, m.uid) {
+        let Ok(mut parsed) = parse_message(raw, a, &m.id, m.folder, &m.remote_folder, m.uid) else {
+            return self.store.save_raw(&m.id, raw);
+        };
+        {
             let mut next = m.clone();
             next.has_attachments = !parsed.attachments().is_empty();
             next.set_attachments(parsed.take_attachments());
@@ -2750,7 +2857,8 @@ impl Backend {
             if next.list_links().is_empty() {
                 next.set_list_links(parsed.list_links().to_vec());
             }
-            self.store.save_messages(&[next])?;
+            // The source and the row, one transaction.
+            self.store.save_raw_with(&m.id, raw, Some(&next))?;
         }
         Ok(())
     }
@@ -3034,8 +3142,13 @@ impl Backend {
         self.learn_autocrypt(raw);
         let (protection, plain) = self.plaintext_of(a, Some(&m.id), raw)?;
         // Keys the sender passed along inside the encryption for the
-        // other recipients (Autocrypt-Gossip), where it was decrypted.
-        if plain.len() != raw.len() || plain != raw {
+        // other recipients (Autocrypt-Gossip), only where OpenPGP
+        // decrypted it (Autocrypt 1.1 §2.4): signed mail unwraps too
+        // (`plain` differs from `raw`), but its headers inside are anyone's,
+        // even under a forged or bad signature.
+        let decrypted = crate::manage::crypto::encrypted_part(raw).is_some()
+            && self.verdicts.lock().unwrap().get(&m.id).is_some_and(|v| v.decrypted);
+        if decrypted && plain != raw {
             let recipients: Vec<String> = crate::sync::smtp::recipients(&format!("{}, {}", m.to, m.cc()))
                 .unwrap_or_default()
                 .into_iter()
@@ -3052,7 +3165,14 @@ impl Backend {
                     }
                 }
                 if changed {
+                    // A new keyring forgets every verdict; this message's
+                    // was reached with the keys it had, which the gossip
+                    // (keys for other people) doesn't change, so it's kept.
+                    let verdict = self.verdict(&m.id);
                     let _ = self.set_keyring(next);
+                    if let Some(verdict) = verdict {
+                        self.verdicts.lock().unwrap().insert(m.id.clone(), verdict);
+                    }
                 }
             }
         }
@@ -4572,8 +4692,7 @@ impl Backend {
         let large = d
             .attachments
             .iter()
-            .filter_map(|p| std::fs::metadata(p).ok())
-            .map(|m| m.len())
+            .filter_map(|p| crate::manage::sealed_files::len(p).ok())
             .sum::<u64>()
             >= BURL_FROM;
         if a.provider != Provider::Imap || endpoint.host != a.smtp_host || !large {
@@ -4686,8 +4805,8 @@ impl Backend {
         // is read to compare.
         let attached = d.attachments.iter().any(|p| {
             p.extension().is_some_and(|e| e.eq_ignore_ascii_case("eml"))
-                && std::fs::metadata(p).is_ok_and(|m| m.len() == source.len() as u64)
-                && std::fs::read(p).is_ok_and(|bytes| bytes == source)
+                && crate::manage::sealed_files::len(p).is_ok_and(|n| n == source.len() as u64)
+                && crate::manage::sealed_files::read(p).is_ok_and(|bytes| bytes == source)
         });
         if !attached || source.len() < 64 {
             return None;
@@ -4950,8 +5069,11 @@ impl Backend {
         let mut used: HashSet<String> = std::fs::read_dir(&dir)
             .map(|e| e.flatten().map(|e| e.file_name().to_string_lossy().to_lowercase()).collect())
             .unwrap_or_default();
-        let target = dir.join(distinct_name(name, &mut used));
-        std::fs::write(&target, bytes)?;
+        // The name comes from what was pasted (a web page's `data:` URL
+        // among them): never a path out of the draft's folder.
+        let name = opened::safe_file_name(name);
+        let target = dir.join(distinct_name(&name, &mut used));
+        crate::manage::sealed_files::write(&target, bytes)?;
         Ok(target)
     }
     fn draft_removals(&self, account: &str) -> Vec<RemoteDraft> {
@@ -5253,10 +5375,16 @@ impl Backend {
             let mut used = std::collections::HashSet::new();
             let mut save = |part: usize, name: String, d: &mut Draft| -> Result<()> {
                 let leaf = leaves[part];
+                // Named by the message (a server's draft, written anywhere):
+                // never a path out of the draft's folder, a Windows stream
+                // or device name.
+                let name = opened::safe_file_name(&name);
                 // Two attachments of one name each keep their own file.
                 let name = distinct_name(&name, &mut used);
                 let path = dir.join(&name);
-                std::fs::write(&path, leaf.get_body_raw()?)?;
+                // Sealed while the database is encrypted: a draft sealed
+                // with your key is decrypted here (`sealed_files`).
+                crate::manage::sealed_files::write(&path, &leaf.get_body_raw()?)?;
                 d.attachments.push(path);
                 if let Some(cid) = wanted(leaf) {
                     pictures.push((cid, name));
@@ -5267,18 +5395,17 @@ impl Backend {
                 if attachment.part >= leaves.len() {
                     continue;
                 }
-                let name: String = std::path::Path::new(&attachment.name)
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .filter(|n| !n.is_empty() && n != "." && n != "..")
-                    .unwrap_or_else(|| format!("attachment-{}", i + 1));
+                let name = opened::safe_file_name(&attachment.name);
+                let name = if attachment.name.trim().is_empty() || name == "attachment" {
+                    format!("attachment-{}", i + 1)
+                } else {
+                    name
+                };
                 save(attachment.part, name, &mut d)?;
             }
             // Pictures sent only for the HTML, without a name of their own.
             for (n, part) in inline_only.into_iter().enumerate() {
-                let mime = &leaves[part].ctype.mimetype;
-                let extension = mime.rsplit('/').next().unwrap_or("png");
-                let extension = extension.split('+').next().unwrap_or(extension);
+                let extension = picture_extension(&leaves[part].ctype.mimetype);
                 save(part, format!("image-{}.{extension}", n + 1), &mut d)?;
             }
         }
@@ -5376,6 +5503,40 @@ fn draft_folder(id: &str) -> String {
 
 /// `name`, or "name (2).ext" and so on when one in `used` is the same
 /// ignoring case; the name returned is added to `used`.
+/// Cached rows for a page of a listing, read in one query
+/// (`Store::messages_by_ids`): the rows a sync builds from a listing
+/// (`proton_mail`, `gmail_mail`…) start from the cached row, read one by one
+/// before, bodies and all, a query each, while holding the account's lock.
+pub(super) struct Prefetched(std::cell::RefCell<HashMap<String, Mail>>);
+impl Prefetched {
+    pub(super) fn new(store: &Store, ids: Vec<String>) -> Result<Self> {
+        Ok(Self(std::cell::RefCell::new(store.messages_by_ids(&ids)?)))
+    }
+    /// Row `id` as cached: from the page read, else read now (a row the
+    /// page didn't have, or listed twice and taken already: never taken
+    /// for uncached, which would build it anew and lose its text).
+    pub(super) fn cached(pre: Option<&Self>, store: &Store, id: &str) -> Result<Option<Mail>> {
+        if let Some(found) = pre.and_then(|pre| pre.0.borrow_mut().remove(id)) {
+            return Ok(Some(found));
+        }
+        store.message(id)
+    }
+}
+
+/// A file extension for a picture of type `mime` (`image/svg+xml` gives
+/// `svg`): letters and digits only, as the type comes from the message;
+/// `png` when there are none.
+pub(crate) fn picture_extension(mime: &str) -> String {
+    let subtype = mime.rsplit('/').next().unwrap_or_default();
+    let subtype = subtype.split(['+', ';']).next().unwrap_or_default();
+    let extension: String = subtype
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .take(16)
+        .collect::<String>()
+        .to_ascii_lowercase();
+    if extension.is_empty() { "png".into() } else { extension }
+}
 fn distinct_name(name: &str, used: &mut std::collections::HashSet<String>) -> String {
     let path = std::path::Path::new(name);
     let (stem, ext) = match (path.file_stem(), path.extension()) {
@@ -5660,6 +5821,48 @@ mod layout_tests {
         let _ = std::fs::remove_dir_all(path);
         Ok(())
     }
+    /// Other people's OpenPGP keys are kept in the database, not the
+    /// keychain: a new Backend on the same store has them again.
+    #[test]
+    fn others_keys_are_kept_in_the_database() -> Result<()> {
+        use pgp::ser::Serialize as _;
+        let path = std::env::temp_dir().join(format!("picacho-keys-{}", uuid::Uuid::new_v4()));
+        let store = Arc::new(Store::open(&path)?);
+        let b = Backend::new(store.clone());
+        let bo = pgp::composed::SignedPublicKey::from(crate::manage::openpgp::test_key("Bo <bo@example.se>", ""))
+            .to_bytes()?;
+        let mut ring = crate::manage::openpgp::Keyring::clone(&b.keyring());
+        ring.add_autocrypt("bo@example.se", &bo)?;
+        b.set_keyring(ring.clone())?;
+        let kept: crate::manage::openpgp::Keyring = serde_json::from_str(&store.preference(OPENPGP_KEYS).unwrap())?;
+        assert_eq!(kept, ring.others_part());
+        let again = Backend::new(store);
+        assert!(again.keyring().key_for("bo@example.se").is_some());
+        assert_eq!(*again.keyring(), ring);
+        let _ = std::fs::remove_dir_all(path);
+        Ok(())
+    }
+
+    /// Verification results are kept for the most recently read
+    /// messages only.
+    #[test]
+    fn verdicts_are_kept_for_recent_messages_only() {
+        let mut recent = Recent::new();
+        for i in 0..VERDICTS + 10 {
+            recent.insert(format!("m{i}"), i);
+        }
+        assert_eq!(recent.found.len(), VERDICTS);
+        assert!(recent.get("m9").is_none() && recent.get("m10").is_some());
+        // Read again, a message is the newest.
+        recent.insert("m10".into(), 0);
+        recent.insert("new".into(), 1);
+        assert!(recent.get("m10").is_some() && recent.get("m11").is_none());
+        assert_eq!(recent.order.len(), recent.found.len());
+        recent.retain(|m| m != "new");
+        assert!(recent.get("new").is_none());
+        assert_eq!(recent.order.len(), recent.found.len());
+    }
+
 
     /// Autocrypt 1.1 §2.3 through `learn_autocrypt`: each counted message
     /// updates the sender's peer state, last_seen without a header; an older

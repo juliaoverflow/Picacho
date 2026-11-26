@@ -216,6 +216,7 @@ impl Store {
         } else {
             None
         };
+        crate::manage::sealed_files::set_key(path, key.as_ref().map(DatabaseKey::file_key));
         let mut db = connect(&file, key.as_ref())?;
         // Free pages go back to the system on `incremental_vacuum` (see
         // `pack_saved_sources`). Takes effect for a new database; an older
@@ -270,7 +271,15 @@ impl Store {
              CREATE INDEX IF NOT EXISTS email_id ON messages(account, {EMAIL_ID}) WHERE {EMAIL_ID} <> '';
              -- A server mailbox's rows, for replacing or forgetting them
              -- (under the write lock, which a scan of the account held).
-             CREATE INDEX IF NOT EXISTS remote_folder ON messages(account, json_extract(data,'$.remote_folder'));"
+             CREATE INDEX IF NOT EXISTS remote_folder ON messages(account, json_extract(data,'$.remote_folder'));
+             -- A message by its Message-ID (`by_message_id`: replies, a
+             -- notification's message, mid: links), starred mail (Starred's
+             -- list and count), and downloaded mail with attachments not yet
+             -- indexed (`index_attachments`): each scanned every message's
+             -- JSON, bodies and all, before.
+             CREATE INDEX IF NOT EXISTS message_id ON messages(json_extract(data,'$.message_id'));
+             CREATE INDEX IF NOT EXISTS starred ON messages(account, date) WHERE json_extract(data,'$.starred');
+             CREATE INDEX IF NOT EXISTS with_attachments ON messages(account) WHERE json_extract(data,'$.has_attachments');"
         ))?;
         // The local full-text index of messages' subjects, people, text and
         // attachments' text (FTS5, contentless: the text itself stays in
@@ -340,7 +349,7 @@ impl Store {
         let thread = std::thread::Builder::new()
             .name("preferences".into())
             .spawn(move || write_preferences(&writer, &queue, rx))?;
-        Ok(Self {
+        let store = Self {
             db: Mutex::new(db),
             list_dirty,
             list_revisions: Default::default(),
@@ -354,7 +363,12 @@ impl Store {
             key: Mutex::new(key),
             keys,
             path: path.into(),
-        })
+        };
+        // Whatever opens the store (the window, the background process, a
+        // phone's service or widget refresh) announces mail with Hide mail
+        // outside Picacho as set.
+        crate::manage::applock::load_hiding(&store);
+        Ok(store)
     }
     /// Whether the database is encrypted (Settings → Privacy).
     pub fn encrypted(&self) -> bool {
@@ -377,6 +391,12 @@ impl Store {
         // Preferences waiting to be written go into the copy.
         self.flush();
         let mut held = self.hold_all();
+        // Again, holding everything: another switch may have finished while
+        // this one waited, and going on would replace its key (and, on a
+        // failure, forget the key the database is now encrypted with).
+        if on == self.encrypted() {
+            return Ok(());
+        }
         let file = self.path.join(vault::DATABASE_FILE);
         let converting = self.path.join(vault::CONVERTING_FILE);
         remove_database_files(&converting);
@@ -387,7 +407,11 @@ impl Store {
         let copied = (|| -> Result<()> {
             // Everything in the log goes into the file first, so the copy
             // is all of it.
-            held.writer.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+            // The main database only: the writer's temporary triggers keep
+            // its temporary database in use, and checkpointing every
+            // database then failed ("database table is locked") right after
+            // a switch, so a second switch in one session never worked.
+            held.writer.execute_batch("PRAGMA main.wal_checkpoint(TRUNCATE);")?;
             let literal = match &new_key {
                 Some(key) => key.sql_literal(),
                 None => zeroize::Zeroizing::new(String::new()),
@@ -438,7 +462,7 @@ impl Store {
         })();
         let key = match &replaced {
             Ok(()) => new_key.clone(),
-            Err(_) => old_key,
+            Err(_) => old_key.clone(),
         };
         // Open again: the new file, or the old one if it couldn't be replaced.
         let reopened = (|| -> Result<()> {
@@ -460,8 +484,24 @@ impl Store {
             reopened?;
             return Err(e);
         }
-        *self.key.lock().unwrap_or_else(|e| e.into_inner()) = key;
+        *self.key.lock().unwrap_or_else(|e| e.into_inner()) = key.clone();
         drop(held);
+        // The files kept beside the database follow it (it was replaced, or
+        // this returned above): sealed with the new key, or opened again
+        // while the old one is still here.
+        {
+            let old = old_key.as_ref().map(DatabaseKey::file_key);
+            let new = key.as_ref().map(DatabaseKey::file_key);
+            crate::manage::sealed_files::set_key(&self.path, new.clone());
+            let failed = crate::manage::sealed_files::reseal_dir(
+                &self.path.join("draft-files"),
+                old.as_deref(),
+                new.as_deref(),
+            );
+            if failed > 0 {
+                eprintln!("Picacho: {failed} draft files couldn't follow the database's encryption");
+            }
+        }
         // The old key opens nothing now.
         if !on && let Err(e) = vault::forget_key(&self.path, &*self.keys) {
             eprintln!("Picacho: couldn't remove the old database key from the keychain: {e:#}");
@@ -816,7 +856,7 @@ impl Store {
         // ordinary mailbox is asked for alone, so that SQLite reads it from
         // the (account, folder, date) index rather than scanning and
         // sorting every message of the account.
-        let which = virtual_rows(folder).unwrap_or("folder=?2");
+        let which = virtual_listed(folder).unwrap_or("folder=?2");
         let mut q = db.prepare(&format!("SELECT {data} FROM messages WHERE account=?1 AND {which} ORDER BY date DESC, id DESC LIMIT ?3"))?;
         let mut rows = q.query(params![
             account,
@@ -903,9 +943,17 @@ impl Store {
     /// rather than by reading them all.
     pub fn count_messages(&self, account: &str, mailbox: impl Into<Mailbox>) -> Result<usize> {
         let mailbox = mailbox.into();
-        if mailbox.folder().is_virtual() {
-            // Starred and All Mail count each message once, as they list it.
-            return Ok(self.summaries(account, mailbox)?.len());
+        if let Some(rows) = virtual_listed(mailbox.folder()) {
+            // Starred and All Mail count each message once, as they list it
+            // (`query_messages`), by the database: reading every message of
+            // the account into memory only to count them cost as much as
+            // its whole cache, on every sidebar count.
+            let n: i64 = self.read().query_row(
+                &format!("SELECT COUNT(DISTINCT {LISTED_ONCE}) FROM messages WHERE account=?1 AND {rows}"),
+                params![account, mailbox.key()],
+                |r| r.get(0),
+            )?;
+            return Ok(n as usize);
         }
         let n: i64 = self.read().query_row(
             "SELECT COUNT(*) FROM messages WHERE account=?1 AND folder=?2",
@@ -918,13 +966,21 @@ impl Store {
     /// index, without reading the messages.
     pub fn unread_ids(&self, account: &str, mailbox: impl Into<Mailbox>) -> Result<Vec<String>> {
         let mailbox = mailbox.into();
-        if mailbox.folder().is_virtual() {
-            return Ok(self
-                .summaries(account, mailbox)?
-                .into_iter()
-                .filter(|m| m.unread)
-                .map(|m| m.id)
-                .collect());
+        if let Some(rows) = virtual_listed(mailbox.folder()) {
+            // As listed (`query_messages`): each message once, as its newest
+            // copy, unread or not; by the database, not read whole.
+            let db = self.read();
+            let mut q = db.prepare_cached(&format!(
+                "SELECT id FROM (
+                    SELECT id, json_extract(data,'$.unread') AS unread,
+                           ROW_NUMBER() OVER (PARTITION BY {LISTED_ONCE} ORDER BY date DESC, id DESC) AS n
+                    FROM messages WHERE account=?1 AND {rows}
+                 ) WHERE n=1 AND unread ORDER BY id"
+            ))?;
+            let ids = q
+                .query_map(params![account, mailbox.key()], |r| r.get(0))?
+                .collect::<rusqlite::Result<_>>()?;
+            return Ok(ids);
         }
         let db = self.read();
         let mut q = db.prepare_cached(
@@ -1964,6 +2020,82 @@ impl Store {
         json.map(|s| serde_json::from_str(&s).map_err(Into::into))
             .transpose()
     }
+    /// Whether message `id`'s whole source is kept here, without reading it.
+    pub fn has_source(&self, id: &str) -> Result<bool> {
+        use rusqlite::OptionalExtension;
+        Ok(self
+            .read()
+            .prepare_cached(&format!("SELECT 1 FROM messages WHERE id=?1 AND {DOWNLOADED}"))?
+            .query_row([id], |_| Ok(()))
+            .optional()?
+            .is_some())
+    }
+    /// Whether message `id` is cached, without reading it (its JSON holds
+    /// its whole text): what sync loops ask of each listed message.
+    pub fn has_message(&self, id: &str) -> Result<bool> {
+        use rusqlite::OptionalExtension;
+        Ok(self
+            .read()
+            .prepare_cached("SELECT 1 FROM messages WHERE id=?1")?
+            .query_row([id], |_| Ok(()))
+            .optional()?
+            .is_some())
+    }
+    /// Gives each row `to` the downloaded source row `from` has, as stored
+    /// (compressed, not read back): messages whose ids changed (an EWS
+    /// move). Both rows must exist.
+    pub fn copy_sources(&self, pairs: &[(String, String)]) -> Result<()> {
+        if pairs.is_empty() {
+            return Ok(());
+        }
+        let mut db = self.write();
+        let tx = db.transaction()?;
+        {
+            let mut q = tx.prepare_cached(
+                "UPDATE messages SET raw=(SELECT raw FROM messages WHERE id=?1), source=(SELECT source FROM messages WHERE id=?1) WHERE id=?2",
+            )?;
+            for (from, to) in pairs {
+                q.execute(params![from, to])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+    /// The earliest date (past 0) of the cached messages among `ids`.
+    pub fn oldest_date(&self, ids: &[String]) -> Result<Option<i64>> {
+        let db = self.read();
+        let mut oldest: Option<i64> = None;
+        for chunk in ids.chunks(500) {
+            let marks = vec!["?"; chunk.len()].join(",");
+            let found: Option<i64> = db.query_row(
+                &format!("SELECT MIN(date) FROM messages WHERE date > 0 AND id IN ({marks})"),
+                rusqlite::params_from_iter(chunk.iter()),
+                |r| r.get(0),
+            )?;
+            oldest = match (oldest, found) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            };
+        }
+        Ok(oldest)
+    }
+    /// The cached messages among `ids`, whole, by id: one query for a page
+    /// of a listing rather than one for each message.
+    pub fn messages_by_ids(&self, ids: &[String]) -> Result<HashMap<String, Mail>> {
+        let mut out = HashMap::new();
+        let db = self.read();
+        // SQLite's limit on bound parameters, with room.
+        for chunk in ids.chunks(500) {
+            let marks = vec!["?"; chunk.len()].join(",");
+            let mut q = db.prepare(&format!("SELECT data FROM messages WHERE id IN ({marks})"))?;
+            let mut rows = q.query(rusqlite::params_from_iter(chunk.iter()))?;
+            while let Some(row) = rows.next()? {
+                let mail: Mail = serde_json::from_str(row.get_ref(0)?.as_str()?)?;
+                out.insert(mail.id.clone(), mail);
+            }
+        }
+        Ok(out)
+    }
     pub fn message(&self, id: &str) -> Result<Option<Mail>> {
         use rusqlite::OptionalExtension;
         let json: Option<String> = self
@@ -2083,7 +2215,8 @@ impl Store {
             let mut rows = q.query([])?;
             while rows.next()?.is_some() {}
         }
-        self.write().execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+        // The main database only, as in `set_encrypted`.
+        self.write().execute_batch("PRAGMA main.wal_checkpoint(TRUNCATE);")?;
         Ok(())
     }
     /// Rebuilds a database made before free pages were given back, so that
@@ -2132,7 +2265,7 @@ impl Store {
             return Ok(true);
         }
         if let Err(e) =
-            db.execute_batch("PRAGMA auto_vacuum=INCREMENTAL; VACUUM; PRAGMA wal_checkpoint(TRUNCATE);")
+            db.execute_batch("PRAGMA auto_vacuum=INCREMENTAL; VACUUM; PRAGMA main.wal_checkpoint(TRUNCATE);")
         {
             let week = 7 * 24 * 60 * 60;
             db.execute(PUT_PREFERENCE, params![RETRY, (now + week).to_string()])?;
@@ -2230,6 +2363,20 @@ impl Store {
             "UPDATE messages SET raw=NULL, source=?2 WHERE id=?1",
             params![id, source],
         )?;
+        Ok(())
+    }
+    /// `save_raw` and, where given, the message's row brought up to date
+    /// from it, in one transaction: background downloads committed two for
+    /// every message. Compressed before the writer is taken.
+    pub fn save_raw_with(&self, id: &str, raw: &[u8], row: Option<&Mail>) -> Result<()> {
+        let source = pack(raw)?;
+        let mut db = self.write();
+        let tx = db.transaction()?;
+        tx.execute("UPDATE messages SET raw=NULL, source=?2 WHERE id=?1", params![id, source])?;
+        if let Some(row) = row {
+            write_messages(&tx, std::slice::from_ref(row))?;
+        }
+        tx.commit()?;
         Ok(())
     }
     /// One accepted remote command is one local transaction. Earlier confirmed
@@ -3028,6 +3175,21 @@ fn virtual_rows(folder: Folder) -> Option<&'static str> {
         _ => None,
     }
 }
+/// The rows a virtual mailbox lists (`query_messages`): `virtual_rows`,
+/// and for Starred only those starred.
+fn virtual_listed(folder: Folder) -> Option<&'static str> {
+    match folder {
+        // ?2 named, as every caller passes it; the condition alone is the
+        // `starred` index's, so SQLite reads Starred from it.
+        Folder::Starred => Some("(json_extract(data,'$.starred') AND ?2 IS NOT NULL)"),
+        Folder::All => virtual_rows(folder),
+        _ => None,
+    }
+}
+/// What a virtual mailbox lists a message once by: its Message-ID, else its
+/// id (as `query_messages` does).
+const LISTED_ONCE: &str =
+    "CASE WHEN json_extract(data,'$.message_id') <> '' THEN json_extract(data,'$.message_id') ELSE id END";
 /// What earlier builds of this change put before a compressed source they
 /// kept in `raw`. No downloaded message starts with a NUL.
 const LEGACY_PACKED: &[u8] = b"\0PZ1";
@@ -3301,6 +3463,49 @@ mod tests {
         Ok((p, s))
     }
 
+    /// Starred and All Mail are counted, and their unread found, by the
+    /// database as they list (each message once, by its newest copy), not
+    /// by reading every message.
+    #[test]
+    fn virtual_mailboxes_count_as_they_list() -> Result<()> {
+        let (p, store) = temp_store()?;
+        let mail = |id: &str, folder: Folder, message_id: &str, date: i64, unread: bool, starred: bool| Mail {
+            id: id.into(),
+            account: id.split(':').next().unwrap_or_default().into(),
+            folder,
+            message_id: message_id.into(),
+            date,
+            unread,
+            starred,
+            subject: id.into(),
+            ..Mail::default()
+        };
+        store.save_messages(&[
+            // One message under two labels: its newer copy is read.
+            mail("a:inbox:1", Folder::Inbox, "<1@x>", 10, true, true),
+            mail("a:work:1", Folder::Archive, "<1@x>", 20, false, true),
+            mail("a:inbox:2", Folder::Inbox, "<2@x>", 30, true, false),
+            mail("a:inbox:3", Folder::Inbox, "", 40, true, true),
+            mail("a:sent:4", Folder::Sent, "<4@x>", 50, false, false),
+            mail("a:drafts:5", Folder::Drafts, "<5@x>", 60, true, true),
+            mail("b:inbox:6", Folder::Inbox, "<6@x>", 70, true, true),
+        ])?;
+        for folder in [Folder::Starred, Folder::All] {
+            let listed = store.summaries("a", folder)?;
+            assert_eq!(store.count_messages("a", folder)?, listed.len(), "{folder:?}");
+            let mut unread: Vec<String> = listed.into_iter().filter(|m| m.unread).map(|m| m.id).collect();
+            unread.sort();
+            assert_eq!(store.unread_ids("a", folder)?, unread, "{folder:?}");
+        }
+        assert_eq!(store.count_messages("a", Folder::Starred)?, 3);
+        assert_eq!(store.count_messages("a", Folder::All)?, 4);
+        assert_eq!(store.unread_ids("a", Folder::All)?, ["a:inbox:2", "a:inbox:3"]);
+        assert_eq!(store.by_message_id("<2@x>")?.map(|m| m.id).as_deref(), Some("a:inbox:2"));
+        drop(store);
+        let _ = std::fs::remove_dir_all(p);
+        Ok(())
+    }
+
     /// Whether any file in `dir` holds `needle` as it is.
     fn files_hold(dir: &Path, needle: &[u8]) -> Result<bool> {
         for entry in std::fs::read_dir(dir)? {
@@ -3382,6 +3587,10 @@ mod tests {
         // Turning it on again changes nothing.
         store.set_encrypted(true)?;
 
+        store.set_encrypted(false)?;
+        // Switched twice in one session (on, then off again).
+        store.set_encrypted(true)?;
+        assert!(store.encrypted());
         store.set_encrypted(false)?;
         assert!(!store.encrypted());
         assert!(!vault::is_encrypted(&p.join(vault::DATABASE_FILE))?);

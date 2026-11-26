@@ -78,6 +78,14 @@ final class ShareViewController: UIViewController {
             .appendingPathComponent(id, isDirectory: true)
         do {
             try files.createDirectory(at: folder, withIntermediateDirectories: true)
+            // Shared files (copies of mail-to-be) stay on this device: not
+            // in iCloud or computer backups of the App Group's container.
+            var values = URLResourceValues()
+            values.isExcludedFromBackup = true
+            var shares = folder.deletingLastPathComponent()
+            try? shares.setResourceValues(values)
+            var share = folder
+            try? share.setResourceValues(values)
         } catch {
             return fail(String(
                 localized: "Picacho couldn't take this: \(error.localizedDescription)",
@@ -189,13 +197,30 @@ final class ShareViewController: UIViewController {
         }
     }
 
+    /// The most one share copies, per file and in all: as much as a message
+    /// may attach (as Android's shares and picks), so a large share can't
+    /// fill the device.
+    nonisolated private static let maxFile: Int64 = 100 * 1024 * 1024
+    nonisolated private static let maxTotal: Int64 = 100 * 1024 * 1024
+
     /// Copies the file at `url` into `folder` as `name` (made safe, and
-    /// unlike the names `taken`).
+    /// unlike the names `taken`): a regular file only, within `maxFile`, and
+    /// with what `folder` holds already within `maxTotal`.
     nonisolated private static func copy(_ url: URL, named name: String, into folder: URL, taken: [String]) -> Loaded {
         let scoped = url.startAccessingSecurityScopedResource()
         defer {
             if scoped { url.stopAccessingSecurityScopedResource() }
         }
+        guard let source = try? url.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey]),
+            source.isRegularFile == true
+        else { return .nothing }
+        let size = Int64(source.fileSize ?? 0)
+        let held = ((try? FileManager.default.contentsOfDirectory(
+            at: folder, includingPropertiesForKeys: [.fileSizeKey])) ?? [])
+            .reduce(Int64(0)) { sum, file in
+                sum + Int64((try? file.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0)
+            }
+        guard size <= maxFile, held + size <= maxTotal else { return .nothing }
         var safe = name.replacingOccurrences(of: "/", with: "_").replacingOccurrences(of: ":", with: "_")
             .trimmingCharacters(in: .whitespacesAndNewlines)
         if safe.isEmpty || safe == "." || safe == ".." || safe.hasPrefix(".") {

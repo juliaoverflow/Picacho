@@ -20,7 +20,11 @@ finish-args:
   - --socket=fallback-x11
   # GPU rendering, and USB security keys for passkey sign-in (all includes
   # dri). Security keys are hidraw devices, which only --device=all exposes;
-  # a narrower --device=dri would leave them out.
+  # a narrower --device=dri would leave them out, and so would
+  # --device=usb (/dev/bus/usb only) and --device=input (/dev/input), as of
+  # Flatpak 1.18. It also exposes cameras and every other device to an app
+  # that renders untrusted mail: revisit when Flatpak can grant hidraw
+  # alone, or a portal offers security keys.
   - --device=all
   # Credentials live in the Secret Service (GNOME Keyring, KWallet).
   - --talk-name=org.freedesktop.secrets

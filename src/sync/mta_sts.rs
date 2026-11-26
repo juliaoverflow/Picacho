@@ -128,16 +128,32 @@ fn fetch(domain: &str) -> Result<Policy> {
         is_domain(domain),
         t!("sync-mta-sts-isnt-a-domain-name-that-can", domain = format!("{:?}", domain))
     );
-    let client = reqwest::blocking::Client::builder()
-        .min_tls_version(reqwest::tls::Version::TLS_1_2)
-        .timeout(Duration::from_secs(10))
-        .https_only(true)
-        .redirect(reqwest::redirect::Policy::none())
-        .user_agent(concat!("Picacho/", env!("CARGO_PKG_VERSION")))
-        .build()?;
+    // One client for every fetch, reaching servers on the internet only:
+    // the domain is a recipient's, anyone's to choose, and its name could
+    // otherwise lead to this computer's network.
+    static CLIENT: std::sync::OnceLock<reqwest::blocking::Client> = std::sync::OnceLock::new();
+    let client = match CLIENT.get() {
+        Some(client) => client,
+        None => {
+            let built = reqwest::blocking::Client::builder()
+                .min_tls_version(reqwest::tls::Version::TLS_1_2)
+                .timeout(Duration::from_secs(10))
+                .https_only(true)
+                .redirect(reqwest::redirect::Policy::none())
+                .dns_resolver(std::sync::Arc::new(super::public_net::PublicOnly))
+                .user_agent(concat!("Picacho/", env!("CARGO_PKG_VERSION")))
+                .build()?;
+            CLIENT.get_or_init(|| built)
+        }
+    };
     let url = format!("https://mta-sts.{domain}/.well-known/mta-sts.txt");
+    let parsed = url::Url::parse(&url).with_context(|| t!("sync-mta-sts-couldnt-fetch", url = url))?;
+    ensure!(
+        !super::public_net::reaches_inside(&parsed),
+        t!("sync-mta-sts-couldnt-fetch", url = url)
+    );
     let response = client
-        .get(&url)
+        .get(parsed)
         .send()
         .with_context(|| t!("sync-mta-sts-couldnt-fetch", url = url))?;
     // 200 only (RFC 8461 §3.3): other successes aren't a policy.

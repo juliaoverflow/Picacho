@@ -137,10 +137,7 @@ impl Backend {
         for der in &verdict.checked {
             let Ok(cert) = openssl::x509::X509::from_der(der) else { continue };
             let who = crate::manage::smime::emails(&cert).into_iter().next().unwrap_or_default();
-            // Its issuer: among what the message carried, or what's known.
-            let issuer = carried.iter().chain(known.iter()).find(|i| {
-                i.issued(&cert) == openssl::x509::X509VerifyResult::OK && i.to_der().ok().as_deref() != Some(der)
-            });
+            let issuer = issuer_of(&cert, &known, &carried);
             let Some(issuer) = issuer else {
                 unknown.push(t!("manage-crl-files-its-issuers-certificate-isnt-here", who = who));
                 continue;
@@ -177,9 +174,80 @@ impl Backend {
     }
 }
 
+/// `cert`'s issuer: among what's known first, then what the message
+/// carried (`carried`). Names and key ids (what `issued` compares) are
+/// anyone's to copy: an issuer is one whose key signed the certificate.
+/// Otherwise a stolen, revoked certificate could come with a made-up
+/// "issuer" of the same name, whose own OCSP answer or CRL (signed by it,
+/// fetched over plain http) would say it was never revoked.
+fn issuer_of<'a>(
+    cert: &openssl::x509::X509,
+    known: &'a [openssl::x509::X509],
+    carried: &'a [openssl::x509::X509],
+) -> Option<&'a openssl::x509::X509> {
+    let der = cert.to_der().ok();
+    known.iter().chain(carried.iter()).find(|i| {
+        i.issued(cert) == openssl::x509::X509VerifyResult::OK
+            && i.to_der().ok() != der
+            && i.public_key().ok().is_some_and(|key| cert.verify(&key).unwrap_or(false))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A certificate named `name`, signed by `issuer` (itself when None).
+    fn certificate(
+        name: &str,
+        key: &openssl::pkey::PKey<openssl::pkey::Private>,
+        issuer: Option<(&openssl::x509::X509, &openssl::pkey::PKey<openssl::pkey::Private>)>,
+        ca: bool,
+    ) -> openssl::x509::X509 {
+        use openssl::x509::{X509NameBuilder, extension::BasicConstraints, extension::KeyUsage};
+        let mut n = X509NameBuilder::new().unwrap();
+        n.append_entry_by_text("CN", name).unwrap();
+        let n = n.build();
+        let mut b = openssl::x509::X509::builder().unwrap();
+        b.set_version(2).unwrap();
+        b.set_subject_name(&n).unwrap();
+        b.set_issuer_name(issuer.map_or(&*n, |(c, _)| c.subject_name())).unwrap();
+        b.set_pubkey(key).unwrap();
+        b.set_not_before(&openssl::asn1::Asn1Time::days_from_now(0).unwrap()).unwrap();
+        b.set_not_after(&openssl::asn1::Asn1Time::days_from_now(30).unwrap()).unwrap();
+        if ca {
+            b.append_extension(BasicConstraints::new().critical().ca().build().unwrap()).unwrap();
+            b.append_extension(KeyUsage::new().key_cert_sign().crl_sign().build().unwrap()).unwrap();
+        }
+        let signer = issuer.map_or(key, |(_, k)| k);
+        b.sign(signer, openssl::hash::MessageDigest::sha256()).unwrap();
+        b.build()
+    }
+
+    /// An "issuer" with the real one's name, carried by the message, isn't
+    /// taken for it: its key didn't sign the certificate.
+    #[test]
+    fn issuers_are_those_whose_key_signed() {
+        let key = || openssl::pkey::PKey::from_ec_key(
+            openssl::ec::EcKey::generate(
+                &openssl::ec::EcGroup::from_curve_name(openssl::nid::Nid::X9_62_PRIME256V1).unwrap(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let (ca_key, fake_key, signer_key) = (key(), key(), key());
+        let ca = certificate("Real CA", &ca_key, None, true);
+        let fake = certificate("Real CA", &fake_key, None, true);
+        let signer = certificate("ana@example.org", &signer_key, Some((&ca, &ca_key)), false);
+        assert!(issuer_of(&signer, &[], std::slice::from_ref(&fake)).is_none());
+        let both = [fake.clone(), ca.clone()];
+        let found = issuer_of(&signer, &[], &both).unwrap();
+        assert_eq!(found.to_der().unwrap(), ca.to_der().unwrap());
+        // What's known comes first.
+        let fakes = [fake];
+        let found = issuer_of(&signer, std::slice::from_ref(&ca), &fakes).unwrap();
+        assert_eq!(found.to_der().unwrap(), ca.to_der().unwrap());
+    }
 
     fn fixture(name: &str) -> Vec<u8> {
         let path = format!("{}/tests/fixtures/smime/{name}", env!("CARGO_MANIFEST_DIR"));

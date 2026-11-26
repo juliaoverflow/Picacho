@@ -383,7 +383,7 @@ pub fn snapshot(store: &Store, now: i64) -> Snapshot {
     raw_messages.truncate(MAX_MESSAGES);
 
     let hide_codes = local_ai::otp_enabled(store);
-    let detector = hide_codes.then(|| local_ai::otp_detector(store).ok());
+    let detector = hide_codes.then(|| local_ai::otp_detector(store).ok()).flatten();
 
     let messages = raw_messages
         .into_iter()
@@ -392,7 +392,7 @@ pub fn snapshot(store: &Store, now: i64) -> Snapshot {
                 &m.subject,
                 &m.snippet,
                 hide_codes,
-                detector.as_ref().and_then(|d| d.as_ref()),
+                detector.as_ref(),
             );
             let sender = if m.sender.trim().is_empty() {
                 m.from.trim().to_owned()
@@ -557,6 +557,12 @@ fn labels(snap: &Snapshot) -> BTreeMap<String, String> {
 /// The snapshot is a file outside the (perhaps encrypted) database that the
 /// system's widget hosts read.
 pub fn redact(snap: &mut Snapshot) {
+    // Keys stay stable row ids for the widget hosts, but no longer name a
+    // tracking or order number.
+    let opaque = |key: &str| -> String {
+        use sha2::Digest as _;
+        sha2::Sha256::digest(key.as_bytes())[..12].iter().map(|b| format!("{b:02x}")).collect()
+    };
     for m in &mut snap.messages {
         m.sender = m.account_label.clone();
         m.subject = t!("manage-widgets-details-hidden").to_owned();
@@ -565,10 +571,15 @@ pub fn redact(snap: &mut Snapshot) {
     for e in &mut snap.events {
         e.title = t!("manage-widgets-event").to_owned();
         e.location.clear();
+        // A calendar's name can say as much as its events ("Oncology").
+        e.calendar_name.clear();
     }
     for p in &mut snap.packages {
         p.title = t!("manage-widgets-package").to_owned();
         p.number.clear();
+        // Who carries it says where it's from (a merchant's own delivery).
+        p.carrier.clear();
+        p.key = opaque(&p.key);
     }
     for r in &mut snap.receipts {
         r.merchant = if r.refund {
@@ -579,6 +590,7 @@ pub fn redact(snap: &mut Snapshot) {
         .to_owned();
         r.amount.clear();
         r.order.clear();
+        r.key = opaque(&r.key);
     }
 }
 
@@ -848,28 +860,17 @@ fn account_label(a: &Account) -> String {
 }
 
 /// Masks sign-in codes in subject and snippet when Local AI's Hide sign-in
-/// codes setting is enabled, matching `manage::background::Codes::hide`.
-fn sanitize_preview(
-    subject: &str,
-    snippet: &str,
-    hide_codes: bool,
-    detector: Option<&otp::Detector>,
-) -> (String, String) {
+/// codes setting is enabled, as `manage::background::Codes::hide` does:
+/// those the model finds in them, read together, or, without the model,
+/// every string shaped like a code. A widget has no Show code to click.
+fn sanitize_preview(subject: &str, snippet: &str, hide_codes: bool, detector: Option<&otp::Detector>) -> (String, String) {
     let clean_subject = collapse_whitespace(subject);
     let clean_snippet = collapse_whitespace(snippet);
     if !hide_codes {
         return (clean_subject, clean_snippet);
     }
-    match detector {
-        Some(det) => {
-            let sub = otp::mask(&clean_subject, &det.codes(&clean_subject, "")).into_owned();
-            let snip = otp::mask(&clean_snippet, &det.codes("", &clean_snippet)).into_owned();
-            (sub, snip)
-        }
-        // Without the model a code cannot be distinguished; stay safe rather than
-        // leaking a sign-in code onto the home screen.
-        None => (t!("manage-widgets-new-message").to_owned(), String::new()),
-    }
+    let codes = otp::codes_to_hide(detector, &clean_subject, &clean_snippet);
+    (otp::mask(&clean_subject, &codes).into_owned(), otp::mask(&clean_snippet, &codes).into_owned())
 }
 
 fn collapse_whitespace(s: &str) -> String {

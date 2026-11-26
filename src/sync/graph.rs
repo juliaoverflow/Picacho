@@ -13,7 +13,7 @@
 //! These helpers only talk to Microsoft; Manage keeps the result
 //! (`manage/graph.rs`).
 use super::rest::{Rest, escape};
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use base64::Engine as _;
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -218,13 +218,27 @@ impl Session {
 
     /// Every page of a listing, up to `most` items.
     pub fn all_pages(&self, first: &str, most: usize) -> Result<Vec<Value>> {
+        /// The most pages asked for: a server answering with empty pages,
+        /// each linking to another (or the same), would be asked for ever.
+        const MAX_PAGES: usize = 1000;
         let mut out = Vec::new();
         let mut next = Some(Self::p(first));
+        let mut seen = std::collections::HashSet::new();
+        let mut pages = 0;
         while let Some(path) = next.take() {
+            pages += 1;
+            if pages > MAX_PAGES || !seen.insert(path.clone()) {
+                break;
+            }
             let v = self.rest.get(&path)?;
-            out.extend(v["value"].as_array().cloned().unwrap_or_default());
+            let page = v["value"].as_array().cloned().unwrap_or_default();
+            let empty = page.is_empty();
+            out.extend(page);
             if out.len() >= most {
                 out.truncate(most);
+                break;
+            }
+            if empty {
                 break;
             }
             next = v["@odata.nextLink"].as_str().map(str::to_owned);
@@ -558,8 +572,20 @@ impl Session {
         )?;
         let url = session["uploadUrl"].as_str().with_context(|| t!("sync-graph-microsoft-gave-nowhere-to-upload"))?;
         // The upload address is Outlook's own, signed; it takes no token.
+        // Over https (in tests, the loopback server's http), never to this
+        // computer's network, and not redirected: the file goes where
+        // Microsoft said, with the account's TLS settings.
+        let parsed = url::Url::parse(url).with_context(|| t!("sync-graph-microsoft-gave-nowhere-to-upload"))?;
+        ensure!(
+            (parsed.scheme() == "https" || cfg!(test)) && !crate::sync::public_net::reaches_inside(&parsed),
+            t!("sync-graph-microsoft-gave-nowhere-to-upload")
+        );
         let http = reqwest::blocking::Client::builder()
+            .use_preconfigured_tls(self.rest.tls.clone())
             .timeout(std::time::Duration::from_secs(600))
+            .connect_timeout(std::time::Duration::from_secs(12))
+            .redirect(reqwest::redirect::Policy::none())
+            .user_agent(concat!("Picacho/", env!("CARGO_PKG_VERSION")))
             .https_only(!cfg!(test))
             .build()?;
         const PIECE: usize = 4 * 1024 * 1024 - 64 * 1024;
@@ -568,14 +594,15 @@ impl Session {
             let start = i * PIECE;
             let end = start + piece.len() - 1;
             let response = http
-                .put(url)
+                .put(parsed.clone())
                 .header("Content-Range", format!("bytes {start}-{end}/{total}"))
                 .header("Content-Type", "application/octet-stream")
                 .body(piece.to_vec())
                 .send()?;
             if !response.status().is_success() {
                 let status = response.status();
-                return Err(self.rest.problem(status, &response.text().unwrap_or_default(), None));
+                let body = crate::sync::public_net::bounded_text(response, 64 * 1024).unwrap_or_default();
+                return Err(self.rest.problem(status, &body, None));
             }
         }
         Ok(())

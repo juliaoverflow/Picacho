@@ -51,13 +51,17 @@ fn exchange_accounts_read_change_and_send_through_ews() -> Result<()> {
     let now = b.store.message(&inbox[0].id)?.unwrap();
     assert!(!now.unread && now.starred && now.answered && now.labels() == ["Finance"]);
 
-    // Moved: its row takes the new id; undo finds it there.
+    // Moved: its row takes the new id, with its downloaded source; undo
+    // finds it there.
     let before = b.store.message(&inbox[0].id)?.unwrap();
+    let source = b"From: a@corp.example\r\nSubject: Budget\r\n\r\nThe numbers.\r\n".to_vec();
+    b.store.save_raw(&before.id, &source)?;
     b.change_many(&a, std::slice::from_ref(&before), Change::MoveTo("Inbox/Projects".into()))?;
     assert!(b.store.message(&before.id)?.is_none());
     let moved = b.store.summaries(&a.id, Mailbox::Remote("Inbox/Projects".into()))?;
     let budget_now = moved.iter().find(|m| m.subject == "Budget").unwrap().clone();
     assert!(budget_now.starred, "kept what it was");
+    assert_eq!(b.store.raw(&budget_now.id)?.as_deref(), Some(&source[..]), "its source moved with it");
     assert!(fake.lock().unwrap().items.iter().any(|i| i.subject == "Budget" && i.folder == projects));
     let undo = vec![Moved { before: before.clone(), change: Change::MoveTo("Inbox/Projects".into()) }];
     assert_eq!(b.undo_move(&a, &undo)?, 1);
@@ -189,7 +193,7 @@ fn exchange_calendars_contacts_and_directory_through_ews() -> Result<()> {
     assert_eq!(weekly.overrides.len(), 1);
     assert_eq!(weekly.href, "ews:cal1");
     // Answered here: answered in the calendar too (the reply went by mail).
-    b.file_answer(&weekly.event, &a.email, crate::sync::ical::PartStat::Accepted)?;
+    b.file_answer(&weekly.event, &a.email, crate::sync::ical::PartStat::Accepted, true)?;
     assert_eq!(fake.lock().unwrap().answered, [("cal1".to_owned(), "AcceptItem".to_owned())]);
     // A new event: made from iCalendar.
     let made = b.save_event(crate::sync::ical::Event { uid: "new-1".into(), summary: "Planning".into(), start: 1_796_000_000, end: 1_796_003_600, ..Default::default() }, None)?;

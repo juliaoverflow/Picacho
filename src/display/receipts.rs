@@ -372,12 +372,19 @@ impl MailApp {
                                     .text_size(px(12.))
                                     .font_weight(FontWeight::MEDIUM)
                                     .child(l.merchant.clone()),
-                            )
-                            .when(l.receipt.kind == Kind::Refund, |d| {
-                                d.child(tag(t!("summary-refund"), c))
-                            })
-                            .when_some(account, |d, name| d.child(tag(&name, c))),
+                            ),
                     )
+                    // The mailbox it came to, under who sent it.
+                    .when_some(account, |d, name| {
+                        d.child(
+                            div()
+                                .min_w_0()
+                                .truncate()
+                                .text_size(px(11.))
+                                .text_color(rgb(c.muted))
+                                .child(name),
+                        )
+                    })
                     .child(
                         div()
                             .min_w_0()
@@ -391,7 +398,8 @@ impl MailApp {
             .into_any_element()
     }
 
-    /// A receipt's amount, at its row's end: a refund's as money back.
+    /// A receipt's amount, at its row's end: a refund's as money back,
+    /// with "Refund" under it.
     fn receipt_amount(&self, id: &str, l: &Listed) -> AnyElement {
         let c = self.colors();
         let selector = id.to_owned();
@@ -400,13 +408,22 @@ impl MailApp {
             .id(SharedString::from(id.to_owned()))
             .debug_selector(move || selector)
             .flex_shrink_0()
-            .text_size(px(12.))
-            .font_weight(FontWeight::SEMIBOLD)
+            .flex()
+            .flex_col()
+            .items_end()
             .text_color(rgb(if refund { c.accent } else { c.text }))
-            .child(match &l.receipt.total {
-                Some(total) if refund => format!("+{}", total.show()),
-                Some(total) => total.show(),
-                None => "—".to_owned(),
+            .child(
+                div()
+                    .text_size(px(12.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(match &l.receipt.total {
+                        Some(total) if refund => format!("+{}", total.show()),
+                        Some(total) => total.show(),
+                        None => "—".to_owned(),
+                    }),
+            )
+            .when(refund, |d| {
+                d.child(div().text_size(px(10.)).child(t!("summary-refund")))
             })
             .into_any_element()
     }
@@ -752,13 +769,9 @@ impl MailApp {
                                     .font_weight(FontWeight::MEDIUM)
                                     .child(l.merchant.clone()),
                             )
-                            .when(l.receipt.kind == Kind::Refund, |d| {
-                                d.child(tag(t!("summary-refund"), c))
-                            })
                             .when(l.receipt.source == receipts::Source::Markup, |d| {
                                 d.child(tag(t!("summary-from-sender"), c))
                             })
-                            .when_some(account, |d, name| d.child(tag(&name, c)))
                             .when(l.hidden, |d| d.child(tag(t!("summary-hidden"), c)))
                             .when(in_email, |d| {
                                 d.child(
@@ -773,12 +786,23 @@ impl MailApp {
                                 )
                             }),
                     )
+                    // The mailbox it came to, under who sent it.
+                    .when_some(account, |d, name| {
+                        d.child(
+                            div()
+                                .min_w_0()
+                                .truncate()
+                                .text_size(px(11.))
+                                .text_color(rgb(c.muted))
+                                .child(name),
+                        )
+                    })
                     .child(
                         div()
                             .min_w_0()
                             .truncate()
                             .text_size(px(12.))
-                            .child(l.emails[0].subject.clone()),
+                            .child(self.hide_codes_in(&l.emails[0].subject).into_owned()),
                     )
                     .child(
                         div()

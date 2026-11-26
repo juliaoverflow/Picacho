@@ -132,6 +132,10 @@ fn inline_pgp_attachments_are_encrypted_each_and_opened_when_read() {
     assert!(!raw.contains("old mill") && !raw.contains("the secret plan"), "{raw}");
     let names: Vec<String> = attached(&sent).into_iter().map(|(n, _)| n).collect();
     assert_eq!(names, ["notes.txt.pgp", "map.png.pgp"]);
+    // Encrypted, though its top-level body is a multipart's: a reply to it
+    // is encrypted too (`protected_reply`).
+    assert!(crate::manage::crypto::is_encrypted(&sent));
+    assert!(crate::manage::protected_reply::Original::of(&sent).encrypted);
 
     // Bo sees the text and the files as they were sent.
     let (readable, verdict) = open(&sent, &p.bos).unwrap();
@@ -144,6 +148,84 @@ fn inline_pgp_attachments_are_encrypted_each_and_opened_when_read() {
     ]);
     let parsed = mailparse::parse_mail(&readable).unwrap();
     assert_eq!(parsed.subparts[2].ctype.mimetype, "image/png");
+    assert!(verdict.uncovered.is_empty(), "{verdict:?}");
+    assert!(verdict.signature_line().unwrap().1);
+
+    // A file added on the way wasn't encrypted: shown, but named as not
+    // covered, and the result is no longer good.
+    let added = with_file(&sent, "invoice.pdf", b"%PDF-evil");
+    let (readable, verdict) = open(&added, &p.bos).unwrap();
+    assert!(verdict.decrypted);
+    assert_eq!(verdict.signature, Signature::Good("Ana <ana@example.org>".into()));
+    assert_eq!(verdict.uncovered, ["invoice.pdf"]);
+    let (line, good) = verdict.signature_line().unwrap();
+    assert!(!good && line.contains("invoice.pdf"), "{line}");
+    assert!(attached(&readable).iter().any(|(n, _)| n == "invoice.pdf"));
+}
+
+/// A file anyone could encrypt to Bo (his key is public), unsigned, added
+/// to Ana's signed and encrypted message: shown, but not covered by her
+/// signature.
+#[test]
+fn encrypted_files_not_signed_by_the_signer_are_not_covered() {
+    let p = people();
+    let (dir, attachments) = files(&[("notes.txt", b"the secret plan")]);
+    let d = Draft { body: TEXT.into(), sign: true, encrypt: true, attachments, ..Draft::default() };
+    let sent = send(&p, d).unwrap();
+    // Mallory's message to Bo, encrypted to his public key, not signed.
+    let mut mallorys = Keyring::default();
+    let mallory = test_key("Mallory <mallory@example.net>", "");
+    mallorys.import(&mallory.to_armored_string(ArmorOptions::default()).unwrap(), "").unwrap();
+    let bos_key = p
+        .bos
+        .public_keys()
+        .into_iter()
+        .chain(p.bos.secret_keys().into_iter().map(SignedPublicKey::from))
+        .find(|k| super::super::has_address(k, "bo@example.se"))
+        .unwrap();
+    mallorys.import(&bos_key.to_armored_string(ArmorOptions::default()).unwrap(), "").unwrap();
+    let (evil_dir, evil) = files(&[("invoice.pdf", b"%PDF-evil")]);
+    let mut a = Account::new(Provider::Imap);
+    a.email = "mallory@example.net".into();
+    let md = Draft {
+        to: "bo@example.se".into(),
+        subject: "x".into(),
+        body: "x".into(),
+        pgp_inline: true,
+        encrypt: true,
+        attachments: evil,
+        ..Draft::default()
+    };
+    let message = smtp::build(&a, &md, false).unwrap();
+    let certs = crate::manage::smime::Certificates::default();
+    let mallory_sent = smtp::protected(&message, &md, &smtp::Keys { ring: &mallorys, certs: &certs }).unwrap();
+    let _ = std::fs::remove_dir_all(dir);
+    let _ = std::fs::remove_dir_all(evil_dir);
+    let (name, bytes) = attached(&mallory_sent).into_iter().find(|(n, _)| n.ends_with(".pgp")).unwrap();
+    assert_eq!(name, "invoice.pdf.pgp");
+    let added = with_file(&sent, &name, &bytes);
+    let (readable, verdict) = open(&added, &p.bos).unwrap();
+    assert_eq!(verdict.signature, Signature::Good("Ana <ana@example.org>".into()));
+    assert_eq!(verdict.uncovered, ["invoice.pdf.pgp"]);
+    assert!(!verdict.signature_line().unwrap().1);
+    // Still decrypted and shown, named as not covered.
+    assert!(attached(&readable).iter().any(|(n, b)| n == "invoice.pdf" && b == b"%PDF-evil"));
+}
+
+/// `raw` (a multipart/mixed message) with one more file, as anyone on the
+/// way could add.
+fn with_file(raw: &[u8], name: &str, bytes: &[u8]) -> Vec<u8> {
+    let parsed = mailparse::parse_mail(raw).unwrap();
+    let boundary = parsed.ctype.params["boundary"].clone();
+    let text = String::from_utf8_lossy(raw).into_owned();
+    let close = format!("--{boundary}--");
+    let at = text.rfind(&close).unwrap();
+    use base64::Engine as _;
+    let part = format!(
+        "--{boundary}\r\nContent-Type: application/octet-stream\r\nContent-Disposition: attachment; filename=\"{name}\"\r\nContent-Transfer-Encoding: base64\r\n\r\n{}\r\n",
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    );
+    format!("{}{part}{}", &text[..at], &text[at..]).into_bytes()
 }
 
 #[test]
@@ -166,6 +248,21 @@ fn signed_inline_pgp_attachments_carry_their_own_signatures() {
     assert_eq!(verdict.signature, Signature::Good("Ana <ana@example.org>".into()));
     let names: Vec<String> = attached(&readable).into_iter().map(|(n, _)| n).collect();
     assert_eq!(names, ["notes.txt", "notes.txt.sig"]);
+    // Each file is covered by its own signature, made by the text's signer.
+    assert!(verdict.uncovered.is_empty(), "{verdict:?}");
+    assert!(verdict.signature_line().unwrap().1);
+
+    // A file added to the genuine signed message isn't covered; nor is one
+    // whose signature beside it was made over something else.
+    let added = with_file(&sent, "invoice.pdf", b"%PDF-evil");
+    let (_, verdict) = open(&added, &p.bos).unwrap();
+    assert_eq!(verdict.signature, Signature::Good("Ana <ana@example.org>".into()));
+    assert_eq!(verdict.uncovered, ["invoice.pdf"]);
+    let (line, good) = verdict.signature_line().unwrap();
+    assert!(!good && line.contains("invoice.pdf"), "{line}");
+    let resigned = with_file(&with_file(&sent, "plan.txt", b"changed"), "plan.txt.sig", &files[1].1);
+    let (_, verdict) = open(&resigned, &p.bos).unwrap();
+    assert_eq!(verdict.uncovered, ["plan.txt", "plan.txt.sig"]);
 }
 
 #[test]

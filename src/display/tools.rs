@@ -201,6 +201,116 @@ pub(super) fn plain_as_html(text: &str) -> String {
 const MAX_PREVIEW_DIM: u32 = 8192;
 /// Maximum byte allocation when decoding a non-native image preview.
 const MAX_PREVIEW_ALLOC: u64 = 64 * 1024 * 1024;
+/// The largest picture file previewed: it is downloaded and held whole to
+/// decode, and one larger couldn't be decoded within the limits anyway.
+/// Larger ones open in another app (from a file, written as it downloads).
+const MAX_PREVIEW_FILE: usize = 64 * 1024 * 1024;
+
+/// What decoding a picture may take: `MAX_PREVIEW_DIM` a side and
+/// `MAX_PREVIEW_ALLOC` of memory. For pictures from mail (attachments,
+/// and those in quoted replies in the composer), whose stated size can be
+/// anything.
+pub(crate) fn preview_limits() -> image::Limits {
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(MAX_PREVIEW_DIM);
+    limits.max_image_height = Some(MAX_PREVIEW_DIM);
+    limits.max_alloc = Some(MAX_PREVIEW_ALLOC);
+    limits
+}
+/// The most memory GPUI may decode a PNG, GIF, WebP or JPEG preview into,
+/// all its frames together (4 bytes a pixel each).
+const MAX_NATIVE_DECODED: u64 = 256 * 1024 * 1024;
+
+/// Whether GPUI may decode `bytes` (`fmt`) itself: sides within
+/// `MAX_PREVIEW_DIM`, and every frame together within `MAX_NATIVE_DECODED`.
+/// A small file can stand for thousands of large frames.
+fn native_decode_fits(bytes: &[u8], fmt: image::ImageFormat) -> bool {
+    let Some((w, h)) = image::ImageReader::with_format(std::io::Cursor::new(bytes), fmt)
+        .into_dimensions()
+        .ok()
+    else {
+        return false;
+    };
+    if w > MAX_PREVIEW_DIM || h > MAX_PREVIEW_DIM {
+        return false;
+    }
+    let Some(frames) = animation_frames(bytes, fmt) else {
+        return false;
+    };
+    u64::from(w)
+        .saturating_mul(u64::from(h))
+        .saturating_mul(4)
+        .saturating_mul(frames.max(1))
+        <= MAX_NATIVE_DECODED
+}
+
+/// How many frames an image has, read from its structure without decoding
+/// any (APNG's `acTL`, WebP's `ANMF` chunks, GIF's image descriptors);
+/// None when that can't be read.
+fn animation_frames(bytes: &[u8], fmt: image::ImageFormat) -> Option<u64> {
+    let u32_be = |at: usize| Some(u32::from_be_bytes(bytes.get(at..at + 4)?.try_into().ok()?));
+    let u32_le = |at: usize| Some(u32::from_le_bytes(bytes.get(at..at + 4)?.try_into().ok()?));
+    match fmt {
+        image::ImageFormat::Png => {
+            let mut at = 8;
+            while at + 8 <= bytes.len() {
+                let len = u32_be(at)? as usize;
+                let kind = &bytes[at + 4..at + 8];
+                if kind == b"acTL" {
+                    return Some(u64::from(u32_be(at + 8)?));
+                }
+                if kind == b"IDAT" || kind == b"IEND" {
+                    // acTL comes before the image data.
+                    return Some(1);
+                }
+                at = at.checked_add(12)?.checked_add(len)?;
+            }
+            Some(1)
+        }
+        image::ImageFormat::WebP => {
+            let mut at = 12;
+            let mut frames = 0u64;
+            while at + 8 <= bytes.len() {
+                let len = u32_le(at + 4)? as usize;
+                if &bytes[at..at + 4] == b"ANMF" {
+                    frames += 1;
+                }
+                at = at.checked_add(8)?.checked_add(len)?.checked_add(len & 1)?;
+            }
+            Some(frames.max(1))
+        }
+        image::ImageFormat::Gif => {
+            let byte = |at: usize| bytes.get(at).copied();
+            let table = |flags: u8| if flags & 0x80 != 0 { 3usize << ((flags & 7) + 1) } else { 0 };
+            // Sub-blocks from `at`, to just past their terminator.
+            let skip_blocks = |mut at: usize| -> Option<usize> {
+                loop {
+                    let n = byte(at)? as usize;
+                    at += 1 + n;
+                    if n == 0 {
+                        return Some(at);
+                    }
+                }
+            };
+            let mut at = 13 + table(byte(10)?);
+            let mut frames = 0u64;
+            loop {
+                match byte(at) {
+                    Some(0x21) => at = skip_blocks(at + 2)?,
+                    Some(0x2C) => {
+                        frames += 1;
+                        let flags = byte(at + 9)?;
+                        at = skip_blocks(at + 10 + table(flags) + 1)?;
+                    }
+                    // The trailer, or data cut short (GPUI shows what's there).
+                    Some(0x3B) | None => return Some(frames.max(1)),
+                    Some(_) => return None,
+                }
+            }
+        }
+        _ => Some(1),
+    }
+}
 /// Maximum pixel edge when rasterizing an SVG preview.
 const MAX_SVG_DIM: f32 = 1600.;
 
@@ -289,6 +399,14 @@ fn decode_image_preview(bytes: Vec<u8>, mime: &str, name: &str) -> anyhow::Resul
             },
             ..Default::default()
         };
+        // Inflated here if SVGZ (usvg inflates to the end, however large),
+        // and refused if it names a picture outside itself (`svg_guard`).
+        let bytes = crate::display::html::svg_guard::attachment(&bytes).ok_or_else(|| {
+            anyhow::anyhow!(t!(
+                "tools-couldnt-read-svg-image",
+                error = "it is too large, or holds pictures too large to show"
+            ))
+        })?;
         let tree = resvg::usvg::Tree::from_data(&bytes, &opt)
             .map_err(|e| anyhow::anyhow!(t!("tools-couldnt-read-svg-image", error = e.to_string())))?;
         let size = tree.size();
@@ -306,22 +424,27 @@ fn decode_image_preview(bytes: Vec<u8>, mime: &str, name: &str) -> anyhow::Resul
         return Ok((ImageFormat::Png, png));
     }
 
+    // GPUI decodes these itself, every frame of an animation at once: as
+    // they are only when that fits `MAX_NATIVE_DECODED`. Otherwise their
+    // first frame is decoded below, within `preview_limits`.
     if let Ok(fmt) = image::guess_format(&bytes) {
-        match fmt {
-            image::ImageFormat::Png => return Ok((ImageFormat::Png, bytes)),
-            image::ImageFormat::Gif => return Ok((ImageFormat::Gif, bytes)),
-            image::ImageFormat::WebP => return Ok((ImageFormat::Webp, bytes)),
-            image::ImageFormat::Jpeg => return Ok((ImageFormat::Jpeg, bytes)),
-            _ => {}
+        let native = match fmt {
+            image::ImageFormat::Png => Some(ImageFormat::Png),
+            image::ImageFormat::Gif => Some(ImageFormat::Gif),
+            image::ImageFormat::WebP => Some(ImageFormat::Webp),
+            image::ImageFormat::Jpeg => Some(ImageFormat::Jpeg),
+            _ => None,
+        };
+        if let Some(native) = native
+            && native_decode_fits(&bytes, fmt)
+        {
+            return Ok((native, bytes));
         }
     }
 
     // Try decoding via `image` (BMP, ICO, TIFF, TGA, PNM, QOI, HDR, …)
     // using format detection from content, falling back to extension/MIME.
-    let mut limits = image::Limits::default();
-    limits.max_image_width = Some(MAX_PREVIEW_DIM);
-    limits.max_image_height = Some(MAX_PREVIEW_DIM);
-    limits.max_alloc = Some(MAX_PREVIEW_ALLOC);
+    let limits = preview_limits();
 
     let reader = image::ImageReader::new(std::io::Cursor::new(&bytes))
         .with_guessed_format()?;
@@ -608,6 +731,16 @@ impl MailApp {
                         Ok(path) => match how {
                             ToolAction::QuickLook(_) => quick_look(&path),
                             ToolAction::RevealAttachment(_) => cx.reveal_path(&path),
+                            // A program or script from an email isn't run
+                            // with one click: it's shown in its folder,
+                            // where opening it is a choice of its own.
+                            _ if path
+                                .file_name()
+                                .is_some_and(|n| crate::manage::backend::opened::runs_code(&n.to_string_lossy())) =>
+                            {
+                                cx.reveal_path(&path);
+                                this.notice(t!("tools-programs-arent-opened"), true, cx);
+                            }
                             _ => cx.open_with_system(&path),
                         },
                         Err(e) => this.notice(format!("{e:#}"), true, cx),
@@ -699,16 +832,24 @@ impl MailApp {
             ToolAction::PreviewImage(i) => {
                 let Some(m) = self.selected_mail() else { return };
                 let key = (m.id.clone(), i);
-                if self.image_previews.remove(&key).is_some() {
+                if let Some(image) = self.image_previews.remove(&key) {
+                    crate::display::textures::retire_image(image);
                     cx.notify();
                     return;
                 }
                 let Some(a) = m.attachments().get(i).cloned() else { return };
                 let Some(account) = self.account_of(&m) else { return };
+                // Told before anything downloads.
+                if a.size > MAX_PREVIEW_FILE {
+                    self.notice(t!("tools-this-picture-is-too-large-to-preview"), true, cx);
+                    return;
+                }
                 self.task(
                     cx,
                     move |b| {
                         let bytes = b.attachment(&account, &m, a.part)?;
+                        // Its listed size may be an estimate.
+                        anyhow::ensure!(bytes.len() <= MAX_PREVIEW_FILE, t!("tools-this-picture-is-too-large-to-preview"));
                         decode_image_preview(bytes, &a.mime, &a.name)
                     },
                     move |this, result: anyhow::Result<(ImageFormat, Vec<u8>)>, cx| match result {
@@ -951,6 +1092,10 @@ impl MailApp {
     /// addresses, shows email files, and attaches shared files to a new
     /// message (the one a `mailto:` just started, if any).
     pub(super) fn take_launch_requests(&mut self, w: &mut Window, cx: &mut Context<Self>) {
+        // Locked: they wait, queued, until unlocked (drawn again then).
+        if self.lock.locked {
+            return;
+        }
         let requests = crate::display::launch::take();
         if requests.is_empty() {
             return;
@@ -967,6 +1112,8 @@ impl MailApp {
                     self.open_notified(target, w, cx);
                 }
             } else if let Some(path) = request.strip_prefix("attach:") {
+                // Shared to Picacho from a phone's Share sheet; elsewhere
+                // `launch::request` refuses them.
                 files.push(std::path::PathBuf::from(path));
             } else if let Some(path) = request.strip_prefix("file:") {
                 self.open_eml_file(std::path::Path::new(path), w, cx);
@@ -1124,6 +1271,15 @@ impl MailApp {
         cx: &mut Context<Self>,
     ) {
         if !self.accounts.iter().any(|a| a.id == target.account) {
+            return;
+        }
+        if self.lock.locked {
+            // Bounded: a flood of presses while locked keeps the latest.
+            if self.lock.deferred.len() < 256 {
+                self.lock
+                    .deferred
+                    .push(super::applock::Deferred::Quick(target, action.to_owned()));
+            }
             return;
         }
         if action == "reply" {
