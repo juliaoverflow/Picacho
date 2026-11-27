@@ -3,9 +3,10 @@
 //! searches in the sidebar, blocked senders and rules applied here, list
 //! density and where the reader goes; and Settings → Rules & Layout.
 use super::*;
+use crate::manage::categories::Category;
 use crate::manage::organize::{
-    Density, ReaderLayout, Rule, RuleAction, RuleField, SavedSearch, conversation_key,
-    mail_key,
+    Condition, Density, ReaderLayout, Rule, RuleAction, RuleField, RuleOp, SavedSearch,
+    conversation_key, mail_key,
 };
 
 /// Messages dragged from the list to a sidebar folder.
@@ -65,9 +66,10 @@ pub(super) enum RuleKind {
     Trash,
     MoveTo,
     Label,
+    Silence,
 }
 impl RuleKind {
-    const ALL: [Self; 7] = [
+    const ALL: [Self; 8] = [
         Self::MarkRead,
         Self::Star,
         Self::Archive,
@@ -75,6 +77,7 @@ impl RuleKind {
         Self::Trash,
         Self::MoveTo,
         Self::Label,
+        Self::Silence,
     ];
     fn label(self) -> &'static str {
         match self {
@@ -85,7 +88,11 @@ impl RuleKind {
             Self::Trash => t!("organize-trash"),
             Self::MoveTo => t!("organize-move-to-folder"),
             Self::Label => t!("organize-label"),
+            Self::Silence => t!("organize-dont-notify"),
         }
+    }
+    fn named(self) -> bool {
+        matches!(self, Self::MoveTo | Self::Label)
     }
     fn action(self, name: &str) -> Option<RuleAction> {
         Some(match self {
@@ -96,6 +103,7 @@ impl RuleKind {
             Self::Trash => RuleAction::Trash,
             Self::MoveTo if !name.is_empty() => RuleAction::MoveTo(name.to_owned()),
             Self::Label if !name.is_empty() => RuleAction::Label(name.to_owned()),
+            Self::Silence => RuleAction::Silence,
             _ => return None,
         })
     }
@@ -124,8 +132,30 @@ pub(super) enum OrgAction {
     SetDensity(Density),
     SetLayout(ReaderLayout),
     RuleField(RuleField),
+    RuleOp(RuleOp),
+    /// The condition being added holds when its test doesn't.
+    RuleNegate,
+    /// The category a Category condition names.
+    RuleCategory(Category),
     RuleKind(RuleKind),
-    AddRule,
+    /// Adds the condition typed to the rule being put together.
+    AddCondition,
+    RemoveCondition(usize),
+    /// Adds the action chosen to the rule being put together.
+    AddAction,
+    RemoveAction(usize),
+    /// Any condition is enough (OR), or all must hold (AND).
+    RuleAny(bool),
+    /// No later rule applies to mail the rule matched.
+    RuleStop,
+    /// Keeps the rule put together (a new one, or the one edited).
+    SaveRule,
+    /// Puts a rule back in the form, to change it.
+    EditRule(usize),
+    /// Leaves the rule put together.
+    CancelRule,
+    /// Moves a rule one place earlier.
+    RaiseRule(usize),
     ToggleRule(usize),
     RemoveRule(usize),
     /// Applies blocked senders and rules to mail in the inboxes now.
@@ -135,19 +165,33 @@ pub(super) enum OrgAction {
 /// Settings' fields for rules and blocked senders.
 pub(super) struct OrgUi {
     pub(super) rule_text: Entity<InputState>,
+    pub(super) rule_header: Entity<InputState>,
     pub(super) rule_name: Entity<InputState>,
     pub(super) block: Entity<InputState>,
     pub(super) field: RuleField,
+    pub(super) op: RuleOp,
+    pub(super) negate: bool,
+    pub(super) category: Category,
     pub(super) kind: RuleKind,
+    /// The rule being put together: its conditions and actions so far.
+    pub(super) draft: Rule,
+    /// Where the rule being changed was, when one is.
+    pub(super) editing: Option<usize>,
 }
 impl OrgUi {
     pub(super) fn new(window: &mut Window, cx: &mut App) -> Self {
         Self {
             rule_text: input(t!("organize-text-to-look-for-as-newsletter"), false, window, cx),
+            rule_header: input(t!("organize-header-name"), false, window, cx),
             rule_name: input(t!("organize-folder-or-label-name"), false, window, cx),
             block: input(t!("organize-address-or-domain-to-block"), false, window, cx),
             field: RuleField::default(),
+            op: RuleOp::default(),
+            negate: false,
+            category: Category::Promotions,
             kind: RuleKind::default(),
+            draft: Rule { enabled: true, ..Rule::default() },
+            editing: None,
         }
     }
 }
@@ -628,33 +672,97 @@ impl MailApp {
             }
             OrgAction::RuleField(f) => {
                 self.org_ui.field = f;
+                if !f.ops().contains(&self.org_ui.op) {
+                    self.org_ui.op = f.ops().first().copied().unwrap_or_default();
+                }
+                cx.notify();
+            }
+            OrgAction::RuleOp(op) => {
+                self.org_ui.op = op;
+                cx.notify();
+            }
+            OrgAction::RuleNegate => {
+                self.org_ui.negate = !self.org_ui.negate;
+                cx.notify();
+            }
+            OrgAction::RuleCategory(c) => {
+                self.org_ui.category = c;
                 cx.notify();
             }
             OrgAction::RuleKind(k) => {
                 self.org_ui.kind = k;
                 cx.notify();
             }
-            OrgAction::AddRule => {
-                let text = Self::value(&self.org_ui.rule_text, cx).trim().to_owned();
-                let name = Self::value(&self.org_ui.rule_name, cx).trim().to_owned();
-                if text.is_empty() {
-                    self.notice(t!("organize-type-the-text-the-rule-looks"), true, cx);
+            OrgAction::AddCondition => {
+                if let Err(problem) = self.take_condition(w, cx) {
+                    self.notice(problem, true, cx);
+                }
+            }
+            OrgAction::RemoveCondition(i) => {
+                if i < self.org_ui.draft.conditions.len() {
+                    self.org_ui.draft.conditions.remove(i);
+                }
+            }
+            OrgAction::AddAction => {
+                if let Err(problem) = self.take_action(w, cx) {
+                    self.notice(problem, true, cx);
+                }
+            }
+            OrgAction::RemoveAction(i) => {
+                if i < self.org_ui.draft.actions.len() {
+                    self.org_ui.draft.actions.remove(i);
+                }
+            }
+            OrgAction::RuleAny(any) => self.org_ui.draft.any = any,
+            OrgAction::RuleStop => self.org_ui.draft.stop = !self.org_ui.draft.stop,
+            OrgAction::SaveRule => {
+                // What's typed and not yet added is taken as the last
+                // condition and action.
+                let typed = !Self::value(&self.org_ui.rule_text, cx).trim().is_empty()
+                    || (self.org_ui.field == RuleField::Attachment && self.org_ui.draft.conditions.is_empty());
+                if typed && let Err(problem) = self.take_condition(w, cx) {
+                    self.notice(problem, true, cx);
                     return;
                 }
-                let Some(action) = self.org_ui.kind.action(&name) else {
-                    self.notice(t!("organize-type-the-folder-or-labels-name"), true, cx);
+                let chosen = self.org_ui.draft.actions.is_empty() || !Self::value(&self.org_ui.rule_name, cx).trim().is_empty();
+                if chosen && let Err(problem) = self.take_action(w, cx) {
+                    self.notice(problem, true, cx);
                     return;
-                };
-                self.org.rules.push(Rule {
-                    field: self.org_ui.field,
-                    contains: text,
-                    action,
-                    account: String::new(),
-                    enabled: true,
-                });
+                }
+                let rule = Rule { enabled: true, ..self.org_ui.draft.clone() };
+                if let Some(problem) = rule.problem() {
+                    self.notice(problem, true, cx);
+                    return;
+                }
+                match self.org_ui.editing.take() {
+                    Some(i) if i < self.org.rules.len() => self.org.rules[i] = Rule { enabled: self.org.rules[i].enabled, ..rule },
+                    _ => self.org.rules.push(rule),
+                }
+                self.org_ui.draft = Rule { enabled: true, ..Rule::default() };
+                self.save_org(cx);
+            }
+            OrgAction::EditRule(i) => {
+                if let Some(r) = self.org.rules.get(i) {
+                    self.org_ui.draft = r.clone();
+                    self.org_ui.editing = Some(i);
+                }
+            }
+            OrgAction::CancelRule => {
+                self.org_ui.draft = Rule { enabled: true, ..Rule::default() };
+                self.org_ui.editing = None;
                 Self::set(&self.org_ui.rule_text, "", w, cx);
                 Self::set(&self.org_ui.rule_name, "", w, cx);
-                self.save_org(cx);
+            }
+            OrgAction::RaiseRule(i) => {
+                if i > 0 && i < self.org.rules.len() {
+                    self.org.rules.swap(i - 1, i);
+                    match self.org_ui.editing {
+                        Some(e) if e == i => self.org_ui.editing = Some(i - 1),
+                        Some(e) if e == i - 1 => self.org_ui.editing = Some(i),
+                        _ => {}
+                    }
+                    self.save_org(cx);
+                }
             }
             OrgAction::ToggleRule(i) => {
                 if let Some(r) = self.org.rules.get_mut(i) {
@@ -666,11 +774,63 @@ impl MailApp {
             OrgAction::RemoveRule(i) => {
                 if i < self.org.rules.len() {
                     self.org.rules.remove(i);
+                    match self.org_ui.editing {
+                        Some(e) if e == i => self.org_ui.editing = None,
+                        Some(e) if e > i => self.org_ui.editing = Some(e - 1),
+                        _ => {}
+                    }
                     self.save_org(cx);
                 }
             }
         }
         cx.notify();
+    }
+
+    /// Adds the condition typed in Settings to the rule being put
+    /// together, or says what's missing.
+    fn take_condition(&mut self, w: &mut Window, cx: &mut Context<Self>) -> Result<(), &'static str> {
+        let ui = &self.org_ui;
+        let value = match ui.field {
+            RuleField::Category => ui.category.key().to_owned(),
+            RuleField::Attachment => String::new(),
+            _ => Self::value(&ui.rule_text, cx).trim().to_owned(),
+        };
+        let condition = Condition {
+            field: ui.field,
+            op: ui.field.ops().contains(&ui.op).then_some(ui.op).or(ui.field.ops().first().copied()).unwrap_or_default(),
+            value,
+            header: if ui.field == RuleField::Header { Self::value(&ui.rule_header, cx).trim().to_owned() } else { String::new() },
+            negate: ui.negate,
+        };
+        if let Some(problem) = condition.problem() {
+            return Err(problem);
+        }
+        if !self.org_ui.draft.conditions.contains(&condition) {
+            self.org_ui.draft.conditions.push(condition);
+        }
+        self.org_ui.negate = false;
+        Self::set(&self.org_ui.rule_text, "", w, cx);
+        cx.notify();
+        Ok(())
+    }
+
+    /// Adds the action chosen in Settings to the rule being put together,
+    /// or says what's missing.
+    fn take_action(&mut self, w: &mut Window, cx: &mut Context<Self>) -> Result<(), &'static str> {
+        let name = Self::value(&self.org_ui.rule_name, cx).trim().to_owned();
+        let Some(action) = self.org_ui.kind.action(&name) else {
+            return Err(t!("organize-type-the-folder-or-labels-name"));
+        };
+        let draft = &mut self.org_ui.draft;
+        if action.moves() && draft.actions.iter().any(RuleAction::moves) {
+            return Err(t!("manage-organize-a-rule-moves-mail-once"));
+        }
+        if !draft.actions.contains(&action) {
+            draft.actions.push(action);
+        }
+        Self::set(&self.org_ui.rule_name, "", w, cx);
+        cx.notify();
+        Ok(())
     }
 
     /// Applies blocked senders, muted conversations and rules to mail that
@@ -1215,108 +1375,49 @@ impl MailApp {
         );
         let mut rules = Rows::new();
         for (i, r) in org.rules.iter().enumerate() {
-            let text = t!("organize-contains", label = r.field.label(), contains = r.contains, label2 = r.action.label());
-            rules = rules.row(row(
-                format!("rule-row-{i}"),
-                text,
+            let editing = self.org_ui.editing == Some(i);
+            rules = rules.row(
                 div()
+                    .id(SharedString::from(format!("rule-row-{i}")))
                     .flex()
+                    .flex_wrap()
                     .items_center()
-                    .gap_2()
-                    .child(self.switch(
-                        format!("rule-on-{i}"),
-                        r.enabled,
-                        act(OrgAction::ToggleRule(i)),
-                        cx,
-                    ))
-                    .child(self.button(
-                        format!("remove-rule-{i}"),
-                        t!("organize-remove-rule"),
-                        "trash",
-                        act(OrgAction::RemoveRule(i)),
-                        false,
-                        cx,
-                    ))
-                    .into_any_element(),
-            ));
-        }
-        let fields = self.segmented(
-            "rule-field",
-            RuleField::ALL
-                .iter()
-                .map(|f| {
-                    (
-                        f.label().to_owned(),
-                        act(OrgAction::RuleField(*f)),
-                        self.org_ui.field == *f,
+                    .gap_3()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(220.))
+                            .flex()
+                            .flex_col()
+                            .gap(px(2.))
+                            .text_size(px(13.))
+                            .when(!r.name.is_empty(), |d| d.child(div().font_weight(FontWeight::SEMIBOLD).child(r.name.clone())))
+                            .child(r.describe())
+                            .when(r.stop, |d| d.child(small(t!("organize-then-stop").into())))
+                            .when(editing, |d| d.child(small(t!("organize-being-changed-below").into()))),
                     )
-                })
-                .collect(),
-            cx,
-        );
-        let kinds = self.segmented(
-            "rule-kind",
-            RuleKind::ALL
-                .iter()
-                .map(|k| {
-                    (
-                        k.label().to_owned(),
-                        act(OrgAction::RuleKind(*k)),
-                        self.org_ui.kind == *k,
-                    )
-                })
-                .collect(),
-            cx,
-        );
-        let named = matches!(self.org_ui.kind, RuleKind::MoveTo | RuleKind::Label);
-        rules = rules.row(
-            div()
-                .flex()
-                .flex_col()
-                .gap_2()
-                .child(small(t!("organize-when").into()))
-                .child(fields)
-                .child(small("contains".into()))
-                .child(field(Input::new(&self.org_ui.rule_text), c, false))
-                .child(small("then".into()))
-                .child(kinds)
-                .when(named, |d| d.child(field(Input::new(&self.org_ui.rule_name), c, false)))
-                .child(
-                    div()
-                        .flex()
-                        .justify_end()
-                        .gap_2()
-                        .child(if self.applying_rules {
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap_2()
-                                .text_size(px(12.))
-                                .text_color(rgb(c.muted))
-                                .child(spinner(12., c.muted))
-                                .child(t!("organize-applying"))
-                                .into_any_element()
-                        } else {
-                            self.button(
-                                "apply-rules",
-                                t!("organize-apply-rules-now"),
-                                "",
-                                act(OrgAction::ApplyRulesNow),
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(self.switch(format!("rule-on-{i}"), r.enabled, act(OrgAction::ToggleRule(i)), cx))
+                            .when(i > 0, |d| {
+                                d.child(self.button(format!("raise-rule-{i}"), t!("organize-move-up"), "chevron-up", act(OrgAction::RaiseRule(i)), false, cx))
+                            })
+                            .child(self.button(format!("edit-rule-{i}"), t!("organize-edit-rule"), "", act(OrgAction::EditRule(i)), false, cx))
+                            .child(self.button(
+                                format!("remove-rule-{i}"),
+                                t!("organize-remove-rule"),
+                                "trash",
+                                act(OrgAction::RemoveRule(i)),
                                 false,
                                 cx,
-                            )
-                            .into_any_element()
-                        })
-                        .child(self.button(
-                            "add-rule",
-                            t!("organize-add-rule"),
-                            "plus",
-                            act(OrgAction::AddRule),
-                            true,
-                            cx,
-                        )),
-                ),
-        );
+                            )),
+                    ),
+            );
+        }
+        rules = rules.row(self.rule_form(cx));
         self.settings_column()
             .child(self.settings_group(t!("organize-layout"), layout_rows))
             .child(self.categories_settings(cx))
@@ -1324,6 +1425,196 @@ impl MailApp {
             .child(self.settings_group(t!("organize-blocked-senders"), blocked))
             .child(self.settings_group(t!("organize-rules"), rules))
             .into_any_element()
+    }
+}
+
+impl MailApp {
+    /// Putting a rule together: its conditions (each added in turn), all
+    /// or any of them, its actions in order, and whether later rules still
+    /// apply.
+    fn rule_form(&self, cx: &Context<Self>) -> Div {
+        let c = self.colors();
+        let ui = &self.org_ui;
+        let draft = &ui.draft;
+        let act = |a: OrgAction| Action::Organize(a);
+        let small = |t: String| div().text_size(px(12.)).text_color(rgb(c.muted)).child(t);
+        let chip = |id: String, text: String, remove: OrgAction| {
+            div()
+                .id(SharedString::from(id.clone()))
+                .debug_selector(move || id.clone())
+                .max_w_full()
+                .h(px(26.))
+                .pl_2()
+                .pr_1()
+                .flex()
+                .items_center()
+                .gap_1()
+                .rounded(px(13.))
+                .bg(rgb(c.soft))
+                .text_size(px(12.))
+                .text_color(rgb(c.text))
+                .child(div().min_w_0().truncate().child(text.clone()))
+                .child(
+                    div()
+                        .id("remove")
+                        .role(Role::Button)
+                        .aria_label(t!("organize-remove-part", part = text))
+                        .size(px(18.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded_full()
+                        .cursor_pointer()
+                        .hover(move |s| s.bg(rgb(c.border)))
+                        .child(icon_el("close", 10., c.muted))
+                        .on_click(cx.listener(move |this, _, w, cx| this.handle(Action::Organize(remove.clone()), w, cx))),
+                )
+        };
+        let conditions = div().flex().flex_wrap().gap_1().children(
+            draft
+                .conditions
+                .iter()
+                .enumerate()
+                .map(|(i, cond)| chip(format!("rule-condition-{i}"), cond.describe(), OrgAction::RemoveCondition(i))),
+        );
+        let actions = div().flex().flex_wrap().gap_1().children(
+            draft
+                .actions
+                .iter()
+                .enumerate()
+                .map(|(i, a)| chip(format!("rule-action-{i}"), a.label(), OrgAction::RemoveAction(i))),
+        );
+        let fields = self.segmented(
+            "rule-field",
+            RuleField::ALL
+                .iter()
+                .map(|f| (f.label().to_owned(), act(OrgAction::RuleField(*f)), ui.field == *f))
+                .collect(),
+            cx,
+        );
+        let ops = ui.field.ops();
+        let op = if ops.contains(&ui.op) { ui.op } else { ops.first().copied().unwrap_or_default() };
+        let comparisons = (ops.len() > 1).then(|| {
+            self.segmented(
+                "rule-op",
+                ops.iter().map(|o| (o.label().to_owned(), act(OrgAction::RuleOp(*o)), op == *o)).collect(),
+                cx,
+            )
+        });
+        let value: AnyElement = match ui.field {
+            RuleField::Attachment => small(t!("organize-attachment-condition").into()).into_any_element(),
+            RuleField::Category => self
+                .segmented(
+                    "rule-category",
+                    Category::ALL
+                        .iter()
+                        .map(|cat| (cat.label().to_owned(), act(OrgAction::RuleCategory(*cat)), ui.category == *cat))
+                        .collect(),
+                    cx,
+                )
+                .into_any_element(),
+            RuleField::Header => div()
+                .flex()
+                .gap_2()
+                .child(div().w(px(160.)).child(field(Input::new(&ui.rule_header), c, false)))
+                .child(div().flex_1().child(field(Input::new(&ui.rule_text), c, false)))
+                .into_any_element(),
+            _ => field(Input::new(&ui.rule_text), c, false).into_any_element(),
+        };
+        let kinds = self.segmented(
+            "rule-kind",
+            RuleKind::ALL
+                .iter()
+                .map(|k| (k.label().to_owned(), act(OrgAction::RuleKind(*k)), ui.kind == *k))
+                .collect(),
+            cx,
+        );
+        let several = draft.conditions.len() > 1;
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(div().text_size(px(13.)).font_weight(FontWeight::SEMIBOLD).child(if ui.editing.is_some() {
+                t!("organize-change-rule")
+            } else {
+                t!("organize-new-rule")
+            }))
+            .child(small(t!("organize-when").into()))
+            .when(!draft.conditions.is_empty(), |d| d.child(conditions))
+            .when(several, |d| {
+                d.child(
+                    self.segmented(
+                        "rule-any",
+                        vec![
+                            (t!("organize-all-conditions").into(), act(OrgAction::RuleAny(false)), !draft.any),
+                            (t!("organize-any-condition").into(), act(OrgAction::RuleAny(true)), draft.any),
+                        ],
+                        cx,
+                    )
+                    .max_w(px(360.)),
+                )
+            })
+            .child(fields)
+            .children(comparisons)
+            .child(value)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .child(self.switch_setting(t!("organize-doesnt-match"), "", "rule-negate".into(), ui.negate, act(OrgAction::RuleNegate), cx).flex_1())
+                    .child(self.button("add-condition", t!("organize-add-condition"), "plus", act(OrgAction::AddCondition), false, cx)),
+            )
+            .child(small(t!("organize-then").into()))
+            .when(!draft.actions.is_empty(), |d| d.child(actions))
+            .child(kinds)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(div().flex_1().when(ui.kind.named(), |d| d.child(field(Input::new(&ui.rule_name), c, false))))
+                    .child(self.button("add-action", t!("organize-add-action"), "plus", act(OrgAction::AddAction), false, cx)),
+            )
+            .child(self.switch_setting(
+                t!("organize-stop-other-rules"),
+                t!("organize-stop-other-rules-caption"),
+                "rule-stop".into(),
+                draft.stop,
+                act(OrgAction::RuleStop),
+                cx,
+            ))
+            .child(
+                div()
+                    .flex()
+                    .justify_end()
+                    .gap_2()
+                    .child(if self.applying_rules {
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .text_size(px(12.))
+                            .text_color(rgb(c.muted))
+                            .child(spinner(12., c.muted))
+                            .child(t!("organize-applying"))
+                            .into_any_element()
+                    } else {
+                        self.button("apply-rules", t!("organize-apply-rules-now"), "", act(OrgAction::ApplyRulesNow), false, cx)
+                            .into_any_element()
+                    })
+                    .when(ui.editing.is_some() || !draft.conditions.is_empty() || !draft.actions.is_empty(), |d| {
+                        d.child(self.button("cancel-rule", t!("organize-cancel"), "", act(OrgAction::CancelRule), false, cx))
+                    })
+                    .child(self.button(
+                        "add-rule",
+                        if ui.editing.is_some() { t!("organize-save-rule") } else { t!("organize-add-rule") },
+                        "plus",
+                        act(OrgAction::SaveRule),
+                        true,
+                        cx,
+                    )),
+            )
     }
 }
 

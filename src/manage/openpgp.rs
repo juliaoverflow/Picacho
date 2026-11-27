@@ -20,6 +20,8 @@ use pgp::types::{KeyDetails, Password, SigningKey};
 use serde::{Deserialize, Serialize};
 
 pub mod keys;
+/// Your keys on OpenPGP cards (security keys).
+pub mod card;
 mod autocrypt;
 mod inline;
 mod legacy_display;
@@ -67,6 +69,10 @@ pub struct Keyring {
     /// Off (nopreference) unless turned on in Settings → Encryption.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub prefer_mutual: Vec<String>,
+    /// Your keys on OpenPGP cards: each one's certificate and the card that
+    /// holds its secret parts (`card.rs`). Nothing secret is kept.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cards: Vec<card::CardKey>,
 }
 
 /// One key, as Settings lists it.
@@ -86,6 +92,8 @@ pub struct KeyInfo {
     /// The key carries a Key Revocation signature (RFC 9580 §5.2.1.11):
     /// it is no longer encrypted to nor trusted (see `key_for`).
     pub revoked: bool,
+    /// Its secret parts are on this OpenPGP card (its name), not here.
+    pub card: Option<String>,
 }
 
 /// What a message's OpenPGP protection turned out to be when read.
@@ -334,6 +342,7 @@ impl Keyring {
         Keyring {
             secret: self.secret.clone(),
             prefer_mutual: self.prefer_mutual.clone(),
+            cards: self.cards.clone(),
             ..Keyring::default()
         }
     }
@@ -380,7 +389,49 @@ impl Keyring {
             .filter_map(|k| read_public(k))
             .collect();
         keys.extend(self.secret_keys().into_iter().map(SignedPublicKey::from));
+        keys.extend(self.cards.iter().filter_map(card::CardKey::certificate));
         keys
+    }
+    /// Whether you have a key of your own: here, or on a card.
+    pub fn has_own(&self) -> bool {
+        !self.secret.is_empty() || !self.cards.is_empty()
+    }
+    /// Your own public keys: of your keys here, then of your cards.
+    pub fn own_public_keys(&self) -> Vec<SignedPublicKey> {
+        self.secret_keys()
+            .into_iter()
+            .map(SignedPublicKey::from)
+            .chain(self.cards.iter().filter_map(card::CardKey::certificate))
+            .collect()
+    }
+    /// What can decrypt: your keys here and your cards.
+    pub(crate) fn secrets(&self) -> Secrets {
+        Secrets { keys: self.secret_keys(), cards: self.cards.clone() }
+    }
+    /// Your public key for `email`: of a key here, else of a card.
+    pub fn own_public(&self, email: &str) -> Option<SignedPublicKey> {
+        self.own_key(email)
+            .map(SignedPublicKey::from)
+            .or_else(|| self.own_card(email).and_then(card::CardKey::certificate))
+    }
+    /// Your card whose key is for `email`.
+    pub fn own_card(&self, email: &str) -> Option<&card::CardKey> {
+        self.cards.iter().find(|c| c.is_for(email))
+    }
+    /// What signs as `email`: your key here, else your card.
+    pub(crate) fn signer(&self, email: &str) -> Option<Signer> {
+        self.own_key(email)
+            .map(|k| Signer::Key(Box::new(k)))
+            .or_else(|| self.own_card(email).cloned().map(Signer::Card))
+    }
+    /// Adds (or replaces) a card's key. Its certificate leaves the public
+    /// keys, where it may have been imported before.
+    pub fn add_card(&mut self, key: card::CardKey) {
+        let fp = key.fingerprint();
+        self.cards.retain(|c| c.ident != key.ident && c.fingerprint() != fp);
+        self.public.retain(|k| parsed_public(k).is_none_or(|k| fingerprint(&*k) != fp));
+        self.found.retain(|f| *f != fp);
+        self.cards.push(key);
     }
     /// Other people's public keys as parsed, without copying them.
     fn each_public(&self) -> impl Iterator<Item = std::sync::Arc<SignedPublicKey>> + '_ {
@@ -401,9 +452,23 @@ impl Keyring {
                     verified: true,
                     expires: keys::expires(&public),
                     revoked: !public.details.revocation_signatures.is_empty(),
+                    card: None,
                 }
             })
             .collect();
+        for c in &self.cards {
+            let Some(public) = c.certificate() else { continue };
+            out.push(KeyInfo {
+                fingerprint: fingerprint(&public),
+                users: users(&public),
+                secret: true,
+                found: false,
+                verified: true,
+                expires: keys::expires(&public),
+                revoked: !public.details.revocation_signatures.is_empty(),
+                card: Some(c.name.clone()),
+            });
+        }
         for k in self
             .public
             .iter()
@@ -418,6 +483,7 @@ impl Keyring {
                 fingerprint: fp,
                 users: users(&k),
                 secret: false,
+                card: None,
             });
         }
         out
@@ -546,7 +612,7 @@ impl Keyring {
     /// Your public key for `email`, binary, as Autocrypt sends it.
     pub fn own_public_bytes(&self, email: &str) -> Option<Vec<u8>> {
         use pgp::ser::Serialize as _;
-        SignedPublicKey::from(self.own_key(email)?).to_bytes().ok()
+        self.own_public(email)?.to_bytes().ok()
     }
     /// Checks a key against a fingerprint its owner gave you (read out,
     /// pasted from their mail or chat, or from their QR code): spaces,
@@ -610,6 +676,7 @@ impl Keyring {
         });
         self.public
             .retain(|k| parsed_public(k).is_none_or(|k| fingerprint(&*k) != fp));
+        self.cards.retain(|c| c.fingerprint() != fp);
     }
     /// Your secret key for `email`, for signing.
     pub fn own_key(&self, email: &str) -> Option<SignedSecretKey> {
@@ -630,8 +697,47 @@ impl Keyring {
                 self.secret_keys()
                     .into_iter()
                     .map(SignedPublicKey::from)
+                    .chain(self.cards.iter().filter_map(card::CardKey::certificate))
                     .find(|k| usable(k))
             })
+    }
+}
+
+/// What decrypts messages to you: your secret keys here, and your cards
+/// (used when unlocked; see `card::session_keys`).
+pub(crate) struct Secrets {
+    pub keys: Vec<SignedSecretKey>,
+    pub cards: Vec<card::CardKey>,
+}
+impl Secrets {
+    pub fn is_empty(&self) -> bool {
+        self.keys.is_empty() && self.cards.iter().all(|c| c.decryption.is_none())
+    }
+}
+
+/// What signs your mail: a key of yours here, or a card.
+pub(crate) enum Signer {
+    Key(Box<SignedSecretKey>),
+    Card(card::CardKey),
+}
+impl Signer {
+    /// Runs `work` with the signing key: the key's signing subkey, or the
+    /// card (its PIN kept, `manage/hardware.rs`; else `PinNeeded`).
+    pub fn with<T>(&self, work: impl FnOnce(&dyn SigningKey) -> Result<T>) -> Result<T> {
+        match self {
+            Signer::Key(key) => work(signing_key(key)),
+            Signer::Card(key) => {
+                let signer = card::CardSigner::open(key)?;
+                work(&signer)
+            }
+        }
+    }
+    /// Its certificate, which mail encrypted to you also goes to.
+    pub fn public(&self) -> Option<SignedPublicKey> {
+        match self {
+            Signer::Key(key) => Some(SignedPublicKey::from(SignedSecretKey::clone(key))),
+            Signer::Card(key) => key.certificate(),
+        }
     }
 }
 
@@ -949,7 +1055,7 @@ fn open_layer(raw: &[u8], ring: &Keyring, depth: &mut usize) -> Option<(Vec<u8>,
     // the message is from (see `good_from`).
     let from = from_address(raw);
     if let Some((armored, outer)) = crate::manage::crypto::encrypted_part(raw) {
-        let secret = ring.secret_keys();
+        let secret = ring.secrets();
         if secret.is_empty() {
             return None;
         }
@@ -1090,7 +1196,7 @@ fn open_inline(raw: &[u8], ring: &Keyring, from: Option<&str>, depth: &mut usize
         let files = if parsed.subparts.is_empty() {
             inline::Files { parts: Vec::new(), uncovered: Vec::new() }
         } else {
-            inline::attachments(&parsed, text_part, &ring.secret_keys(), depth, signed, sealed)
+            inline::attachments(&parsed, text_part, &ring.secrets(), depth, signed, sealed)
         };
         if files.parts.is_empty() {
             out.extend_from_slice(&part);
@@ -1144,7 +1250,7 @@ fn open_inline(raw: &[u8], ring: &Keyring, from: Option<&str>, depth: &mut usize
     }
     if let Some(start) = body.find("-----BEGIN PGP MESSAGE-----") {
         let end = body[start..].find("-----END PGP MESSAGE-----")? + start + 25;
-        let secret = ring.secret_keys();
+        let secret = ring.secrets();
         if secret.is_empty() {
             return None;
         }
@@ -1334,20 +1440,23 @@ pub fn protect(
     } else {
         part
     };
-    let own = ring.own_key(from);
+    let own = ring.signer(from);
     let mut content = part.clone();
     if how.sign {
         let key = own.as_ref().with_context(|| {
             t!("manage-openpgp-theres-no-openpgp-key-of-yours", from = from)
         })?;
-        let signature = DetachedSignature::sign_binary_data(
-            rand08::thread_rng(),
-            &Box::new(signing_key(key)),
-            &Password::empty(),
-            HashAlgorithm::Sha256,
-            &part[..],
-        )?
-        .to_armored_string(ArmorOptions::default())?;
+        let signature = key
+            .with(|signer| {
+                Ok(DetachedSignature::sign_binary_data(
+                    rand08::thread_rng(),
+                    &Box::new(signer),
+                    &Password::empty(),
+                    HashAlgorithm::Sha256,
+                    &part[..],
+                )?)
+            })?
+            .to_armored_string(ArmorOptions::default())?;
         let b = boundary();
         let mut signed = format!(
             "Content-Type: multipart/signed; micalg=pgp-sha256; protocol=\"application/pgp-signature\"; boundary=\"{b}\"\r\n\r\n--{b}\r\n"
@@ -1363,7 +1472,7 @@ pub fn protect(
     let mut out = outer;
     out.extend_from_slice(b"MIME-Version: 1.0\r\n");
     if how.encrypt {
-        let keys = recipient_keys(to, own.as_ref(), ring)?;
+        let keys = recipient_keys(to, own.as_ref().and_then(Signer::public), ring)?;
         let armored = encrypt(content, &keys, None, true)?;
         let armored = String::from_utf8(armored)?;
         let b = boundary();
@@ -1392,7 +1501,7 @@ fn signing_key(key: &SignedSecretKey) -> &dyn SigningKey {
 
 /// The keys a message is encrypted to: every recipient's (each must have
 /// one), and your own, so the copy in Sent stays readable.
-fn recipient_keys(to: &[String], own: Option<&SignedSecretKey>, ring: &Keyring) -> Result<Vec<SignedPublicKey>> {
+fn recipient_keys(to: &[String], own: Option<SignedPublicKey>, ring: &Keyring) -> Result<Vec<SignedPublicKey>> {
     let mut keys = Vec::new();
     let mut missing = Vec::new();
     for address in to {
@@ -1406,7 +1515,7 @@ fn recipient_keys(to: &[String], own: Option<&SignedSecretKey>, ring: &Keyring) 
         t!("manage-openpgp-theres-no-openpgp-key-for-import", addresses = missing.join(", "))
     );
     if let Some(own) = own {
-        keys.push(SignedPublicKey::from(own.clone()));
+        keys.push(own);
     }
     Ok(keys)
 }
@@ -1417,7 +1526,7 @@ fn recipient_keys(to: &[String], own: Option<&SignedSecretKey>, ring: &Keyring) 
 fn encrypt(
     content: Vec<u8>,
     keys: &[SignedPublicKey],
-    signer: Option<&SignedSecretKey>,
+    signer: Option<&dyn SigningKey>,
     armored: bool,
 ) -> Result<Vec<u8>> {
     // Each recipient's key to encrypt to: an encryption subkey bound to
@@ -1426,7 +1535,7 @@ fn encrypt(
         ($builder:expr) => {{
             let mut builder = $builder;
             if let Some(signer) = signer {
-                builder.sign(signing_key(signer), Password::empty(), HashAlgorithm::Sha256);
+                builder.sign(signer, Password::empty(), HashAlgorithm::Sha256);
             }
             for key in keys {
                 match encryption_subkey(key) {

@@ -121,12 +121,12 @@ fn graph_accounts_read_change_and_send_without_imap() -> Result<()> {
     b.mark_all_read(&a, &Folder::Inbox.into())?;
     assert!(fake.lock().unwrap().messages.iter().filter(|m| m.folder == "f-inbox").all(|m| m.read));
 
-    // Inbox rules and automatic replies; a rule made in Outlook with two
-    // tests is kept as it is.
+    // Inbox rules and automatic replies; a rule made in Outlook with a
+    // test Picacho has no words for (importance) is kept as it is.
     use crate::sync::sieve::{Act, Field, Filters, Rule, Vacation};
     fake.lock().unwrap().rules.push(serde_json::json!({
         "id": "outlook-1", "displayName": "Mine", "sequence": 1, "isEnabled": true,
-        "conditions": {"subjectContains": ["a"], "bodyContains": ["b"]}, "actions": {"markAsRead": true},
+        "conditions": {"subjectContains": ["a"], "importance": "high"}, "actions": {"markAsRead": true},
     }));
     let wanted = Filters {
         rules: vec![Rule { field: Field::Subject, value: "invoice".into(), act: Act::Folder("Inbox/Work".into()), stop: true, ..Default::default() }],

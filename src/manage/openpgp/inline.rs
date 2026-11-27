@@ -7,13 +7,11 @@
 //! Inline PGP protects no header fields, so the subject always stays
 //! readable, and only plain text: a formatted message has HTML, which
 //! nothing would sign or decrypt as part of the text.
-use super::{
-    Keyring, Protect, encrypt, nested, recipient_keys, signing_key, split_body,
-};
+use super::{Keyring, Protect, Secrets, Signer, encrypt, nested, recipient_keys, split_body};
 use anyhow::{Context, Result, ensure};
 use lettre::message::{Attachment, SinglePart, header::ContentType};
 use mailparse::{DispositionType, ParsedMail};
-use pgp::composed::{ArmorOptions, CleartextSignedMessage, DetachedSignature, Message, SignedSecretKey};
+use pgp::composed::{ArmorOptions, CleartextSignedMessage, DetachedSignature, Message};
 use pgp::crypto::hash::HashAlgorithm;
 use pgp::types::Password;
 
@@ -21,16 +19,27 @@ use pgp::types::Password;
 /// `protect` with `how.inline`. Encrypted, the signature (with
 /// `how.sign`) goes inside the encryption, as `gpg --sign --encrypt` does.
 pub(super) fn protect(raw: &[u8], from: &str, to: &[String], how: Protect, ring: &Keyring) -> Result<Vec<u8>> {
+    let own = ring.signer(from);
+    match (how.sign, own.as_ref()) {
+        (true, Some(own)) => own.with(|signer| protect_with(raw, to, how, ring, Some(own), Some(signer))),
+        (true, None) => anyhow::bail!(t!("manage-openpgp-theres-no-openpgp-key-of-yours", from = from)),
+        (false, own) => protect_with(raw, to, how, ring, own, None),
+    }
+}
+
+/// `protect`, signing with `signer` (your key or card, `own`) when given.
+fn protect_with(
+    raw: &[u8],
+    to: &[String],
+    how: Protect,
+    ring: &Keyring,
+    own: Option<&Signer>,
+    signer: Option<&dyn pgp::types::SigningKey>,
+) -> Result<Vec<u8>> {
     let (part, mut out) = split_body(raw);
     let parsed = mailparse::parse_mail(&part)?;
     let (text, attachments) = contents(&parsed)?;
-    let own = ring.own_key(from);
-    let signer = if how.sign {
-        Some(own.as_ref().with_context(|| t!("manage-openpgp-theres-no-openpgp-key-of-yours", from = from))?)
-    } else {
-        None
-    };
-    let keys = if how.encrypt { recipient_keys(to, own.as_ref(), ring)? } else { Vec::new() };
+    let keys = if how.encrypt { recipient_keys(to, own.and_then(Signer::public), ring)? } else { Vec::new() };
     let armored = match signer {
         _ if how.encrypt => String::from_utf8(encrypt(text.into_bytes(), &keys, signer, true)?)?,
         Some(key) => CleartextSignedMessage::sign(
@@ -38,7 +47,7 @@ pub(super) fn protect(raw: &[u8], from: &str, to: &[String], how: Protect, ring:
             // RFC 9580 §7.2: trailing spaces aren't signed, and are left
             // out when checked; rPGP signs the text as given.
             &text.split('\n').map(|l| l.trim_end_matches([' ', '\t'])).collect::<Vec<_>>().join("\n"),
-            &Box::new(signing_key(key)),
+            &Box::new(key),
             &Password::empty(),
         )?
         .to_armored_string(ArmorOptions::default())?,
@@ -68,7 +77,7 @@ pub(super) fn protect(raw: &[u8], from: &str, to: &[String], how: Protect, ring:
             parts.push(attachment.raw_bytes.to_vec());
             let signature = DetachedSignature::sign_binary_data(
                 rand08::thread_rng(),
-                &Box::new(signing_key(key)),
+                &Box::new(key),
                 &Password::empty(),
                 HashAlgorithm::Sha256,
                 &bytes[..],
@@ -163,7 +172,7 @@ pub(super) struct Files {
 pub(super) fn attachments(
     parsed: &ParsedMail,
     text: &ParsedMail,
-    secret: &[SignedSecretKey],
+    secret: &Secrets,
     depth: usize,
     signed: &dyn Fn(&[u8], &[u8]) -> bool,
     sealed: &dyn Fn(&Message<'_>) -> bool,
@@ -228,7 +237,7 @@ pub(super) fn detached(bytes: &[u8]) -> Option<pgp::packet::Signature> {
 /// sign may have been added on the way.
 fn opened(
     leaf: &ParsedMail,
-    secret: &[SignedSecretKey],
+    secret: &Secrets,
     mut depth: usize,
     sealed: &dyn Fn(&Message<'_>) -> bool,
 ) -> Option<(Vec<u8>, bool)> {

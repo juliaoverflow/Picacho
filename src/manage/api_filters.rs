@@ -2,15 +2,15 @@
 //! rules (`sieve::Rule`) as Gmail's filters and as Microsoft 365's inbox
 //! rules, and back, with the away reply as each keeps it.
 //!
-//! A filter or rule set elsewhere that Picacho's rules can say (one test,
-//! one action) is shown and edited here like any other; one that can't
-//! (several tests, several actions, what Picacho has no words for) is left
-//! as it is, and counted (`State::kept_elsewhere`). What a provider can't
+//! A filter or rule set elsewhere that Picacho's rules can say (its tests,
+//! all or any of them, and its actions) is shown and edited here like any
+//! other; one that can't (tests Picacho has no words for, or combined in a
+//! way it can't say) is left as it is, and counted (`State::kept_elsewhere`). What a provider can't
 //! do with a rule is refused when it is saved, saying what.
 use super::*;
 use crate::sync::gmail::{self, Label};
 use crate::sync::graph::{self, MailFolder};
-use crate::sync::sieve::{Act, Field, Match, Rule, State, Vacation};
+use crate::sync::sieve::{Act, Field, Match, Rule, State, Test, Vacation};
 use serde_json::{Value, json};
 
 /// What the filter editor offers for Gmail (as Sieve extensions).
@@ -35,10 +35,11 @@ fn date_of(at: i64) -> Option<String> {
 
 // --- Gmail ---------------------------------------------------------------
 
-/// A Gmail search word for a rule's test.
-fn gmail_query(r: &Rule) -> Result<String> {
+/// A Gmail search word for one test (without its negation).
+fn gmail_query(r: &Test) -> Result<String> {
     let v = r.value.trim();
     let quoted = if v.contains(' ') { format!("\"{v}\"") } else { v.to_owned() };
+    let kb = || v.trim_end_matches(['K', 'k']).trim().parse::<u64>().map_err(|_| unsupported("Gmail", v));
     Ok(match r.field {
         Field::From => format!("from:{quoted}"),
         Field::To => format!("to:{quoted}"),
@@ -46,14 +47,22 @@ fn gmail_query(r: &Rule) -> Result<String> {
         Field::Subject => format!("subject:{quoted}"),
         Field::List => format!("list:{quoted}"),
         Field::Body => quoted,
-        Field::LargerThan => format!("larger:{}K", v.parse::<u64>().map_err(|_| unsupported("Gmail", v))?),
+        Field::LargerThan => format!("larger:{}K", kb()?),
+        Field::SmallerThan => format!("smaller:{}K", kb()?),
+        Field::Attachment => "has:attachment".to_owned(),
         Field::DeliveredTo => format!("deliveredto:{quoted}"),
         Field::Header => return Err(unsupported("Gmail", &t!("filters-header", header = r.header))),
     })
 }
-/// A rule's test, read back from a Gmail search word.
-fn gmail_test(query: &str) -> (Field, String) {
+/// A test's search word with its negation: `-(…)`.
+fn gmail_term(t: &Test) -> Result<String> {
+    let q = gmail_query(t)?;
+    Ok(if t.negate { format!("-({q})") } else { q })
+}
+/// A test, read back from a Gmail search word.
+fn gmail_test(query: &str) -> Test {
     let unquote = |s: &str| s.trim().trim_matches('"').to_owned();
+    let test = |field, value| Test { field, value, ..Test::default() };
     for (prefix, field) in [
         ("from:", Field::From),
         ("to:", Field::To),
@@ -62,17 +71,89 @@ fn gmail_test(query: &str) -> (Field, String) {
         ("deliveredto:", Field::DeliveredTo),
     ] {
         if let Some(v) = query.strip_prefix(prefix) {
-            return (field, unquote(v));
+            return test(field, unquote(v));
         }
     }
     if let Some(v) = query.strip_prefix("{to:") {
         let v = v.split(" cc:").next().unwrap_or(v);
-        return (Field::Recipients, unquote(v));
+        return test(Field::Recipients, unquote(v));
     }
     if let Some(v) = query.strip_prefix("larger:") {
-        return (Field::LargerThan, v.trim_end_matches(['K', 'k']).to_owned());
+        return test(Field::LargerThan, v.trim_end_matches(['K', 'k']).to_owned());
     }
-    (Field::Body, unquote(query))
+    if let Some(v) = query.strip_prefix("smaller:") {
+        return test(Field::SmallerThan, v.trim_end_matches(['K', 'k']).to_owned());
+    }
+    if query.eq_ignore_ascii_case("has:attachment") {
+        return test(Field::Attachment, String::new());
+    }
+    test(Field::Body, unquote(query))
+}
+/// A Gmail search's words at its top level: split at spaces outside
+/// quotes, braces and parentheses.
+fn query_terms(query: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let (mut depth, mut quoted, mut start) = (0i32, false, None);
+    for (i, c) in query.char_indices() {
+        match c {
+            '"' => quoted = !quoted,
+            '(' | '{' if !quoted => depth += 1,
+            ')' | '}' if !quoted => depth -= 1,
+            c if c.is_whitespace() && !quoted && depth == 0 => {
+                if let Some(s) = start.take() {
+                    out.push(&query[s..i]);
+                }
+                continue;
+            }
+            _ => {}
+        }
+        start.get_or_insert(i);
+    }
+    if let Some(s) = start {
+        out.push(&query[s..]);
+    }
+    out
+}
+/// Whether `term` is a Recipients test, as Picacho writes it:
+/// `{to:x cc:x}`.
+fn recipients_term(term: &str) -> bool {
+    let Some(inner) = term.strip_prefix("{to:").and_then(|t| t.strip_suffix('}')) else { return false };
+    inner.split_once(" cc:").is_some_and(|(a, b)| a == b)
+}
+/// One word of a search as a test: negated (`-(…)`, `-word`) or not.
+fn gmail_term_test(term: &str) -> Option<Test> {
+    if let Some(inner) = term.strip_prefix("-(").and_then(|t| t.strip_suffix(')')) {
+        let mut t = gmail_term_test(inner)?;
+        if t.negate {
+            return None;
+        }
+        t.negate = true;
+        return Some(t);
+    }
+    if let Some(inner) = term.strip_prefix('-').filter(|t| !t.is_empty()) {
+        let mut t = gmail_term_test(inner)?;
+        t.negate = !t.negate;
+        return Some(t);
+    }
+    if term.starts_with('{') && !recipients_term(term) {
+        return None;
+    }
+    Some(gmail_test(term))
+}
+/// A Gmail search as tests: all of its words, or, for one `{…}` group,
+/// any of them (`true`).
+fn gmail_query_tests(query: &str) -> Option<(Vec<Test>, bool)> {
+    let terms = query_terms(query.trim());
+    if let [one] = terms.as_slice()
+        && one.starts_with('{')
+        && !recipients_term(one)
+    {
+        let inner = one.strip_prefix('{')?.strip_suffix('}')?;
+        let tests = query_terms(inner).into_iter().map(gmail_term_test).collect::<Option<Vec<_>>>()?;
+        return Some((tests, true));
+    }
+    let tests = terms.into_iter().map(gmail_term_test).collect::<Option<Vec<_>>>()?;
+    Some((tests, false))
 }
 
 /// Picacho's rules as Gmail filters. Labels a rule names that Gmail
@@ -92,84 +173,142 @@ pub(super) fn gmail_filters(rules: &[Rule], labels: &[Label], missing: &mut Vec<
     };
     let mut out = Vec::new();
     for r in rules {
-        if matches!(r.matching, Match::Matches | Match::Regex) {
-            return Err(unsupported("Gmail", r.matching.label()));
+        let tests = r.tests();
+        if let Some(t) = tests.iter().find(|t| matches!(t.matching, Match::Matches | Match::Regex) && t.field.has_value()) {
+            return Err(unsupported("Gmail", t.matching.label()));
         }
         let mut f = gmail::Filter::default();
-        let query = gmail_query(r)?;
-        match r.field {
-            // Mail that doesn't match, in Gmail's search words.
-            _ if r.negate => f.query = format!("-({query})"),
-            Field::From => f.from = r.value.trim().to_owned(),
-            Field::To => f.to = r.value.trim().to_owned(),
-            Field::Subject => f.subject = r.value.trim().to_owned(),
-            _ => f.query = query,
+        if r.any && tests.len() > 1 {
+            // Any of them: one `{…}` group of Gmail's search words.
+            let terms = tests.iter().map(gmail_term).collect::<Result<Vec<_>>>()?;
+            f.query = format!("{{{}}}", terms.join(" "));
+        } else {
+            // All of them: Gmail's own criteria where free, the rest as
+            // search words.
+            let mut terms = Vec::new();
+            for t in &tests {
+                let v = t.value.trim().to_owned();
+                match t.field {
+                    _ if t.negate => terms.push(gmail_term(t)?),
+                    Field::From if f.from.is_empty() => f.from = v,
+                    Field::To if f.to.is_empty() => f.to = v,
+                    Field::Subject if f.subject.is_empty() => f.subject = v,
+                    Field::Attachment => f.has_attachment = true,
+                    _ => terms.push(gmail_term(t)?),
+                }
+            }
+            f.query = terms.join(" ");
         }
-        out.push(act_gmail(r, &mut label_id, f)?);
+        for act in r.acts() {
+            act_gmail(act, r.keep_copy, &mut label_id, &mut f)?;
+        }
+        out.push(f);
     }
     Ok(out)
 }
-fn act_gmail(r: &Rule, label_id: &mut impl FnMut(&str) -> String, mut f: gmail::Filter) -> Result<gmail::Filter> {
+fn act_gmail(act: &Act, keep_copy: bool, label_id: &mut impl FnMut(&str) -> String, f: &mut gmail::Filter) -> Result<()> {
     use gmail::label;
-    match &r.act {
-        // Kept in the inbox: never to Spam.
-        Act::Inbox => f.remove_labels.push(label::SPAM.into()),
-        Act::Folder(name) => {
-            f.add_labels.push(label_id(name));
-            f.remove_labels.push(label::INBOX.into());
+    let add = |labels: &mut Vec<String>, l: String| {
+        if !labels.contains(&l) {
+            labels.push(l);
         }
-        Act::MarkRead => f.remove_labels.push(label::UNREAD.into()),
-        Act::Star => f.add_labels.push(label::STARRED.into()),
-        Act::Discard => f.add_labels.push(label::TRASH.into()),
+    };
+    match act {
+        // Kept in the inbox: never to Spam.
+        Act::Inbox => add(&mut f.remove_labels, label::SPAM.into()),
+        Act::Folder(name) => {
+            if f.remove_labels.iter().any(|l| l == label::INBOX) {
+                return Err(unsupported("Gmail", t!("filters-two-folders")));
+            }
+            add(&mut f.add_labels, label_id(name));
+            add(&mut f.remove_labels, label::INBOX.into());
+        }
+        Act::MarkRead => add(&mut f.remove_labels, label::UNREAD.into()),
+        Act::Star => add(&mut f.add_labels, label::STARRED.into()),
+        Act::Discard => add(&mut f.add_labels, label::TRASH.into()),
         Act::Redirect(to) => {
+            if !f.forward.is_empty() {
+                return Err(unsupported("Gmail", t!("filters-two-redirects")));
+            }
             f.forward = to.trim().to_owned();
-            if !r.keep_copy {
-                f.add_labels.push(label::TRASH.into());
+            if !keep_copy {
+                add(&mut f.add_labels, label::TRASH.into());
             }
         }
         Act::Reject(_) => return Err(unsupported("Gmail", t!("filters-act-refuse"))),
-        Act::Label(name) => f.add_labels.push(label_id(name)),
+        Act::Label(name) => add(&mut f.add_labels, label_id(name)),
     }
-    Ok(f)
+    Ok(())
 }
 
 /// A Gmail filter as one of Picacho's rules, where one can say it.
 fn gmail_rule(f: &gmail::Filter, labels: &[Label]) -> Option<Rule> {
     use gmail::label;
-    let tests = [!f.from.is_empty(), !f.to.is_empty(), !f.subject.is_empty(), !f.query.is_empty(), f.has_attachment];
-    if tests.iter().filter(|t| **t).count() != 1 {
+    let mut tests = Vec::new();
+    let test = |field, value: &str| Test { field, value: value.to_owned(), ..Test::default() };
+    if !f.from.is_empty() {
+        tests.push(test(Field::From, &f.from));
+    }
+    if !f.to.is_empty() {
+        tests.push(test(Field::To, &f.to));
+    }
+    if !f.subject.is_empty() {
+        tests.push(test(Field::Subject, &f.subject));
+    }
+    if f.has_attachment {
+        tests.push(test(Field::Attachment, ""));
+    }
+    let mut any = false;
+    if !f.query.trim().is_empty() {
+        let (found, either) = gmail_query_tests(&f.query)?;
+        if either && !tests.is_empty() {
+            return None;
+        }
+        any = either && found.len() > 1;
+        tests.extend(found);
+    }
+    if tests.is_empty() {
         return None;
     }
-    let (field, value, negate) = if !f.from.is_empty() {
-        (Field::From, f.from.clone(), false)
-    } else if !f.to.is_empty() {
-        (Field::To, f.to.clone(), false)
-    } else if !f.subject.is_empty() {
-        (Field::Subject, f.subject.clone(), false)
-    } else if let Some(inner) = f.query.strip_prefix("-(").and_then(|q| q.strip_suffix(')')) {
-        let (field, value) = gmail_test(inner);
-        (field, value, true)
-    } else if !f.query.is_empty() {
-        let (field, value) = gmail_test(&f.query);
-        (field, value, false)
-    } else {
-        return None;
-    };
     let name = |id: &str| labels.iter().find(|l| l.id == id && !l.system).map(|l| l.name.clone());
     let trash = f.add_labels.iter().any(|l| l == label::TRASH);
-    let (act, keep_copy) = match (f.add_labels.as_slice(), f.remove_labels.as_slice(), f.forward.is_empty()) {
-        (_, _, false) if f.add_labels.iter().all(|l| l == label::TRASH) && f.remove_labels.is_empty() => {
-            (Act::Redirect(f.forward.clone()), !trash)
+    let archived = f.remove_labels.iter().any(|l| l == label::INBOX);
+    let redirect = !f.forward.is_empty();
+    // In the order Picacho writes them.
+    let mut acts = Vec::new();
+    let mut custom = f.add_labels.iter().filter(|l| !matches!(l.as_str(), label::STARRED | label::TRASH));
+    if archived {
+        acts.push(Act::Folder(name(custom.next()?)?));
+    }
+    for l in custom {
+        acts.push(Act::Label(name(l)?));
+    }
+    for r in &f.remove_labels {
+        match r.as_str() {
+            label::UNREAD => acts.push(Act::MarkRead),
+            label::SPAM => acts.push(Act::Inbox),
+            label::INBOX => {}
+            _ => return None,
         }
-        ([], [r], true) if r == label::SPAM => (Act::Inbox, false),
-        ([], [r], true) if r == label::UNREAD => (Act::MarkRead, false),
-        ([a], [], true) if a == label::STARRED => (Act::Star, false),
-        ([a], [], true) if a == label::TRASH => (Act::Discard, false),
-        ([a], [], true) => (Act::Label(name(a)?), false),
-        ([a], [r], true) if r == label::INBOX => (Act::Folder(name(a)?), false),
-        _ => return None,
-    };
-    Some(Rule { field, value, act, negate, keep_copy, ..Default::default() })
+    }
+    if f.add_labels.iter().any(|l| l == label::STARRED) {
+        acts.push(Act::Star);
+    }
+    // Sent on without a copy kept: what Trash means beside a forward.
+    if trash && !redirect {
+        acts.push(Act::Discard);
+    }
+    if redirect {
+        acts.push(Act::Redirect(f.forward.clone()));
+    }
+    if acts.is_empty() {
+        return None;
+    }
+    let mut rule = Rule { any, keep_copy: redirect && !trash, ..Rule::default() };
+    rule.set_tests(tests);
+    rule.any = any;
+    rule.set_acts(acts);
+    Some(rule)
 }
 
 /// What Gmail has, as the filter editor shows it.
@@ -212,30 +351,81 @@ pub(super) fn gmail_vacation(v: &Vacation) -> gmail::Vacation {
 /// The name Picacho gives the inbox rules it writes.
 const GRAPH_NAME: &str = "Picacho";
 
+/// One test as an inbox rule's predicate: its name and value.
+fn graph_test(t: &Test) -> Result<(&'static str, Value)> {
+    const SERVICE: &str = "Microsoft 365";
+    if matches!(t.matching, Match::Matches | Match::Regex) && t.field.has_value() && !t.field.is_size() {
+        return Err(unsupported(SERVICE, t.matching.label()));
+    }
+    let v = t.value.trim();
+    let person = || json!([{"emailAddress": {"address": v}}]);
+    let size = || v.trim_end_matches(['K', 'k']).trim().parse::<i64>().map_err(|_| unsupported(SERVICE, v));
+    Ok(match (t.field, t.matching) {
+        (Field::From, Match::Is) => ("fromAddresses", person()),
+        (Field::From, _) => ("senderContains", json!([v])),
+        (Field::To, Match::Is) => ("sentToAddresses", person()),
+        (Field::To | Field::Recipients | Field::DeliveredTo, _) => ("recipientContains", json!([v])),
+        (Field::Subject, _) => ("subjectContains", json!([v])),
+        (Field::Body, _) => ("bodyContains", json!([v])),
+        (Field::List, _) => ("headerContains", json!([format!("List-Id: {v}")])),
+        (Field::Header, _) => ("headerContains", json!([format!("{}: {v}", t.header.trim())])),
+        (Field::LargerThan, _) => ("withinSizeRange", json!({"minimumSize": size()?, "maximumSize": i32::MAX})),
+        (Field::SmallerThan, _) => ("withinSizeRange", json!({"minimumSize": 0, "maximumSize": size()?})),
+        (Field::Attachment, _) => ("hasAttachments", json!(true)),
+    })
+}
+
+/// Adds predicate `key` to `into`: a list's values join the list there
+/// (any of them), where `join` allows; a size range narrows the one
+/// there. Anything else twice can't be said.
+fn add_predicate(into: &mut serde_json::Map<String, Value>, key: &str, value: Value, join: bool) -> Result<()> {
+    const SERVICE: &str = "Microsoft 365";
+    let Some(there) = into.get_mut(key) else {
+        into.insert(key.to_owned(), value);
+        return Ok(());
+    };
+    match (there, value) {
+        (Value::Array(list), Value::Array(more)) if join => list.extend(more),
+        (range @ Value::Object(_), Value::Object(more)) if key == "withinSizeRange" && !join => {
+            let min = range["minimumSize"].as_i64().unwrap_or(0).max(more["minimumSize"].as_i64().unwrap_or(0));
+            let max = range["maximumSize"]
+                .as_i64()
+                .unwrap_or(i32::MAX.into())
+                .min(more["maximumSize"].as_i64().unwrap_or(i32::MAX.into()));
+            *range = json!({"minimumSize": min, "maximumSize": max});
+        }
+        (Value::Bool(_), Value::Bool(_)) => {}
+        _ => return Err(unsupported(SERVICE, t!("filters-these-tests-together"))),
+    }
+    Ok(())
+}
+
 /// Picacho's rules as inbox rules, in order.
 pub(super) fn graph_rules(rules: &[Rule], folders: &[MailFolder]) -> Result<Vec<Value>> {
     const SERVICE: &str = "Microsoft 365";
     let mut out = Vec::new();
     for (i, r) in rules.iter().enumerate() {
-        if matches!(r.matching, Match::Matches | Match::Regex) {
-            return Err(unsupported(SERVICE, r.matching.label()));
+        let tests = r.tests();
+        // Conditions all hold (a list's values: any of them); any one
+        // exception stops the rule (so each is a test that mustn't hold).
+        let mut conditions = serde_json::Map::new();
+        let mut exceptions = serde_json::Map::new();
+        let either = r.any && tests.len() > 1;
+        for t in &tests {
+            let (key, value) = graph_test(t)?;
+            match (either, t.negate) {
+                (false, false) => add_predicate(&mut conditions, key, value, false)?,
+                (false, true) => add_predicate(&mut exceptions, key, value, true)?,
+                // Any of several: only values of one list.
+                (true, false) if conditions.is_empty() || conditions.contains_key(key) => {
+                    if !value.is_array() {
+                        return Err(unsupported(SERVICE, t!("filters-any-of-these-tests")));
+                    }
+                    add_predicate(&mut conditions, key, value, true)?
+                }
+                (true, _) => return Err(unsupported(SERVICE, t!("filters-any-of-these-tests"))),
+            }
         }
-        let v = r.value.trim();
-        let person = || json!([{"emailAddress": {"address": v}}]);
-        let test = match (r.field, r.matching) {
-            (Field::From, Match::Is) => json!({"fromAddresses": person()}),
-            (Field::From, _) => json!({"senderContains": [v]}),
-            (Field::To, Match::Is) => json!({"sentToAddresses": person()}),
-            (Field::To | Field::Recipients | Field::DeliveredTo, _) => json!({"recipientContains": [v]}),
-            (Field::Subject, _) => json!({"subjectContains": [v]}),
-            (Field::Body, _) => json!({"bodyContains": [v]}),
-            (Field::List, _) => json!({"headerContains": [format!("List-Id: {v}")]}),
-            (Field::Header, _) => json!({"headerContains": [format!("{}: {v}", r.header.trim())]}),
-            (Field::LargerThan, _) => json!({"withinSizeRange": {
-                "minimumSize": v.parse::<i64>().map_err(|_| unsupported(SERVICE, v))?,
-                "maximumSize": i32::MAX,
-            }}),
-        };
         let folder = |name: &str| -> Result<String> {
             folders
                 .iter()
@@ -243,24 +433,32 @@ pub(super) fn graph_rules(rules: &[Rule], folders: &[MailFolder]) -> Result<Vec<
                 .map(|f| f.id.clone())
                 .with_context(|| t!("manage-proton-the-folder-no-longer-exists-at", name = name))
         };
-        let mut actions = match &r.act {
-            Act::Inbox => json!({"moveToFolder": folder("INBOX")?}),
-            Act::Folder(name) => json!({"moveToFolder": folder(name)?}),
-            Act::MarkRead => json!({"markAsRead": true}),
-            Act::Star => return Err(unsupported(SERVICE, t!("filters-star"))),
-            Act::Discard => json!({"delete": true}),
-            Act::Redirect(to) => {
-                let mut a = json!({"redirectTo": [{"emailAddress": {"address": to.trim()}}]});
-                if !r.keep_copy {
-                    a["delete"] = true.into();
-                }
-                a
+        let mut actions = serde_json::Map::new();
+        let mut set = |key: &str, value: Value| -> Result<()> {
+            if actions.contains_key(key) && !value.is_array() && actions[key] != value {
+                return Err(unsupported(SERVICE, t!("filters-two-folders")));
             }
-            Act::Reject(_) => return Err(unsupported(SERVICE, t!("filters-act-refuse"))),
-            Act::Label(name) => json!({"assignCategories": [name]}),
+            add_predicate(&mut actions, key, value, true)
         };
+        for act in r.acts() {
+            match act {
+                Act::Inbox => set("moveToFolder", folder("INBOX")?.into())?,
+                Act::Folder(name) => set("moveToFolder", folder(name)?.into())?,
+                Act::MarkRead => set("markAsRead", true.into())?,
+                Act::Star => return Err(unsupported(SERVICE, t!("filters-star"))),
+                Act::Discard => set("delete", true.into())?,
+                Act::Redirect(to) => {
+                    set("redirectTo", json!([{"emailAddress": {"address": to.trim()}}]))?;
+                    if !r.keep_copy {
+                        set("delete", true.into())?;
+                    }
+                }
+                Act::Reject(_) => return Err(unsupported(SERVICE, t!("filters-act-refuse"))),
+                Act::Label(name) => set("assignCategories", json!([name]))?,
+            }
+        }
         if r.stop {
-            actions["stopProcessingRules"] = true.into();
+            actions.insert("stopProcessingRules".into(), true.into());
         }
         let mut rule = json!({
             "displayName": format!("{GRAPH_NAME} {}", i + 1),
@@ -268,76 +466,131 @@ pub(super) fn graph_rules(rules: &[Rule], folders: &[MailFolder]) -> Result<Vec<
             "isEnabled": true,
             "actions": actions,
         });
-        rule[if r.negate { "exceptions" } else { "conditions" }] = test;
+        if !conditions.is_empty() {
+            rule["conditions"] = conditions.into();
+        }
+        if !exceptions.is_empty() {
+            rule["exceptions"] = exceptions.into();
+        }
         out.push(rule);
     }
     Ok(out)
 }
 
-/// An inbox rule as one of Picacho's rules, where one can say it.
-fn graph_rule(rule: &Value, folders: &[MailFolder]) -> Option<Rule> {
-    let tests = |v: &Value| v.as_object().map(|o| o.iter().filter(|(_, x)| !x.is_null()).count()).unwrap_or(0);
-    let (test, negate) = match (tests(&rule["conditions"]), tests(&rule["exceptions"])) {
-        (1, 0) => (&rule["conditions"], false),
-        (0, 1) => (&rule["exceptions"], true),
-        _ => return None,
+/// An inbox rule's predicates (`conditions` or `exceptions`) as tests:
+/// each value of a list its own test. `None` for one Picacho can't say.
+fn graph_tests(predicates: &Value) -> Option<Vec<Test>> {
+    let mut out = Vec::new();
+    let Some(map) = predicates.as_object() else {
+        return predicates.is_null().then_some(out);
     };
-    let (key, value) = test.as_object()?.iter().find(|(_, v)| !v.is_null())?;
-    let first = |v: &Value| -> Option<String> {
-        let list = v.as_array()?;
-        (list.len() == 1).then(|| list[0].as_str().map(str::to_owned).or_else(|| list[0]["emailAddress"]["address"].as_str().map(str::to_owned)))?
-    };
-    let (field, matching, value, header) = match key.as_str() {
-        "fromAddresses" => (Field::From, Match::Is, first(value)?, String::new()),
-        "senderContains" => (Field::From, Match::Contains, first(value)?, String::new()),
-        "sentToAddresses" => (Field::To, Match::Is, first(value)?, String::new()),
-        "recipientContains" => (Field::Recipients, Match::Contains, first(value)?, String::new()),
-        "subjectContains" => (Field::Subject, Match::Contains, first(value)?, String::new()),
-        "bodyContains" => (Field::Body, Match::Contains, first(value)?, String::new()),
-        "headerContains" => {
-            let h = first(value)?;
-            match h.strip_prefix("List-Id: ") {
-                Some(list) => (Field::List, Match::Contains, list.to_owned(), String::new()),
-                None => {
-                    let (name, v) = h.split_once(": ")?;
-                    (Field::Header, Match::Contains, v.to_owned(), name.to_owned())
+    for (key, value) in map.iter().filter(|(_, v)| !v.is_null()) {
+        let values = || -> Option<Vec<String>> {
+            value
+                .as_array()?
+                .iter()
+                .map(|x| x.as_str().map(str::to_owned).or_else(|| x["emailAddress"]["address"].as_str().map(str::to_owned)))
+                .collect()
+        };
+        let test = |field, matching, value: String| Test { field, matching, value, ..Test::default() };
+        match key.as_str() {
+            "fromAddresses" => out.extend(values()?.into_iter().map(|v| test(Field::From, Match::Is, v))),
+            "senderContains" => out.extend(values()?.into_iter().map(|v| test(Field::From, Match::Contains, v))),
+            "sentToAddresses" => out.extend(values()?.into_iter().map(|v| test(Field::To, Match::Is, v))),
+            "recipientContains" => out.extend(values()?.into_iter().map(|v| test(Field::Recipients, Match::Contains, v))),
+            "subjectContains" => out.extend(values()?.into_iter().map(|v| test(Field::Subject, Match::Contains, v))),
+            "bodyContains" => out.extend(values()?.into_iter().map(|v| test(Field::Body, Match::Contains, v))),
+            "headerContains" => {
+                for h in values()? {
+                    out.push(match h.strip_prefix("List-Id: ") {
+                        Some(list) => test(Field::List, Match::Contains, list.to_owned()),
+                        None => {
+                            let (name, v) = h.split_once(": ")?;
+                            Test { header: name.to_owned(), ..test(Field::Header, Match::Contains, v.to_owned()) }
+                        }
+                    });
                 }
             }
+            "withinSizeRange" => {
+                let min = value["minimumSize"].as_i64().unwrap_or(0);
+                let max = value["maximumSize"].as_i64().unwrap_or(i32::MAX.into());
+                if min > 0 {
+                    out.push(test(Field::LargerThan, Match::Contains, min.to_string()));
+                }
+                if max < i64::from(i32::MAX) {
+                    out.push(test(Field::SmallerThan, Match::Contains, max.to_string()));
+                }
+            }
+            "hasAttachments" if value.as_bool() == Some(true) => out.push(test(Field::Attachment, Match::Contains, String::new())),
+            "hasAttachments" => {}
+            _ => return None,
         }
-        "withinSizeRange" => (Field::LargerThan, Match::Contains, value["minimumSize"].as_i64()?.to_string(), String::new()),
-        _ => return None,
-    };
+    }
+    Some(out)
+}
+
+/// An inbox rule as one of Picacho's rules, where one can say it.
+fn graph_rule(rule: &Value, folders: &[MailFolder]) -> Option<Rule> {
+    let conditions = graph_tests(&rule["conditions"])?;
+    let mut exceptions = graph_tests(&rule["exceptions"])?;
+    // Several values of one list in the conditions are any of them: a
+    // rule of that list alone, or one Picacho can't say.
+    let keys: Vec<&Value> = rule["conditions"].as_object().map(|o| o.values().filter(|v| !v.is_null()).collect()).unwrap_or_default();
+    let several = keys.iter().any(|v| v.as_array().is_some_and(|a| a.len() > 1));
+    let any = several && keys.len() == 1;
+    if (several && !any) || (any && !exceptions.is_empty()) {
+        return None;
+    }
+    for e in &mut exceptions {
+        e.negate = true;
+    }
+    let tests: Vec<Test> = conditions.into_iter().chain(exceptions).collect();
+    if tests.is_empty() {
+        return None;
+    }
     let actions = rule["actions"].as_object()?;
     let stop = actions.get("stopProcessingRules").and_then(Value::as_bool).unwrap_or(false);
-    let set: Vec<(&String, &Value)> = actions
-        .iter()
-        .filter(|(k, v)| k.as_str() != "stopProcessingRules" && !v.is_null() && **v != json!(false))
-        .collect();
-    let folder_path = |id: &Value| -> Option<String> {
+    let on = |key: &str| actions.get(key).filter(|v| !v.is_null() && **v != json!(false));
+    if actions.iter().any(|(k, v)| {
+        !v.is_null()
+            && *v != json!(false)
+            && !matches!(k.as_str(), "stopProcessingRules" | "moveToFolder" | "markAsRead" | "delete" | "redirectTo" | "assignCategories")
+    }) {
+        return None;
+    }
+    let strings = |v: &Value| -> Option<Vec<String>> {
+        v.as_array()?
+            .iter()
+            .map(|x| x.as_str().map(str::to_owned).or_else(|| x["emailAddress"]["address"].as_str().map(str::to_owned)))
+            .collect()
+    };
+    // In the order Picacho writes them.
+    let mut acts = Vec::new();
+    if let Some(id) = on("moveToFolder") {
         let f = folders.iter().find(|f| Some(f.id.as_str()) == id.as_str())?;
-        Some(if f.well_known.as_deref() == Some("inbox") { String::new() } else { f.path.clone() })
-    };
-    let (act, keep_copy) = match set.as_slice() {
-        [(k, v)] if k.as_str() == "moveToFolder" => match folder_path(v)? {
-            inbox if inbox.is_empty() => (Act::Inbox, false),
-            path => (Act::Folder(path), false),
-        },
-        [(k, _)] if k.as_str() == "markAsRead" => (Act::MarkRead, false),
-        [(k, _)] if k.as_str() == "delete" => (Act::Discard, false),
-        [(k, v)] if k.as_str() == "redirectTo" => (Act::Redirect(first(v)?), true),
-        [(k, v)] if k.as_str() == "assignCategories" => (Act::Label(first(v)?), false),
-        // Sent on and deleted here: without a copy kept.
-        [(a, x), (b, y)] if a.as_str() == "delete" && b.as_str() == "redirectTo" => {
-            let _ = x;
-            (Act::Redirect(first(y)?), false)
-        }
-        [(a, x), (b, y)] if a.as_str() == "redirectTo" && b.as_str() == "delete" => {
-            let _ = y;
-            (Act::Redirect(first(x)?), false)
-        }
-        _ => return None,
-    };
-    Some(Rule { field, value, act, matching, negate, header, keep_copy, stop })
+        acts.push(if f.well_known.as_deref() == Some("inbox") { Act::Inbox } else { Act::Folder(f.path.clone()) });
+    }
+    if on("markAsRead").is_some() {
+        acts.push(Act::MarkRead);
+    }
+    for label in on("assignCategories").map(strings).unwrap_or(Some(Vec::new()))? {
+        acts.push(Act::Label(label));
+    }
+    let redirects = on("redirectTo").map(strings).unwrap_or(Some(Vec::new()))?;
+    // Deleted beside a redirect: sent on without a copy kept.
+    let deleted = on("delete").is_some();
+    if deleted && redirects.is_empty() {
+        acts.push(Act::Discard);
+    }
+    acts.extend(redirects.iter().cloned().map(Act::Redirect));
+    if acts.is_empty() {
+        return None;
+    }
+    let mut out = Rule { stop, keep_copy: !redirects.is_empty() && !deleted, ..Rule::default() };
+    out.set_tests(tests);
+    out.any = any;
+    out.set_acts(acts);
+    Some(out)
 }
 
 /// What Microsoft 365 has, as the filter editor shows it. Rules are in
@@ -491,9 +744,14 @@ mod tests {
         let state = gmail_state(&filters, &labels, &gmail::Vacation::default());
         assert_eq!(state.filters.rules, rules);
         assert_eq!(state.kept_elsewhere, 0);
-        // Several tests at once: left as it is.
+        // Several tests at once: all of them.
         let both = gmail::Filter { from: "a@example.com".into(), subject: "x".into(), add_labels: vec!["STARRED".into()], ..Default::default() };
-        assert_eq!(gmail_state(&[both], &labels, &Default::default()).kept_elsewhere, 1);
+        let state = gmail_state(&[both], &labels, &Default::default());
+        assert_eq!(state.kept_elsewhere, 0);
+        assert_eq!(state.filters.rules[0].tests().len(), 2);
+        // What Picacho has no words for (a label that isn't there): left as it is.
+        let unknown = gmail::Filter { from: "a@example.com".into(), add_labels: vec!["Label_gone".into()], ..Default::default() };
+        assert_eq!(gmail_state(&[unknown], &labels, &Default::default()).kept_elsewhere, 1);
         // What Gmail can't do.
         assert!(gmail_filters(&[rule(Field::From, "a", Act::Reject("no".into()))], &labels, &mut missing).is_err());
         assert!(gmail_filters(&[Rule { matching: Match::Regex, ..rule(Field::From, "a.*", Act::Star) }], &labels, &mut missing).is_err());
@@ -534,6 +792,94 @@ mod tests {
         assert_eq!(r.internal, "Away\n\nBack Monday");
         assert_eq!(date_of(r.start).as_deref(), Some("2026-12-20"));
         assert_eq!(date_of(r.end).as_deref(), Some("2026-12-27"));
+        Ok(())
+    }
+
+    fn test(field: Field, value: &str) -> Test {
+        Test { field, value: value.into(), ..Default::default() }
+    }
+
+    #[test]
+    fn several_tests_and_actions_as_gmail_filters() -> Result<()> {
+        let labels = vec![Label { id: "Label_1".into(), name: "Receipts".into(), system: false }];
+        // All of: Gmail's own criteria where they're free, the rest as words.
+        let mut all = rule(Field::From, "shop@example.com", Act::Folder("Receipts".into()));
+        all.more = vec![
+            test(Field::Subject, "invoice"),
+            Test { negate: true, ..test(Field::Body, "draft") },
+            test(Field::Attachment, ""),
+            test(Field::SmallerThan, "2000"),
+        ];
+        all.also = vec![Act::MarkRead, Act::Star];
+        // Any of: one `{…}` group.
+        let mut any = rule(Field::From, "a@example.com", Act::Label("Receipts".into()));
+        any.more = vec![test(Field::Subject, "receipt")];
+        any.any = true;
+        let filters = gmail_filters(&[all.clone(), any.clone()], &labels, &mut Vec::new())?;
+        assert_eq!((filters[0].from.as_str(), filters[0].subject.as_str()), ("shop@example.com", "invoice"));
+        assert!(filters[0].has_attachment);
+        assert_eq!(filters[0].query, "-(draft) smaller:2000K");
+        assert!(filters[0].remove_labels.contains(&"UNREAD".into()) && filters[0].add_labels.contains(&"STARRED".into()));
+        assert_eq!(filters[1].query, "{from:a@example.com subject:receipt}");
+        // Read back: the same tests (in Gmail's order) and actions.
+        let state = gmail_state(&filters, &labels, &gmail::Vacation::default());
+        assert_eq!(state.kept_elsewhere, 0);
+        let back = &state.filters.rules[0];
+        assert_eq!(back.tests().len(), 5);
+        assert!(back.tests().contains(&Test { negate: true, ..test(Field::Body, "draft") }));
+        assert_eq!(back.acts().cloned().collect::<Vec<_>>(), [Act::Folder("Receipts".into()), Act::MarkRead, Act::Star]);
+        assert_eq!(state.filters.rules[1], any);
+        // Two folders can't be.
+        let mut two = rule(Field::From, "x", Act::Folder("Receipts".into()));
+        two.also = vec![Act::Folder("Other".into())];
+        assert!(gmail_filters(&[two], &labels, &mut Vec::new()).is_err());
+        // Recipients stays one test, not an "any".
+        assert_eq!(gmail_query_tests("{to:t@x.example cc:t@x.example}"), Some((vec![test(Field::Recipients, "t@x.example")], false)));
+        Ok(())
+    }
+
+    #[test]
+    fn several_tests_and_actions_as_inbox_rules() -> Result<()> {
+        let folders = vec![
+            MailFolder { id: "f-in".into(), name: "Inbox".into(), path: "Inbox".into(), well_known: Some("inbox".into()), ..Default::default() },
+            MailFolder { id: "f-r".into(), name: "Receipts".into(), path: "Inbox/Receipts".into(), depth: 1, ..Default::default() },
+        ];
+        let mut all = rule(Field::From, "shop", Act::Folder("Inbox/Receipts".into()));
+        all.more = vec![
+            test(Field::Subject, "invoice"),
+            test(Field::Attachment, ""),
+            test(Field::LargerThan, "10"),
+            test(Field::SmallerThan, "900"),
+            Test { negate: true, ..test(Field::Body, "draft") },
+        ];
+        all.also = vec![Act::MarkRead, Act::Label("Finance".into())];
+        let json = graph_rules(std::slice::from_ref(&all), &folders)?;
+        let c = &json[0]["conditions"];
+        assert_eq!(c["senderContains"][0], "shop");
+        assert_eq!(c["hasAttachments"], true);
+        assert_eq!((c["withinSizeRange"]["minimumSize"].as_i64(), c["withinSizeRange"]["maximumSize"].as_i64()), (Some(10), Some(900)));
+        assert_eq!(json[0]["exceptions"]["bodyContains"][0], "draft");
+        assert_eq!(json[0]["actions"]["markAsRead"], true);
+        assert_eq!(json[0]["actions"]["assignCategories"][0], "Finance");
+        let read = vec![graph::Rule { id: "r".into(), json: json[0].clone() }];
+        let (state, _) = graph_state(&read, &folders, &Default::default());
+        let back = &state.filters.rules[0];
+        assert_eq!(back.tests().len(), 6);
+        assert_eq!(back.acts().cloned().collect::<Vec<_>>(), [Act::Folder("Inbox/Receipts".into()), Act::MarkRead, Act::Label("Finance".into())]);
+        // Any of one kind's values: one list.
+        let mut any = rule(Field::Subject, "invoice", Act::MarkRead);
+        any.more = vec![test(Field::Subject, "receipt")];
+        any.any = true;
+        let json = graph_rules(std::slice::from_ref(&any), &folders)?;
+        assert_eq!(json[0]["conditions"]["subjectContains"], json!(["invoice", "receipt"]));
+        let (state, _) = graph_state(&[graph::Rule { id: "r".into(), json: json[0].clone() }], &folders, &Default::default());
+        assert_eq!(state.filters.rules[0], any);
+        // Any of different kinds can't be said; nor two of one kind, all.
+        any.more = vec![test(Field::Body, "receipt")];
+        assert!(graph_rules(std::slice::from_ref(&any), &folders).is_err());
+        any.any = false;
+        any.more = vec![test(Field::Subject, "receipt")];
+        assert!(graph_rules(&[any], &folders).is_err());
         Ok(())
     }
 }

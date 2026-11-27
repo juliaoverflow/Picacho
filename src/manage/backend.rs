@@ -1458,6 +1458,12 @@ impl Backend {
             .collect();
         self.keyring().recommend(&peers, own_mutual, reply_to_encrypted)
     }
+    /// Forgets what OpenPGP and S/MIME found of messages read so far, so
+    /// each is opened again when next read: a security key was unlocked.
+    pub(crate) fn forget_verdicts(&self) {
+        self.verdicts.lock().unwrap().clear();
+        self.smime_verdicts.lock().unwrap().clear();
+    }
     /// What OpenPGP found when the message was last read, if it had any.
     pub fn verdict(&self, id: &str) -> Option<crate::manage::openpgp::Verdict> {
         self.verdicts.lock().unwrap().get(id).cloned()
@@ -1541,7 +1547,7 @@ impl Backend {
         raw: &[u8],
     ) -> Option<(crate::manage::crypto::Protection, Vec<u8>)> {
         let ring = self.keyring();
-        if ring.secret.is_empty() && ring.public.is_empty() {
+        if ring.secret.is_empty() && ring.public.is_empty() && ring.cards.is_empty() {
             return None;
         }
         let (readable, verdict) = crate::manage::openpgp::open(raw, &ring)?;
@@ -4508,7 +4514,7 @@ impl Backend {
                 && crate::sync::graph::Session::too_large_to_send(&raw)
                 && !d.pgp_inline
                 && !d.formatted
-                && !(d.smime || ring.secret.is_empty())
+                && !(d.smime || !ring.has_own())
             {
                 raw = crate::sync::smtp::protected(&message, &Draft { pgp_inline: true, ..d.clone() }, &keys)?;
                 sent_inline = true;
@@ -5045,10 +5051,10 @@ impl Backend {
             .map(|f| f.to_string())
             .unwrap_or_default();
         let ring = self.keyring();
-        if d.smime || ring.secret.is_empty() {
+        if d.smime || !ring.has_own() {
             return Ok(self.certificates().has_own(&me).then_some((me, true)));
         }
-        Ok(ring.own_key(&me).is_some().then_some((me, false)))
+        Ok(ring.own_public(&me).is_some().then_some((me, false)))
     }
     /// After a draft to be encrypted couldn't be sealed: its earlier copy on
     /// the server (perhaps readable) is no longer it, so the draft stays on

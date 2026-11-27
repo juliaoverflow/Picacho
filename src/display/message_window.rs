@@ -367,7 +367,13 @@ impl Render for MessageWindow {
                             .flex()
                             .items_center()
                             .gap_3()
-                            .child(avatar(&m.initials(), 40., 0, c))
+                            .child(sender_picture(
+                                &m.initials(),
+                                self.app.upgrade().and_then(|app| app.read(cx).brand_marks.get(&m.id).cloned()).as_ref(),
+                                40.,
+                                0,
+                                c,
+                            ))
                             .child(
                                 div()
                                     .flex_1()

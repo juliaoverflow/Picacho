@@ -524,7 +524,7 @@ impl MailApp {
                     .gap_3()
                     .flex_wrap()
                     .mb_6()
-                    .child(avatar(&m.initials(), 40., 0, c))
+                    .child(sender_picture(&m.initials(), self.brand_marks.get(&m.id), 40., 0, c))
                     .child(
                         div()
                             .flex_1()
@@ -600,6 +600,7 @@ impl MailApp {
             .children(if locked { Vec::new() } else { self.parcel_banners(m, cx) })
             .children((!locked).then(|| self.invitation_card(m, cx)).flatten())
             .children((!locked).then(|| self.delivery_report_card(m)).flatten())
+            .children((!locked).then(|| self.security_key_card(m, cx)).flatten())
             .children((!locked).then(|| self.setup_message_card(m, cx)).flatten())
             .children((!locked).then(|| self.carried_certificates_card(m, cx)).flatten());
         if !locked && !self.invitations.contains_key(&m.id) {
@@ -1379,6 +1380,25 @@ impl MailApp {
                     panel_rows.push(row("signers:", self.signer_list(&d.signers)).into_any_element());
                 }
                 // RFC 5280 §6.3, RFC 6960: what Check sender found of the
+                // BIMI: what Check sender found of the sender's logo.
+                if let Some((line, good)) = &d.brand {
+                    let (icon, color) = if *good { ("check", 0x1e8e3e) } else { ("info", c.muted) };
+                    panel_rows.push(
+                        row(
+                            "brand:",
+                            div()
+                                .id("bimi-brand")
+                                .debug_selector(|| "bimi-brand".into())
+                                .flex()
+                                .items_center()
+                                .gap_1()
+                                .child(icon_el(icon, 13., color))
+                                .child(div().text_color(rgb(c.text)).child(line.clone()))
+                                .into_any_element(),
+                        )
+                        .into_any_element(),
+                    );
+                }
                 // S/MIME signers' revocation.
                 if let Some((line, good)) = &d.revocation {
                     let (icon, color) = if *good { ("lock", 0x1e8e3e) } else { ("warning", c.danger) };

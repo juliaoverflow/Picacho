@@ -36,6 +36,7 @@
 //! A category whose tab is turned off (`Categorizing::hidden`) is shown in
 //! the one it belongs to (`Category::parent`: Travel in Transactions,
 //! Finance and Newsletters in Updates, the rest in Primary, as Gmail does).
+//! Which categories' new mail is announced is `inbox_control`'s.
 //! Saved as one Store preference.
 use super::local_ai::categories::Ai;
 use super::model::{Folder, Mail};
@@ -239,7 +240,9 @@ pub struct Categorizing {
     /// Where the person sorted senders: a lowercase address, or `@domain`
     /// for a whole domain (and its subdomains).
     pub senders: BTreeMap<String, Category>,
-    /// New mail is announced only when it is in Primary.
+    /// New mail was announced only when it is in Primary: read once, to
+    /// carry it over to Settings → Inbox Control
+    /// (`InboxControl::from_categories`), which decides it now.
     pub notify_primary_only: bool,
     /// All Mail is the first tab, and the inbox opens on it (rather than
     /// on Primary, with All Mail last).
@@ -346,16 +349,6 @@ impl Categorizing {
             }
         }
         c
-    }
-    /// Whether new mail like `m` is announced, as far as categories go.
-    pub fn announces(&self, m: &Mail, known: &Known) -> bool {
-        self.announces_with(m, known, None)
-    }
-    /// `announces`, asking the inbox category model too where given.
-    pub fn announces_with(&self, m: &Mail, known: &Known, ai: Option<&Ai>) -> bool {
-        !self.notify_primary_only
-            || !self.sorting()
-            || self.fold(decide(m, Content::of_with(m, ai), self, known)) == Category::Primary
     }
 }
 
@@ -2073,13 +2066,6 @@ mod tests {
         assert!(!prefs.tabs().contains(&Category::Promotions));
         prefs.toggle_tab(Category::Primary);
         assert!(prefs.tabs().contains(&Category::Primary));
-        // Announcing only Primary.
-        prefs.notify_primary_only = true;
-        prefs.toggle_tab(Category::Promotions);
-        assert!(!prefs.announces(&m, &Known::default()));
-        assert!(prefs.announces(&mail("ana@example.com", "Hi", ""), &Known::default()));
-        prefs.enabled = false;
-        assert!(prefs.announces(&m, &Known::default()));
     }
 
     #[test]

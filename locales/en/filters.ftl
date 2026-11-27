@@ -67,11 +67,6 @@ filters-label = label “{ $l }”
 
 filters-header = Header { $header }
 
-filters-larger-than-kb = { $negate ->
-        [yes] Not larger than { $kb } KB: { $what }
-       *[no] larger than { $kb } KB: { $what }
-    }
-
 filters-has-picacho-can-show = “{ $other }” has { $n ->
         [one] { $n } filter
        *[other] { $n } filters
@@ -153,21 +148,6 @@ filters-save-filters = Save Filters
 # A filter, in the list: "From contains “ana@example.com”: move to Work".
 # $field: what it looks at; $negate: yes for "doesn't"; $matching: how it
 # compares; $text: the text it looks for; $what: what it does.
-filters-rule = { $field } { $negate ->
-        [yes] { $matching ->
-            [contains] doesn't contain
-            [is] doesn't equal
-            [matches] doesn't match
-           *[pattern] doesn't match the pattern
-        }
-       *[no] { $matching ->
-            [contains] contains
-            [is] is
-            [matches] matches
-           *[pattern] matches the pattern
-        }
-    } “{ $text }”: { $what }
-
 # What a filter does, in the list of filters
 filters-act-star = star
 
@@ -180,3 +160,61 @@ filters-kept-as-they-are = { $n ->
         [one] { $n } filter made elsewhere has more than Picacho's filters can say; it's kept as it is.
        *[other] { $n } filters made elsewhere have more than Picacho's filters can say; they're kept as they are.
     }
+
+filters-test = { $field } { $negate ->
+        [yes] { $matching ->
+            [contains] doesn't contain
+            [is] doesn't equal
+            [matches] doesn't match
+           *[pattern] doesn't match the pattern
+        }
+       *[no] { $matching ->
+            [contains] contains
+            [is] is
+            [matches] matches
+           *[pattern] matches the pattern
+        }
+    } “{ $text }”
+
+filters-test-larger = { $negate ->
+        [yes] not larger than { $kb } KB
+       *[no] larger than { $kb } KB
+    }
+
+filters-test-smaller = { $negate ->
+        [yes] not smaller than { $kb } KB
+       *[no] smaller than { $kb } KB
+    }
+
+filters-test-attachment = { $negate ->
+        [yes] has no attachments
+       *[no] has attachments
+    }
+
+filters-rule = { $tests }: { $what }
+
+filters-and = and
+
+filters-or = or
+
+filters-then = then
+
+filters-add-test = Add Test
+
+filters-add-action = Add Action
+
+filters-all-tests = All tests match
+
+filters-any-test = Any test matches
+
+filters-remove-part = Remove “{ $part }”
+
+filters-one-folder-per-filter = A filter can move mail into one folder only
+
+filters-two-folders = moving mail into two folders
+
+filters-two-redirects = sending mail on to two addresses
+
+filters-these-tests-together = these tests together
+
+filters-any-of-these-tests = any one of these tests

@@ -2,8 +2,8 @@
 //! Transactions, Updates, Promotions, Social and Forums above an inbox's
 //! list, each with its unread count; moving senders from one to another
 //! (a message's menu, or dragging messages onto a tab); the filter menu's
-//! switch and Settings → Rules & Layout's card; and announcing only
-//! Primary's new mail when asked.
+//! switch and Settings → Rules & Layout's card. Which tabs' new mail is
+//! announced is Settings → Inbox Control's (`inbox_control`).
 //!
 //! Each listed message is sorted from a quick look at once, and from a
 //! whole one (receipts, packages, codes, and the inbox category model when
@@ -62,8 +62,6 @@ pub(super) enum CatAction {
     ToggleEnabled,
     /// Turns a category's tab on or off.
     ToggleTab(Category),
-    /// Announces only Primary's new mail, or all of it again.
-    ToggleNotifyPrimaryOnly,
     /// Makes All Mail the first tab and the one the inbox opens on, or
     /// puts it back last, after Primary.
     ToggleAllMailFirst,
@@ -169,6 +167,11 @@ impl Sorting {
             categories.chain([Tab::All]).collect()
         }
     }
+    /// Whether who is known has been read at least once: until then,
+    /// everyone would look new to the Screener.
+    pub(super) fn known_ready(&self) -> bool {
+        self.known_read.is_some()
+    }
     /// A tab's unread listed mail.
     pub(super) fn unread_in(&self, tab: Tab) -> usize {
         match tab {
@@ -185,6 +188,7 @@ impl MailApp {
     pub(super) fn shows_categories(&self) -> bool {
         self.sorting.prefs().sorting()
             && self.folder == Folder::Inbox
+            && self.lens == inbox_control::Lens::Inbox
             && self.local_results.is_none()
             && !self.subs_open
             && !self.summary_open
@@ -207,12 +211,18 @@ impl MailApp {
         sorter.forget_unlisted(&self.messages);
         if tabs {
             let extras = &self.thread_extras;
+            let sorter = &self.sorting.sorter;
+            // Mail waiting in the Screener isn't in the inbox's tabs.
+            let mut unread = [0; Category::ALL.len()];
+            let mut all = 0;
             for m in self.messages.iter().filter(|m| {
-                m.unread && !m.pending && !extras.contains(&m.id) && self.scope.admits(m)
+                m.unread && !m.pending && !extras.contains(&m.id) && self.scope.admits(m) && !self.screened(m)
             }) {
-                self.sorting.unread[sorter.tab_known(m) as usize] += 1;
-                self.sorting.all_unread += 1;
+                unread[sorter.tab_known(m) as usize] += 1;
+                all += 1;
             }
+            self.sorting.unread = unread;
+            self.sorting.all_unread = all;
         }
         Some(self.sorting.sorter.clone())
     }
@@ -323,7 +333,9 @@ impl MailApp {
     /// addresses) again when mail changed, at most every `KNOWN_EVERY`:
     /// their mail is Primary.
     pub(super) fn load_known(&mut self, cx: &mut Context<Self>) {
-        if self.sorting.known_loading || !self.sorting.prefs().sorting() || self.accounts.is_empty()
+        if self.sorting.known_loading
+            || !(self.sorting.prefs().sorting() || self.control.screener.enabled)
+            || self.accounts.is_empty()
         {
             return;
         }
@@ -358,24 +370,6 @@ impl MailApp {
         .detach();
     }
 
-    /// Whether new mail like `m` is announced, as far as categories go:
-    /// with only Primary announced, mail in other tabs arrives quietly.
-    /// New mail is few messages, each looked at closely here (a code is
-    /// Primary, which a quick look can't tell).
-    pub(super) fn announces(&self, m: &Mail) -> bool {
-        let sorter = &self.sorting.sorter;
-        let prefs = &sorter.prefs;
-        if !prefs.notify_primary_only || !prefs.sorting() {
-            return true;
-        }
-        let ai = sorter.model();
-        let content = sorter
-            .content(m)
-            .filter(|c| c.complete)
-            .unwrap_or_else(|| cats::Content::of_with(m, ai.as_deref()));
-        prefs.fold(cats::decide(m, content, prefs, &sorter.known)) == Category::Primary
-    }
-
     fn save_categories(&mut self, cx: &mut Context<Self>) {
         self.sorting.prefs().save(&self.backend.store);
         if !self.sorting.tabs().contains(&self.sorting.tab) {
@@ -399,11 +393,6 @@ impl MailApp {
             }
             CatAction::ToggleTab(c) => {
                 Arc::make_mut(&mut self.sorting.sorter).prefs.toggle_tab(c);
-                self.save_categories(cx);
-            }
-            CatAction::ToggleNotifyPrimaryOnly => {
-                let prefs = &mut Arc::make_mut(&mut self.sorting.sorter).prefs;
-                prefs.notify_primary_only = !prefs.notify_primary_only;
                 self.save_categories(cx);
             }
             CatAction::ToggleAllMailFirst => {
@@ -983,14 +972,6 @@ impl MailApp {
                     cx,
                 ));
             }
-            rows = rows.row(self.switch_setting(
-                t!("categories-notify-primary-only"),
-                t!("categories-notify-primary-only-caption"),
-                "categories-notify-primary".into(),
-                prefs.notify_primary_only,
-                act(CatAction::ToggleNotifyPrimaryOnly),
-                cx,
-            ));
         }
         let mut senders = Rows::new();
         if prefs.enabled {

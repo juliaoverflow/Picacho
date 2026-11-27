@@ -1062,6 +1062,21 @@ impl MailApp {
         Self::set(&self.fwd_key, "", w, cx);
         Self::set(&self.fwd_pass_password, "", w, cx);
     }
+    /// Fastmail's Masked Email through a JMAP account's own session.
+    pub(super) fn connect_fastmail_account(&mut self, id: String, cx: &mut Context<Self>) {
+        let Some(account) = self.accounts.iter().find(|a| a.id == id).cloned() else {
+            return;
+        };
+        if !self.fwd_busy.insert("connect".into()) {
+            return;
+        }
+        self.fwd_error = None;
+        self.task(
+            cx,
+            move |b| fwd::connect_jmap_account(&b, &account),
+            move |this, result, cx| this.forwarding_connected(result, cx),
+        );
+    }
     /// A service just connected, or why it couldn't be.
     fn forwarding_connected(&mut self, result: anyhow::Result<ForwardingAccount>, cx: &mut Context<Self>) {
         self.fwd_busy.remove("connect");

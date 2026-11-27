@@ -442,6 +442,9 @@ pub struct Session {
     may_create_task_list: bool,
     /// The sign-in's principals account (JMAP Principals, RFC 9670).
     principals_account: Option<String>,
+    /// Fastmail's Masked Email account, where the sign-in may use it
+    /// (`sync/masked_email.rs`).
+    masked_email_account: Option<String>,
     /// The Mailbox state `mailboxes` was read in, for Mailbox/changes.
     mailbox_state: Mutex<String>,
     /// The quotas as last read, and the Quota state then (Quota/changes).
@@ -897,6 +900,10 @@ impl Session {
                 .and_then(|id| v["accounts"][id]["accountCapabilities"][TASKS]["mayCreateTaskList"].as_bool())
                 .unwrap_or(true),
             principals_account: v["primaryAccounts"][PRINCIPALS].as_str().map(str::to_owned),
+            masked_email_account: v["primaryAccounts"][crate::sync::masked_email::CAPABILITY]
+                .as_str()
+                .filter(|_| caps.get(crate::sync::masked_email::CAPABILITY).is_some())
+                .map(str::to_owned),
             mailbox_state: Mutex::new(String::new()),
             quotas: Mutex::new((None, Vec::new())),
         })
@@ -1050,6 +1057,9 @@ impl Session {
             .any(|(n, _)| n.starts_with("Principal/") || n.starts_with("ShareNotification/"))
         {
             using.push(PRINCIPALS);
+        }
+        if calls.iter().any(|(n, _)| n.starts_with("MaskedEmail/")) {
+            using.push(crate::sync::masked_email::CAPABILITY);
         }
         // Principal/getAvailability is its own capability (RFC 9670 §2.2).
         if calls.iter().any(|(n, _)| *n == "Principal/getAvailability") {
@@ -2062,6 +2072,10 @@ impl Session {
     /// results in the items' order.
     pub fn in_parallel<T: Sync, R: Send>(&self, items: &[T], work: impl Fn(&T) -> R + Sync) -> Vec<R> {
         bounded_parallel(items, self.max_concurrent_requests, work)
+    }
+    /// Fastmail's Masked Email account, where the sign-in may use it.
+    pub fn masked_email_account(&self) -> Option<&str> {
+        self.masked_email_account.as_deref()
     }
     /// The sign-in's calendar account, where the server has calendars.
     pub fn calendars_account(&self) -> Option<&str> {

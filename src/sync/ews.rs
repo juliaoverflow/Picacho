@@ -245,6 +245,7 @@ const RULE_TESTS: &[(&str, &str)] = &[
     ("ContainsSenderStrings", "senderContains"),
     ("ContainsSubjectStrings", "subjectContains"),
     ("FromAddresses", "fromAddresses"),
+    ("HasAttachments", "hasAttachments"),
     ("SentToAddresses", "sentToAddresses"),
     ("WithinSizeRange", "withinSizeRange"),
 ];
@@ -274,6 +275,7 @@ fn tests_json(n: Option<Node>) -> serde_json::Value {
         let ews = test.tag_name().name();
         let value = match ews {
             "FromAddresses" | "SentToAddresses" => addresses_of(test),
+            "HasAttachments" => (test.text().unwrap_or_default() == "true").into(),
             "WithinSizeRange" => serde_json::json!({
                 "minimumSize": text(test, "MinimumSize").parse::<i64>().unwrap_or(0),
                 "maximumSize": text(test, "MaximumSize").parse::<i64>().unwrap_or(i32::MAX as i64),
@@ -326,6 +328,7 @@ pub fn rule_xml(rule: &serde_json::Value, id: Option<&str>) -> String {
                 let value = v.get(*graph)?;
                 Some(match *ews {
                     "FromAddresses" | "SentToAddresses" => format!("<t:{ews}>{}</t:{ews}>", addresses(value)),
+                    "HasAttachments" => format!("<t:HasAttachments>{}</t:HasAttachments>", value.as_bool().unwrap_or(false)),
                     "WithinSizeRange" => format!(
                         "<t:WithinSizeRange><t:MinimumSize>{}</t:MinimumSize><t:MaximumSize>{}</t:MaximumSize></t:WithinSizeRange>",
                         value["minimumSize"].as_i64().unwrap_or(0),

@@ -468,11 +468,11 @@ impl Composer {
 
     /// Whether you have a key or certificate to sign or encrypt with.
     fn can_protect(&self) -> bool {
-        !self.backend.keyring().secret.is_empty() || !self.backend.certificates().own.is_empty()
+        self.backend.keyring().has_own() || self.backend.certificates().has_any_own()
     }
     /// Whether you have an OpenPGP key of your own.
     fn can_protect_openpgp(&self) -> bool {
-        !self.backend.keyring().secret.is_empty()
+        self.backend.keyring().has_own()
     }
     /// Whether it goes as inline PGP: asked for, and protected with
     /// OpenPGP (not S/MIME, which is used too when there's no OpenPGP key).
@@ -481,7 +481,7 @@ impl Composer {
     }
     /// Whether you have both an OpenPGP key and an S/MIME certificate.
     fn has_both_kinds(&self) -> bool {
-        !self.backend.keyring().secret.is_empty() && !self.backend.certificates().own.is_empty()
+        self.backend.keyring().has_own() && self.backend.certificates().has_any_own()
     }
     fn changed(&mut self, cx: &mut Context<Self>) {
         self.saved = false;

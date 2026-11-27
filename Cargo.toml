@@ -127,6 +127,18 @@ pgp = "0.21"
 # S/MIME (manage/smime.rs): PKCS#7 and PKCS#12, from the OpenSSL already
 # linked for native-tls and Proton's push encryption.
 openssl = "0.10"
+# Security keys (manage/hardware.rs) whose private keys never leave them:
+# OpenPGP cards (YubiKey, Nitrokey, Gnuk…) over PC/SC, which sync/pcsc.rs
+# loads from the system when first used (no PC/SC headers needed to
+# build), signing and decrypting with rPGP through openpgp-card-rpgp; and
+# PKCS#11 tokens for S/MIME, whose module (OpenSC, YubiKey's ykcs11, a
+# vendor's) cryptoki loads at run time.
+openpgp-card = "0.7"
+openpgp-card-rpgp = "0.9"
+card-backend = "0.2"
+cryptoki = "0.12"
+secrecy = "0.10"
+libloading = "0.8"
 # Reading a CRL's extensions (its scope: issuing distribution point, delta
 # indicator) and a certificate's distribution points, which the openssl
 # crate doesn't expose (manage/smime/revocation.rs).
@@ -315,11 +327,10 @@ webauthn-authenticator-rs = { version = "0.6.2", features = ["usb", "cable"] }
 # Wayland's data-control protocol where the compositor has it, else X11.
 arboard = { version = "3.7", default-features = false, features = ["wayland-data-control"] }
 
-# Kerberos sign-in (sync/gss.rs): the system's GSS-API library, loaded
-# when first used, so builds need no Kerberos headers and computers without
-# Kerberos run as before. Windows uses SSPI (windows-sys, below).
-[target.'cfg(all(unix, not(any(target_os = "android", target_os = "ios"))))'.dependencies]
-libloading = "0.8"
+# Kerberos sign-in (sync/gss.rs) loads the system's GSS-API library with
+# libloading (above) when first used, so builds need no Kerberos headers and
+# computers without Kerberos run as before. Windows uses SSPI (windows-sys,
+# below).
 
 # Spelling in the formatted composer on Linux and the BSDs (manage/spelling.rs):
 # the Hunspell dictionaries desktop apps install. macOS and Windows use the

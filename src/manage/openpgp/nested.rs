@@ -3,8 +3,8 @@
 //! MIME level (RFC 3156 parts nested in each other) and at the OpenPGP
 //! packet level (RFC 9580 §10.3.1: decrypting or decompressing yields a new
 //! OpenPGP message, which may itself be encrypted, compressed or signed).
-use super::{Keyring, Signature, Verdict};
-use pgp::composed::{Message, SignedPublicKey, SignedSecretKey};
+use super::{Keyring, Secrets, Signature, Verdict};
+use pgp::composed::{Message, SignedPublicKey, TheRing};
 use pgp::types::Password;
 
 /// How many layers a message may have: each PGP/MIME part opened counts
@@ -97,10 +97,10 @@ fn innermost(message: &Message<'_>) -> Layer {
 /// nothing was encrypted (it is opened as encrypted, and was claimed to be).
 pub(super) fn unwrap_message<'a>(
     mut message: Message<'a>,
-    secret: &[SignedSecretKey],
+    secret: &Secrets,
     depth: &mut usize,
 ) -> Option<Message<'a>> {
-    let passwords: Vec<Password> = secret.iter().map(|_| Password::empty()).collect();
+    let passwords: Vec<Password> = secret.keys.iter().map(|_| Password::empty()).collect();
     let mut decrypted = false;
     loop {
         match innermost(&message) {
@@ -109,9 +109,15 @@ pub(super) fn unwrap_message<'a>(
                 if !descend(depth) {
                     return None;
                 }
-                message = message
-                    .decrypt_with_keys(passwords.iter().collect(), secret.iter().collect())
-                    .ok()?;
+                // A card's session key, where the layer is encrypted to an
+                // unlocked card (tried first), else the keys here.
+                let ring = TheRing {
+                    secret_keys: secret.keys.iter().collect(),
+                    key_passwords: passwords.iter().collect(),
+                    session_keys: super::card::session_keys(&message, &secret.cards),
+                    ..TheRing::default()
+                };
+                message = message.decrypt_the_ring(ring, true).ok()?.0;
                 decrypted = true;
             }
             Layer::Compressed => {
@@ -197,7 +203,7 @@ pub(super) fn message_signature_and_signers<'k>(
 mod tests {
     use super::super::{Protect, encryption_subkey, open, protect, test_key};
     use super::*;
-    use pgp::composed::{ArmorOptions, MessageBuilder, SignedPublicKey};
+    use pgp::composed::{ArmorOptions, MessageBuilder, SignedPublicKey, SignedSecretKey};
     use pgp::crypto::{hash::HashAlgorithm, sym::SymmetricKeyAlgorithm};
     use pgp::packet::{Packet, PublicKeyEncryptedSessionKey, SymEncryptedProtectedData};
 
@@ -381,7 +387,7 @@ mod tests {
         let sent = protect(MESSAGE, "ana@example.org", &["bo@example.se".into()], both, &p.anas).unwrap();
         let (armored, _) = crate::manage::crypto::encrypted_part(&sent).unwrap();
         let (message, _) = Message::from_string(&armored).unwrap();
-        let mut opened = unwrap_message(message, std::slice::from_ref(&p.bo), &mut 0).unwrap();
+        let mut opened = unwrap_message(message, &Secrets { keys: vec![p.bo.clone()], cards: Vec::new() }, &mut 0).unwrap();
         assert!(!opened.is_signed(), "no OpenPGP signature packets: §6.1, not §6.2");
         let inner = opened.as_data_vec().unwrap();
         assert!(String::from_utf8_lossy(&inner).starts_with("Content-Type: multipart/signed"));

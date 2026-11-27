@@ -1,5 +1,6 @@
-//! Alias forwarding services (SimpleLogin, addy.io, Firefox Relay, and
-//! Proton's own aliases for a Proton account signed in without Bridge) and
+//! Alias forwarding services (SimpleLogin, addy.io, Firefox Relay, Fastmail's
+//! Masked Email, DuckDuckGo Email Protection, and Proton's own aliases for a
+//! Proton account signed in without Bridge) and
 //! the mailbox views they add: an alias shown as an account of its own, and All
 //! Mail across every account.
 //!
@@ -38,15 +39,30 @@ pub enum ForwardingService {
     /// for a Proton account signed in without Bridge. SimpleLogin forwards
     /// their mail, but they are Proton's, not a SimpleLogin account's.
     Proton,
+    /// Fastmail's Masked Email, over JMAP (`sync/masked_email.rs`): with an
+    /// API token, or the session of a Fastmail account added here.
+    Fastmail,
+    /// DuckDuckGo Email Protection's private Duck Addresses. Its API only
+    /// makes new ones, so the ones made here are kept here.
+    DuckDuckGo,
 }
 impl ForwardingService {
-    pub const ALL: [Self; 4] = [Self::SimpleLogin, Self::Addy, Self::FirefoxRelay, Self::Proton];
+    pub const ALL: [Self; 6] = [
+        Self::SimpleLogin,
+        Self::Addy,
+        Self::FirefoxRelay,
+        Self::Fastmail,
+        Self::DuckDuckGo,
+        Self::Proton,
+    ];
     pub fn label(self) -> &'static str {
         match self {
             Self::SimpleLogin => "SimpleLogin",
             Self::Addy => "addy.io",
             Self::FirefoxRelay => "Firefox Relay",
             Self::Proton => "Proton",
+            Self::Fastmail => "Fastmail",
+            Self::DuckDuckGo => "DuckDuckGo",
         }
     }
     pub fn default_server(self) -> &'static str {
@@ -55,7 +71,29 @@ impl ForwardingService {
             Self::Addy => "https://app.addy.io",
             Self::FirefoxRelay => "https://relay.firefox.com",
             Self::Proton => "https://pass.proton.me",
+            Self::Fastmail => crate::sync::masked_email::FASTMAIL_SESSION,
+            Self::DuckDuckGo => "https://quack.duckduckgo.com",
         }
+    }
+    /// Whether it uses Masked Email over JMAP rather than a REST API.
+    pub fn uses_jmap(self) -> bool {
+        matches!(self, Self::Fastmail)
+    }
+    /// Whether the service can list its aliases. DuckDuckGo's API only
+    /// makes new ones: those made here are the ones known.
+    pub fn lists_aliases(self) -> bool {
+        !matches!(self, Self::DuckDuckGo)
+    }
+    /// Whether an alias can be turned off, deleted, and its description
+    /// changed at the service. A Duck Address can only be deactivated on
+    /// DuckDuckGo's own site; here it can only be forgotten.
+    pub fn manages_aliases(self) -> bool {
+        !matches!(self, Self::DuckDuckGo)
+    }
+    /// Whether a new alias's prefix and domain are chosen in the form:
+    /// Firefox Relay, Fastmail and DuckDuckGo make the whole address.
+    pub fn picks_address(self) -> bool {
+        !matches!(self, Self::FirefoxRelay | Self::Fastmail | Self::DuckDuckGo)
     }
     /// Whether it signs in with a Proton account here rather than an API
     /// key and server.
@@ -70,17 +108,19 @@ impl ForwardingService {
     /// Whether mail can be written as an alias, not only replied to.
     /// SimpleLogin does it with reverse aliases and addy.io with
     /// `alias+name=domain` addresses; Firefox Relay only relays replies.
+    /// Firefox Relay, Fastmail's masked addresses and Duck Addresses are
+    /// left to replies, which each service routes itself.
     pub fn can_send(self) -> bool {
-        !matches!(self, Self::FirefoxRelay)
+        !matches!(self, Self::FirefoxRelay | Self::Fastmail | Self::DuckDuckGo)
     }
     /// Whether an alias can have a display name, the name recipients see
     /// on mail sent from it: SimpleLogin's `name`, addy.io's `from_name`.
     pub fn has_display_name(self) -> bool {
-        !matches!(self, Self::FirefoxRelay)
+        !matches!(self, Self::FirefoxRelay | Self::Fastmail | Self::DuckDuckGo)
     }
     /// Whether aliases can be pinned to the top of the list.
     pub fn can_pin(self) -> bool {
-        !matches!(self, Self::FirefoxRelay)
+        !matches!(self, Self::FirefoxRelay | Self::Fastmail | Self::DuckDuckGo)
     }
     /// What the service calls the real addresses an alias forwards to
     /// (SimpleLogin's and Proton's mailboxes, addy.io's recipients), if it
@@ -89,7 +129,7 @@ impl ForwardingService {
         match self {
             Self::SimpleLogin | Self::Proton => Some(t!("manage-forwarding-mailboxes")),
             Self::Addy => Some(t!("manage-forwarding-recipients")),
-            Self::FirefoxRelay => None,
+            Self::FirefoxRelay | Self::Fastmail | Self::DuckDuckGo => None,
         }
     }
     /// Whether aliases list their reverse aliases (contacts), and write
@@ -120,6 +160,14 @@ impl ForwardingService {
             Self::Proton => (
                 t!("manage-forwarding-proton-aliases-use-the-accounts-sign-in"),
                 "https://pass.proton.me/",
+            ),
+            Self::Fastmail => (
+                t!("masked-email-make-an-api-token-in-fastmail"),
+                "https://app.fastmail.com/settings/security/tokens",
+            ),
+            Self::DuckDuckGo => (
+                t!("masked-email-copy-the-token-duckduckgo"),
+                "https://duckduckgo.com/email/settings/autofill",
             ),
         }
     }
@@ -269,6 +317,10 @@ pub struct ForwardingAccount {
     /// whose aliases these are.
     #[serde(default)]
     pub proton_account: String,
+    /// Fastmail: the Picacho account (JMAP, at Fastmail) whose session
+    /// reaches its Masked Email, when no API token was given.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub jmap_account: String,
 }
 impl ForwardingAccount {
     fn secret_id(&self) -> String {
@@ -292,6 +344,14 @@ impl ForwardingAccount {
                 extra: Some(zeroize::Zeroizing::new(secret.password.clone())).filter(|p| !p.is_empty()),
                 pass: Some(secret.proton()).filter(|p| !p.uid.is_empty()),
             }));
+        }
+        if self.service.uses_jmap() {
+            if !self.jmap_account.is_empty() {
+                return Ok(Api::Masked(MaskedApi::Account(backend, self.jmap_account.clone())));
+            }
+            let key = store::read_secret(&self.secret_id())?.password;
+            return crate::sync::masked_email::Token::open(&self.server, &key)
+                .map(|t| Api::Masked(MaskedApi::Token(Box::new(t))));
         }
         self.client().map(Api::Http)
     }
@@ -320,6 +380,29 @@ fn secret_id(id: &str) -> String {
 enum Api<'a> {
     Http(Client),
     Proton(ProtonApi<'a>),
+    Masked(MaskedApi<'a>),
+}
+/// Fastmail's Masked Email: through an API token, or a Fastmail account's
+/// own JMAP session (the backend keeps it, by the account's id).
+enum MaskedApi<'a> {
+    Token(Box<crate::sync::masked_email::Token>),
+    Account(&'a Backend, String),
+}
+impl MaskedApi<'_> {
+    fn run<T>(&self, work: impl FnOnce(&dyn crate::sync::masked_email::Caller) -> Result<T>) -> Result<T> {
+        match self {
+            MaskedApi::Token(t) => work(t.as_ref()),
+            MaskedApi::Account(backend, id) => {
+                let account = backend
+                    .store
+                    .accounts()?
+                    .into_iter()
+                    .find(|a| &a.id == id)
+                    .with_context(|| t!("masked-email-the-fastmail-account-is-gone"))?;
+                backend.with_jmap(&account, |s| work(s))
+            }
+        }
+    }
 }
 /// Proton's aliases of one account.
 struct ProtonApi<'a> {
@@ -366,18 +449,24 @@ impl ProtonApi<'_> {
 /// session as `$s`.
 macro_rules! ask {
     ($api:expr, $c:ident => $http:expr, $s:ident => $proton:expr) => {
+        ask!($api, $c => $http, $s => $proton, _m => anyhow::bail!(t!("masked-email-fastmail-cant-do-this")))
+    };
+    ($api:expr, $c:ident => $http:expr, $s:ident => $proton:expr, $m:ident => $masked:expr) => {
         match $api {
             Api::Http($c) => $http,
             Api::Proton(p) => p.run(|$s| $proton),
+            Api::Masked(m) => m.run(|$m| $masked),
         }
     };
 }
+use crate::sync::masked_email as masked;
 impl Api<'_> {
     /// Every alias; for Proton, its Pass aliases and then the account's
     /// own addresses but its original one and the one it signs in with.
     fn aliases(&self) -> Result<Vec<Alias>> {
         match self {
             Api::Http(c) => c.aliases(),
+            Api::Masked(m) => m.run(masked::aliases),
             Api::Proton(p) => {
                 let own = p.backend.store.accounts()?.into_iter().find(|a| a.id == p.account).map(|a| a.email);
                 p.run(|s| proton_aliases_and_addresses(s, own.as_deref()))
@@ -385,22 +474,27 @@ impl Api<'_> {
         }
     }
     fn mailboxes(&self) -> Result<Vec<ServiceMailbox>> {
-        ask!(self, c => c.mailboxes(), s => s.proton_alias_mailboxes())
+        ask!(self, c => c.mailboxes(), s => s.proton_alias_mailboxes(), _m => Ok(Vec::new()))
     }
     fn options(&self) -> Result<AliasOptions> {
-        ask!(self, c => c.options(), s => s.proton_alias_options())
+        ask!(self, c => c.options(), s => s.proton_alias_options(), _m => Ok(masked::options()))
     }
     fn create(&self, new: &NewAlias) -> Result<Alias> {
-        ask!(self, c => c.create(new), s => s.create_proton_alias(new))
+        ask!(self, c => c.create(new), s => s.create_proton_alias(new), m => masked::create(m, new))
     }
     fn alias_exists(&self, alias: &Alias) -> Result<bool> {
-        ask!(self, c => c.alias_exists(alias), s => s.proton_alias_exists(alias))
+        ask!(self, c => c.alias_exists(alias), s => s.proton_alias_exists(alias), m => masked::exists(m, alias))
     }
     fn set_note(&self, alias: &Alias, note: &str) -> Result<()> {
-        ask!(self, c => c.set_note(alias, note), s => s.set_proton_alias_note(alias, note))
+        ask!(self, c => c.set_note(alias, note), s => s.set_proton_alias_note(alias, note), m => masked::set_note(m, alias, note))
     }
     fn set_enabled(&self, alias: &Alias, enabled: bool) -> Result<()> {
-        ask!(self, c => c.set_enabled(alias, enabled), s => s.set_proton_alias_enabled(alias, enabled))
+        ask!(
+            self,
+            c => c.set_enabled(alias, enabled),
+            s => s.set_proton_alias_enabled(alias, enabled),
+            m => masked::set_enabled(m, alias, enabled)
+        )
     }
     fn set_name(&self, alias: &Alias, name: &str) -> Result<()> {
         ask!(self, c => c.set_name(alias, name), s => s.set_proton_alias_name(alias, name))
@@ -414,7 +508,7 @@ impl Api<'_> {
     fn set_pgp(&self, alias: &Alias, enabled: bool) -> Result<()> {
         match self {
             Api::Http(c) => c.set_pgp(alias, enabled),
-            Api::Proton(..) => anyhow::bail!(t!("sync-forwarding-only-simplelogin-encrypts-forwarded-mail-per")),
+            Api::Proton(..) | Api::Masked(..) => anyhow::bail!(t!("sync-forwarding-only-simplelogin-encrypts-forwarded-mail-per")),
         }
     }
     /// An alias's contacts. Proton's come with their counts.
@@ -440,7 +534,7 @@ impl Api<'_> {
         )
     }
     fn delete(&self, alias: &Alias) -> Result<()> {
-        ask!(self, c => c.delete(alias), s => s.delete_proton_alias(alias))
+        ask!(self, c => c.delete(alias), s => s.delete_proton_alias(alias), m => masked::delete(m, alias))
     }
 }
 
@@ -465,6 +559,9 @@ pub fn connect(
     key: &str,
     accounts: &[Account],
 ) -> Result<ForwardingAccount> {
+    if service.uses_jmap() {
+        return connect_masked(server, key, accounts);
+    }
     let client = Client::new(service, server, key)?;
     let profile = client.profile()?;
     let aliases = client.aliases()?;
@@ -489,6 +586,7 @@ pub fn connect(
         mailboxes,
         aliases_only: false,
         proton_account: String::new(),
+        jmap_account: String::new(),
     };
     store::write_secret(
         &account.secret_id(),
@@ -499,6 +597,63 @@ pub fn connect(
     )?;
     Ok(account)
 }
+/// Fastmail's Masked Email with an API token: checks it can reach Masked
+/// Email, lists the addresses and keeps the token in the keychain.
+fn connect_masked(server: &str, key: &str, accounts: &[Account]) -> Result<ForwardingAccount> {
+    let token = crate::sync::masked_email::Token::open(server, key)?;
+    let aliases = masked::aliases(&token)?;
+    let session = crate::sync::masked_email::session_url_of(server)?;
+    let account = ForwardingAccount {
+        id: uuid::Uuid::new_v4().to_string(),
+        service: ForwardingService::Fastmail,
+        server: if session == crate::sync::masked_email::FASTMAIL_SESSION { String::new() } else { session },
+        name: token.username.clone(),
+        deliver_to: accounts
+            .iter()
+            .find(|a| a.email.eq_ignore_ascii_case(&token.username))
+            .map(|a| a.id.clone()),
+        aliases,
+        ..ForwardingAccount::default()
+    };
+    store::write_secret(
+        &account.secret_id(),
+        &Secret {
+            password: key.trim().to_owned(),
+            ..Secret::default()
+        },
+    )?;
+    Ok(account)
+}
+
+/// Fastmail's Masked Email through `account`'s own JMAP session (a
+/// Fastmail account added here): no token is kept, the account's sign-in
+/// is used.
+pub fn connect_jmap_account(backend: &Backend, account: &Account) -> Result<ForwardingAccount> {
+    anyhow::ensure!(
+        account.provider == Provider::Jmap,
+        t!("masked-email-this-account-has-no-masked-email")
+    );
+    let aliases = backend.with_jmap(account, |s| masked::aliases(s))?;
+    Ok(ForwardingAccount {
+        id: uuid::Uuid::new_v4().to_string(),
+        service: ForwardingService::Fastmail,
+        name: account.email.clone(),
+        deliver_to: Some(account.id.clone()),
+        aliases,
+        jmap_account: account.id.clone(),
+        ..ForwardingAccount::default()
+    })
+}
+/// The JMAP accounts whose Masked Email isn't listed here yet: those that
+/// might be at Fastmail. Whether one has Masked Email shows on connecting.
+pub fn jmap_accounts<'a>(forwarding: &[ForwardingAccount], accounts: &'a [Account]) -> Vec<&'a Account> {
+    accounts
+        .iter()
+        .filter(|a| a.provider == Provider::Jmap && a.credentials_of.is_empty())
+        .filter(|a| !forwarding.iter().any(|f| f.service.uses_jmap() && f.jmap_account == a.id))
+        .collect()
+}
+
 /// A Proton account's Pass aliases, then its own addresses but `own` (the
 /// one it is signed in with here), each address after the aliases.
 fn proton_aliases_and_addresses(s: &crate::sync::proton::Session, own: Option<&str>) -> Result<Vec<Alias>> {
@@ -656,6 +811,10 @@ pub struct Refreshed {
 }
 /// The account's aliases and mailboxes as the service lists them now.
 pub fn refresh(backend: &Backend, account: &ForwardingAccount) -> Result<Refreshed> {
+    if !account.service.lists_aliases() {
+        // Nothing to ask: the ones made here are all that is known.
+        return Ok(Refreshed { aliases: account.aliases.clone(), mailboxes: None });
+    }
     let api = account.api(backend)?;
     Ok(Refreshed {
         aliases: account.merge(api.aliases()?),
@@ -698,7 +857,11 @@ pub fn options(backend: &Backend, account: &ForwardingAccount) -> Result<AliasOp
     account.api(backend)?.options()
 }
 /// Changes an alias's description at the service.
+/// For DuckDuckGo, whose API keeps no descriptions, the note stays here.
 pub fn set_note(backend: &Backend, account: &ForwardingAccount, alias: &Alias, note: &str) -> Result<()> {
+    if !account.service.manages_aliases() {
+        return Ok(());
+    }
     account.api(backend)?.set_note(alias, note)
 }
 
@@ -811,6 +974,7 @@ pub fn reverse_aliases(backend: &Backend, account: &ForwardingAccount, alias: &A
     let client = match account.api(backend)? {
         // Proton's contacts come with their counts.
         api @ Api::Proton(..) => return api.contacts(alias),
+        Api::Masked(..) => anyhow::bail!(t!("sync-forwarding-only-simplelogin-has-reverse-aliases")),
         Api::Http(client) => client,
     };
     let (contacts, activity) = std::thread::scope(|scope| {
@@ -959,9 +1123,19 @@ pub fn clean_prefix(prefix: &str) -> String {
         .collect()
 }
 pub fn set_enabled(backend: &Backend, account: &ForwardingAccount, alias: &Alias, enabled: bool) -> Result<()> {
+    anyhow::ensure!(
+        account.service.manages_aliases(),
+        t!("masked-email-turn-duck-addresses-off-on-duckduckgo")
+    );
     account.api(backend)?.set_enabled(alias, enabled)
 }
+/// Deletes an alias at its service. A Duck Address, which DuckDuckGo's API
+/// can't delete, is only forgotten here: it keeps forwarding until it is
+/// deactivated on DuckDuckGo's site.
 pub fn delete(backend: &Backend, account: &ForwardingAccount, alias: &Alias) -> Result<()> {
+    if !account.service.manages_aliases() {
+        return Ok(());
+    }
     account.api(backend)?.delete(alias)
 }
 /// Forgets the account's key (for Proton's aliases, Pass's extra password,
@@ -1242,7 +1416,9 @@ pub fn route(backend: &Backend, draft: &Draft) -> Result<Draft> {
             );
             out
         }
-        ForwardingService::FirefoxRelay => unreachable!("Firefox Relay cannot send"),
+        ForwardingService::FirefoxRelay | ForwardingService::Fastmail | ForwardingService::DuckDuckGo => {
+            unreachable!("{} cannot send", account.service.label())
+        }
     };
     let _ = remember_routes(
         store,

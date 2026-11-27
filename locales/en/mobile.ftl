@@ -207,3 +207,5 @@ mobile-sheets-open-anyway = Open Anyway
 mobile-sheets-always-trust = Always Trust { $site }
 
 mobile-sheets-copy-link = Copy Link
+
+mobile-settings-inbox-control = Inbox Control

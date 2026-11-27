@@ -310,22 +310,45 @@ pub fn read(text: &str) -> Result<Read> {
     Ok(out)
 }
 
-/// One `if test { action; [stop;] }` as a rule.
+/// One `if test { actions; [stop;] }` as a rule: its test may be
+/// `allof (…)` or `anyof (…)` of several, each perhaps `not`.
 fn rule_of(c: &Command) -> Option<Rule> {
     let [test] = c.tests.as_slice() else { return None };
-    let (test, negate) = match test.name.as_str() {
-        "not" => (test.tests.first()?, true),
-        _ => (test, false),
+    let (parts, any): (&[Test], bool) = match test.name.as_str() {
+        "allof" => (&test.tests, false),
+        "anyof" => (&test.tests, true),
+        _ => (std::slice::from_ref(test), false),
     };
-    let mut rule = rule_test(test)?;
-    rule.negate = negate;
-    let block = c.block.as_ref()?;
-    let mut actions = block.iter().filter(|a| a.name != "stop");
-    let action = actions.next()?;
-    if actions.next().is_some() {
+    let mut tests = Vec::new();
+    for t in parts {
+        let (t, negate) = match t.name.as_str() {
+            "not" => (t.tests.first()?, true),
+            _ => (t, false),
+        };
+        let r = rule_test(t)?;
+        tests.push(super::sieve::Test { field: r.field, value: r.value, matching: r.matching, negate, header: r.header });
+    }
+    if tests.is_empty() {
         return None;
     }
+    let mut rule = Rule::default();
+    rule.set_tests(tests);
+    rule.any = any && !rule.more.is_empty();
+    let block = c.block.as_ref()?;
+    let mut acts = Vec::new();
+    for action in block.iter().filter(|a| a.name != "stop") {
+        acts.push(act_of(action, &mut rule.keep_copy)?);
+    }
+    if acts.is_empty() {
+        return None;
+    }
+    rule.set_acts(acts);
     rule.stop = block.iter().any(|a| a.name == "stop");
+    Some(rule)
+}
+
+/// One action of a rule's block.
+fn act_of(action: &Command, keep_copy: &mut bool) -> Option<Act> {
     let first = |args: &[Arg]| {
         args.iter().rev().find_map(|a| match a {
             Arg::Strings(s) => s.first().cloned(),
@@ -342,7 +365,7 @@ fn rule_of(c: &Command) -> Option<Rule> {
     }) {
         return None;
     }
-    rule.act = match action.name.as_str() {
+    Some(match action.name.as_str() {
         "fileinto" => {
             let name = first(&action.args)?;
             // A standard folder by its role: kept as the role.
@@ -355,7 +378,7 @@ fn rule_of(c: &Command) -> Option<Rule> {
         "discard" => Act::Discard,
         "keep" => Act::Inbox,
         "redirect" => {
-            rule.keep_copy = action.args.contains(&Arg::Tag("copy".into()));
+            *keep_copy = action.args.contains(&Arg::Tag("copy".into()));
             Act::Redirect(first(&action.args)?)
         }
         "reject" | "ereject" => Act::Reject(first(&action.args)?),
@@ -369,8 +392,7 @@ fn rule_of(c: &Command) -> Option<Rule> {
             }
         }
         _ => return None,
-    };
-    Some(rule)
+    })
 }
 
 /// A single test as a rule's field, comparison and value.
@@ -401,6 +423,20 @@ fn rule_test(t: &Test) -> Option<Rule> {
     // matches; such tests aren't rules. So do RFC 5703's `:mime` header
     // tests (a body part's headers), RFC 5260's `:index`, and RFC 5229's
     // variables in a value (`${1}`), which Picacho's rules can't say.
+    // Any part an attachment, as Picacho writes it (RFC 5703 §4.2).
+    if t.name == "header"
+        && t.args.contains(&Arg::Tag("mime".into()))
+        && t.args.contains(&Arg::Tag("anychild".into()))
+        && lists.len() == 2
+        && lists[0].len() == 1
+        && lists[0][0].eq_ignore_ascii_case("content-disposition")
+        && lists[1].len() == 1
+        && lists[1][0].eq_ignore_ascii_case("attachment")
+    {
+        rule.field = Field::Attachment;
+        rule.matching = Match::Contains;
+        return Some(rule);
+    }
     if t.args.iter().any(|a| matches!(a, Arg::Tag(t) if matches!(t.as_str(), "localpart" | "domain" | "user" | "detail" | "comparator" | "count" | "value" | "mime" | "anychild" | "index" | "last" | "type" | "subtype" | "contenttype" | "param" | "raw" | "content")))
         || lists.iter().flat_map(|l| l.iter()).any(|s| s.contains("${"))
     {
@@ -434,12 +470,14 @@ fn rule_test(t: &Test) -> Option<Rule> {
             rule.field = Field::Body;
             rule.value = value.clone();
         }
-        "size" if t.args.contains(&Arg::Tag("over".into())) => {
+        "size" if t.args.contains(&Arg::Tag("over".into())) || t.args.contains(&Arg::Tag("under".into())) => {
             let n = t.args.iter().find_map(|a| match a {
                 Arg::Number(n) => Some(*n),
                 _ => None,
             })?;
-            rule.field = Field::LargerThan;
+            rule.field = if t.args.contains(&Arg::Tag("over".into())) { Field::LargerThan } else { Field::SmallerThan };
+            // Sizes compare by themselves; as Picacho's own rules keep them.
+            rule.matching = Match::Contains;
             rule.value = (n / 1024).max(1).to_string();
         }
         _ => return None,
@@ -555,13 +593,19 @@ mod tests {
     fn roundcube_scripts_are_read() {
         let read = read(ROUNDCUBE).unwrap();
         let rules = &read.filters.rules;
-        // The two single-test rules; `anyof` and `allof` with two tests
-        // are more than a rule.
-        assert_eq!(rules.len(), 2, "{rules:#?}");
-        assert_eq!(rules[0].act, Act::Redirect("me@mobile.example".into()));
-        assert!(rules[0].keep_copy);
-        assert_eq!((rules[1].field, rules[1].value.as_str()), (Field::LargerThan, "10240"));
-        assert_eq!(read.left_out, 2);
+        // Every rule, `anyof` and `allof` of several tests and several
+        // actions too.
+        assert_eq!(rules.len(), 4, "{rules:#?}");
+        assert!(rules[0].any && rules[0].stop);
+        assert_eq!(rules[0].tests().len(), 2);
+        assert_eq!((rules[0].more[0].field, rules[0].more[0].matching), (Field::From, Match::Is));
+        assert!(!rules[1].any);
+        assert!(rules[1].more[0].negate, "not header :contains …");
+        assert_eq!(rules[1].acts().cloned().collect::<Vec<_>>(), [Act::MarkRead, Act::Folder("Newsletters".into())]);
+        assert_eq!(rules[2].act, Act::Redirect("me@mobile.example".into()));
+        assert!(rules[2].keep_copy);
+        assert_eq!((rules[3].field, rules[3].value.as_str()), (Field::LargerThan, "10240"));
+        assert_eq!(read.left_out, 0);
         // The vacation reply within its dates (RFC 5260 currentdate).
         let v = &read.filters.vacation;
         assert!(v.on);
@@ -574,9 +618,12 @@ mod tests {
     fn fastmail_scripts_are_read() {
         let read = read(FASTMAIL).unwrap();
         // Nested blocks, `set`, `duplicate` and `exists` are parsed and
-        // counted, not refused.
+        // counted, not refused; the rule filing receipts and labelling
+        // them is read, both its actions.
         let rules = &read.filters.rules;
-        assert_eq!(rules.len(), 0, "{rules:#?}");
+        assert_eq!(rules.len(), 1, "{rules:#?}");
+        assert_eq!(rules[0].act, Act::Folder("INBOX.Receipts".into()));
+        assert_eq!(rules[0].also, [Act::Label("$label1".into())]);
         assert!(read.left_out >= 5, "{}", read.left_out);
         assert!(!read.filters.vacation.on, "the reply is inside an `if`");
     }
@@ -714,7 +761,7 @@ I'm away.
 "#;
         let read = read(script).unwrap();
         let rules = &read.filters.rules;
-        assert_eq!(rules.len(), 4, "{rules:#?}");
+        assert_eq!(rules.len(), 5, "{rules:#?}");
         assert_eq!((rules[0].field, rules[0].matching, rules[0].value.as_str()), (Field::Subject, Match::Contains, "invoice"));
         assert_eq!(rules[0].act, Act::Folder("Bills".into()));
         assert!(rules[0].stop);
@@ -722,7 +769,11 @@ I'm away.
         assert!(rules[2].negate && rules[2].keep_copy);
         assert_eq!(rules[2].act, Act::Redirect("me@example.org".into()));
         assert_eq!((rules[3].field, rules[3].value.as_str()), (Field::LargerThan, "5120"));
-        assert_eq!(read.left_out, 1);
+        // Any of two tests.
+        assert!(rules[4].any);
+        assert_eq!((rules[4].field, rules[4].header.as_str()), (Field::Header, "x-spam"));
+        assert_eq!(rules[4].more[0].field, Field::Body);
+        assert_eq!(read.left_out, 0);
         assert!(read.filters.vacation.on);
         assert_eq!(read.filters.vacation.days, 3);
         assert_eq!(read.filters.vacation.body, "I'm away.\n.Really.\n");

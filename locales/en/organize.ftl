@@ -68,8 +68,6 @@ organize-type-an-address-or-and-a = Type an address, or @ and a domain
 
 organize-saved-its-in-the-sidebar-under = Saved: it's in the sidebar under Saved Searches
 
-organize-type-the-text-the-rule-looks = Type the text the rule looks for
-
 organize-type-the-folder-or-labels-name = Type the folder or label's name
 
 organize-a-rule-couldnt-be-applied = A rule couldn't be applied: { $e }
@@ -142,8 +140,6 @@ organize-block-2 = Block
 
 organize-rules = Rules
 
-organize-contains = { $label } contains “{ $contains }” → { $label2 }
-
 organize-remove-rule = @Remove rule
 
 organize-when = When
@@ -154,3 +150,43 @@ organize-apply-rules-now = Apply Rules Now
 
 organize-add-rule = Add Rule
 
+
+organize-dont-notify = Don't notify
+
+organize-header-name = Header, as X-Mailer
+
+organize-then-stop = Later rules don't apply to what it matches
+
+organize-being-changed-below = Being changed below
+
+organize-move-up = @Move up
+
+organize-edit-rule = Edit
+
+organize-remove-part = Remove “{ $part }”
+
+organize-attachment-condition = Mail with attachments (turn on “Doesn't match” for mail without)
+
+organize-new-rule = New rule
+
+organize-change-rule = Change rule
+
+organize-all-conditions = All conditions
+
+organize-any-condition = Any condition
+
+organize-doesnt-match = Doesn't match
+
+organize-add-condition = Add Condition
+
+organize-then = then
+
+organize-add-action = Add Action
+
+organize-stop-other-rules = Stop after this rule
+
+organize-stop-other-rules-caption = Later rules don't apply to mail this one matches
+
+organize-cancel = Cancel
+
+organize-save-rule = Save Rule

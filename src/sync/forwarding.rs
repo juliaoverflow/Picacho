@@ -1,6 +1,7 @@
-//! Alias forwarding services: SimpleLogin, addy.io and Firefox Relay.
-//! (Proton's own aliases use the Proton account's session instead:
-//! `sync/proton/aliases.rs`.)
+//! Alias forwarding services: SimpleLogin, addy.io, Firefox Relay and
+//! DuckDuckGo Email Protection. (Proton's own aliases use the Proton
+//! account's session instead, `sync/proton/aliases.rs`, and Fastmail's
+//! Masked Email is JMAP, `sync/masked_email.rs`.)
 //!
 //! Each one forwards mail sent to an alias on to a real mailbox, and has a
 //! JSON API, authenticated with a key made in its web app, for listing,
@@ -61,6 +62,7 @@ impl Client {
             !service.uses_proton_account(),
             t!("manage-forwarding-proton-aliases-use-the-accounts-sign-in")
         );
+        ensure!(!service.uses_jmap(), t!("masked-email-fastmail-cant-do-this"));
         let key = key.trim();
         ensure!(!key.is_empty(), t!("sync-forwarding-enter-an-api-key"));
         ensure!(
@@ -90,10 +92,11 @@ impl Client {
             ForwardingService::Addy => r
                 .bearer_auth(&self.key)
                 .header("X-Requested-With", "XMLHttpRequest"),
-            ForwardingService::Proton => unreachable!("Proton's aliases go through its session"),
+            ForwardingService::Proton | ForwardingService::Fastmail => unreachable!("Proton's and Fastmail's aliases go through their sessions"),
             ForwardingService::FirefoxRelay => {
                 r.header("Authorization", format!("Token {}", self.key))
             }
+            ForwardingService::DuckDuckGo => r.bearer_auth(&self.key),
         }
     }
 
@@ -142,12 +145,15 @@ impl Client {
                     mailbox: String::new(),
                 }
             }
-            ForwardingService::Proton => unreachable!("Proton's aliases go through its session"),
+            ForwardingService::Proton | ForwardingService::Fastmail => unreachable!("Proton's and Fastmail's aliases go through their sessions"),
             ForwardingService::FirefoxRelay => {
                 let v = self.send(self.request(Method::GET, "/api/v1/profiles/"))?;
                 ensure!(v.is_array(), t!("sync-forwarding-firefox-relay-sent-an-unexpected-reply"));
                 Profile::default()
             }
+            // DuckDuckGo has nothing to ask but to make an address; the
+            // token is checked when the first one is made.
+            ForwardingService::DuckDuckGo => Profile::default(),
         })
     }
 
@@ -181,11 +187,13 @@ impl Client {
                     }
                 }
             }
-            ForwardingService::Proton => unreachable!("Proton's aliases go through its session"),
+            ForwardingService::Proton | ForwardingService::Fastmail => unreachable!("Proton's and Fastmail's aliases go through their sessions"),
             ForwardingService::FirefoxRelay => {
                 let v = self.send(self.request(Method::GET, "/api/v1/relayaddresses/"))?;
                 out.extend(parse_relay(&v));
             }
+            // DuckDuckGo lists none: the ones made here are kept here.
+            ForwardingService::DuckDuckGo => {}
         }
         Ok(out)
     }
@@ -209,8 +217,8 @@ impl Client {
                     .unwrap_or_default();
                 parse_addy_options(&v, &custom, &username)
             }
-            ForwardingService::Proton => unreachable!("Proton's aliases go through its session"),
-            ForwardingService::FirefoxRelay => AliasOptions {
+            ForwardingService::Proton | ForwardingService::Fastmail => unreachable!("Proton's and Fastmail's aliases go through their sessions"),
+            ForwardingService::FirefoxRelay | ForwardingService::DuckDuckGo => AliasOptions {
                 can_create: true,
                 ..AliasOptions::default()
             },
@@ -289,13 +297,17 @@ impl Client {
                 let v = self.send(self.request(Method::POST, "/api/v1/aliases").json(&body))?;
                 parse_addy_alias(&v["data"])
             }
-            ForwardingService::Proton => unreachable!("Proton's aliases go through its session"),
+            ForwardingService::Proton | ForwardingService::Fastmail => unreachable!("Proton's and Fastmail's aliases go through their sessions"),
             ForwardingService::FirefoxRelay => {
                 let v = self.send(
                     self.request(Method::POST, "/api/v1/relayaddresses/")
                         .json(&json!({ "enabled": true, "description": note })),
                 )?;
                 parse_relay_alias(&v)
+            }
+            ForwardingService::DuckDuckGo => {
+                let v = self.send(self.request(Method::POST, "/api/email/addresses"))?;
+                parse_duck_alias(&v, note)
             }
         };
         alias.with_context(|| t!("sync-forwarding-the-new-alias-was-made-but"))
@@ -309,8 +321,10 @@ impl Client {
         let path = match self.service {
             ForwardingService::SimpleLogin => format!("/api/aliases/{id}"),
             ForwardingService::Addy => format!("/api/v1/aliases/{id}"),
-            ForwardingService::Proton => unreachable!("Proton's aliases go through its session"),
+            ForwardingService::Proton | ForwardingService::Fastmail => unreachable!("Proton's and Fastmail's aliases go through their sessions"),
             ForwardingService::FirefoxRelay => format!("/api/v1/relayaddresses/{id}/"),
+            // It can't be asked; a deactivated address bounces sending.
+            ForwardingService::DuckDuckGo => return Ok(true),
         };
         let response = self
             .request(Method::GET, &path)
@@ -345,11 +359,12 @@ impl Client {
                 format!("/api/v1/aliases/{id}"),
                 json!({ "description": note }),
             ),
-            ForwardingService::Proton => unreachable!("Proton's aliases go through its session"),
+            ForwardingService::Proton | ForwardingService::Fastmail => unreachable!("Proton's and Fastmail's aliases go through their sessions"),
             ForwardingService::FirefoxRelay => (
                 format!("/api/v1/relayaddresses/{id}/"),
                 json!({ "description": note }),
             ),
+            ForwardingService::DuckDuckGo => return Ok(()),
         };
         self.send(self.request(Method::PATCH, &path).json(&body))?;
         Ok(())
@@ -383,13 +398,14 @@ impl Client {
                     )?;
                 }
             }
-            ForwardingService::Proton => unreachable!("Proton's aliases go through its session"),
+            ForwardingService::Proton | ForwardingService::Fastmail => unreachable!("Proton's and Fastmail's aliases go through their sessions"),
             ForwardingService::FirefoxRelay => {
                 self.send(
                     self.request(Method::PATCH, &format!("/api/v1/relayaddresses/{id}/"))
                         .json(&json!({ "enabled": enabled })),
                 )?;
             }
+            ForwardingService::DuckDuckGo => bail!(t!("masked-email-turn-duck-addresses-off-on-duckduckgo")),
         }
         Ok(())
     }
@@ -545,8 +561,8 @@ impl Client {
                 Method::GET,
                 "/api/v1/recipients?filter[verified]=true&filter[alias_count]=false",
             ))?,
-            ForwardingService::Proton => unreachable!("Proton's aliases go through its session"),
-            ForwardingService::FirefoxRelay => return Ok(Vec::new()),
+            ForwardingService::Proton | ForwardingService::Fastmail => unreachable!("Proton's and Fastmail's aliases go through their sessions"),
+            ForwardingService::FirefoxRelay | ForwardingService::DuckDuckGo => return Ok(Vec::new()),
         };
         Ok(parse_mailboxes(self.service, &v))
     }
@@ -563,8 +579,10 @@ impl Client {
                 format!("/api/v1/aliases/{}", alias.id),
                 json!({ "from_name": value }),
             ),
-            ForwardingService::Proton => unreachable!("Proton's aliases go through its session"),
-            ForwardingService::FirefoxRelay => bail!(t!("sync-forwarding-firefox-relay-aliases-have-no-display")),
+            ForwardingService::Proton | ForwardingService::Fastmail => unreachable!("Proton's and Fastmail's aliases go through their sessions"),
+            ForwardingService::FirefoxRelay | ForwardingService::DuckDuckGo => {
+                bail!(t!("sync-forwarding-firefox-relay-aliases-have-no-display"))
+            }
         };
         self.send(self.request(Method::PATCH, &path).json(&body))?;
         Ok(())
@@ -585,8 +603,10 @@ impl Client {
             ForwardingService::Addy => {
                 self.send(self.request(Method::DELETE, &format!("/api/v1/pinned-aliases/{id}")))?
             }
-            ForwardingService::Proton => unreachable!("Proton's aliases go through its session"),
-            ForwardingService::FirefoxRelay => bail!(t!("sync-forwarding-firefox-relay-aliases-cant-be-pinned")),
+            ForwardingService::Proton | ForwardingService::Fastmail => unreachable!("Proton's and Fastmail's aliases go through their sessions"),
+            ForwardingService::FirefoxRelay | ForwardingService::DuckDuckGo => {
+                bail!(t!("sync-forwarding-firefox-relay-aliases-cant-be-pinned"))
+            }
         };
         Ok(())
     }
@@ -612,8 +632,10 @@ impl Client {
                         .json(&json!({ "alias_id": alias.id, "recipient_ids": ids })),
                 )?;
             }
-            ForwardingService::Proton => unreachable!("Proton's aliases go through its session"),
-            ForwardingService::FirefoxRelay => bail!(t!("sync-forwarding-firefox-relay-forwards-to-your-accounts")),
+            ForwardingService::Proton | ForwardingService::Fastmail => unreachable!("Proton's and Fastmail's aliases go through their sessions"),
+            ForwardingService::FirefoxRelay | ForwardingService::DuckDuckGo => {
+                bail!(t!("sync-forwarding-firefox-relay-forwards-to-your-accounts"))
+            }
         }
         Ok(())
     }
@@ -658,8 +680,9 @@ impl Client {
         let path = match self.service {
             ForwardingService::SimpleLogin => format!("/api/aliases/{id}"),
             ForwardingService::Addy => format!("/api/v1/aliases/{id}"),
-            ForwardingService::Proton => unreachable!("Proton's aliases go through its session"),
+            ForwardingService::Proton | ForwardingService::Fastmail => unreachable!("Proton's and Fastmail's aliases go through their sessions"),
             ForwardingService::FirefoxRelay => format!("/api/v1/relayaddresses/{id}/"),
+            ForwardingService::DuckDuckGo => bail!(t!("masked-email-turn-duck-addresses-off-on-duckduckgo")),
         };
         self.send(self.request(Method::DELETE, &path))?;
         Ok(())
@@ -957,8 +980,8 @@ fn parse_mailboxes(service: ForwardingService, v: &Value) -> Vec<ServiceMailbox>
     let list = match service {
         ForwardingService::SimpleLogin => &v["mailboxes"],
         ForwardingService::Addy => &v["data"],
-        ForwardingService::Proton => unreachable!("Proton's aliases go through its session"),
-        ForwardingService::FirefoxRelay => return Vec::new(),
+        ForwardingService::Proton | ForwardingService::Fastmail => unreachable!("Proton's and Fastmail's aliases go through their sessions"),
+        ForwardingService::FirefoxRelay | ForwardingService::DuckDuckGo => return Vec::new(),
     };
     list.as_array()
         .into_iter()
@@ -969,6 +992,22 @@ fn parse_mailboxes(service: ForwardingService, v: &Value) -> Vec<ServiceMailbox>
             (!id.is_empty() && !email.is_empty()).then_some(ServiceMailbox { id, email })
         })
         .collect()
+}
+/// A Duck Address just made: DuckDuckGo answers its local part alone
+/// (`{"address": "abc123"}`), always at duck.com. The note is kept here.
+fn parse_duck_alias(v: &Value, note: &str) -> Option<Alias> {
+    let local = v["address"].as_str()?.trim().trim_end_matches("@duck.com").to_lowercase();
+    if local.is_empty() || !local.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_')) {
+        return None;
+    }
+    let email = format!("{local}@duck.com");
+    Some(Alias {
+        id: email.clone(),
+        email,
+        enabled: true,
+        note: note.trim().to_owned(),
+        ..Alias::default()
+    })
 }
 fn parse_relay(v: &Value) -> Vec<Alias> {
     v.as_array()
@@ -1154,6 +1193,15 @@ mod tests {
                 ("@jo.anonaddy.com", DomainKind::Username, true),
             ]
         );
+    }
+
+    #[test]
+    fn reads_a_new_duck_address() {
+        let a = parse_duck_alias(&json!({ "address": "Quiet-Fox7" }), " shop ").unwrap();
+        assert_eq!((a.id.as_str(), a.email.as_str(), a.note.as_str()), ("quiet-fox7@duck.com", "quiet-fox7@duck.com", "shop"));
+        assert!(a.enabled);
+        assert!(parse_duck_alias(&json!({ "address": "x@evil.example" }), "").is_none());
+        assert!(parse_duck_alias(&json!({}), "").is_none());
     }
 
     #[test]

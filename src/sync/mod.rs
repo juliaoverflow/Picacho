@@ -1,6 +1,7 @@
 //! Sync: provider discovery, authentication, and incoming/outgoing protocols.
 //! Protocol helpers never depend on Display and never mutate the message database.
 pub mod auth;
+pub(crate) mod bimi;
 pub mod caldav;
 /// CTAP2 over NFC, for security keys held to a phone.
 #[cfg(any(target_os = "android", target_os = "ios", test))]
@@ -23,11 +24,14 @@ mod imap;
 mod imap_ext;
 pub(crate) mod jmap;
 pub(crate) mod jscal;
+pub(crate) mod masked_email;
 pub mod mime;
 pub mod msg;
 pub mod models;
 pub(crate) mod mta_sts;
 pub mod oauth;
+/// PC/SC, for OpenPGP cards.
+pub(crate) mod pcsc;
 mod pop;
 pub(crate) mod proton;
 pub(crate) mod proton_push;

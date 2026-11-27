@@ -11,6 +11,9 @@ use crate::manage::store;
 mod capabilities;
 mod der;
 pub mod revocation;
+/// Identities whose keys are on PKCS#11 tokens (security keys).
+pub mod token;
+pub use token::TokenIdentity;
 pub use capabilities::learn_capabilities;
 use anyhow::{Context, Result, bail, ensure};
 use openssl::cms::{CMSOptions, CmsContentInfo};
@@ -36,6 +39,10 @@ pub struct Certificates {
     /// 8551 §2.7.1), from their signed mail.
     #[serde(default)]
     pub capabilities: Vec<capabilities::Capabilities>,
+    /// Your identities whose private keys are on PKCS#11 tokens: their
+    /// certificates and where the keys are (`token.rs`). Nothing secret.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tokens: Vec<TokenIdentity>,
 }
 
 /// One certificate, as Settings lists it.
@@ -48,6 +55,8 @@ pub struct CertInfo {
     /// Unix seconds.
     pub expires: i64,
     pub own: bool,
+    /// Its key is on this token (its label), not here.
+    pub token: Option<String>,
 }
 
 /// What S/MIME found when a message was read.
@@ -254,6 +263,7 @@ fn info(cert: &X509, own: bool) -> CertInfo {
         issuer: name(cert.issuer_name()),
         expires: expires(cert),
         own,
+        token: None,
     }
 }
 
@@ -296,8 +306,28 @@ impl Certificates {
             .iter()
             .map(|(c, _, _)| info(c, true))
             .collect();
+        out.extend(self.tokens.iter().filter_map(|t| {
+            let mut i = info(&t.certificate()?, true);
+            i.token = Some(t.label.clone());
+            Some(i)
+        }));
         out.extend(self.others().iter().map(|c| info(c, false)));
         out
+    }
+    /// Adds identities found on a token, replacing any with the same
+    /// certificate (here or on a token).
+    pub fn add_tokens(&mut self, found: Vec<TokenIdentity>) -> Vec<CertInfo> {
+        let mut added = Vec::new();
+        for identity in found {
+            let Some(cert) = identity.certificate() else { continue };
+            let fp = fingerprint(&cert);
+            self.remove(&fp);
+            let mut i = info(&cert, true);
+            i.token = Some(identity.label.clone());
+            added.push(i);
+            self.tokens.push(identity);
+        }
+        added
     }
     /// Imports a PKCS#12 file (your certificate and key) with its password.
     pub fn import_identity(&mut self, der: &[u8], password: &str) -> Result<CertInfo> {
@@ -367,6 +397,14 @@ impl Certificates {
         self.others
             .retain(|c| X509::from_pem(c.as_bytes()).map_or(true, |c| fingerprint(&c) != fp));
         self.capabilities.retain(|c| c.fingerprint != fp);
+        self.tokens.retain(|t| t.certificate().is_none_or(|c| fingerprint(&c) != fp));
+    }
+    /// Your identity on a token for `email`, when there is none here.
+    pub(crate) fn token_for(&self, email: &str) -> Option<&TokenIdentity> {
+        let email = email.trim().to_lowercase();
+        self.tokens
+            .iter()
+            .find(|t| t.certificate().is_some_and(|c| emails(&c).contains(&email) && !expired(&c)))
     }
     fn own_for(&self, email: &str) -> Option<(X509, Vec<X509>, PKey<Private>)> {
         let email = email.trim().to_lowercase();
@@ -379,6 +417,7 @@ impl Certificates {
         self.identities()
             .into_iter()
             .map(|(c, _, _)| c)
+            .chain(self.tokens.iter().filter_map(TokenIdentity::certificate))
             .chain(self.others())
             .filter(|c| emails(c).contains(&email) && !expired(c))
             .max_by(|a, b| {
@@ -391,11 +430,16 @@ impl Certificates {
     /// certificate the message doesn't carry is checked with these.
     pub(crate) fn known(&self) -> Vec<X509> {
         let mut out: Vec<X509> = self.identities().into_iter().map(|(c, _, _)| c).collect();
+        out.extend(self.tokens.iter().filter_map(TokenIdentity::certificate));
         out.extend(self.others());
         out
     }
+    /// Whether you have an identity of your own: here, or on a token.
+    pub fn has_any_own(&self) -> bool {
+        !self.own.is_empty() || !self.tokens.is_empty()
+    }
     pub fn has_own(&self, email: &str) -> bool {
-        self.own_for(email).is_some()
+        self.own_for(email).is_some() || self.token_for(email).is_some()
     }
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn has_cert(&self, email: &str) -> bool {
@@ -451,6 +495,8 @@ mod oids {
     /// RFC 3370 §3.2: rsaEncryption, as today's PKCS#7 signatures name
     /// PKCS#1 v1.5.
     pub const RSA_ENCRYPTION: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01];
+    /// RFC 5758 §3.2: ecdsa-with-SHA256, 1.2.840.10045.4.3.2.
+    pub const ECDSA_SHA256: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x02];
     /// RFC 5084 §3.2 and RFC 3565 §4: AES-GCM and AES-CBC.
     pub const AES256_GCM: &[u8] = &[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x01, 0x2e];
     pub const AES128_GCM: &[u8] = &[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x01, 0x06];
@@ -500,6 +546,25 @@ fn sign_rsa(
     content: &[u8],
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<Vec<u8>> {
+    signed_data(cert, chain, content, now, |signed_attributes| {
+        let mut signer = openssl::sign::Signer::new(openssl::hash::MessageDigest::sha256(), key)?;
+        signer.set_rsa_padding(openssl::rsa::Padding::PKCS1)?;
+        signer.update(signed_attributes)?;
+        Ok(signer.sign_to_vec()?)
+    })
+}
+
+/// A detached SignedData over `content` as `sign_rsa` writes it, the
+/// signature over the signed attributes made by `sign`: PKCS#1 v1.5 for
+/// an RSA certificate, ECDSA (a DER ECDSA-Sig-Value) for an EC one. A
+/// token's key signs this way (`token.rs`).
+fn signed_data(
+    cert: &X509,
+    chain: &[X509],
+    content: &[u8],
+    now: chrono::DateTime<chrono::Utc>,
+    sign: impl FnOnce(&[u8]) -> Result<Vec<u8>>,
+) -> Result<Vec<u8>> {
     let sha256 = der::encode(der::SEQUENCE, &[&der::oid(oids::SHA256), &der::encode(der::NULL, &[])]);
     let digest = openssl::hash::hash(openssl::hash::MessageDigest::sha256(), content)?;
     // RFC 5652 §5.3, §11: contentType, signingTime and messageDigest,
@@ -513,10 +578,7 @@ fn sign_rsa(
     // RFC 5652 §5.4: the signature is over the attributes' DER as a SET
     // OF (sorted, X.690 §11.6), which goes in the message as [0] IMPLICIT.
     let signed_attributes = der::set_of(&attributes);
-    let mut signer = openssl::sign::Signer::new(openssl::hash::MessageDigest::sha256(), key)?;
-    signer.set_rsa_padding(openssl::rsa::Padding::PKCS1)?;
-    signer.update(&signed_attributes)?;
-    let signature = signer.sign_to_vec()?;
+    let signature = sign(&signed_attributes)?;
     let mut implicit = signed_attributes;
     if let Some(tag) = implicit.first_mut() {
         *tag = der::CONTEXT_0;
@@ -524,7 +586,13 @@ fn sign_rsa(
     // RFC 5652 §5.3: version 1, with issuerAndSerialNumber.
     let issuer = cert.issuer_name().to_der()?;
     let serial = der::unsigned_integer(&cert.serial_number().to_bn()?.to_vec());
-    let rsa = der::encode(der::SEQUENCE, &[&der::oid(oids::RSA_ENCRYPTION), &der::encode(der::NULL, &[])]);
+    // RFC 3370 §3.2: rsaEncryption with NULL; RFC 5758 §3.2:
+    // ecdsa-with-SHA256 with its parameters absent.
+    let rsa = if cert.public_key()?.rsa().is_ok() {
+        der::encode(der::SEQUENCE, &[&der::oid(oids::RSA_ENCRYPTION), &der::encode(der::NULL, &[])])
+    } else {
+        der::encode(der::SEQUENCE, &[&der::oid(oids::ECDSA_SHA256)])
+    };
     let version = der::unsigned_integer(&[1]);
     let signer_info = der::encode(
         der::SEQUENCE,
@@ -816,6 +884,7 @@ pub fn protect_with_options(
         part.truncate(part.len() - 2);
     }
     let own = certs.own_for(from);
+    let token = if own.is_none() { certs.token_for(from) } else { None };
     // RFC 9788 §5.2: the user-facing header fields are protected too,
     // signed (and encrypted) with the body.
     let mut content = protected_part(&part, &outer, encrypt, hide_subject);
@@ -823,10 +892,19 @@ pub fn protect_with_options(
     // inner part keeps the real one.
     let outer = if hide_subject { obscured_subject(&outer) } else { outer };
     if sign {
-        let (cert, chain, key) = own.as_ref().with_context(|| {
-            t!("manage-smime-theres-no-s-mime-certificate-of", from = from)
-        })?;
-        content = sign_part(cert, chain, key, &content)?;
+        content = match (&own, token) {
+            (Some((cert, chain, key)), _) => sign_part(cert, chain, key, &content)?,
+            // The token signs; the SignedData is written here.
+            (None, Some(identity)) => {
+                let key = token::TokenKey::open(identity)?;
+                let cert = identity.certificate().context("the token's certificate can't be read")?;
+                let signature = signed_data(&cert, &identity.others(), &content, chrono::Utc::now(), |attributes| {
+                    token::PrivateOps::sign(&key, attributes)
+                })?;
+                multipart_signed(&content, &signature)
+            }
+            (None, None) => bail!(t!("manage-smime-theres-no-s-mime-certificate-of", from = from)),
+        };
     }
     if encrypt {
         let mut recipients = Stack::new()?;
@@ -847,6 +925,8 @@ pub fn protect_with_options(
         );
         if let Some((cert, _, _)) = &own {
             recipients.push(cert.clone())?;
+        } else if let Some(cert) = token.and_then(TokenIdentity::certificate) {
+            recipients.push(cert)?;
         }
         let cipher = capabilities::content_cipher(certs, &theirs);
         content = encrypt_part(&recipients, &content, cipher)?;
@@ -1246,12 +1326,23 @@ fn open_checked(
 /// recipients, and AES-GCM (RFC 5084), whose tag it checks before giving
 /// back any content. With the certificate given, only the recipient info
 /// naming it is tried (OpenSSL's guard against Bleichenbacher's attack).
+///
+/// Then your tokens' identities, each whose PIN is kept: the token
+/// unwraps the content key (`token::decrypt`). A locked token is passed
+/// over; the reader offers to unlock it.
 fn decrypt(der: &[u8], certs: &Certificates) -> Option<Vec<u8>> {
     let cms = CmsContentInfo::from_der(der).ok()?;
     certs
         .identities()
         .into_iter()
         .find_map(|(cert, _, key)| cms.decrypt(&key, &cert).ok())
+        .or_else(|| {
+            certs.tokens.iter().find_map(|identity| {
+                let cert = identity.certificate()?;
+                let key = token::TokenKey::open(identity).ok()?;
+                token::decrypt(der, &cert, &key).ok()
+            })
+        })
 }
 
 /// RFC 1847 §2.1: a multipart/signed's first part, byte for byte as it was

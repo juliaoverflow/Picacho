@@ -150,6 +150,9 @@ impl MailApp {
                                         facts.push(t!("encryption-revoked-2").to_owned());
                                     }
                                     facts.extend(expiry_text(key.expires));
+                                    if let Some(name) = &key.card {
+                                        facts.push(t!("security-keys-on-key", name = name.clone()));
+                                    }
                                     facts.push(
                                         if key.secret {
                                             t!("encryption-your-key-2")
@@ -166,11 +169,11 @@ impl MailApp {
                                     facts.join(" · ")
                                 }),
                         )
-                        .when(key.secret && !key.revoked, |d| {
+                        .when(key.secret && !key.revoked && key.card.is_none(), |d| {
                             d.child(self.revocation_certificate_control(&fp, cx))
                         }),
                 )
-                .when(key.secret && !key.revoked, |row| {
+                .when(key.secret && !key.revoked && key.card.is_none(), |row| {
                     // Renewing for "Never" takes the end date away.
                     let label = if self.key_expiry == KeyExpiry::Never {
                         t!("encryption-remove-expiry")
@@ -378,9 +381,9 @@ impl MailApp {
         );
         let openpgp = Rows::new()
             .row(add_keys)
-            .when(ring.secret.iter().len() > 0, |rows| rows.row(share))
+            .when(ring.has_own(), |rows| rows.row(share))
             // Autocrypt 1.1 §2.2: prefer-encrypt per account, off by default.
-            .rows(self.accounts.iter().filter(|a| ring.own_key(&a.email).is_some()).map(|a| {
+            .rows(self.accounts.iter().filter(|a| ring.own_public(&a.email).is_some()).map(|a| {
                 self.switch_setting(
                     &t!("encryption-ask-for-encrypted-replies", email = a.email),
                     "",
@@ -415,6 +418,7 @@ impl MailApp {
                 .child(list)
         };
         self.settings_column()
+            .child(self.security_keys_section(cx))
             .child(
                 div()
                     .flex()
@@ -853,8 +857,7 @@ impl MailApp {
                         return;
                     };
                     let mut text = String::new();
-                    for key in ring.secret_keys() {
-                        let public = pgp::composed::SignedPublicKey::from(key);
+                    for public in ring.own_public_keys() {
                         if let Ok(armored) = public.to_armored_string(Default::default()) {
                             text.push_str(&armored);
                             text.push('\n');
@@ -1258,10 +1261,12 @@ impl MailApp {
                                         .text_size(px(11.))
                                         .text_color(rgb(c.muted))
                                         .truncate()
-                                        .child(t!("encryption-issued-by-expires", kind = if cert.own {
-                                                t!("encryption-your-certificate-2")
+                                        .child(t!("encryption-issued-by-expires", kind = if let Some(token) = &cert.token {
+                                                t!("security-keys-on-key", name = token.clone())
+                                            } else if cert.own {
+                                                t!("encryption-your-certificate-2").to_owned()
                                             } else {
-                                                t!("encryption-certificate")
+                                                t!("encryption-certificate").to_owned()
                                             }, issuer = if cert.issuer.is_empty() {
                                                 t!("encryption-an-unnamed-issuer-2").to_owned()
                                             } else {

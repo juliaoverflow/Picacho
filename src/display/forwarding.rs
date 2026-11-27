@@ -418,7 +418,8 @@ impl MailApp {
                             )),
                     ),
             ))
-            .when(!service.uses_proton_account(), |d| d.child(
+            .when(service.uses_jmap(), |d| d.children(self.fastmail_account_choice(cx)))
+            .when(!service.uses_proton_account() && service != ForwardingService::DuckDuckGo, |d| d.child(
                 div()
                     .flex()
                     .flex_col()
@@ -446,6 +447,39 @@ impl MailApp {
                 )
             })
             .child(self.forwarding_buttons(busy, cx))
+    }
+    /// Fastmail: the JMAP accounts added here, each a way to Masked Email
+    /// without a token. `None` when there are none.
+    fn fastmail_account_choice(&self, cx: &Context<Self>) -> Option<Div> {
+        let c = self.colors();
+        let open = fwd::jmap_accounts(&self.forwarding, &self.accounts);
+        if open.is_empty() {
+            return None;
+        }
+        let busy = self.fwd_busy.contains("connect");
+        Some(
+            div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .max_w(px(420.))
+                .child(
+                    div()
+                        .text_size(px(11.))
+                        .text_color(rgb(c.muted))
+                        .child(t!("masked-email-or-use-an-account-added-here")),
+                )
+                .child(div().flex().flex_wrap().gap_2().children(open.into_iter().map(|a| {
+                    self.small_button(
+                        format!("forwarding-fastmail-{}", a.id),
+                        &a.email,
+                        "",
+                        Action::ConnectFastmailAccount(a.id.clone()),
+                        cx,
+                    )
+                    .when(busy, |d| d.opacity(0.6))
+                }))),
+        )
     }
     /// Connect; or, signing in to Proton Pass, the buttons Proton Mail's
     /// sign-in has at each step: Continue, Verify and the like, and Back.
@@ -1040,7 +1074,7 @@ impl MailApp {
     fn alias_form(&self, f: &ForwardingAccount, busy: bool, cx: &Context<Self>) -> Stateful<Div> {
         let c = self.colors();
         let id = f.id.clone();
-        let picks = f.service != ForwardingService::FirefoxRelay;
+        let picks = f.service.picks_address();
         let loading = self.fwd_busy.contains(&format!("options:{id}"));
         let options = self.fwd_options.get(&id);
         let domain = self.alias_domain(&id);
@@ -1346,7 +1380,7 @@ impl MailApp {
                     })
                     .tooltip(move |w, cx| Tooltip::new(tip.clone()).build(w, cx)),
             )
-            .child(switch)
+            .when(f.service.manages_aliases(), |d| d.child(switch))
             .child(self.fwd_icon_button(
                 format!("alias-menu-{key}"),
                 "ellipsis",
@@ -1403,8 +1437,12 @@ impl MailApp {
             .when(deleting, |d| {
                 d.child(self.confirm_strip(
                     format!("alias-delete-{key}"),
-                    t!("forwarding-delete-mail-sent-to-it-will", email = a.email),
-                    t!("forwarding-delete"),
+                    if f.service.manages_aliases() {
+                        t!("forwarding-delete-mail-sent-to-it-will", email = a.email)
+                    } else {
+                        t!("masked-email-forget-it-keeps-forwarding", email = a.email)
+                    },
+                    if f.service.manages_aliases() { t!("forwarding-delete") } else { t!("masked-email-forget") },
                     Action::DeleteAlias(f.id.clone(), a.id.clone()),
                     cx,
                 ))
@@ -2354,7 +2392,13 @@ impl MailApp {
             show(t!("forwarding-show-as-its-own-account"), AliasDisplay::Separate),
             Entry::Separator,
             danger(
-                if address { t!("forwarding-delete-address") } else { t!("forwarding-delete-alias") },
+                if !f.service.manages_aliases() {
+                    t!("masked-email-forget-address")
+                } else if address {
+                    t!("forwarding-delete-address")
+                } else {
+                    t!("forwarding-delete-alias")
+                },
                 "trash",
                 Action::DeleteAlias(id.into(), alias.into()),
             ),

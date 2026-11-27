@@ -965,6 +965,9 @@ pub struct Details {
     /// found revoked, when asked (Check sender): a line saying so, and
     /// whether all was well.
     pub revocation: Option<(String, bool)>,
+    /// BIMI: what Check sender found of the sender's brand logo (see
+    /// `manage/bimi.rs`): a line saying so, and whether one is shown.
+    pub brand: Option<(String, bool)>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]

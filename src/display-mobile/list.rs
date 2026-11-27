@@ -183,6 +183,10 @@ impl MailApp {
             .child(self.nav_bar("mobile-list-bar", insets, back, title, subtitle, trailing))
             .when(!self.selecting, |d| {
                 d.children(self.mobile_category_chips(insets, cx))
+                    .children(
+                        self.lens_bar(cx)
+                            .map(|bar| div().px(px(insets.left + GUTTER)).child(bar)),
+                    )
                     .child(self.mobile_filter_chips(insets, cx))
             })
             .when(self.search_open, |d| {
@@ -421,7 +425,7 @@ impl MailApp {
                 .when(checked, |d| d.child(icon_el("check", 15., c.on_accent)))
                 .into_any_element()
         } else {
-            avatar(&m.initials(), 40., index, c).into_any_element()
+            sender_picture(&m.initials(), self.brand_marks.get(&m.id), 40., index, c)
         };
         let weight = if unread {
             FontWeight::SEMIBOLD
@@ -486,6 +490,7 @@ impl MailApp {
                                     .font_weight(weight)
                                     .child(sender),
                             )
+                            .children(self.vip_mark(m, 14.))
                             .when(m.starred, |d| d.child(icon_el("star-filled", 14., STAR)))
                             .child(
                                 div()

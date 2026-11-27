@@ -476,14 +476,25 @@ fn only_primary_is_announced_when_asked(cx: &mut TestAppContext) {
             ..Mail::default()
         };
         assert!(this.announces(&figma) && this.announces(&alex));
-        Arc::make_mut(&mut this.sorting.sorter)
-            .prefs
-            .notify_primary_only = true;
+        this.control.notifications.mode =
+            crate::manage::inbox_control::NotifyMode::PrimaryAndVips;
         assert!(!this.announces(&figma));
         assert!(this.announces(&alex));
         // A code is Primary, though a quick look can't tell.
         assert!(this.announces(&code));
-        // Categories off: everything is.
+        // A VIP is, whatever the tab.
+        this.control.toggle_vip(&figma.from);
+        assert!(this.announces(&figma));
+        this.control.toggle_vip(&figma.from);
+        // Promotions kept silent, everything else announced.
+        this.control.notifications.mode = crate::manage::inbox_control::NotifyMode::Everything;
+        let tab = this.announced_tab(&figma);
+        this.control.toggle_silent(tab);
+        assert!(!this.announces(&figma));
+        assert!(this.announces(&alex));
+        // Categories off: everything is Primary.
+        this.control.notifications.mode =
+            crate::manage::inbox_control::NotifyMode::PrimaryAndVips;
         Arc::make_mut(&mut this.sorting.sorter).prefs.enabled = false;
         assert!(this.announces(&figma));
     });
@@ -516,7 +527,6 @@ fn settings_list_the_tabs_and_sorted_senders(cx: &mut TestAppContext) {
         "categories-on",
         "categories-all-mail-first",
         "category-shown-forums",
-        "categories-notify-primary",
     ] {
         assert!(cx.debug_bounds(s).is_some(), "{s}");
     }

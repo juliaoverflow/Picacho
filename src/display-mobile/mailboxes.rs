@@ -100,6 +100,41 @@ impl MailApp {
                 .collect();
             body = body.child(div().pt_4().child(self.group(rows)));
         }
+        // The inbox's VIPs and Screener, while there are VIPs or it's on.
+        let mut control = Vec::new();
+        if !self.control.vips.is_empty() {
+            control.push(
+                self.cell(
+                    "mobile-open-vips",
+                    icon_el("vip", 22., c.accent).into_any_element(),
+                    t!("inbox-control-vips"),
+                    None,
+                    true,
+                    false,
+                    super::chrome::push(Action::Control(inbox_control::ControlAction::Lens(inbox_control::Lens::Vips))),
+                    cx,
+                )
+                .into_any_element(),
+            );
+        }
+        if self.control.screener.enabled {
+            control.push(
+                self.cell(
+                    "mobile-open-screener",
+                    icon_el("screener", 22., c.accent).into_any_element(),
+                    t!("inbox-control-screener"),
+                    None,
+                    true,
+                    false,
+                    super::chrome::push(Action::Control(inbox_control::ControlAction::Lens(inbox_control::Lens::Screener))),
+                    cx,
+                )
+                .into_any_element(),
+            );
+        }
+        if !control.is_empty() {
+            body = body.child(div().pt_6().child(self.group(control)));
+        }
         body = body.child(div().pt_6().child(self.group(vec![
             self.cell(
                 "mobile-open-calendar",

@@ -897,12 +897,11 @@ impl MailApp {
                     cx,
                     move |b| {
                         let ring = b.keyring();
-                        let keys = ring.secret_keys();
+                        let keys = ring.own_public_keys();
                         anyhow::ensure!(!keys.is_empty(), t!("tools-you-have-no-openpgp-key-of"));
                         let mut done = crate::sync::keys::Published::default();
                         for key in keys {
-                            let armored = pgp::composed::SignedPublicKey::from(key)
-                                .to_armored_string(Default::default())?;
+                            let armored = key.to_armored_string(Default::default())?;
                             let one = crate::sync::keys::publish(&armored, &addresses, b.tls_connector_pub()?)?;
                             done.listed.extend(one.listed);
                             done.confirming.extend(one.confirming);
@@ -970,7 +969,7 @@ impl MailApp {
                                 move |b| {
                                     use pgp::ser::Serialize as _;
                                     let ring = b.keyring();
-                                    let keys = ring.secret_keys();
+                                    let keys = ring.own_public_keys();
                                     anyhow::ensure!(
                                         !keys.is_empty(),
                                         t!("tools-you-have-no-openpgp-key-of-2")
@@ -979,8 +978,7 @@ impl MailApp {
                                     // address's user ID alone, so a domain's
                                     // directory doesn't list the person's others.
                                     let mut pairs = Vec::new();
-                                    for key in keys {
-                                        let public = pgp::composed::SignedPublicKey::from(key);
+                                    for public in keys {
                                         let emails: Vec<String> = public
                                             .details
                                             .users
@@ -1064,15 +1062,14 @@ impl MailApp {
             cx,
             move |b| {
                 let ring = b.keyring();
-                let keys = ring.secret_keys();
+                let keys = ring.own_public_keys();
                 anyhow::ensure!(
                     !keys.is_empty(),
                     t!("tools-you-have-no-openpgp-key-of")
                 );
                 let mut host = server.clone();
                 for key in keys {
-                    let armored = pgp::composed::SignedPublicKey::from(key)
-                        .to_armored_string(Default::default())?;
+                    let armored = key.to_armored_string(Default::default())?;
                     host = crate::sync::keys::publish_hkp(&server, &armored, b.tls_connector_pub()?)?;
                 }
                 Ok(host)

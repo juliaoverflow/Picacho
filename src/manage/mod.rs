@@ -3,6 +3,8 @@
 /// The app lock's passcode, biometrics setting and wrong tries.
 pub mod applock;
 pub mod avatar;
+/// Brand logos (BIMI) of checked senders.
+pub mod bimi;
 pub mod backend;
 /// Checking for new mail without a window (desktop background, Android's
 /// service). iOS only reads its preferences.
@@ -14,6 +16,11 @@ pub mod categories;
 pub mod composing;
 pub mod crypto;
 pub mod forwarding;
+/// Security keys: OpenPGP cards and PKCS#11 tokens, and their PINs.
+pub mod hardware;
+/// VIPs, the first-time sender Screener, and which new mail is announced
+/// when (quiet hours, per-category notifications).
+pub mod inbox_control;
 /// Mailing lists' List-Help, -Subscribe, -Post, -Owner, -Archive and
 /// List-Id headers (RFC 2369, RFC 2919).
 pub mod list_headers;

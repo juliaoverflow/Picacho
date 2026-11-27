@@ -1284,3 +1284,63 @@ manage-calendar-this-calendar-cant-say-when-people = This calendar can't say whe
 manage-calendar-this-calendar-is-no-longer-on = This calendar is no longer there; read your calendars again.
 
 manage-pim-sources-couldnt-read = Couldn't read { $source }
+
+manage-organize-text = Text
+
+manage-organize-header = Header
+
+manage-organize-mailing-list = Mailing list
+
+manage-organize-size-kb = Size (KB)
+
+manage-organize-attachments = Attachments
+
+manage-organize-category = Category
+
+manage-organize-op-contains = contains
+
+manage-organize-op-is = is
+
+manage-organize-op-starts-with = starts with
+
+manage-organize-op-ends-with = ends with
+
+manage-organize-op-matches-pattern = matches the pattern
+
+manage-organize-op-over = is over
+
+manage-organize-op-under = is under
+
+manage-organize-condition = { $field } { $op } “{ $value }”
+
+manage-organize-condition-not = Not { $field } { $op } “{ $value }”
+
+manage-organize-has-attachments = Has attachments
+
+manage-organize-has-no-attachments = Has no attachments
+
+manage-organize-and = and
+
+manage-organize-or = or
+
+manage-organize-rule = When { $conditions } → { $actions }
+
+manage-organize-dont-notify = Don't notify
+
+manage-organize-each-condition-needs-a-value = Type what the condition looks for
+
+manage-organize-name-the-header = Name the header the condition looks at, as X-Mailer
+
+manage-organize-enter-a-size-in-kilobytes = Enter a size in kilobytes, as 500
+
+manage-organize-choose-a-category = Choose a category
+
+manage-organize-the-pattern-isnt-valid = The pattern isn't a valid regular expression
+
+manage-organize-name-the-folder-or-label = Type the folder or label's name
+
+manage-organize-add-a-condition = Add a condition to the rule
+
+manage-organize-add-an-action = Add an action to the rule
+
+manage-organize-a-rule-moves-mail-once = A rule can move mail to one place only

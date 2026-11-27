@@ -24,6 +24,9 @@ mod compose;
 mod contacts;
 #[path = "encryption.rs"]
 mod encryption;
+#[path = "security_keys.rs"]
+mod security_keys;
+use security_keys::SecurityKeyAction;
 #[path = "calendar.rs"]
 mod calendar;
 #[path = "jmap_extras.rs"]
@@ -110,6 +113,11 @@ mod summary_tests;
 mod thread;
 #[path = "organize.rs"]
 mod organize;
+#[path = "inbox_control.rs"]
+mod inbox_control;
+#[cfg(test)]
+#[path = "inbox_control_tests.rs"]
+mod inbox_control_tests;
 #[path = "tools.rs"]
 mod tools;
 #[cfg(target_os = "linux")]
@@ -685,6 +693,8 @@ enum Page {
     /// Rules & Layout: blocked senders, rules applied here, saved
     /// searches, list density, the reader's place.
     Organizing,
+    /// Inbox Control: VIPs, the Screener, notifications and quiet hours.
+    InboxControl,
     /// Keyboard Shortcuts: every shortcut, changed by pressing new keys.
     Shortcuts,
     Account(String),
@@ -1237,6 +1247,14 @@ enum Action {
     /// The Proton account (signed in without Bridge) picked in the add
     /// form, whose own aliases to list.
     ForwardingProtonAccount(String),
+    /// Connects Fastmail's Masked Email through a JMAP account added here
+    /// (its id), with no token.
+    ConnectFastmailAccount(String),
+    /// Security keys: finding, adding, unlocking and removing them.
+    SecurityKey(SecurityKeyAction),
+    /// Settings → Privacy: checks each message's sender (DKIM, SPF, DMARC
+    /// and its brand logo) as it opens.
+    SetBrandAuto(bool),
     /// Opens the sign-in to Proton Pass for a Proton service (its id).
     PassSignIn(String),
     /// Continues that sign-in with what its step asks for.
@@ -1332,6 +1350,8 @@ enum Action {
     Filters(filters::FilterAction),
     /// Pins, mutes, saved searches, blocked senders, rules and layout.
     Organize(organize::OrgAction),
+    /// VIPs, the Screener and notifications (`inbox_control`).
+    Control(inbox_control::ControlAction),
     /// The inbox's category tabs and sorting senders into them.
     Categories(categories::CatAction),
     /// Find in Message, printing, PDFs and opening attachments.
@@ -1406,6 +1426,13 @@ pub struct MailApp {
     preview_bounds: Rc<Cell<Bounds<Pixels>>>,
     /// Account pictures saved on this computer.
     avatars: HashMap<String, std::path::PathBuf>,
+    /// Verified brand logos (BIMI) of messages whose sender was checked,
+    /// by message id (`manage/bimi.rs`).
+    brand_marks: HashMap<String, std::path::PathBuf>,
+    /// Messages whose sender was checked on opening this session.
+    brand_checked: HashSet<String>,
+    /// Settings → Privacy: check senders (and their logos) as messages open.
+    brand_auto: bool,
     menu: Option<PopupMenu>,
     filter_anchor: Rc<Cell<Bounds<Pixels>>>,
     selecting: bool,
@@ -1715,6 +1742,13 @@ pub struct MailApp {
     /// layout (`manage::organize`), and Settings' fields for them.
     org: crate::manage::organize::Organizing,
     org_ui: organize::OrgUi,
+    /// VIPs, the Screener and when new mail is announced
+    /// (`manage::inbox_control`), Settings' fields for them, how the
+    /// inbox is looked at, and how much of it waits in the Screener.
+    control: crate::manage::inbox_control::InboxControl,
+    control_ui: inbox_control::ControlUi,
+    lens: inbox_control::Lens,
+    screened_waiting: usize,
     /// The inbox's categories: the tab shown, how mail is sorted into
     /// them, and each tab's unread count (`manage::categories`).
     sorting: categories::Sorting,
@@ -2023,6 +2057,11 @@ pub struct MailApp {
     contact_filter: Entity<InputState>,
     /// Encryption settings: the passphrase of a key being imported.
     key_passphrase: Entity<InputState>,
+    /// Security keys: the PIN field, the PKCS#11 module field, and what
+    /// Settings and the reader show of them.
+    hw_pin: Entity<InputState>,
+    hw_module: Entity<InputState>,
+    hw: security_keys::SecurityKeys,
     key_error: Option<String>,
     /// Encryption settings: the address to look a key up for.
     key_lookup: Entity<InputState>,
@@ -2239,6 +2278,8 @@ impl MailApp {
     /// window on a desktop running in the background (see `shell`).
     pub fn with_backend(backend: Arc<Backend>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let store = backend.store.clone();
+        let brand_marks = backend.brand_marks();
+        let brand_auto = backend.brand_auto();
         let motion = motion::Motion::from_key(&store.preference(motion::Motion::PREFERENCE).unwrap_or_default());
         let contrast =
             motion::Contrast::from_key(&store.preference(motion::Contrast::PREFERENCE).unwrap_or_default());
@@ -2344,6 +2385,8 @@ impl MailApp {
         let filter_inputs = filters::FilterInputs::new(window, cx);
         let org = crate::manage::organize::Organizing::load(&backend.store);
         let org_ui = organize::OrgUi::new(window, cx);
+        let control = crate::manage::inbox_control::InboxControl::load(&backend.store);
+        let control_ui = inbox_control::ControlUi::new(window, cx);
         let sorting = categories::Sorting::load(&backend.store);
         let find = tools::Find::new(window, cx);
         subscriptions.push(cx.subscribe_in(&find.input, window, |this, _, event, w, cx| {
@@ -2450,6 +2493,11 @@ impl MailApp {
         let event_guests = input(t!("ui-ana-example-com-bo-example-com"), false, window, cx);
         let key_check_input = input(t!("ui-their-fingerprint"), false, window, cx);
         let key_lookup = input("name@example.com", false, window, cx);
+        let hw_pin = input(t!("security-keys-pin-placeholder"), true, window, cx);
+        let hw_module = input(t!("security-keys-module-placeholder"), false, window, cx);
+        if let Some(first) = crate::manage::smime::token::suggested_modules().into_iter().next() {
+            hw_module.update(cx, |s, cx| s.set_value(first, window, cx));
+        }
         let key_passphrase = input(
             t!("ui-passphrase-only-for-a-protected-secret"),
             true,
@@ -2915,6 +2963,9 @@ impl MailApp {
             reader_since: None,
             reader_shown: Cell::new(0.),
             avatars: HashMap::new(),
+            brand_marks,
+            brand_checked: HashSet::new(),
+            brand_auto,
             menu: None,
             filter_anchor: Rc::new(Cell::new(Bounds::default())),
             selecting: false,
@@ -3214,6 +3265,9 @@ impl MailApp {
             key_passphrase,
             key_error: None,
             key_lookup,
+            hw_pin,
+            hw_module,
+            hw: Default::default(),
             key_busy: false,
             key_checking: None,
             key_check_input,
@@ -3291,6 +3345,10 @@ impl MailApp {
             filter_inputs,
             org,
             org_ui,
+            control,
+            control_ui,
+            lens: inbox_control::Lens::Inbox,
+            screened_waiting: 0,
             sorting,
             keys_ui: Default::default(),
             thread_counts: HashMap::new(),
@@ -3989,6 +4047,8 @@ impl MailApp {
         if let Some(sorter) = sorter.filter(|_| query.is_empty() && self.shows_categories()) {
             self.keep_tab(&sorter);
         }
+        // VIPs' mail, or the Screener's; the inbox without the Screener's.
+        self.keep_lens(!query.is_empty());
         // Mail a search found on a server is added at the list's end.
         if !query.is_empty() {
             let messages = &self.messages;
@@ -4208,10 +4268,7 @@ impl MailApp {
         // when it would be announced: deciding the tab looks at the whole
         // message (with the category model, where it's on), which for the
         // first check's unread mail held up the window at launch.
-        let fresh: Vec<&Mail> = fresh
-            .into_iter()
-            .filter(|m| !self.org.silenced(m) && self.announces(m))
-            .collect();
+        let fresh: Vec<&Mail> = fresh.into_iter().filter(|m| self.announces(m)).collect();
         if fresh.is_empty() {
             return arrived;
         }
@@ -5022,6 +5079,7 @@ impl MailApp {
             ));
         }
         entries.extend(self.cat_entries(m));
+        entries.extend(self.control_entries(m));
         entries.extend(self.org_entries(m));
         entries
     }
@@ -5465,6 +5523,7 @@ impl MailApp {
         self.unfillable.clear();
         self.filter_by = Filter::All;
         self.sorting.tab = self.sorting.default_tab();
+        self.lens = inbox_control::Lens::Inbox;
         Self::set(&self.search, "", w, cx);
         self.search_open = false;
         self.server_search = None;
@@ -6011,6 +6070,8 @@ impl MailApp {
                                 this.forget_bodies(this.selected.clone().as_deref().unwrap_or(""));
                             }
                             this.filter(cx);
+                            this.check_brand_on_open(mark.clone(), mail.clone(), cx);
+                            this.check_security_key_needed(&mail, cx);
                             if unread {
                                 this.mark_read(mark, mail, cx);
                             } else {
@@ -7457,12 +7518,23 @@ impl MailApp {
                 {
                     details.revocation = b.check_revocation(&message, &fetcher);
                 }
-                Ok(Original::new(details, &raw))
+                // BIMI: the sender's brand logo, now that DMARC is known.
+                let brand = if cfg!(test) { None } else { b.check_brand(&message, &details) };
+                details.brand = brand.as_ref().map(|v| v.line());
+                let logo = match brand {
+                    Some(crate::manage::bimi::Verdict::Shown { path, .. }) => Some(path),
+                    _ => None,
+                };
+                Ok((Original::new(details, &raw), logo))
             },
-            move |this, result, cx| {
+            move |this, result: anyhow::Result<(Original, Option<std::path::PathBuf>)>, cx| {
                 if this.sender_checking.as_ref() == Some(&id) {
                     this.sender_checking = None;
                 }
+                let result = result.map(|(original, logo)| {
+                    this.set_brand(&id, logo);
+                    original
+                });
                 if let (Ok(original), Some(info)) = (result, this.details.as_mut())
                     && info.id == id
                 {
@@ -7472,6 +7544,39 @@ impl MailApp {
             },
         );
         cx.notify();
+    }
+    /// Shows (or stops showing) a message's verified brand logo.
+    fn set_brand(&mut self, id: &str, logo: Option<std::path::PathBuf>) {
+        match logo {
+            Some(path) => self.brand_marks.insert(id.to_owned(), path),
+            None => self.brand_marks.remove(id),
+        };
+    }
+    /// With Settings → Privacy's "Check senders when opening messages",
+    /// checks the opened message's sender (and its brand logo), once.
+    fn check_brand_on_open(&mut self, a: Account, m: Mail, cx: &mut Context<Self>) {
+        if cfg!(test) || !self.brand_auto || !self.brand_checked.insert(m.id.clone()) {
+            return;
+        }
+        let id = m.id.clone();
+        self.task(
+            cx,
+            move |b| {
+                let raw = b.original(&a, &m)?;
+                let mut details = crate::sync::mime::details(&raw, b.decrypts(&a, &raw));
+                crate::sync::auth::check(&raw, &mut details);
+                Ok(match b.check_brand(&m.id, &details) {
+                    Some(crate::manage::bimi::Verdict::Shown { path, .. }) => Some(path),
+                    _ => None,
+                })
+            },
+            move |this, result, cx| {
+                if let Ok(logo) = result {
+                    this.set_brand(&id, logo);
+                    cx.notify();
+                }
+            },
+        );
     }
     fn original_source(&self) -> Option<Rc<Original>> {
         let info = self.details.as_ref()?;
@@ -8934,6 +9039,14 @@ impl MailApp {
                 self.fwd_error = None;
             }
             Action::ConnectForwarding => self.connect_forwarding(w, cx),
+            Action::ConnectFastmailAccount(id) => self.connect_fastmail_account(id, cx),
+            Action::SecurityKey(action) => self.security_key_action(action, w, cx),
+            Action::SetBrandAuto(on) => {
+                match self.backend.set_brand_auto(on) {
+                    Ok(()) => self.brand_auto = on,
+                    Err(e) => self.notice(format!("{e:#}"), true, cx),
+                }
+            }
             Action::PassSignIn(id) => self.open_pass_sign_in(id, w, cx),
             Action::SubmitPassSignIn(id) => self.submit_pass_sign_in(id, w, cx),
             Action::RefreshAliases(id) => self.refresh_aliases(id, false, cx),
@@ -9071,6 +9184,7 @@ impl MailApp {
             Action::Receipt(id, send) => self.answer_receipt(id, send, cx),
             Action::Filters(action) => self.filter_action(action, w, cx),
             Action::Organize(action) => self.org_action(action, w, cx),
+            Action::Control(action) => self.control_action(action, w, cx),
             Action::Categories(action) => self.cat_action(action, w, cx),
             Action::Tools(action) => self.tool_action(action, w, cx),
             Action::Keys(action) => self.key_action(action, cx),
@@ -9887,6 +10001,7 @@ impl MailApp {
                 .on_click(cx.listener(|this, _, w, cx| this.handle(Action::AddMenu, w, cx))),
         );
         list = list.child(self.app_view_links(false, cx));
+        list = list.children(self.control_sidebar(cx));
         list = list.children(self.saved_searches_sidebar(cx));
         list = list.child(self.tree_end("sidebar-end", cx));
         div()
@@ -10557,6 +10672,7 @@ impl MailApp {
                     }),
             );
         header = header.children(self.category_tabs(cx));
+        header = header.children(self.lens_bar(cx));
         if self.search_open {
             header = header.child(
                 div()
@@ -10843,7 +10959,11 @@ impl MailApp {
             .relative()
             .size(px(36.))
             .flex_shrink_0()
-            .child(avatar(&m.initials(), 36., index, c).when(self.selecting, |d| d.opacity(0.)))
+            .child(
+                div()
+                    .child(sender_picture(&m.initials(), self.brand_marks.get(&m.id), 36., index, c))
+                    .when(self.selecting, |d| d.opacity(0.)),
+            )
             .when(!drafts, |d| {
                 d.child(
                     div()
@@ -10977,6 +11097,7 @@ impl MailApp {
                                     })
                                     .child(sender),
                             )
+                            .children(self.vip_mark(m, 12.))
                             .child(
                                 div()
                                     .flex_1()
@@ -13731,6 +13852,8 @@ fn icon_el(name: &str, size: f32, color: u32) -> Div {
         "keyboard",
         "grip",
         "bell-off",
+        "vip",
+        "screener",
         "print",
         "external",
         "template",
@@ -13895,6 +14018,21 @@ fn notice_box(text: impl Into<SharedString>, c: Colors) -> Div {
         .text_size(px(12.))
         .child(div().pt(px(1.)).child(icon_el("info", 14., c.accent)))
         .child(div().flex_1().min_w_0().child(text))
+}
+/// A message's sender: its brand logo, where a check of this message
+/// verified one (BIMI), else initials.
+fn sender_picture(initials: &str, logo: Option<&std::path::PathBuf>, size: f32, index: usize, c: Colors) -> AnyElement {
+    match logo {
+        Some(path) => div()
+            .size(px(size))
+            .flex_shrink_0()
+            .rounded_full()
+            .overflow_hidden()
+            .bg(rgb(0xffffff))
+            .child(img(path.clone()).size(px(size)).object_fit(ObjectFit::Contain))
+            .into_any_element(),
+        None => avatar(initials, size, index, c).into_any_element(),
+    }
 }
 fn avatar(initials: &str, size: f32, index: usize, c: Colors) -> Div {
     let light = [
@@ -14076,12 +14214,17 @@ pub fn new_backend(store: Arc<Store>) -> Arc<Backend> {
                 subject: subject.to_owned(),
                 ..Default::default()
             };
-            // Only Primary's announced: what the sender and subject say.
-            let categories = crate::manage::categories::Categorizing::load(&settings);
-            if org.silenced(&pushed)
-                || !categories.announces(&pushed, &crate::manage::categories::Known::default())
-            {
+            if org.silenced(&pushed) {
                 return;
+            }
+            // First-time senders wait in the Screener; VIPs, categories
+            // kept silent and quiet hours decide the rest, the category
+            // from what the sender and subject say.
+            if let Some(backend) = fetching.upgrade() {
+                let gate = crate::manage::inbox_control::Gate::load(&backend, std::slice::from_ref(a));
+                if !gate.announces(&pushed, || crate::manage::categories::Content::quick(&pushed)) {
+                    return;
+                }
             }
             crate::display::notify::new_mail(&a.email, &a.id, message, &[message], (sender, subject), 1)
         }

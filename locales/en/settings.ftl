@@ -384,3 +384,5 @@ settings-delivery = Delivery
 settings-new-mail-scheduled-mail-and-snoozes = Keep checking for mail, sending scheduled mail and bringing back snoozes.
 
 settings-switching-signs-in-again = Instead of IMAP and SMTP. Switching signs in again in the browser and reads the account's mail again; drafts are kept.
+
+settings-inbox-control = Inbox Control

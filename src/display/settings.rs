@@ -464,6 +464,13 @@ impl MailApp {
                 Page::Organizing,
                 cx,
             ))
+            .child(self.settings_nav(
+                "settings-inbox-control".into(),
+                t!("settings-inbox-control").into(),
+                icon_el("vip", 15., c.muted).into_any_element(),
+                Page::InboxControl,
+                cx,
+            ))
             .when(!self.mobile.on, |nav| {
                 nav.child(self.settings_nav(
                     "settings-shortcuts".into(),
@@ -2578,6 +2585,7 @@ impl MailApp {
             Page::Privacy => self.privacy_page(cx),
             Page::LocalAi => self.local_ai_page(cx),
             Page::Organizing => self.organizing_page(cx),
+            Page::InboxControl => self.inbox_control_page(cx),
             Page::Shortcuts => self.shortcuts_page(cx),
             Page::About if self.mobile.on => self.mobile_about_page(cx),
             Page::About => self.general_page(cx),

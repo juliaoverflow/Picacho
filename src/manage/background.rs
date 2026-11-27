@@ -337,22 +337,20 @@ fn arrived(
         if let Err(e) = super::organize::apply_to_arrivals(backend, a, &arrived) {
             eprintln!("Picacho: a rule couldn't be applied to {}: {e:#}", a.email);
         }
-        fresh.retain(|m| !org.silenced(m));
+        let facts = super::organize::BackendFacts::new(backend, &org, std::slice::from_ref(a));
+        facts.with(|facts| fresh.retain(|m| !org.silenced_with(m, facts)));
     }
-    if !a.sync.notify || (pushed && a.pushes_new_mail()) || shared.stopped() {
+    if !a.sync.notify || (pushed && a.pushes_new_mail()) || shared.stopped() || fresh.is_empty() {
         return;
     }
-    // Where only Primary's new mail is announced, mail sorted into the
-    // inbox's other tabs arrives quietly.
-    let categories = super::categories::Categorizing::load(store);
-    if categories.notify_primary_only && categories.sorting() && !fresh.is_empty() {
-        let known = super::categories::Known::load(backend, std::slice::from_ref(a));
-        // As the window sorts it: with the inbox category model where it's on.
-        let ai = super::local_ai::categories_enabled(store)
-            .then(|| super::local_ai::category_ai(store).ok())
-            .flatten();
-        fresh.retain(|m| categories.announces_with(m, &known, ai.as_ref()));
-    }
+    // First-time senders wait in the Screener; VIPs, categories kept
+    // silent and quiet hours decide the rest (`inbox_control`), sorted as
+    // the window sorts: with the inbox category model where it's on.
+    let gate = super::inbox_control::Gate::load(backend, std::slice::from_ref(a));
+    let ai = (gate.control.wants_category() && gate.categories.sorting() && super::local_ai::categories_enabled(store))
+        .then(|| super::local_ai::category_ai(store).ok())
+        .flatten();
+    fresh.retain(|m| gate.announces(m, || super::categories::Content::of_with(m, ai.as_ref())));
     if let Some(latest) = fresh.iter().max_by_key(|m| m.date) {
         // The preview gives the model the message's context, as the window
         // has; only the subject is shown.

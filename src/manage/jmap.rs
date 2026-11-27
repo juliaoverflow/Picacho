@@ -417,7 +417,7 @@ impl Backend {
     }
     /// Runs `work` with the account's session; a refused sign-in drops it,
     /// so the next try signs in again.
-    pub(super) fn with_jmap<T>(
+    pub(crate) fn with_jmap<T>(
         &self,
         a: &Account,
         work: impl FnOnce(&Session) -> Result<T>,

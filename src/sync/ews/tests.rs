@@ -674,6 +674,22 @@ fn rules_go_both_ways() {
     assert_eq!(back["conditions"], rule["conditions"]);
     assert_eq!(back["actions"]["moveToFolder"], "f-r");
     assert_eq!(back["actions"]["stopProcessingRules"], true);
+    // Several tests and actions, attachments among them, in the schema's order.
+    let rule = serde_json::json!({
+        "displayName": "Picacho 2", "sequence": 2, "isEnabled": true,
+        "conditions": {"senderContains": ["shop"], "hasAttachments": true, "withinSizeRange": {"minimumSize": 10, "maximumSize": 900}},
+        "exceptions": {"bodyContains": ["draft"]},
+        "actions": {"markAsRead": true, "assignCategories": ["Bills"]},
+    });
+    let xml = rule_xml(&rule, None);
+    assert!(xml.find("<t:ContainsSenderStrings").unwrap() < xml.find("<t:HasAttachments>true</t:HasAttachments>").unwrap(), "{xml}");
+    assert!(xml.find("<t:HasAttachments").unwrap() < xml.find("<t:WithinSizeRange").unwrap(), "{xml}");
+    let wrapped = format!(r#"<r xmlns:t="{TYPES}">{xml}</r>"#);
+    let doc = roxmltree::Document::parse(&wrapped).unwrap();
+    let back = rule_json(find(doc.root(), "Rule").unwrap());
+    assert_eq!(back["conditions"], rule["conditions"]);
+    assert_eq!(back["exceptions"], rule["exceptions"]);
+    assert_eq!(back["actions"]["assignCategories"], rule["actions"]["assignCategories"]);
 }
 
 #[test]

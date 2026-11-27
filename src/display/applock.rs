@@ -272,6 +272,9 @@ impl MailApp {
             return;
         }
         self.lock.locked = true;
+        // Security keys' PINs go with the lock: unlocking Picacho doesn't
+        // unlock them again.
+        crate::manage::hardware::forget_pins();
         self.lock.away_since = None;
         self.lock.error = None;
         self.lock.checking = false;
@@ -969,9 +972,20 @@ impl MailApp {
                     .child(error.clone()),
             );
         }
+        // BIMI and the rest of Check sender, as each message opens: off,
+        // since the lookups tell senders when their mail was opened.
+        let senders = Rows::new().row(self.switch_setting(
+            t!("bimi-check-senders-when-messages-open"),
+            t!("bimi-check-senders-caption"),
+            "bimi-auto".into(),
+            self.brand_auto,
+            Action::SetBrandAuto(!self.brand_auto),
+            cx,
+        ));
         self.settings_column()
             .child(self.settings_group(t!("applock-app-lock"), app_lock))
             .child(self.settings_group(t!("applock-notifications-widgets"), outside))
+            .child(self.settings_group(t!("bimi-senders"), senders))
             .child(self.settings_group(t!("applock-local-database"), database))
             .into_any_element()
     }

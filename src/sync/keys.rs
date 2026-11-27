@@ -498,6 +498,17 @@ pub fn lookup_fingerprint(fingerprint: &str, tls: native_tls::TlsConnector) -> R
     }
 }
 
+/// The public key at the URL an OpenPGP card names for it (its "URL of
+/// public key" data object): https on the internet only. `None` when the
+/// address can't be fetched.
+pub fn fetch_url(url: &str, tls: native_tls::TlsConnector) -> Result<Option<Vec<u8>>> {
+    let client = http(tls)?;
+    match get(&client, url.trim()) {
+        Some(response) if response.status().is_success() => Ok(Some(limited(response)?)),
+        _ => Ok(None),
+    }
+}
+
 /// The Autocrypt header advertising `armored_public` for `email`.
 pub fn autocrypt_header(email: &str, public: &[u8]) -> String {
     autocrypt_header_with(email, public, false)

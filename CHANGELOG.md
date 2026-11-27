@@ -13,6 +13,49 @@ same version in `Cargo.toml`.
 
 ### Added
 
+- Security keys: OpenPGP keys on a YubiKey, Nitrokey, Gnuk or other
+  OpenPGP card, and S/MIME certificates on a PKCS#11 token (a YubiKey's
+  PIV through ykcs11 or OpenSC, a smart card), sign and decrypt on the key
+  itself: the private key never leaves it and isn't kept in the keychain.
+  Add them in Settings → Encryption → Security keys; the PIN is asked
+  there, or above a message encrypted to the key, and kept in memory only
+  until unused for 30 minutes or Picacho locks. Desktop only.
+- Brand logos (BIMI): checking a sender also looks up its domain's
+  verified logo, shown in place of the initials on the message's row and
+  header. Only for a message that passed DMARC with an enforcing policy,
+  and only with a Verified Mark or Common Mark Certificate from a Mark
+  Verifying Authority (DigiCert, GlobalSign, SSL.com), whose embedded logo
+  is shown. Settings → Privacy → **Check senders when messages open** does
+  it without asking (off by default: the lookups reach the sender's DNS).
+- Fastmail's Masked Email in Settings → Forwarding, with an API token or
+  through a Fastmail account already added (its JMAP session): list, make,
+  describe, turn off and delete masked addresses. DuckDuckGo Email
+  Protection makes new Duck Addresses there too (its API can't list,
+  turn off or delete them, so those made in Picacho are kept here).
+
+- Inbox Control (Settings → Inbox Control). **VIPs**: senders or whole
+  domains whose mail is marked with a crown, gathered under VIPs in the
+  sidebar, and always announced. **The Screener**: mail from first-time
+  senders (not in your contacts, never written to) waits in the Screener,
+  unannounced, until you approve, block or route the sender to a
+  category; nothing moves on the server. **Notifications**: alert for
+  everything, only Primary and VIPs, or only VIPs, and keep any inbox tab
+  silent. **Quiet hours**: scheduled Do Not Disturb times on chosen days,
+  which VIPs may break through, and pausing notifications for an hour or
+  until morning. They apply with the window open, in the background and
+  to Proton's pushes; "Notify only for Primary" carries over.
+- Rules applied by Picacho have several conditions (all or any of them) and
+  several actions in order (as label, mark read and archive): conditions
+  on the text, a header, the mailing list, the size, attachments and the
+  inbox category besides sender, recipients and subject; contains, is,
+  starts with, ends with or a regular expression; and Don't notify and
+  Stop after this rule. Rules can be edited and reordered.
+- Server filters (Sieve, Gmail, Microsoft 365 and Exchange) have several
+  tests (all or any) and several actions, with tests for attachments and
+  for mail smaller than a size. Filters with several tests or actions made
+  in other apps are shown and edited rather than left aside, where the
+  service can say them.
+
 - Snoozed mail is shared with Picacho on your other computers on every
   kind of account, not only IMAP servers with METADATA: a message
   snoozed on one shows as snoozed on the others and comes back there at

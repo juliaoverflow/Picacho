@@ -76,10 +76,6 @@ categories-all-mail-first = Open the inbox on All Mail
 
 categories-all-mail-first-caption = All Mail becomes the first tab, before Primary
 
-categories-notify-primary-only = Notify only for Primary
-
-categories-notify-primary-only-caption = New mail in other categories arrives quietly
-
 categories-senders = Sorted senders
 
 categories-senders-none = Right-click a message and choose Move to Category… to always sort its sender there.

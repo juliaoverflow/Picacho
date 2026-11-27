@@ -40,9 +40,14 @@ pub enum Field {
     /// The address mail was delivered to (Sieve `envelope "to"`), which
     /// for mail sent as Bcc or by a list differs from To.
     DeliveredTo,
+    /// The message's size in kilobytes, under the value (Sieve `size
+    /// :under`).
+    SmallerThan,
+    /// It has attachments (no value; Sieve's `mime` extension, RFC 5703).
+    Attachment,
 }
 impl Field {
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 11] = [
         Self::From,
         Self::To,
         Self::Recipients,
@@ -50,6 +55,8 @@ impl Field {
         Self::List,
         Self::Body,
         Self::LargerThan,
+        Self::SmallerThan,
+        Self::Attachment,
         Self::Header,
         Self::DeliveredTo,
     ];
@@ -64,6 +71,8 @@ impl Field {
             Self::LargerThan => t!("sync-sieve-larger-than-kb"),
             Self::Header => t!("sync-sieve-header"),
             Self::DeliveredTo => t!("sync-sieve-delivered-to"),
+            Self::SmallerThan => t!("sync-sieve-smaller-than-kb"),
+            Self::Attachment => t!("sync-sieve-has-attachments"),
         }
     }
     /// The Sieve extension it needs, if any.
@@ -71,8 +80,17 @@ impl Field {
         match self {
             Self::Body => Some("body"),
             Self::DeliveredTo => Some("envelope"),
+            Self::Attachment => Some("mime"),
             _ => None,
         }
+    }
+    /// Whether its tests compare a value (`Attachment`'s doesn't).
+    pub fn has_value(self) -> bool {
+        self != Self::Attachment
+    }
+    /// Whether its value is a size, compared by itself rather than `Match`.
+    pub fn is_size(self) -> bool {
+        matches!(self, Self::LargerThan | Self::SmallerThan)
     }
 }
 /// How a rule's value is compared (RFC 5228 §2.7.1).
@@ -135,12 +153,36 @@ pub enum Act {
     /// Given a label (an IMAP keyword, imap4flags).
     Label(String),
 }
-/// One filter: mail whose `field` contains `value` gets `act`.
+/// One more test of a rule, beside its first (`Rule::more`).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Test {
+    pub field: Field,
+    pub value: String,
+    #[serde(default)]
+    pub matching: Match,
+    #[serde(default)]
+    pub negate: bool,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub header: String,
+}
+
+/// One filter: mail whose `field` contains `value` gets `act`. With
+/// `more` tests, all must match (`allof`), or one (`anyof`, with `any`);
+/// with `also`, more actions follow `act`.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Rule {
     pub field: Field,
     pub value: String,
     pub act: Act,
+    /// Tests beside the first (`field`, `value`…).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub more: Vec<Test>,
+    /// One test matching is enough, rather than all.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub any: bool,
+    /// Actions after `act`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub also: Vec<Act>,
     /// How `value` is compared.
     #[serde(default)]
     pub matching: Match,
@@ -157,6 +199,51 @@ pub struct Rule {
     #[serde(default)]
     pub stop: bool,
 }
+impl Rule {
+    /// Its first test, as a `Test`.
+    pub fn first_test(&self) -> Test {
+        Test {
+            field: self.field,
+            value: self.value.clone(),
+            matching: self.matching,
+            negate: self.negate,
+            header: self.header.clone(),
+        }
+    }
+    /// Every test, the first first.
+    pub fn tests(&self) -> Vec<Test> {
+        std::iter::once(self.first_test()).chain(self.more.iter().cloned()).collect()
+    }
+    /// Every action, in order.
+    pub fn acts(&self) -> impl Iterator<Item = &Act> {
+        std::iter::once(&self.act).chain(self.also.iter())
+    }
+    /// Makes `tests` its tests (the first in the rule's own fields).
+    pub fn set_tests(&mut self, mut tests: Vec<Test>) {
+        if tests.is_empty() {
+            return;
+        }
+        let first = tests.remove(0);
+        self.field = first.field;
+        self.value = first.value;
+        self.matching = first.matching;
+        self.negate = first.negate;
+        self.header = first.header;
+        self.more = tests;
+        if self.more.is_empty() {
+            self.any = false;
+        }
+    }
+    /// Makes `acts` its actions.
+    pub fn set_acts(&mut self, mut acts: Vec<Act>) {
+        if acts.is_empty() {
+            return;
+        }
+        self.act = acts.remove(0);
+        self.also = acts;
+    }
+}
+
 /// An automatic reply while away.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Vacation {
@@ -356,127 +443,21 @@ pub fn script(filters: &Filters, extensions: &[String], addresses: &[String]) ->
         }
     }
     for rule in &filters.rules {
-        let value = rule.value.trim();
-        ensure!(
-            !value.is_empty(),
-            t!("sync-sieve-each-filter-needs-something-to-look")
-        );
-        let m = rule.matching.tag();
-        if rule.matching == Match::Regex {
-            ensure!(has("regex"), t!("sync-sieve-this-server-cant-match-patterns-in"));
-            require.push("regex");
+        let mut tests = Vec::new();
+        for test in rule.tests() {
+            tests.push(sieve_test(&test, &has, &mut require)?);
         }
-        if let Some(ext) = rule.field.needs() {
-            ensure!(has(ext), t!("sync-sieve-this-server-cant-filter-on", label = rule.field.label(), ext = ext));
-            require.push(ext);
+        let test = match tests.as_slice() {
+            [one] => one.clone(),
+            many => format!("{} ({})", if rule.any { "anyof" } else { "allof" }, many.join(", ")),
+        };
+        let mut actions = Vec::new();
+        for act in rule.acts() {
+            actions.push(sieve_action(act, rule.keep_copy, &has, &mut require)?);
         }
-        let test = match rule.field {
-            Field::From => format!("address {m} \"from\" {}", string(value)),
-            Field::To => format!("address {m} \"to\" {}", string(value)),
-            Field::Recipients => format!("address {m} [\"to\", \"cc\"] {}", string(value)),
-            Field::Subject => format!("header {m} \"subject\" {}", string(value)),
-            Field::List => format!("header {m} \"list-id\" {}", string(value)),
-            Field::Body => format!("body :text {m} {}", string(value)),
-            Field::LargerThan => {
-                let kb: u64 = value
-                    .trim_end_matches(|c: char| c.is_alphabetic() || c.is_whitespace())
-                    .parse()
-                    .ok()
-                    .filter(|n| *n > 0)
-                    .with_context(|| t!("sync-sieve-enter-a-size-in-kilobytes-such"))?;
-                format!("size :over {kb}K")
-            }
-            Field::Header => {
-                let name = rule.header.trim();
-                ensure!(
-                    !name.is_empty() && name.bytes().all(|b| b.is_ascii_graphic() && b != b':'),
-                    t!("sync-sieve-name-the-header-the-filter-looks")
-                );
-                format!("header {m} {} {}", string(name), string(value))
-            }
-            Field::DeliveredTo => format!("envelope {m} \"to\" {}", string(value)),
-        };
-        let test = if rule.negate { format!("not {test}") } else { test };
-        let action = match &rule.act {
-            Act::Inbox => "keep;".to_owned(),
-            Act::Folder(name) => {
-                ensure!(has("fileinto"), t!("sync-sieve-this-server-cant-file-mail-into"));
-                require.push("fileinto");
-                // A standard folder by its role (`\\Trash`): the server
-                // finds it by its special use (RFC 8579), whatever it's
-                // called; its usual name if the server can't.
-                if let Some(role) = name.strip_prefix('\\') {
-                    let plain = match role {
-                        "Junk" => "Junk",
-                        "Trash" => "Trash",
-                        "Archive" => "Archive",
-                        "Sent" => "Sent",
-                        other => bail!(t!("sync-sieve-isnt-a-folder-filters-can-use", folder = other)),
-                    };
-                    if has("special-use") {
-                        require.push("special-use");
-                        format!("fileinto :specialuse {} {};", string(name), string(plain))
-                    } else {
-                        format!("fileinto {};", string(plain))
-                    }
-                } else {
-                    // `mailbox`'s :create (RFC 5490): a folder deleted
-                    // since isn't a reason to lose the mail.
-                    let create = if has("mailbox") {
-                        require.push("mailbox");
-                        ":create "
-                    } else {
-                        ""
-                    };
-                    // Sieve names folders in UTF-8.
-                    format!("fileinto {create}{};", string(&super::transport::decode_name(name)))
-                }
-            }
-            Act::MarkRead => {
-                ensure!(
-                    has("imap4flags"),
-                    t!("sync-sieve-this-server-cant-mark-mail-read")
-                );
-                require.push("imap4flags");
-                "addflag \"\\\\Seen\";".to_owned()
-            }
-            Act::Star => {
-                ensure!(
-                    has("imap4flags"),
-                    t!("sync-sieve-this-server-cant-star-mail-from")
-                );
-                require.push("imap4flags");
-                "addflag \"\\\\Flagged\";".to_owned()
-            }
-            Act::Discard => "discard;".to_owned(),
-            Act::Redirect(to) => {
-                let to = to.trim();
-                ensure!(
-                    to.contains('@') && !to.contains(|c: char| c.is_whitespace() || c == ','),
-                    t!("sync-sieve-enter-the-one-address-mail-is")
-                );
-                if rule.keep_copy {
-                    ensure!(has("copy"), t!("sync-sieve-this-server-cant-send-a-copy"));
-                    require.push("copy");
-                    format!("redirect :copy {};", string(to))
-                } else {
-                    format!("redirect {};", string(to))
-                }
-            }
-            Act::Reject(reason) => {
-                ensure!(has("reject"), t!("sync-sieve-this-server-cant-refuse-mail-from"));
-                require.push("reject");
-                format!("reject {};", string(reason.trim()))
-            }
-            Act::Label(label) => {
-                ensure!(has("imap4flags"), t!("sync-sieve-this-server-cant-label-mail-from"));
-                require.push("imap4flags");
-                let keyword = super::transport::keyword(label)?;
-                format!("addflag {};", string(&keyword))
-            }
-        };
         body.push_str(&format!(
-            "if {test} {{\r\n  {action}{}\r\n}}\r\n",
+            "if {test} {{\r\n  {}{}\r\n}}\r\n",
+            actions.join("\r\n  "),
             if rule.stop { "\r\n  stop;" } else { "" }
         ));
     }
@@ -491,6 +472,136 @@ pub fn script(filters: &Filters, extensions: &[String], addresses: &[String]) ->
     out.push_str(&body);
     Ok(out)
 }
+/// One test of a rule, in Sieve, noting the extensions it needs.
+fn sieve_test(rule: &Test, has: &impl Fn(&str) -> bool, require: &mut Vec<&'static str>) -> Result<String> {
+    let value = rule.value.trim();
+    ensure!(
+        !value.is_empty() || !rule.field.has_value(),
+        t!("sync-sieve-each-filter-needs-something-to-look")
+    );
+    let m = rule.matching.tag();
+    if rule.matching == Match::Regex && rule.field.has_value() && !rule.field.is_size() {
+        ensure!(has("regex"), t!("sync-sieve-this-server-cant-match-patterns-in"));
+        require.push("regex");
+    }
+    if let Some(ext) = rule.field.needs() {
+        ensure!(has(ext), t!("sync-sieve-this-server-cant-filter-on", label = rule.field.label(), ext = ext));
+        require.push(ext);
+    }
+    let kb = || -> Result<u64> {
+        value
+            .trim_end_matches(|c: char| c.is_alphabetic() || c.is_whitespace())
+            .parse()
+            .ok()
+            .filter(|n| *n > 0)
+            .with_context(|| t!("sync-sieve-enter-a-size-in-kilobytes-such"))
+    };
+    let test = match rule.field {
+        Field::From => format!("address {m} \"from\" {}", string(value)),
+        Field::To => format!("address {m} \"to\" {}", string(value)),
+        Field::Recipients => format!("address {m} [\"to\", \"cc\"] {}", string(value)),
+        Field::Subject => format!("header {m} \"subject\" {}", string(value)),
+        Field::List => format!("header {m} \"list-id\" {}", string(value)),
+        Field::Body => format!("body :text {m} {}", string(value)),
+        Field::LargerThan => format!("size :over {}K", kb()?),
+        Field::SmallerThan => format!("size :under {}K", kb()?),
+        // RFC 5703 §4.2: any part's Content-Disposition saying attachment.
+        Field::Attachment => "header :mime :anychild :contains \"content-disposition\" \"attachment\"".to_owned(),
+        Field::Header => {
+            let name = rule.header.trim();
+            ensure!(
+                !name.is_empty() && name.bytes().all(|b| b.is_ascii_graphic() && b != b':'),
+                t!("sync-sieve-name-the-header-the-filter-looks")
+            );
+            format!("header {m} {} {}", string(name), string(value))
+        }
+        Field::DeliveredTo => format!("envelope {m} \"to\" {}", string(value)),
+    };
+    Ok(if rule.negate { format!("not {test}") } else { test })
+}
+
+/// One action of a rule, in Sieve, noting the extensions it needs.
+fn sieve_action(act: &Act, keep_copy: bool, has: &impl Fn(&str) -> bool, require: &mut Vec<&'static str>) -> Result<String> {
+    Ok(match act {
+        Act::Inbox => "keep;".to_owned(),
+        Act::Folder(name) => {
+            ensure!(has("fileinto"), t!("sync-sieve-this-server-cant-file-mail-into"));
+            require.push("fileinto");
+            // A standard folder by its role (`\\Trash`): the server
+            // finds it by its special use (RFC 8579), whatever it's
+            // called; its usual name if the server can't.
+            if let Some(role) = name.strip_prefix('\\') {
+                let plain = match role {
+                    "Junk" => "Junk",
+                    "Trash" => "Trash",
+                    "Archive" => "Archive",
+                    "Sent" => "Sent",
+                    other => bail!(t!("sync-sieve-isnt-a-folder-filters-can-use", folder = other)),
+                };
+                if has("special-use") {
+                    require.push("special-use");
+                    format!("fileinto :specialuse {} {};", string(name), string(plain))
+                } else {
+                    format!("fileinto {};", string(plain))
+                }
+            } else {
+                // `mailbox`'s :create (RFC 5490): a folder deleted
+                // since isn't a reason to lose the mail.
+                let create = if has("mailbox") {
+                    require.push("mailbox");
+                    ":create "
+                } else {
+                    ""
+                };
+                // Sieve names folders in UTF-8.
+                format!("fileinto {create}{};", string(&super::transport::decode_name(name)))
+            }
+        }
+        Act::MarkRead => {
+            ensure!(
+                has("imap4flags"),
+                t!("sync-sieve-this-server-cant-mark-mail-read")
+            );
+            require.push("imap4flags");
+            "addflag \"\\\\Seen\";".to_owned()
+        }
+        Act::Star => {
+            ensure!(
+                has("imap4flags"),
+                t!("sync-sieve-this-server-cant-star-mail-from")
+            );
+            require.push("imap4flags");
+            "addflag \"\\\\Flagged\";".to_owned()
+        }
+        Act::Discard => "discard;".to_owned(),
+        Act::Redirect(to) => {
+            let to = to.trim();
+            ensure!(
+                to.contains('@') && !to.contains(|c: char| c.is_whitespace() || c == ','),
+                t!("sync-sieve-enter-the-one-address-mail-is")
+            );
+            if keep_copy {
+                ensure!(has("copy"), t!("sync-sieve-this-server-cant-send-a-copy"));
+                require.push("copy");
+                format!("redirect :copy {};", string(to))
+            } else {
+                format!("redirect {};", string(to))
+            }
+        }
+        Act::Reject(reason) => {
+            ensure!(has("reject"), t!("sync-sieve-this-server-cant-refuse-mail-from"));
+            require.push("reject");
+            format!("reject {};", string(reason.trim()))
+        }
+        Act::Label(label) => {
+            ensure!(has("imap4flags"), t!("sync-sieve-this-server-cant-label-mail-from"));
+            require.push("imap4flags");
+            let keyword = super::transport::keyword(label)?;
+            format!("addflag {};", string(&keyword))
+        }
+    })
+}
+
 /// The rules a script of Picacho's carries, if it is one.
 pub fn read_script(text: &str) -> Option<Filters> {
     let line = text.lines().next()?.strip_prefix(MARKER)?;
@@ -1077,6 +1188,39 @@ pub fn save(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn several_tests_and_actions_in_one_rule() {
+        let ext: Vec<String> = ["fileinto", "imap4flags", "mime", "mailbox"].map(String::from).to_vec();
+        let mut rule = Rule {
+            field: Field::From,
+            value: "shop@example.com".into(),
+            act: Act::Folder("Receipts".into()),
+            also: vec![Act::MarkRead, Act::Label("Bills".into())],
+            more: vec![
+                Test { field: Field::Attachment, ..Test::default() },
+                Test { field: Field::SmallerThan, value: "900".into(), negate: true, ..Test::default() },
+            ],
+            stop: true,
+            ..Rule::default()
+        };
+        let filters = Filters { rules: vec![rule.clone()], ..Filters::default() };
+        let text = script(&filters, &ext, &[]).unwrap();
+        assert!(
+            text.contains("if allof (address :contains \"from\" \"shop@example.com\", header :mime :anychild :contains \"content-disposition\" \"attachment\", not size :under 900K) {"),
+            "{text}"
+        );
+        assert!(text.contains("fileinto :create \"Receipts\";\r\n  addflag \"\\\\Seen\";\r\n  addflag \"Bills\";\r\n  stop;"), "{text}");
+        assert!(text.contains("\"mime\""));
+        assert_eq!(read_script(&text).unwrap(), filters);
+        // Read as another app's script would be: the same rule.
+        assert_eq!(super::super::sieve_parse::read(&text).unwrap().filters.rules, vec![rule.clone()]);
+        rule.any = true;
+        let text = script(&Filters { rules: vec![rule], ..Filters::default() }, &ext, &[]).unwrap();
+        assert!(text.contains("if anyof ("), "{text}");
+        // Without `mime`, attachments can't be tested.
+        assert!(script(&filters, &ext[..2], &[]).is_err());
+    }
 
     /// A script name with a line break can't end a command and start another.
     #[test]

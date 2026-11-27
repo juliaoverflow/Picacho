@@ -75,6 +75,7 @@ impl MailApp {
             Page::Privacy => t!("mobile-settings-privacy").into(),
             Page::LocalAi => t!("mobile-settings-local-ai").into(),
             Page::Organizing => t!("mobile-settings-rules-layout").into(),
+            Page::InboxControl => t!("mobile-settings-inbox-control").into(),
             Page::Shortcuts => t!("mobile-settings-keyboard-shortcuts").into(),
             Page::About => t!("mobile-settings-about-picacho").into(),
             Page::Account(id) => self
@@ -176,6 +177,7 @@ impl MailApp {
                 row("mobile-settings-privacy", "shield", Page::Privacy),
                 row("mobile-settings-local-ai", "sparkle", Page::LocalAi),
                 row("mobile-settings-organizing", "filter", Page::Organizing),
+                row("mobile-settings-inbox-control", "vip", Page::InboxControl),
             ]))
             .child(self.group_label(t!("mobile-settings-mailboxes")))
             .child(self.group(mailboxes))

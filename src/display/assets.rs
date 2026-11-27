@@ -195,6 +195,14 @@ impl AssetSource for Assets {
                 "<rect x='3' y='3' width='18' height='18' rx='2'/><path d='M3 9h18M9 21V9'/>",
             ),
             "mail/ban.svg" => Some("<circle cx='12' cy='12' r='9'/><path d='m5.6 5.6 12.8 12.8'/>"),
+            // A VIP: a crown.
+            "mail/vip.svg" => Some(
+                "<path d='M11.6 3.3a.5.5 0 0 1 .8 0l3 5.6a1 1 0 0 0 1.5.3l4.3-3.7a.5.5 0 0 1 .8.5l-2.8 10.3a1 1 0 0 1-1 .7H5.8a1 1 0 0 1-1-.7L2 6a.5.5 0 0 1 .8-.5l4.3 3.7a1 1 0 0 0 1.5-.3Z M5 21h14'/>",
+            ),
+            // The Screener: a person, checked.
+            "mail/screener.svg" => Some(
+                "<path d='m16 11 2 2 4-4M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2'/><circle cx='9' cy='7' r='4'/>",
+            ),
             // Travel: a plane.
             "mail/plane.svg" => Some(PLANE),
             // Finance: a bank.

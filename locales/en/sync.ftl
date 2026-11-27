@@ -1935,3 +1935,7 @@ sync-proton-aliases-proton-has-no-mailbox-to-forward = Proton has no mailbox to 
 sync-proton-aliases-the-new-alias-was-made-but = The new alias was made, but Proton's reply couldn't be read. Refresh to see it.
 
 sync-proton-aliases-proton-didnt-give-a-reverse-alias = Proton didn't give an address for writing to { $contact }.
+
+sync-sieve-smaller-than-kb = Smaller than (KB)
+
+sync-sieve-has-attachments = Has attachments

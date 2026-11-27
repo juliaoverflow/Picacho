@@ -105,7 +105,7 @@ reader-checking-the-sender = Checking the sender…
 
 reader-check-sender = Check sender
 
-reader-looks-up-spf-dkim-and-dmarc = Looks up SPF, DKIM and DMARC; the sender's DNS can see when.
+reader-looks-up-spf-dkim-and-dmarc = Looks up SPF, DKIM, DMARC and the brand logo; the sender's DNS can see when.
 
 reader-couldnt-check-the-sender-no-dns = Couldn't check the sender (no DNS answer)
 

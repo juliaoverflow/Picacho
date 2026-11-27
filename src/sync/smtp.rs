@@ -1710,7 +1710,7 @@ pub(crate) fn protected(message: &Message, d: &Draft, keys: &Keys) -> Result<Vec
     let ring = keys.ring;
     let mut raw = message.formatted();
     // With only an S/MIME certificate, S/MIME is how it's protected.
-    let smime = d.smime || (ring.secret.is_empty() && (d.sign || d.encrypt));
+    let smime = d.smime || (!ring.has_own() && (d.sign || d.encrypt));
     if smime && (d.sign || d.encrypt) {
         let envelope = message.envelope();
         let from = envelope.from().map(|f| f.to_string()).unwrap_or_default();
