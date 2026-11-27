@@ -82,3 +82,13 @@ local-ai-delete-model-2 = Delete Model
 
 local-ai-mb = { $mb } MB
 
+local-ai-sort-the-inbox = Sort the inbox
+
+local-ai-sort-the-inbox-caption = A { $size } model reads each message's sender, subject and preview to choose its inbox category where the rules aren't sure, and learns from the mail you move
+
+local-ai-picacho-learned-from-messages-you-moved = { $count ->
+        [one] Picacho learned from { $count } message you moved to another category.
+       *[other] Picacho learned from { $count } messages you moved to another category.
+    }
+
+local-ai-picacho-forgot-how-you-sorted = Picacho forgot what it learned from the mail you moved.

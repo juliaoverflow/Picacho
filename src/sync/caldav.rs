@@ -36,6 +36,46 @@ pub struct Server {
     /// The secret given is an OAuth access token, sent as Bearer.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub bearer: bool,
+    /// Calendars kept by Google, reached through the Google Calendar API
+    /// with one of the mail accounts' OAuth sign-in: that account's id.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub google_account: String,
+    /// Calendars kept by Proton Calendar, reached through a Proton (without
+    /// Bridge) mail account's session and keys: that account's id.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub proton_account: String,
+    /// A subscribed calendar feed (`webcal://` or an `.ics` address): read
+    /// whole every `refresh_minutes`, never written.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub feed: bool,
+    /// How often a feed is read again, in minutes (0: `feed::DEFAULT_MINUTES`).
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub refresh_minutes: u32,
+    /// What the person calls this source (a feed's name), where they said.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub label: String,
+}
+
+fn is_zero_u32(n: &u32) -> bool {
+    *n == 0
+}
+
+impl Server {
+    /// Whether it is reached over CalDAV itself, rather than one of the
+    /// APIs a mail account signs in to, or a feed.
+    pub fn dav(&self) -> bool {
+        !self.feed
+            && [&self.jmap_account, &self.graph_account, &self.ews_account, &self.google_account, &self.proton_account]
+                .iter()
+                .all(|a| a.is_empty())
+    }
+    /// The mail account it signs in as, if it shares one's sign-in.
+    pub fn account(&self) -> Option<&str> {
+        [&self.mail_account, &self.jmap_account, &self.graph_account, &self.ews_account, &self.google_account, &self.proton_account]
+            .into_iter()
+            .find(|a| !a.is_empty())
+            .map(String::as_str)
+    }
 }
 
 /// A calendar on the server.

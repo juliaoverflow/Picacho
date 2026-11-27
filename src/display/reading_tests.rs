@@ -550,6 +550,7 @@ fn banner_actions_stay_inside_their_banners_as_the_reader_narrows(cx: &mut TestA
                 until: chrono::Local::now().timestamp() + 3 * 86_400,
                 folder: "Snoozed".into(),
                 ids: vec![],
+                changed: 0,
             }],
         );
         this.selected = Some(m.id.clone());

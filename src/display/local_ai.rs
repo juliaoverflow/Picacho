@@ -267,6 +267,7 @@ impl MailApp {
         self.start_when(cx);
         self.start_parcels(cx);
         self.start_replies(cx);
+        self.start_sort_ai(cx);
     }
 
     /// The replies the model suggests for received mail `m` (from its body,
@@ -520,14 +521,18 @@ impl MailApp {
         self.follow_download(cx);
     }
     /// Redraws while a model downloads, so its progress ring follows it.
-    fn follow_download(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn follow_download(&mut self, cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor().timer(Duration::from_millis(100)).await;
                 let busy = this
                     .update(cx, |this, cx| {
                         cx.notify();
-                        this.model_busy || this.when_busy || this.parcel_busy || this.replies_busy
+                        this.model_busy
+                            || this.when_busy
+                            || this.parcel_busy
+                            || this.replies_busy
+                            || this.sorting.ai_busy
                     })
                     .unwrap_or(false);
                 if !busy {
@@ -683,6 +688,8 @@ impl MailApp {
             self.parcel_busy
         } else if model.id == local_ai::REPLIES.id {
             self.replies_busy
+        } else if model.id == local_ai::CATEGORIES.id {
+            self.sorting.ai_busy
         } else {
             self.model_busy
         }
@@ -696,6 +703,8 @@ impl MailApp {
             &self.parcel_progress
         } else if model.id == local_ai::REPLIES.id {
             &self.replies_progress
+        } else if model.id == local_ai::CATEGORIES.id {
+            &self.sorting.ai_progress
         } else {
             &self.model_progress
         };
@@ -728,6 +737,9 @@ impl MailApp {
         if model.id == local_ai::REPLIES.id {
             self.set_suggest_replies(false, cx);
         }
+        if model.id == local_ai::CATEGORIES.id {
+            self.set_sort_ai(false, cx);
+        }
         match model.remove(&self.backend.store) {
             Ok(()) => self.notice(
                 t!("local-ai-deleted-the", to_lowercase = model.label.to_lowercase()),
@@ -751,10 +763,12 @@ impl MailApp {
             self.set_understand_dates(false, cx);
             self.set_find_parcels(false, cx);
             self.set_suggest_replies(false, cx);
+            self.set_sort_ai(false, cx);
             self.model_error = None;
             self.when_error = None;
             self.parcel_error = None;
             self.replies_error = None;
+            self.sorting.ai_error = None;
             if let Err(e) = local_ai::remove_all(&self.backend.store) {
                 self.notice(format!("{e:#}"), true, cx);
             }
@@ -890,6 +904,40 @@ impl MailApp {
                 self.replies_error.clone(),
                 Action::SetSuggestReplies(true),
             ))
+            .row(feature(
+                t!("local-ai-sort-the-inbox"),
+                &t!(
+                    "local-ai-sort-the-inbox-caption",
+                    size = mb(local_ai::CATEGORIES.size)
+                ),
+                "local-ai-categories",
+                self.sorting.ai_on,
+                Action::SetSortAi(self.local_ai && !self.sorting.ai_on),
+                "local-ai-categories-status",
+                self.sorting.ai_error.clone(),
+                Action::SetSortAi(true),
+            ))
+            .when(self.sort_lessons() > 0, |rows| {
+                let lessons = self.sort_lessons();
+                rows.row(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .text_size(px(12.))
+                        .text_color(rgb(c.muted))
+                        .child(div().flex_1().min_w_0().child(t!(
+                            "local-ai-picacho-learned-from-messages-you-moved",
+                            count = lessons
+                        )))
+                        .child(self.link(
+                            "local-ai-categories-forget",
+                            t!("local-ai-forget"),
+                            Action::ForgetSortLearning,
+                            cx,
+                        )),
+                )
+            })
             .when(!self.reply_history.is_empty(), |rows| {
                 let hidden = self.reply_history.dismissed().len();
                 rows.row(

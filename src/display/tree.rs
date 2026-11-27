@@ -1141,6 +1141,9 @@ impl MailApp {
             }
         }
         block = add(block, self.subscriptions_nav(id, cx));
+        if let Some(nav) = self.waiting_nav(id, cx) {
+            block = add(block, nav);
+        }
         Some(block.into_any_element())
     }
     fn folder_block(
@@ -1475,7 +1478,8 @@ impl MailApp {
                             let active = current
                                 && self.mailbox() == mailbox
                                 && !self.subs_open
-                                && !self.summary_open;
+                                && !self.summary_open
+                                && !self.waiting_open;
                             let count = self.unread_for(id, &mailbox);
                             let entries = self.mailbox_entries(id, mailbox.clone());
                             let button = self
@@ -1541,6 +1545,13 @@ impl MailApp {
                             div().child(self.stagger(button, Self::next_row(row))),
                             Folder::ALL.len() + 1,
                         ));
+                        if let Some(button) = self.waiting_rail(id, cx) {
+                            block = block.child(self.reveal(
+                                id,
+                                div().child(self.stagger(button, Self::next_row(row))),
+                                Folder::ALL.len() + 2,
+                            ));
+                        }
                     }
                     out.push(block.into_any_element());
                 }

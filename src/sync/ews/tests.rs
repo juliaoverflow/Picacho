@@ -58,6 +58,8 @@ pub(crate) struct Fake {
     pub redirect_addr: Option<(String, String)>,
     /// Refuses a calendar item whose UID one in its folder already has.
     pub unique_uids: bool,
+    /// Item classes other than IPM.Note, by item id.
+    pub classes: Vec<(String, String)>,
 }
 
 impl Fake {
@@ -79,6 +81,7 @@ impl Fake {
             stream: Vec::new(),
             redirect_addr: None,
             unique_uids: false,
+            classes: Vec::new(),
         };
         f.folders.push(FakeFolder { id: "root".into(), name: "Top of Information Store".into(), parent: "mailbox".into(), distinguished: Some("msgfolderroot".into()), class: String::new() });
         for (id, name, d, class) in [
@@ -148,6 +151,9 @@ impl Fake {
         if let Some(v) = i.verb {
             x.push_str(&format!(r#"<t:ExtendedProperty><t:ExtendedFieldURI PropertyTag="0x1081" PropertyType="Integer"/><t:Value>{v}</t:Value></t:ExtendedProperty>"#));
         }
+        // A conversation is its subject here.
+        let class = self.classes.iter().find(|(id, _)| *id == i.id).map_or("IPM.Note", |(_, c)| c.as_str());
+        x.push_str(&format!(r#"<t:ItemClass>{}</t:ItemClass><t:ConversationId Id="c-{}"/>"#, esc(class), esc(&i.subject)));
         x.push_str(&format!(r#"<t:From><t:Mailbox><t:Name>Bo Berg</t:Name><t:EmailAddress>bo@example.se</t:EmailAddress></t:Mailbox></t:From><t:IsRead>{}</t:IsRead><t:InternetMessageId>&lt;{}@corp.example&gt;</t:InternetMessageId>"#, i.read, esc(&i.id)));
         x.push_str(&format!("</t:{}>", i.kind));
         x
@@ -330,6 +336,20 @@ impl Fake {
                 let page: String = found.iter().skip(offset).take(max).map(|i| self.item_xml(i, false)).collect();
                 let last = offset + max >= found.len();
                 Self::ok("FindItem", &format!(r#"<m:RootFolder IncludesLastItemInRange="{last}" TotalItemsInView="{}"><t:Items>{page}</t:Items></m:RootFolder>"#, found.len()))
+            }
+            "GetConversationItems" => {
+                let id = find(op, "ConversationId").and_then(|c| c.attribute("Id")).unwrap_or_default().to_owned();
+                let ignored = ["f-trash", "f-drafts"];
+                let items: String = self
+                    .items
+                    .iter()
+                    .filter(|i| format!("c-{}", i.subject) == id && !ignored.contains(&i.folder.as_str()))
+                    .map(|i| self.item_xml(i, false))
+                    .collect();
+                Self::ok(
+                    "GetConversationItems",
+                    &format!("<m:Conversation><t:ConversationNodes><t:ConversationNode><t:Items>{items}</t:Items></t:ConversationNode></t:ConversationNodes></m:Conversation>"),
+                )
             }
             "GetItem" => {
                 let mime = find(op, "IncludeMimeContent").and_then(|n| n.text()) == Some("true");

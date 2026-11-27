@@ -201,7 +201,30 @@ impl Server {
             { "id": "w", "name": "Work", "role": null, "parentId": null },
         ])
     }
-    fn email_json(m: &Message) -> Value {
+    /// A header of a message's source, if it has one.
+    fn header(blobs: &HashMap<String, Vec<u8>>, m: &Message, name: &str) -> Option<String> {
+        use mailparse::MailHeaderMap;
+        let raw = blobs.get(&m.blob)?;
+        let (headers, _) = mailparse::parse_headers(raw).ok()?;
+        headers.get_first_value(name)
+    }
+    fn ids_in(text: Option<String>) -> Value {
+        match text {
+            Some(t) => json!(t.split_whitespace().map(|i| i.trim_matches(['<', '>'])).collect::<Vec<_>>()),
+            None => Value::Null,
+        }
+    }
+    fn email_json(blobs: &HashMap<String, Vec<u8>>, m: &Message) -> Value {
+        let mut v = Self::email_json_alone(m);
+        // What its source says of the thread and automatic answers.
+        v["inReplyTo"] = Self::ids_in(Self::header(blobs, m, "In-Reply-To"));
+        v["references"] = Self::ids_in(Self::header(blobs, m, "References"));
+        if let Some(auto) = Self::header(blobs, m, "Auto-Submitted") {
+            v["header:Auto-Submitted:asText"] = json!(auto);
+        }
+        v
+    }
+    fn email_json_alone(m: &Message) -> Value {
         let keywords: serde_json::Map<String, Value> = m
             .keywords
             .iter()
@@ -225,7 +248,7 @@ impl Server {
             "header:List-Unsubscribe-Post:asText": "List-Unsubscribe=One-Click",
         })
     }
-    fn matches(m: &Message, f: &Value) -> bool {
+    fn matches(blobs: &HashMap<String, Vec<u8>>, m: &Message, f: &Value) -> bool {
         if f.is_null() {
             return true;
         }
@@ -234,7 +257,7 @@ impl Server {
                 .as_array()
                 .unwrap()
                 .iter()
-                .map(|c| Self::matches(m, c));
+                .map(|c| Self::matches(blobs, m, c));
             return match op {
                 "AND" => each.all(|x| x),
                 "OR" => each.any(|x| x),
@@ -256,6 +279,15 @@ impl Server {
         }
         if let Some(t) = f["text"].as_str() {
             ok &= m.subject.to_lowercase().contains(t);
+        }
+        // RFC 8621 §4.4.1: the header is there, containing the value.
+        if let Some(h) = f["header"].as_array() {
+            let name = h[0].as_str().unwrap();
+            let found = Self::header(blobs, m, name);
+            ok &= match h.get(1).and_then(Value::as_str) {
+                Some(value) => found.is_some_and(|f| f.contains(value)),
+                None => found.is_some(),
+            };
         }
         ok
     }
@@ -365,7 +397,7 @@ impl Server {
                 let mut found: Vec<&Message> = self
                     .emails
                     .iter()
-                    .filter(|m| Self::matches(m, &args["filter"]))
+                    .filter(|m| Self::matches(&self.blobs, m, &args["filter"]))
                     .collect();
                 found.sort_by(|a, b| b.received.cmp(&a.received));
                 let total = found.len();
@@ -394,7 +426,7 @@ impl Server {
                 let mut now: Vec<&Message> = self
                     .emails
                     .iter()
-                    .filter(|m| Self::matches(m, &args["filter"]))
+                    .filter(|m| Self::matches(&self.blobs, m, &args["filter"]))
                     .collect();
                 now.sort_by(|a, b| b.received.cmp(&a.received));
                 let now: Vec<String> = now.iter().map(|m| m.id.clone()).collect();
@@ -438,7 +470,7 @@ impl Server {
                     .emails
                     .iter()
                     .filter(|m| wanted.as_ref().is_none_or(|w| w.contains(&m.id)))
-                    .map(Self::email_json)
+                    .map(|m| Self::email_json(&self.blobs, m))
                     .collect();
                 vec![(
                     name.into(),
@@ -3341,5 +3373,72 @@ fn jmap_attachments_download_straight_to_their_file() -> Result<()> {
     gone.set_attachments(vec![Attachment { section: "B-gone".into(), ..m.attachments()[0].clone() }]);
     assert!(b.attachment_to(&a, &gone, 1, &path.join("gone.bin")).is_err());
     assert!(!path.join("gone.bin").exists());
+    Ok(())
+}
+
+/// Follow-up reminders on a JMAP server: an automatic reply is told by its
+/// Auto-Submitted header; a reply not downloaded is found by the server
+/// (the mail naming the message in In-Reply-To or References) before
+/// reminding; the list is kept in a note in a Picacho mailbox, which
+/// another computer reads.
+#[test]
+fn jmap_follow_ups_find_replies_and_share_through_a_note() -> Result<()> {
+    use crate::manage::backend::FollowUp;
+    let mut fixture = Server { state: 1, ..Default::default() };
+    let raw = |from: &str, subject: &str, id: &str, extra: &str| {
+        format!("From: {from}\r\nTo: qa@example.com\r\nSubject: {subject}\r\nDate: Sat, 24 Oct 2026 10:00:00 +0000\r\nMessage-ID: <{id}>\r\n{extra}MIME-Version: 1.0\r\nContent-Type: text/plain\r\n\r\nHi.\r\n").into_bytes()
+    };
+    fixture.blobs.insert("B-S".into(), raw("QA <qa@example.com>", "Question", "sent@qa", ""));
+    fixture.blobs.insert("B-R".into(), raw("Sophie Chen <sophie@example.com>", "Re: Question", "r@sophie", "In-Reply-To: <sent@qa>\r\nReferences: <sent@qa>\r\n"));
+    fixture.blobs.insert("B-A".into(), raw("Sophie Chen <sophie@example.com>", "Away", "a@sophie", "Auto-Submitted: auto-replied\r\n"));
+    for (id, blob, mailbox, subject) in [("S", "B-S", "s", "Question"), ("R", "B-R", "w", "Re: Question"), ("A", "B-A", "i", "Away")] {
+        fixture.emails.push(Message {
+            id: id.into(),
+            blob: blob.into(),
+            mailboxes: vec![mailbox.into()],
+            keywords: vec![],
+            subject: subject.into(),
+            received: "2026-10-24T10:00:00Z".into(),
+        });
+    }
+    let (cert, port, server, _running) = start(fixture)?;
+    let (b, mut a, path) = backend(&cert)?;
+    let _cleanup = Cleanup(path);
+    a.provider = Provider::Jmap;
+    a.incoming_port = port;
+    b.store.save_account(&a)?;
+    let inbox = b.sync(&a, Folder::Inbox, 50)?;
+    assert_eq!(inbox.iter().map(|m| (m.subject.as_str(), m.automatic())).collect::<Vec<_>>(), [("Away", true)]);
+    let now = chrono::Utc::now().timestamp();
+    let waiting = |id: &str, subject: &str, due: i64| FollowUp {
+        message_id: id.into(),
+        subject: subject.into(),
+        to: "sophie@example.com".into(),
+        // The fixture's mail is dated October 24, 2026.
+        sent: 1_792_836_000 - 3600,
+        due,
+        ..Default::default()
+    };
+    b.note_follow_up(&a.id, waiting("<sent@qa>", "Question", now - 60))?;
+    b.note_follow_up(&a.id, waiting("<later@qa>", "Later", now + 86400))?;
+    let check = b.check_follow_ups_online(&a, true)?;
+    assert!(check.due.is_empty(), "{check:?}");
+    assert_eq!(check.replied.len(), 1);
+    assert_eq!(check.replied[0].1, "Sophie Chen");
+    {
+        let s = server.lock().unwrap();
+        let picacho = s.boxes.as_ref().and_then(|b| b.iter().find(|m| m["name"] == "Picacho")).map(|m| m["id"].as_str().unwrap().to_owned());
+        let notes: Vec<_> = s.emails.iter().filter(|e| Some(&e.mailboxes[0]) == picacho.as_ref()).collect();
+        assert_eq!(notes.len(), 1, "one note, in a Picacho mailbox");
+        assert!(notes[0].keywords.contains(&"$seen".to_owned()));
+    }
+    let (b2, mut a2, path2) = backend(&cert)?;
+    let _cleanup2 = Cleanup(path2);
+    a2.provider = Provider::Jmap;
+    a2.incoming_port = port;
+    b2.store.save_account(&a2)?;
+    assert!(b2.sync_follow_ups(&a2, true)?);
+    let ids: Vec<String> = b2.follow_ups(&a2.id).into_iter().map(|f| f.message_id).collect();
+    assert_eq!(ids, ["<later@qa>"]);
     Ok(())
 }

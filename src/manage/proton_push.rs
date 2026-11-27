@@ -12,7 +12,7 @@
 //! pushes or is removed; `on_proton_push_change` hears when they change.
 use super::*;
 use crate::sync::proton_push;
-use protected_email_bridge::push::Presentation;
+use crate::sync::proton_push::Presentation;
 
 /// What a Proton push tells of.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -31,6 +31,8 @@ views-unread = { $count ->
        *[other] { $label } · { $shown } unread
     }
 
+views-sign-in-to-proton-directly-first = Add a Proton account signed in directly (not through Proton Mail Bridge) first; its aliases come with its sign-in.
+
 views-connected-alias = Connected { $label } · { $count ->
         [one] { $count } alias
        *[other] { $count } aliases

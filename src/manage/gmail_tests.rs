@@ -213,3 +213,98 @@ fn switching_forgets_mail_and_keeps_drafts() -> Result<()> {
     let _ = std::fs::remove_dir_all(path);
     Ok(())
 }
+
+/// Gmail's own categories (CATEGORY_PROMOTIONS…) come with each message,
+/// and its inbox's tabs follow them.
+#[test]
+fn gmails_categories_sort_the_inbox() -> Result<()> {
+    use crate::manage::categories::{Categorizing, Category, Known};
+    let mut fake = Fake::new();
+    for id in [
+        "CATEGORY_PERSONAL",
+        "CATEGORY_PROMOTIONS",
+        "CATEGORY_UPDATES",
+    ] {
+        fake.labels.push((id.into(), id.into(), true));
+    }
+    let lunch = fake.add("Lunch", &["INBOX", "CATEGORY_PERSONAL"], 5);
+    let sale = fake.add("A note from us", &["INBOX", "CATEGORY_PROMOTIONS"], 10);
+    let friends = fake.add("New follower", &["INBOX", "CATEGORY_SOCIAL"], 15);
+    let (server, _fake) = serve(fake);
+    let (b, a, path) = setup(server.port)?;
+    b.sync(&a, Folder::Inbox, 50)?;
+    let prefs = Categorizing::default();
+    let category = |id: &str| {
+        let m = b.store.message(&gmail::row_id(&a, id)).unwrap().unwrap();
+        (
+            m.server_category().to_owned(),
+            prefs.category(&m, &Known::default()),
+        )
+    };
+    assert_eq!(category(&lunch), ("personal".into(), Category::Primary));
+    assert_eq!(category(&sale), ("promotions".into(), Category::Promotions));
+    assert_eq!(category(&friends), ("social".into(), Category::Social));
+    // Gmail's categories aren't the person's labels.
+    let sale = b.store.message(&gmail::row_id(&a, &sale))?.unwrap();
+    assert!(sale.labels().is_empty());
+    drop(b);
+    let _ = std::fs::remove_dir_all(path);
+    Ok(())
+}
+
+/// Follow-up reminders through the Gmail API: an automatic reply is told
+/// by its headers; a reply not downloaded is found in the message's thread
+/// before reminding; the list is kept in a note under a Picacho label, out
+/// of the inbox, which another computer reads.
+#[test]
+fn gmail_follow_ups_find_replies_and_share_through_a_note() -> Result<()> {
+    use crate::manage::backend::FollowUp;
+    let mut fake = Fake::new();
+    let sent = fake.add("Question", &["SENT"], 120);
+    let reply = fake.add("Re: Question", &["Label_archive_none"], 30);
+    let away = fake.add("Away", &["INBOX"], 10);
+    let thread = fake.message(&sent).unwrap().thread.clone();
+    for m in &mut fake.messages {
+        if m.id == reply {
+            m.thread = thread.clone();
+        }
+        if m.id == away {
+            m.raw = [b"Auto-Submitted: auto-replied\r\n".as_slice(), &m.raw].concat();
+        }
+    }
+    let (server, fake) = serve(fake);
+    let (b, a, path) = setup(server.port)?;
+    let inbox = b.sync(&a, Folder::Inbox, 50)?;
+    assert_eq!(inbox.iter().map(|m| (m.subject.as_str(), m.automatic())).collect::<Vec<_>>(), [("Away", true)]);
+    b.sync(&a, Folder::Sent, 50)?;
+    let now = chrono::Utc::now().timestamp();
+    let waiting = |id: &str, subject: &str, due: i64| FollowUp {
+        message_id: id.into(),
+        subject: subject.into(),
+        to: "ana@example.org".into(),
+        sent: now - 7200,
+        due,
+        ..Default::default()
+    };
+    b.note_follow_up(&a.id, waiting(&format!("<{sent}@example.org>"), "Question", now - 60))?;
+    b.note_follow_up(&a.id, waiting("<later@example.com>", "Later", now + 86400))?;
+    let check = b.check_follow_ups_online(&a, true)?;
+    assert!(check.due.is_empty(), "{check:?}");
+    assert_eq!(check.replied.len(), 1);
+    assert_eq!(check.replied[0].1, "Ana Lima");
+    {
+        let f = fake.lock().unwrap();
+        let label = f.labels.iter().find(|(_, name, _)| name == "Picacho").map(|(id, _, _)| id.clone()).expect("a Picacho label");
+        let notes: Vec<_> = f.messages.iter().filter(|m| m.labels.contains(&label)).collect();
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].labels, std::slice::from_ref(&label), "out of the inbox");
+    }
+    let (b2, a2, path2) = setup(server.port)?;
+    assert!(b2.sync_follow_ups(&a2, true)?);
+    let ids: Vec<String> = b2.follow_ups(&a2.id).into_iter().map(|f| f.message_id).collect();
+    assert_eq!(ids, ["<later@example.com>"]);
+    drop((b, b2));
+    let _ = std::fs::remove_dir_all(path);
+    let _ = std::fs::remove_dir_all(path2);
+    Ok(())
+}

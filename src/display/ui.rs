@@ -16,6 +16,8 @@ use crate::manage::backend::{KeyMethod, KeyPrompt};
 use proton_login::ProtonStage;
 #[path = "catalog.rs"]
 mod catalog;
+#[path = "categories.rs"]
+mod categories;
 #[path = "compose.rs"]
 mod compose;
 #[path = "contacts.rs"]
@@ -43,6 +45,8 @@ mod devdriver;
 mod datetime;
 #[path = "later.rs"]
 mod later;
+#[path = "follow_up.rs"]
+mod follow_up;
 #[path = "filters.rs"]
 mod filters;
 use datetime::{DateTimePicker, PickerEvent};
@@ -59,6 +63,9 @@ mod local_ai_tests;
 #[cfg(test)]
 #[path = "when_tests.rs"]
 mod when_tests;
+#[cfg(test)]
+#[path = "categories_tests.rs"]
+mod categories_tests;
 #[path = "message_window.rs"]
 mod message_window;
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -83,6 +90,9 @@ use settings::Rows;
 #[path = "reading_tests.rs"]
 mod reading_tests;
 #[cfg(test)]
+#[path = "follow_up_tests.rs"]
+mod follow_up_tests;
+#[cfg(test)]
 #[path = "responsive_tests.rs"]
 mod responsive_tests;
 #[path = "settings.rs"]
@@ -102,6 +112,9 @@ mod thread;
 mod organize;
 #[path = "tools.rs"]
 mod tools;
+#[cfg(target_os = "linux")]
+#[path = "stalls.rs"]
+mod stalls;
 #[path = "shortcuts.rs"]
 mod shortcuts;
 #[path = "templates.rs"]
@@ -531,9 +544,14 @@ enum Modal {
     AliasGone(String, String),
     /// When to bring these messages back.
     Snooze(Vec<String>),
+    /// When to be reminded if this sent message (its id) gets no reply.
+    FollowUp(String),
     /// A link from an email that looks like a trick (desktop): its
     /// address, before it opens.
     LinkWarning(String),
+    /// Signs a Proton forwarding service (its id) in to Proton Pass again,
+    /// as signing in to a Proton Mail account again does.
+    PassSignIn(String),
 }
 /// What is deleted for good, once confirmed.
 #[derive(Clone, Debug, PartialEq)]
@@ -692,8 +710,10 @@ pub(super) enum ParcelField {
 /// What a notice's Undo puts back.
 #[derive(Clone)]
 pub(super) enum Undo {
-    /// Messages an account's move took out of their mailboxes.
-    Moves(String, Vec<Moved>),
+    /// Messages a move took out of their mailboxes, by account.
+    Moves(Vec<(String, Vec<Moved>)>),
+    /// A draft deleted, not yet discarded: kept.
+    Draft(String),
     /// Messages just snoozed, by Message-ID: back to the inbox now.
     Snooze(String, Vec<String>),
 }
@@ -833,6 +853,15 @@ enum Action {
     EventAlarm(Option<i64>),
     /// Calendar settings: use this JMAP account's calendars (its id).
     ConnectJmapCalendar(String),
+    /// Calendar settings: subscribes to the calendar feed in the form, read
+    /// again as often as chosen (`NewFeedInterval`, minutes).
+    SubscribeCalendarFeed,
+    NewFeedInterval(u32),
+    /// How often a subscribed feed (its source id) is read again (minutes).
+    FeedInterval(String, u32),
+    /// Reads one calendar source (its id) again, or disconnects it.
+    SyncCalendarSource(String),
+    RemoveCalendarSource(String),
     /// Makes a calendar named as in the form on the server.
     CreateCalendar,
     /// Renames a calendar (its href) as in the form, or deletes it.
@@ -873,6 +902,9 @@ enum Action {
     AddServerIdentity(String),
     /// Contacts settings: use this JMAP account's contacts (its id).
     ConnectJmapContacts(String),
+    /// Reads one contacts source (its id) again, or disconnects it.
+    SyncContactsSource(String),
+    RemoveContactsSource(String),
     /// Makes an address book named as in the form on the server.
     CreateAddressBook,
     /// Lists the server's address books; renames one (its href) as in the
@@ -975,6 +1007,10 @@ enum Action {
     /// Suggests replies under received mail with the model (installing
     /// it), or stops (deleting it).
     SetSuggestReplies(bool),
+    /// Turns Settings → Local AI → Sort the inbox on or off.
+    SetSortAi(bool),
+    /// Forgets what the inbox category model learned from mail moved.
+    ForgetSortLearning,
     /// Answers the open message with this suggested reply.
     SmartReply(String),
     /// The menu of a suggested reply (right-click).
@@ -1198,6 +1234,13 @@ enum Action {
     SetAllMail(bool),
     /// The service picked in Forwarding settings' add form.
     ForwardingService(ForwardingService),
+    /// The Proton account (signed in without Bridge) picked in the add
+    /// form, whose own aliases to list.
+    ForwardingProtonAccount(String),
+    /// Opens the sign-in to Proton Pass for a Proton service (its id).
+    PassSignIn(String),
+    /// Continues that sign-in with what its step asks for.
+    SubmitPassSignIn(String),
     ConnectForwarding,
     RefreshAliases(String),
     RemoveForwarding(String),
@@ -1273,6 +1316,12 @@ enum Action {
     SnoozeMenu(Vec<String>),
     /// Brings a snoozed message back now: (account, Message-ID).
     Unsnooze(String, String),
+    /// Asks when to be reminded if this sent message (its id) gets no reply.
+    FollowUpMenu(String),
+    /// Stops waiting for a reply to a sent message: (account, Message-ID).
+    StopWaiting(String, String),
+    /// Shows the sent mail an account (or All Accounts) waits on a reply to.
+    OpenWaiting(String),
     /// Searches the open mailbox on the server for what is typed.
     SearchServer,
     /// Back to searching the mail on this computer.
@@ -1283,6 +1332,8 @@ enum Action {
     Filters(filters::FilterAction),
     /// Pins, mutes, saved searches, blocked senders, rules and layout.
     Organize(organize::OrgAction),
+    /// The inbox's category tabs and sorting senders into them.
+    Categories(categories::CatAction),
     /// Find in Message, printing, PDFs and opening attachments.
     Tools(tools::ToolAction),
     /// Changing keyboard shortcuts in Settings.
@@ -1429,6 +1480,13 @@ pub struct MailApp {
     error: bool,
     /// What the notice's Undo puts back (on phones, beside the notice).
     undo: Option<Undo>,
+    /// Each account's moves on their way to its server.
+    moves_in_flight: HashMap<String, usize>,
+    /// Drafts deleted while Undo is offered, discarded after.
+    discarding: HashSet<String>,
+    /// Undo pressed while its move was still on its way: (account, what it
+    /// moved), done once the account's moves have landed (`move_landed`).
+    undo_after_moves: Vec<(String, Vec<Moved>)>,
     form: Vec<Entity<InputState>>,
     service: Service,
     provider: Provider,
@@ -1635,8 +1693,19 @@ pub struct MailApp {
     picker_subscription: Option<Subscription>,
     /// Each account's snoozed messages.
     snoozed: HashMap<String, Vec<crate::manage::backend::Snoozed>>,
+    /// Each account's sent mail waited on for a reply.
+    follow_ups: HashMap<String, Vec<crate::manage::backend::FollowUp>>,
+    /// Each account's mail as last looked through for those replies
+    /// (`Backend::list_revision`), and when.
+    follow_up_replies: HashMap<String, ((u64, u64), std::time::Instant)>,
+    /// Replies and reminders are being looked at now.
+    follow_ups_checking: bool,
+    /// The list shows Waiting For: the open Sent's mail waited on.
+    waiting_open: bool,
     /// Accounts whose snoozed messages are being brought back now.
     waking: HashSet<String>,
+    /// When snoozed messages were last shared with other computers.
+    snooze_shared: Option<std::time::Instant>,
     /// A search of the whole mailbox on the server.
     server_search: Option<later::ServerSearch>,
     /// Server-side filters by account, as loaded in Settings.
@@ -1646,6 +1715,9 @@ pub struct MailApp {
     /// layout (`manage::organize`), and Settings' fields for them.
     org: crate::manage::organize::Organizing,
     org_ui: organize::OrgUi,
+    /// The inbox's categories: the tab shown, how mail is sorted into
+    /// them, and each tab's unread count (`manage::categories`).
+    sorting: categories::Sorting,
     /// Settings → Keyboard Shortcuts' recording.
     keys_ui: shortcuts::KeysUi,
     /// Rows standing for a conversation, by message index: how many
@@ -1892,6 +1964,23 @@ pub struct MailApp {
     scope: fwd::Scope,
     /// Forwarding settings' add form, and the work running there.
     fwd_service: ForwardingService,
+    /// For Proton's aliases, the Proton account picked; `None` is the first.
+    fwd_proton: Option<String>,
+    /// Proton Pass's extra password, for an account that protects Pass
+    /// with one; cleared once sent.
+    fwd_pass_password: Entity<InputState>,
+    /// The Proton account a Proton Pass sign-in in progress is for, in a
+    /// build with a Pass registration. It takes the same steps as Proton
+    /// Mail's (`proton_login.rs`, sharing its fields and `proton_stage`).
+    fwd_pass_login: Option<String>,
+    /// Pass's extra password, taken from its field when the sign-in began,
+    /// until the aliases are listed with it.
+    fwd_pending_extra: zeroize::Zeroizing<String>,
+    /// The Proton service a Proton Pass sign-in again is for (its dialog).
+    fwd_pass_again: Option<String>,
+    /// Proton services whose Pass session Proton ended (or never had), to
+    /// sign in to Pass again.
+    fwd_pass_expired: HashSet<String>,
     fwd_key: Entity<InputState>,
     fwd_server: Entity<InputState>,
     fwd_note: Entity<InputState>,
@@ -1960,6 +2049,10 @@ pub struct MailApp {
     calendar_url: Entity<InputState>,
     calendar_user: Entity<InputState>,
     calendar_password: Entity<InputState>,
+    /// A calendar feed to subscribe to (`webcal://`, `.ics`), and how often
+    /// it's to be read again (minutes).
+    calendar_feed_url: Entity<InputState>,
+    feed_interval: u32,
     calendar_busy: bool,
     calendar_error: Option<String>,
     event_editing: Option<String>,
@@ -2220,6 +2313,11 @@ impl MailApp {
                 if matches!(event, InputEvent::PressEnter { .. }) {
                     let action = if let Some(Modal::Reconnect(id)) = &this.modal {
                         Action::SubmitReconnect(id.clone())
+                    } else if let Some(Modal::PassSignIn(id)) = &this.modal {
+                        Action::SubmitPassSignIn(id.clone())
+                    } else if this.pass_form_active() {
+                        // Signing in to Proton Pass, in Forwarding settings.
+                        Action::ConnectForwarding
                     } else if this.step == Step::Email {
                         Action::Discover
                     } else {
@@ -2246,6 +2344,7 @@ impl MailApp {
         let filter_inputs = filters::FilterInputs::new(window, cx);
         let org = crate::manage::organize::Organizing::load(&backend.store);
         let org_ui = organize::OrgUi::new(window, cx);
+        let sorting = categories::Sorting::load(&backend.store);
         let find = tools::Find::new(window, cx);
         subscriptions.push(cx.subscribe_in(&find.input, window, |this, _, event, w, cx| {
             match event {
@@ -2322,12 +2421,19 @@ impl MailApp {
         );
         let encrypted = HashSet::new();
         let fwd_key = input(t!("ui-api-key"), true, window, cx);
+        let fwd_pass_password = input(t!("ui-proton-pass-extra-password"), true, window, cx);
         let calendar_url = input("https://caldav.example.com", false, window, cx);
         let calendar_user = input(t!("ui-user-name"), false, window, cx);
         let calendar_password = input(t!("ui-password-or-app-password"), true, window, cx);
         subscriptions.push(cx.subscribe_in(&calendar_password, window, |this, _, event, w, cx| {
             if matches!(event, InputEvent::PressEnter { .. }) {
                 this.handle(Action::ConnectCalendar, w, cx);
+            }
+        }));
+        let calendar_feed_url = input("webcal://example.com/holidays.ics", false, window, cx);
+        subscriptions.push(cx.subscribe_in(&calendar_feed_url, window, |this, _, event, w, cx| {
+            if matches!(event, InputEvent::PressEnter { .. }) {
+                this.handle(Action::SubscribeCalendarFeed, w, cx);
             }
         }));
         let event_title = input(t!("ui-title"), false, window, cx);
@@ -2420,11 +2526,17 @@ impl MailApp {
                 cx.notify();
             }
         }));
-        subscriptions.push(cx.subscribe_in(&fwd_key, window, |this, _, event, w, cx| {
-            if matches!(event, InputEvent::PressEnter { .. }) {
-                this.handle(Action::ConnectForwarding, w, cx);
-            }
-        }));
+        for field in [&fwd_key, &fwd_pass_password] {
+            subscriptions.push(cx.subscribe_in(field, window, |this, _, event, w, cx| {
+                if matches!(event, InputEvent::PressEnter { .. }) {
+                    let action = match &this.modal {
+                        Some(Modal::PassSignIn(id)) => Action::SubmitPassSignIn(id.clone()),
+                        _ => Action::ConnectForwarding,
+                    };
+                    this.handle(action, w, cx);
+                }
+            }));
+        }
         subscriptions.push(cx.subscribe_in(&fwd_note, window, |this, _, event, w, cx| {
             if matches!(event, InputEvent::PressEnter { .. })
                 && let Some(id) = this.fwd_creating.clone()
@@ -2454,6 +2566,7 @@ impl MailApp {
             }
         }));
         subscriptions.push(cx.on_app_quit(|this, cx| {
+            this.discard_pending_drafts();
             this.persist_draft(cx);
             this.save_unsaved_account(cx);
             // Preferences changed just before quitting are still written.
@@ -2732,6 +2845,19 @@ impl MailApp {
             })
             .detach();
         }
+        // Mail a push told of, fetched: listed now.
+        {
+            let mut arrivals = crate::display::notify::arrivals();
+            cx.spawn(async move |this, cx| {
+                use futures::StreamExt;
+                while let Some(account) = arrivals.next().await {
+                    if this.update(cx, |this, cx| this.on_arrival(&account, cx)).is_err() {
+                        break;
+                    }
+                }
+            })
+            .detach();
+        }
         // What later launches (or the system) ask Picacho to open: drawn
         // again, the window takes it.
         {
@@ -2836,6 +2962,9 @@ impl MailApp {
             cache_loading: false,
             status: String::new(),
             undo: None,
+            moves_in_flight: HashMap::new(),
+            discarding: HashSet::new(),
+            undo_after_moves: Vec::new(),
             error: false,
             form,
             service: Service::Other,
@@ -3043,6 +3172,12 @@ impl MailApp {
             summary_error: None,
             scope: fwd::Scope::default(),
             fwd_service: ForwardingService::default(),
+            fwd_proton: None,
+            fwd_pass_password,
+            fwd_pass_login: None,
+            fwd_pending_extra: Default::default(),
+            fwd_pass_again: None,
+            fwd_pass_expired: HashSet::new(),
             fwd_key,
             fwd_server,
             fwd_note,
@@ -3091,6 +3226,8 @@ impl MailApp {
             calendar_url,
             calendar_user,
             calendar_password,
+            calendar_feed_url,
+            feed_interval: crate::sync::feed::DEFAULT_MINUTES,
             calendar_busy: false,
             calendar_error: None,
             event_editing: None,
@@ -3143,12 +3280,18 @@ impl MailApp {
             picker: None,
             picker_subscription: None,
             snoozed: HashMap::new(),
+            snooze_shared: None,
+            follow_ups: HashMap::new(),
+            follow_up_replies: HashMap::new(),
+            follow_ups_checking: false,
+            waiting_open: false,
             waking: HashSet::new(),
             server_search: None,
             filters: HashMap::new(),
             filter_inputs,
             org,
             org_ui,
+            sorting,
             keys_ui: Default::default(),
             thread_counts: HashMap::new(),
             find,
@@ -3170,7 +3313,9 @@ impl MailApp {
             open_listed: None,
         };
         this.update_scope();
+        this.load_looks(cx);
         this.load_snoozed();
+        this.load_follow_ups();
         this.load_unsubscribed();
         this.backfill_subscriptions(cx);
         this.refresh_previews(cx);
@@ -3224,7 +3369,9 @@ impl MailApp {
                     this.watch_inboxes();
                     this.check_due(cx);
                     this.send_due(cx);
+                    this.share_snoozed(cx);
                     this.wake_snoozed(cx);
+                    this.check_follow_ups(cx);
                     this.refresh_aliases_due(views::ALIAS_REFRESH, cx);
                     this.show_due_reminders(cx);
                     this.refresh_jmap_threads(cx);
@@ -3358,12 +3505,52 @@ impl MailApp {
         if window.focused(cx).is_some() {
             window.disable_focus(cx);
         }
-        let cover = self.closing_cover(kind, window);
+        let cover = self.closing_cover(kind, window, cx);
         self.keep_spinning(cx);
         content.child(cover)
     }
+    /// While Picacho draws its own title bar: the bar over the closing
+    /// cover, unblurred, so the window can still be moved, minimized and
+    /// maximized as it closes. Close does nothing more: it is closing.
+    fn closing_titlebar(&self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !window::is_client_decorated(window) {
+            return None;
+        }
+        let c = self.colors();
+        let corners = window::window_corners(window);
+        let bar = div()
+            .id("closing-titlebar")
+            .debug_selector(|| "closing-titlebar".into())
+            .absolute()
+            .top_0()
+            .left_0()
+            .right_0()
+            .h(px(TITLEBAR_HEIGHT))
+            .flex()
+            .items_center()
+            .pl(px(12.))
+            .pr_3()
+            .gap_1()
+            .rounded_tl(corners.top_left)
+            .rounded_tr(corners.top_right)
+            .bg(rgb(c.bg))
+            .border_b_1()
+            .border_color(rgb(c.border))
+            .on_click(window::on_titlebar_double_click)
+            .child(img("brand/picacho.svg").w(px(20.)).h(px(17.)))
+            .child(
+                div()
+                    .ml_1()
+                    .text_size(px(13.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child("Picacho"),
+            )
+            .child(div().flex_1());
+        let bar = window::client_titlebar(bar, c, true, |_, _, _| {}, window, cx);
+        Some(bar.into_any_element())
+    }
     /// The window blurred behind a frosted veil, with what is happening.
-    fn closing_cover(&self, kind: Closing, window: &Window) -> AnyElement {
+    fn closing_cover(&self, kind: Closing, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let c = self.colors();
         let corners = window::window_corners(window);
         let text = match kind {
@@ -3427,7 +3614,7 @@ impl MailApp {
                     .items_center()
                     .justify_center()
                     .gap_4()
-                    .child(icon_el("logo", 44., c.accent))
+                    .child(closing_logo(c.accent, still))
                     .child(
                         div()
                             .flex()
@@ -3442,7 +3629,8 @@ impl MailApp {
                                     .child(text),
                             ),
                     ),
-            );
+            )
+            .children(self.closing_titlebar(window, cx));
         if still {
             return cover.into_any_element();
         }
@@ -3640,6 +3828,9 @@ impl MailApp {
         if self.local_results.is_some() {
             return t!("ui-results-on-this-computer").into();
         }
+        if self.waiting_open {
+            return t!("ui-waiting-for").into();
+        }
         if self.folder != Folder::Other {
             return self.folder.label().into();
         }
@@ -3736,6 +3927,9 @@ impl MailApp {
         let query = Self::value(&self.search, cx).trim().to_lowercase();
         let search =
             crate::manage::search::Search::parse(&query).with_kinds(self.mail_kinds.clone());
+        // Sorted into the inbox's tabs, or searched by category.
+        let sorter = self.sort_listed(search.wants_categories());
+        let search = search.with_sorter(sorter.clone());
         let server = self
             .current_server_search(Self::value(&self.search, cx).trim())
             .filter(|s| !s.running && s.error.is_none())
@@ -3751,8 +3945,15 @@ impl MailApp {
             .and_then(|(_, ids)| ids.clone());
         let (subs_open, scope) = (self.subs_open, &self.scope);
         let extras = &self.thread_extras;
+        // Waiting For lists only the sent mail still waited on.
+        let waited = self.waiting_open.then(|| self.waited_on());
         let keep = |m: &Mail| {
             if extras.contains(&m.id) {
+                return false;
+            }
+            if let Some(waited) = &waited
+                && (m.pending || !waited.contains(&(m.account.clone(), m.message_id.trim().to_owned())))
+            {
                 return false;
             }
             // Placeholders have nothing to match yet; they show only in the
@@ -3784,6 +3985,10 @@ impl MailApp {
         };
         // Matching text is what costs: spread it over the cores.
         self.visible = matching_rows(&self.messages, !query.is_empty(), keep);
+        // A search looks in every tab, as Gmail's does.
+        if let Some(sorter) = sorter.filter(|_| query.is_empty() && self.shows_categories()) {
+            self.keep_tab(&sorter);
+        }
         // Mail a search found on a server is added at the list's end.
         if !query.is_empty() {
             let messages = &self.messages;
@@ -3810,6 +4015,8 @@ impl MailApp {
     /// Requests made while one runs are coalesced into a single follow-up,
     /// spaced out so a running download does not query on every batch.
     fn refresh_counts(&mut self, cx: &mut Context<Self>) {
+        // Mail changed: who is written to may have too.
+        self.load_known(cx);
         if self.counts_running {
             self.counts_again = true;
             return;
@@ -3992,16 +4199,20 @@ impl MailApp {
         known.retain(|m| present.contains(m));
         known.extend(messages.iter().filter(|m| m.unread).map(|m| m.id.clone()));
         let arrived: Vec<Mail> = fresh.iter().map(|m| (*m).clone()).collect();
-        // Blocked, muted and filed away by a rule: not announced.
-        let fresh: Vec<&Mail> = fresh.into_iter().filter(|m| !self.org.silenced(m)).collect();
         // Proton's pushes announce mail for accounts that take them.
-        if first
-            || fresh.is_empty()
-            || !a.sync.notify
-            || a.pushes_new_mail()
-            || self.active
-            || self.retired
-        {
+        if first || !a.sync.notify || a.pushes_new_mail() || self.active || self.retired {
+            return arrived;
+        }
+        // Blocked, muted and filed away by a rule: not announced; nor,
+        // where only Primary is, mail sorted into another tab. Only asked
+        // when it would be announced: deciding the tab looks at the whole
+        // message (with the category model, where it's on), which for the
+        // first check's unread mail held up the window at launch.
+        let fresh: Vec<&Mail> = fresh
+            .into_iter()
+            .filter(|m| !self.org.silenced(m) && self.announces(m))
+            .collect();
+        if fresh.is_empty() {
             return arrived;
         }
         if let Some(latest) = fresh.iter().max_by_key(|m| m.date) {
@@ -4396,6 +4607,7 @@ impl MailApp {
     fn show_mailbox_instead(&mut self, mailbox: Mailbox, cx: &mut Context<Self>) {
         self.load_generation += 1;
         self.subs_open = false;
+        self.waiting_open = false;
         self.leave_summary();
         self.folder = mailbox.folder();
         self.remote = match mailbox {
@@ -4748,6 +4960,20 @@ impl MailApp {
                 None => {}
             }
         }
+        // Sent mail: be reminded if nobody replies, or stop waiting.
+        if self.follow_up_of(m).is_some() {
+            entries.push(entry(
+                t!("ui-stop-waiting-for-a-reply"),
+                "close",
+                Action::StopWaiting(m.account.clone(), m.message_id.trim().to_owned()),
+            ));
+        } else if m.folder == Folder::Sent && !m.message_id.trim().is_empty() {
+            entries.push(entry(
+                t!("ui-remind-me-if-no-reply-2"),
+                "waiting",
+                Action::FollowUpMenu(m.id.clone()),
+            ));
+        }
         entries.extend(
             self.move_folder_entry(t!("ui-move-to-folder-2"), MoveTarget::Mail(ids.clone())),
         );
@@ -4795,6 +5021,7 @@ impl MailApp {
                 Action::SearchFor(search_term("reply-to", &email)),
             ));
         }
+        entries.extend(self.cat_entries(m));
         entries.extend(self.org_entries(m));
         entries
     }
@@ -4819,6 +5046,7 @@ impl MailApp {
             self.oldest_first,
             Action::OldestFirst(true),
         ));
+        entries.extend(self.cat_filter_entries());
         entries.extend(self.org_filter_entries());
         entries
     }
@@ -4839,7 +5067,7 @@ impl MailApp {
         self.status = text.into();
         self.error = error;
         // A notice offering Undo stays long enough to reach for it.
-        let shown = if undo.is_some() { 8 } else { 4 };
+        let shown = if undo.is_some() { UNDO_SHOWN.as_secs() } else { 4 };
         self.undo = undo;
         self.notice_generation += 1;
         if !error {
@@ -5210,6 +5438,7 @@ impl MailApp {
         Self::set(&self.unlock_input, "", w, cx);
         self.local_results = None;
         self.subs_open = false;
+        self.waiting_open = false;
         self.app_view = None;
         self.leave_summary();
         self.subs_sender = None;
@@ -5235,6 +5464,7 @@ impl MailApp {
         self.wanted_rows.clear();
         self.unfillable.clear();
         self.filter_by = Filter::All;
+        self.sorting.tab = self.sorting.default_tab();
         Self::set(&self.search, "", w, cx);
         self.search_open = false;
         self.server_search = None;
@@ -5340,7 +5570,8 @@ impl MailApp {
     /// of several accounts, only the accounts whose mail changed are listed
     /// again and put in place of theirs; the others' mail stays.
     fn reload_if_changed(&mut self, cx: &mut Context<Self>) {
-        if self.subs_open || self.summary_open || self.account.is_none() {
+        // Waiting For lists itself whole.
+        if self.subs_open || self.summary_open || self.waiting_open || self.account.is_none() {
             self.reload_cached(cx);
             return;
         }
@@ -5400,7 +5631,9 @@ impl MailApp {
                     return;
                 }
                 match result {
-                    Ok(ds) => {
+                    Ok(mut ds) => {
+                        // Deleted, while Undo is offered.
+                        ds.retain(|d| !this.discarding.contains(&d.id));
                         this.drafts = ds;
                         this.messages = this
                             .drafts
@@ -5512,9 +5745,10 @@ impl MailApp {
         let open = self.account.as_deref() == Some(target.account.as_str())
             && self.mailbox() == target.mailbox
             && !self.subs_open
-            && !self.summary_open;
+            && !self.summary_open
+            && !self.waiting_open;
         if !open {
-            self.open_mailbox(Some(target.account), target.mailbox, w, cx);
+            self.open_mailbox(Some(target.account.clone()), target.mailbox, w, cx);
         }
         self.open_listed = None;
         if let Some(message) = target.message {
@@ -5529,15 +5763,90 @@ impl MailApp {
                     self.read_generation += 1;
                 }
                 let until = std::time::Instant::now() + NOTIFIED_WAIT;
-                self.open_listed = Some((self.load_generation, message, until));
+                self.open_listed = Some((self.load_generation, message.clone(), until));
                 if open {
                     self.refresh(cx);
                 }
+                self.fetch_notified(&target.account, message, w, cx);
             }
         }
         if self.mobile.on {
             self.mobile.mailboxes = false;
             self.mobile_pushed(cx);
+        }
+        cx.notify();
+    }
+    /// Mail a push announced is in the cache (`notify::arrived`): the list
+    /// shows it, if it shows the account's mail, and a tapped notification
+    /// waiting for it opens it.
+    fn on_arrival(&mut self, account: &str, cx: &mut Context<Self>) {
+        if self.retired || !self.accounts.iter().any(|a| a.id == account) {
+            return;
+        }
+        if self.shows(account) {
+            self.reload_if_changed(cx);
+        }
+        self.refresh_counts(cx);
+    }
+    /// A tapped notification's message isn't listed yet: it's looked for
+    /// in the cache, or fetched (`Backend::fetch_notified`), and opened as
+    /// soon as it's there, rather than only when a check lists it (which
+    /// left the person in the inbox).
+    fn fetch_notified(&mut self, account: &str, message: String, w: &mut Window, cx: &mut Context<Self>) {
+        let Some(a) = self.accounts.iter().find(|a| a.id == account).cloned() else {
+            return;
+        };
+        let backend = self.backend.clone();
+        let wanted = message.clone();
+        cx.spawn_in(w, async move |this, cx| {
+            let found = cx
+                .background_executor()
+                .spawn(async move { backend.fetch_notified(&a, &wanted) })
+                .await;
+            let Ok(Some(found)) = found else {
+                return;
+            };
+            let _ = this.update_in(cx, |this, w, cx| this.show_notified(&message, found, w, cx));
+        })
+        .detach();
+    }
+    /// Opens `found`, the message a tapped notification told of (`asked`,
+    /// as the notification named it), if it's still waited for: in the
+    /// list when it belongs there, else in its own mailbox.
+    fn show_notified(&mut self, asked: &str, found: Mail, w: &mut Window, cx: &mut Context<Self>) {
+        let waited = self
+            .open_listed
+            .as_ref()
+            .is_some_and(|(generation, message, until)| {
+                *generation == self.load_generation
+                    && message == asked
+                    && std::time::Instant::now() <= *until
+            });
+        if !waited || self.selected.is_some() {
+            return;
+        }
+        let listed = self.messages.iter().any(|m| m.id == found.id && !m.pending);
+        let belongs = self.shows(&found.account)
+            && (self.folder == Folder::All || found.mailbox() == self.mailbox());
+        if !listed && !belongs {
+            // Filed elsewhere (a filter, a rule): its own mailbox opens,
+            // and it opens once listed there.
+            let until = std::time::Instant::now() + NOTIFIED_WAIT;
+            self.open_mailbox(Some(found.account.clone()), found.mailbox(), w, cx);
+            self.open_listed = Some((self.load_generation, found.id, until));
+            return;
+        }
+        if !listed {
+            self.messages.retain(|m| m.id != found.id);
+            self.messages.push(found.clone());
+            self.messages.sort_by(Mail::newest_first);
+            self.filter(cx);
+        }
+        if self.open_listed_message(&found.id, cx) {
+            self.open_listed = None;
+            if self.mobile.on {
+                self.mobile_pushed(cx);
+            }
         }
         cx.notify();
     }
@@ -5823,18 +6132,50 @@ impl MailApp {
                 None => groups.push((a, vec![m])),
             }
         }
+        // A move says so at once, with Undo, rather than once the server
+        // has done it: on a phone, a swipe's toast came seconds later (or
+        // not at all, another notice having taken its place). Undo pressed
+        // before the server is done waits for it (`undo`).
+        let destination = groups
+            .first()
+            .and_then(|(a, _)| self.destination_label(&a.id, &change));
+        if let Some(to) = destination {
+            let count: usize = groups.iter().map(|(_, ms)| ms.len()).sum();
+            let moved = groups
+                .iter()
+                .map(|(a, ms)| {
+                    let moved = ms
+                        .iter()
+                        .map(|before| Moved { before: before.clone(), change: change.clone() })
+                        .collect();
+                    (a.id.clone(), moved)
+                })
+                .collect();
+            self.notice_undo(
+                t!("ui-moved-messages-to", count = count, to = to),
+                Undo::Moves(moved),
+                cx,
+            );
+        }
         for (a, before) in groups {
             let generation = self.load_generation;
-            let count = before.len();
             let sent = before.clone();
             let account_id = a.id.clone();
             let change = change.clone();
             let sending = change.clone();
-            let undoable = before.clone();
+            let moving = change.moves();
+            if moving {
+                *self.moves_in_flight.entry(account_id.clone()).or_default() += 1;
+            }
+            let moved_ids: HashSet<String> = before.iter().map(|m| m.id.clone()).collect();
             self.task(
                 cx,
                 move |b| b.change_many(&a, &sent, sending),
                 move |this, result, cx| {
+                    if moving {
+                        let failed = if result.is_ok() { None } else { Some(&moved_ids) };
+                        this.move_landed(&account_id, failed, cx);
+                    }
                     this.refresh_counts(cx);
                     this.account_result(&account_id, IssueSource::Change, &result);
                     match result {
@@ -5842,17 +6183,6 @@ impl MailApp {
                             // Moved mail has new identities in its new mailbox.
                             if change.moves() && this.folder == Folder::All {
                                 this.reload_cached(cx);
-                            }
-                            if let Some(to) = this.destination_label(&account_id, &change) {
-                                let moved = undoable
-                                    .into_iter()
-                                    .map(|before| Moved { before, change: change.clone() })
-                                    .collect();
-                                this.notice_undo(
-                                    t!("ui-moved-messages-to", count = count, to = to),
-                                    Undo::Moves(account_id.clone(), moved),
-                                    cx,
-                                );
                             }
                         }
                         Err(_) => {
@@ -5885,13 +6215,15 @@ impl MailApp {
                     self.wake_account(a, message_ids, cx);
                 }
             }
-            Undo::Moves(account, moved) => {
-                let Some(a) = self.accounts.iter().find(|a| a.id == account).cloned() else {
-                    return;
-                };
+            Undo::Draft(id) => {
+                if self.discarding.remove(&id) && self.folder == Folder::Drafts {
+                    self.load_drafts(cx);
+                }
+            }
+            Undo::Moves(groups) => {
                 // Back in the list at once; the server catches up.
                 let mailbox = self.mailbox();
-                for m in &moved {
+                for m in groups.iter().flat_map(|(_, moved)| moved) {
                     if (self.folder == Folder::All || m.before.mailbox() == mailbox)
                         && !self.messages.iter().any(|x| x.id == m.before.id)
                     {
@@ -5900,30 +6232,111 @@ impl MailApp {
                 }
                 self.messages.sort_by(Mail::newest_first);
                 self.filter(cx);
-                let count = moved.len();
-                let account_id = a.id.clone();
-                self.task(
-                    cx,
-                    move |b| b.undo_move(&a, &moved),
-                    move |this, result, cx| {
-                        this.account_result(&account_id, IssueSource::Change, &result);
-                        match result {
-                            Ok(_) => this.notice(
-                                t!("ui-moved-messages-back", count = count),
-                                false,
-                                cx,
-                            ),
-                            Err(e) => {
-                                this.notice(t!("ui-couldnt-undo", e = format!("{:#}", e)), true, cx)
-                            }
-                        }
-                        this.reload_cached(cx);
-                        this.refresh_counts(cx);
-                    },
-                );
+                for (account, moved) in groups {
+                    // The move itself is still on its way to the server:
+                    // undone once it's there (`move_landed`).
+                    if self.moves_in_flight.get(&account).is_some_and(|n| *n > 0) {
+                        self.undo_after_moves.push((account, moved));
+                    } else {
+                        self.undo_moves(&account, moved, cx);
+                    }
+                }
             }
         }
         cx.notify();
+    }
+    /// Discards draft `id` (here, and at its server at the next draft sync).
+    fn discard_draft_now(&mut self, id: &str, cx: &mut Context<Self>) {
+        let account = self
+            .backend
+            .store
+            .draft(id)
+            .ok()
+            .flatten()
+            .map(|d| d.account);
+        // After its saves, in order (`composer::queue_draft_write`).
+        let backend = self.backend.clone();
+        let gone = id.to_owned();
+        drop(composer::queue_draft_write(move || backend.discard_draft(&gone)));
+        if self.folder == Folder::Drafts {
+            self.load_drafts(cx);
+        }
+        if let Some(account) = account {
+            self.sync_drafts_soon(&account, cx);
+        }
+    }
+    /// Drafts deleted whose Undo is still offered are discarded now: Picacho
+    /// is quitting.
+    fn discard_pending_drafts(&mut self) {
+        for id in std::mem::take(&mut self.discarding) {
+            let backend = self.backend.clone();
+            drop(composer::queue_draft_write(move || backend.discard_draft(&id)));
+        }
+    }
+    /// Moves `moved` (of `account`) back where they were, at the server.
+    fn undo_moves(&mut self, account: &str, moved: Vec<Moved>, cx: &mut Context<Self>) {
+        let Some(a) = self.accounts.iter().find(|a| a.id == account).cloned() else {
+            return;
+        };
+        let count = moved.len();
+        let account_id = a.id.clone();
+        self.task(
+            cx,
+            move |b| b.undo_move(&a, &moved),
+            move |this, result, cx| {
+                this.account_result(&account_id, IssueSource::Change, &result);
+                match result {
+                    Ok(_) => this.notice(t!("ui-moved-messages-back", count = count), false, cx),
+                    Err(e) => this.notice(t!("ui-couldnt-undo", e = format!("{:#}", e)), true, cx),
+                }
+                this.reload_cached(cx);
+                this.refresh_counts(cx);
+            },
+        );
+    }
+    /// One of `account`'s moves reached the server, or failed (`failed`:
+    /// the messages it was to move). Once none is on its way, Undo pressed
+    /// meanwhile moves the mail back; mail that never moved has nothing to
+    /// undo, and the notice offering it no longer does.
+    fn move_landed(&mut self, account: &str, failed: Option<&HashSet<String>>, cx: &mut Context<Self>) {
+        let left = match self.moves_in_flight.get_mut(account) {
+            Some(n) => {
+                *n = n.saturating_sub(1);
+                *n
+            }
+            None => 0,
+        };
+        if left == 0 {
+            self.moves_in_flight.remove(account);
+        }
+        if let Some(failed) = failed {
+            let unmoved = |groups: &mut Vec<(String, Vec<Moved>)>| {
+                for (a, moved) in groups.iter_mut() {
+                    if a == account {
+                        moved.retain(|m| !failed.contains(&m.before.id));
+                    }
+                }
+                groups.retain(|(_, moved)| !moved.is_empty());
+            };
+            unmoved(&mut self.undo_after_moves);
+            if let Some(Undo::Moves(groups)) = &mut self.undo {
+                unmoved(groups);
+                if groups.is_empty() {
+                    self.undo = None;
+                    self.status.clear();
+                }
+            }
+        }
+        if left > 0 {
+            return;
+        }
+        let (waiting, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut self.undo_after_moves)
+            .into_iter()
+            .partition(|(a, _)| a == account);
+        self.undo_after_moves = rest;
+        for (account, moved) in waiting {
+            self.undo_moves(&account, moved, cx);
+        }
     }
     /// Where a move puts an account's mail, as the sidebar names it.
     pub(super) fn destination_label(&self, account: &str, change: &Change) -> Option<String> {
@@ -7361,16 +7774,29 @@ impl MailApp {
                 self.new_compose(mode, w, cx);
             }
             Action::DeleteDraft(id) => {
-                let account = self.drafts.iter().find(|d| d.id == id).map(|d| d.account.clone());
-                // After its saves, in order (`composer::queue_draft_write`).
-                let backend = self.backend.clone();
-                let gone = id.clone();
-                drop(composer::queue_draft_write(move || backend.discard_draft(&gone)));
+                // Gone from the list at once, with Undo; discarded once
+                // Undo is no longer offered (a swipe in Drafts deleted it
+                // for good at once).
                 self.drop_composer_for_draft(&id, cx);
-                self.load_drafts(cx);
-                if let Some(account) = account {
-                    self.sync_drafts_soon(&account, cx);
+                self.discarding.insert(id.clone());
+                self.drafts.retain(|d| d.id != id);
+                if self.folder == Folder::Drafts {
+                    self.messages.retain(|m| m.id != id);
+                    if self.selected.as_ref() == Some(&id) {
+                        self.selected = None;
+                    }
+                    self.filter(cx);
                 }
+                self.notice_undo(t!("ui-draft-deleted"), Undo::Draft(id.clone()), cx);
+                cx.spawn(async move |this, cx| {
+                    cx.background_executor().timer(UNDO_SHOWN + Duration::from_millis(500)).await;
+                    let _ = this.update(cx, |this, cx| {
+                        if this.discarding.remove(&id) {
+                            this.discard_draft_now(&id, cx);
+                        }
+                    });
+                })
+                .detach();
             }
             Action::MarkAllRead(id, mailbox) => self.mark_all_read(id, mailbox, cx),
             Action::ExportMailbox(id, mailbox) => self.export_mailbox(id, mailbox, cx),
@@ -7387,6 +7813,8 @@ impl MailApp {
             | Action::CancelContactEdit
             | Action::RemoveContact(_)
             | Action::ConnectJmapContacts(_)
+            | Action::SyncContactsSource(_)
+            | Action::RemoveContactsSource(_)
             | Action::CreateAddressBook
             | Action::ListAddressBooks
             | Action::SearchServerContacts
@@ -7443,6 +7871,11 @@ impl MailApp {
             | Action::DeleteEvent(_)
             | Action::EventAlarm(_)
             | Action::ConnectJmapCalendar(_)
+            | Action::SubscribeCalendarFeed
+            | Action::NewFeedInterval(_)
+            | Action::FeedInterval(..)
+            | Action::SyncCalendarSource(_)
+            | Action::RemoveCalendarSource(_)
             | Action::CreateCalendar
             | Action::RenameCalendar(_)
             | Action::DeleteCalendar(_)
@@ -8119,6 +8552,8 @@ impl MailApp {
             Action::SetUnderstandDates(on) => self.set_understand_dates(on, cx),
             Action::SetFindParcels(on) => self.set_find_parcels(on, cx),
             Action::SetSuggestReplies(on) => self.set_suggest_replies(on, cx),
+            Action::SetSortAi(on) => self.set_sort_ai(on, cx),
+            Action::ForgetSortLearning => self.forget_sort_learning(cx),
             Action::SmartReply(intent) => self.smart_reply(intent, w, cx),
             Action::SmartReplyMenu(intent) => {
                 let entries = vec![entry(
@@ -8485,10 +8920,22 @@ impl MailApp {
             Action::SetComposeOptions(options) => self.save_compose_options(options, cx),
             Action::SetAllMail(on) => self.set_all_mail(on, cx),
             Action::ForwardingService(service) => {
+                if service != self.fwd_service && self.fwd_pass_login.is_some() {
+                    self.drop_proton_login(cx);
+                }
                 self.fwd_service = service;
                 self.fwd_error = None;
             }
+            Action::ForwardingProtonAccount(id) => {
+                if self.fwd_pass_login.as_ref().is_some_and(|p| *p != id) {
+                    self.drop_proton_login(cx);
+                }
+                self.fwd_proton = Some(id);
+                self.fwd_error = None;
+            }
             Action::ConnectForwarding => self.connect_forwarding(w, cx),
+            Action::PassSignIn(id) => self.open_pass_sign_in(id, w, cx),
+            Action::SubmitPassSignIn(id) => self.submit_pass_sign_in(id, w, cx),
             Action::RefreshAliases(id) => self.refresh_aliases(id, false, cx),
             Action::RemoveForwarding(id) => self.remove_forwarding(id, cx),
             Action::SetDeliverTo(id, to) => {
@@ -8597,7 +9044,10 @@ impl MailApp {
             Action::AddForwarding => {
                 self.fwd_adding = !self.fwd_adding;
                 self.fwd_error = None;
-                if self.fwd_adding {
+                if !self.fwd_adding && self.fwd_pass_login.is_some() {
+                    self.drop_proton_login(cx);
+                }
+                if self.fwd_adding && !self.fwd_service.uses_proton_account() {
                     self.fwd_key.update(cx, |s, cx| s.focus(w, cx));
                 }
             }
@@ -8610,6 +9060,9 @@ impl MailApp {
             Action::Undo => self.undo(cx),
             Action::SnoozeMenu(ids) => self.snooze_menu(ids, w, cx),
             Action::Unsnooze(account, message_id) => self.unsnooze(account, message_id, cx),
+            Action::FollowUpMenu(id) => self.follow_up_menu(id, w, cx),
+            Action::StopWaiting(account, message_id) => self.stop_waiting(account, message_id, cx),
+            Action::OpenWaiting(id) => self.open_waiting(id, w, cx),
             Action::SearchServer => self.search_server(cx),
             Action::ClearServerSearch => {
                 self.server_search = None;
@@ -8618,6 +9071,7 @@ impl MailApp {
             Action::Receipt(id, send) => self.answer_receipt(id, send, cx),
             Action::Filters(action) => self.filter_action(action, w, cx),
             Action::Organize(action) => self.org_action(action, w, cx),
+            Action::Categories(action) => self.cat_action(action, w, cx),
             Action::Tools(action) => self.tool_action(action, w, cx),
             Action::Keys(action) => self.key_action(action, cx),
             Action::Templates(action) => self.template_action(action, w, cx),
@@ -9257,7 +9711,8 @@ impl MailApp {
         let active = self.account.as_deref() == Some(account)
             && self.mailbox() == mailbox
             && !self.subs_open
-            && !self.summary_open;
+            && !self.summary_open
+            && !self.waiting_open;
         let count = self.unread_for(account, &mailbox);
         let entries = self.mailbox_entries(account, mailbox.clone());
         let action = Action::OpenMailbox(account.to_owned(), mailbox.clone());
@@ -9837,6 +10292,15 @@ impl MailApp {
             } else {
                 (Some("search"), t!("ui-no-results").into(), None)
             }
+        } else if self.waiting_open
+            && !self.cache_loading
+            && self.account.as_deref().is_some_and(|id| self.waiting_counts(id).0 == 0)
+        {
+            (
+                Some("waiting"),
+                t!("ui-nothing-waiting-for-a-reply").into(),
+                Some(t!("ui-nothing-waiting-for-a-reply-detail").into()),
+            )
         } else if loading {
             let detail = if self.cache_loading && fetching.is_empty() {
                 t!("ui-reading-mail-saved-on-this-computer").to_owned()
@@ -9858,6 +10322,10 @@ impl MailApp {
             )
         } else if self.filter_by != Filter::All {
             (Some("filter"), t!("ui-no-matching-mail").into(), None)
+        } else if self.shows_categories() && !self.messages.is_empty() {
+            // The inbox has mail, in other tabs.
+            let (icon, title, detail) = self.empty_tab();
+            (Some(icon), title, detail)
         } else if self.folder == Folder::Drafts {
             (Some("compose"), t!("ui-no-drafts").into(), None)
         } else {
@@ -10088,6 +10556,7 @@ impl MailApp {
                         .into_any_element()
                     }),
             );
+        header = header.children(self.category_tabs(cx));
         if self.search_open {
             header = header.child(
                 div()
@@ -10552,6 +11021,7 @@ impl MailApp {
                                     })
                                     .child(self.hide_codes(m, &m.subject).into_owned()),
                             )
+                            .children(self.row_category(m, 10.))
                             .child(self.row_marks(index, m))
                             // Replied to, forwarded (here or in other apps)
                             // and snoozed.
@@ -10559,6 +11029,11 @@ impl MailApp {
                             .when(m.forwarded, |d| d.child(icon_el("forwarded", 13., c.muted)))
                             .when(self.snoozed_until(m).is_some(), |d| {
                                 d.child(icon_el("snooze", 13., c.accent))
+                            })
+                            // Waited on for a reply: overdue ones warn.
+                            .when_some(self.follow_up_of(m), |d, f| {
+                                let overdue = f.overdue(chrono::Utc::now().timestamp());
+                                d.child(icon_el("waiting", 13., if overdue { c.danger } else { c.accent }))
                             })
                             .when(m.has_attachments(), |d| {
                                 d.child(icon_el("paperclip", 13., c.muted))
@@ -11232,23 +11707,8 @@ impl MailApp {
             .pt_2()
             .child(self.about_heading())
             .child(
-                div().mt_6().w_full().child(
-                    self.button(
-                        "about-shortcuts",
-                        t!("ui-keyboard-shortcuts"),
-                        "keyboard",
-                        Action::Help,
-                        false,
-                        cx,
-                    )
-                    .w_full()
-                    .border_1()
-                    .border_color(rgb(c.border)),
-                ),
-            )
-            .child(
                 div()
-                    .mt_4()
+                    .mt_6()
                     .flex()
                     .items_center()
                     .justify_center()
@@ -11993,7 +12453,9 @@ impl MailApp {
             Modal::AliasGone(..) => t!("ui-alias-no-longer-exists"),
             Modal::Snooze(ids) if ids.len() > 1 => t!("ui-snooze-messages"),
             Modal::Snooze(_) => t!("ui-snooze-3"),
+            Modal::FollowUp(_) => t!("ui-remind-me-if-no-reply"),
             Modal::LinkWarning(_) => t!("ui-check-this-link"),
+            Modal::PassSignIn(_) => t!("ui-sign-in-to-proton-pass"),
         };
         let content = match modal {
             Modal::Connect => self.setup_view(cx),
@@ -12008,7 +12470,9 @@ impl MailApp {
             Modal::AvatarPresets(id) => self.presets_modal(id, cx),
             Modal::AliasGone(why, from) => self.alias_gone_modal(why, from),
             Modal::Snooze(_) => self.snooze_modal(),
+            Modal::FollowUp(_) => self.follow_up_modal(),
             Modal::LinkWarning(url) => self.link_warning_modal(url),
+            Modal::PassSignIn(id) => self.pass_sign_in_form(id, cx),
         };
         // Dialogs are laid out inside the window's frame, which is smaller
         // than the window while Picacho draws its own decorations.
@@ -12023,7 +12487,7 @@ impl MailApp {
             .w(px(match modal {
                 Modal::Connect => 680.,
                 Modal::AvatarPresets(_) => 560.,
-                Modal::Snooze(_) => 600.,
+                Modal::Snooze(_) | Modal::FollowUp(_) => 600.,
                 Modal::RemoveAccount(_)
                 | Modal::DeleteFolder(..)
                 | Modal::Erase(_)
@@ -12031,7 +12495,8 @@ impl MailApp {
                 | Modal::Reconnect(_)
                 | Modal::About
                 | Modal::AliasGone(..)
-                | Modal::LinkWarning(_) => 400.,
+                | Modal::LinkWarning(_)
+                | Modal::PassSignIn(_) => 400.,
                 Modal::Settings | Modal::Original => 820.,
             }))
             .max_w(available_width)
@@ -12091,7 +12556,7 @@ impl MailApp {
                 // the original source scrolls its own lines.
                 // A phone's picker keeps its own buttons in view and
                 // scrolls only what is between them.
-                Modal::Snooze(_) if self.mobile.on => div()
+                Modal::Snooze(_) | Modal::FollowUp(_) if self.mobile.on => div()
                     .flex_1()
                     .min_h_0()
                     .w_full()
@@ -12167,7 +12632,7 @@ impl MailApp {
             .flex()
             .items_center()
             .gap_2();
-        if matches!(modal, Modal::Connect | Modal::Settings | Modal::Snooze(_)) {
+        if matches!(modal, Modal::Connect | Modal::Settings | Modal::Snooze(_) | Modal::FollowUp(_)) {
             // These carry their own buttons.
             return self.modal_frame(panel, window);
         } else if let Modal::LinkWarning(url) = modal {
@@ -12295,6 +12760,35 @@ impl MailApp {
                     true,
                     cx,
                 ));
+        } else if let Modal::PassSignIn(id) = modal {
+            // As signing in to a Proton Mail account again: Back past the
+            // password, and the step's own button.
+            footer = footer.child(div().flex_1());
+            if self.proton_stage.is_some() {
+                footer = footer.child(self.button(
+                    "pass-sign-in-back",
+                    if self.connecting { t!("ui-cancel") } else { t!("ui-back") },
+                    "",
+                    Action::ProtonBack,
+                    false,
+                    cx,
+                ));
+            }
+            let label = if self.fwd_busy.contains(&format!("pass:{id}")) {
+                Some(t!("proton-login-signing-in"))
+            } else {
+                self.proton_submit_label()
+            };
+            if let Some(label) = label {
+                footer = footer.child(self.button(
+                    "pass-sign-in-submit",
+                    label,
+                    "",
+                    Action::SubmitPassSignIn(id.clone()),
+                    true,
+                    cx,
+                ));
+            }
         } else if let Modal::Reconnect(id) = modal {
             footer = footer.child(div().flex_1());
             if self.sign_in_retry && !self.connecting {
@@ -12424,6 +12918,7 @@ impl Render for MailApp {
         self.apply_pending_place(window, cx);
         self.apply_pending_new_alias(window, cx);
         self.apply_pending_listed(cx);
+        self.sort_in_background(cx);
         if !self.lock.locked
             && let Some(link) = self.pending_link.take()
         {
@@ -13042,6 +13537,10 @@ const CLOSING_FADE: Duration = Duration::from_millis(160);
 /// How much the closing cover blurs the window: the Gaussian's standard
 /// deviation, in logical pixels.
 const CLOSING_BLUR: f32 = 14.;
+/// How long a notice offering Undo shows.
+const UNDO_SHOWN: Duration = Duration::from_secs(8);
+/// One breath of the closing cover's logo.
+const CLOSING_BREATH: Duration = Duration::from_millis(1400);
 /// The least time the closing cover shows, so it's seen rather than a
 /// flicker when there's nothing to wait for.
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -13108,6 +13607,24 @@ fn spinner(size: f32, color: u32) -> impl IntoElement {
         .with_transformation(Transformation::rotate(percentage(
             step as f32 / SPIN_STEPS as f32,
         )))
+}
+/// The closing cover's logo: it breathes (fades gently in and out) while
+/// Picacho closes, still where motion is reduced.
+fn closing_logo(color: u32, still: bool) -> AnyElement {
+    let logo = icon_el("logo", 44., color);
+    if still {
+        return logo.into_any_element();
+    }
+    logo.with_animation(
+        "closing-logo",
+        Animation::new(CLOSING_BREATH).repeat(),
+        |d, t| {
+            // 1 at the start and end of each breath, dimmest halfway.
+            let dip = 0.5 - 0.5 * (t * std::f32::consts::TAU).cos();
+            d.opacity(1. - 0.45 * dip)
+        },
+    )
+    .into_any_element()
 }
 fn folder_icon(f: Folder) -> &'static str {
     match f {
@@ -13208,6 +13725,7 @@ fn icon_el(name: &str, size: f32, color: u32) -> Div {
         "receipt",
         "tag",
         "snooze",
+        "waiting",
         "answered",
         "forwarded",
         "keyboard",
@@ -13218,6 +13736,9 @@ fn icon_el(name: &str, size: f32, color: u32) -> Div {
         "template",
         "fingerprint",
         "face-id",
+        "people",
+        "plane",
+        "bank",
     ]
     .contains(&name)
     {
@@ -13505,6 +14026,7 @@ pub fn new_backend(store: Arc<Store>) -> Arc<Backend> {
     );
     let settings = store.clone();
     let backend = Arc::new(Backend::new(store));
+    let fetching = Arc::downgrade(&backend);
     backend.on_proton_notice(|a, title, body| {
         if a.sync.notify {
             crate::display::notify::account_notice(&a.email, &a.id, title, body);
@@ -13516,6 +14038,21 @@ pub fn new_backend(store: Arc<Store>) -> Arc<Backend> {
             sender,
             subject,
         } => {
+            // The push comes before the mail is synced: fetched now (off
+            // the push's thread), it's in the inbox by the time the
+            // notification is tapped, which then opens it rather than
+            // waiting for the next check.
+            let (backend, account, id) = (fetching.clone(), a.clone(), message.to_owned());
+            let _ = std::thread::Builder::new()
+                .name("proton-pushed-mail".into())
+                .spawn(move || {
+                    let Some(backend) = backend.upgrade() else {
+                        return;
+                    };
+                    if matches!(backend.fetch_notified(&account, &id), Ok(Some(_))) {
+                        crate::display::notify::arrived(&account.id);
+                    }
+                });
             // With codes hidden, a pushed subject never shows one (on the
             // lock screen): those the model finds in it, or, where it can't
             // load, every string shaped like a code, are hidden.
@@ -13539,7 +14076,11 @@ pub fn new_backend(store: Arc<Store>) -> Arc<Backend> {
                 subject: subject.to_owned(),
                 ..Default::default()
             };
-            if org.silenced(&pushed) {
+            // Only Primary's announced: what the sender and subject say.
+            let categories = crate::manage::categories::Categorizing::load(&settings);
+            if org.silenced(&pushed)
+                || !categories.announces(&pushed, &crate::manage::categories::Known::default())
+            {
                 return;
             }
             crate::display::notify::new_mail(&a.email, &a.id, message, &[message], (sender, subject), 1)
@@ -13647,6 +14188,8 @@ fn start(app: Application, open: impl FnOnce(&mut App) + 'static) {
         gpui_component::init(cx);
         prompt::install(cx);
         shortcuts::save_base(cx);
+        #[cfg(target_os = "linux")]
+        stalls::start(cx);
         cx.on_action(|_: &Hide, cx| cx.hide());
         cx.on_action(|_: &HideOthers, cx| cx.hide_other_apps());
         cx.on_action(|_: &ShowAll, cx| cx.unhide_other_apps());
@@ -14019,6 +14562,134 @@ mod tests {
         cx.run_until_parked();
         (app.unwrap(), cx)
     }
+    /// Times what the window does on its own thread with a real cache
+    /// (`PICACHO_BENCH_DIR`, a copy of a data folder; run offline). Not a
+    /// check: `cargo test --release bench_window_thread -- --ignored --nocapture`.
+    #[gpui::test]
+    #[ignore]
+    fn bench_window_thread(cx: &mut TestAppContext) {
+        let Some(dir) = std::env::var_os("PICACHO_BENCH_DIR") else {
+            return;
+        };
+        let store = Arc::new(Store::open(std::path::Path::new(&dir)).unwrap());
+        let t = std::time::Instant::now();
+        let (view, cx) = open(store, cx);
+        eprintln!("BENCH open+parked {:?}", t.elapsed());
+        let time = |label: &str, view: &Entity<MailApp>, cx: &mut VisualTestContext, f: &dyn Fn(&mut MailApp, &mut Context<MailApp>)| {
+            let mut best = Duration::MAX;
+            for _ in 0..3 {
+                let t = std::time::Instant::now();
+                view.update(cx, |this, cx| f(this, cx));
+                best = best.min(t.elapsed());
+            }
+            eprintln!("BENCH {label:<28} {best:?}");
+        };
+        let n = view.read_with(cx, |this, _| (this.messages.len(), this.visible.len(), this.account.clone()));
+        eprintln!("BENCH listed {n:?}");
+        let t = std::time::Instant::now();
+        frame(cx);
+        eprintln!("BENCH frame {:?}", t.elapsed());
+        time("apply_filter", &view, cx, &|this, cx| this.apply_filter(cx));
+        time("sort_listed", &view, cx, &|this, _| drop(this.sort_listed(false)));
+        time("organize_rows", &view, cx, &|this, _| this.organize_rows());
+        view.update(cx, |this, _| this.sorting.tab = categories::Tab::Is(crate::manage::categories::Category::Primary));
+        time("apply_filter (Primary tab)", &view, cx, &|this, cx| this.apply_filter(cx));
+        let shown = view.read_with(cx, |this, _| this.visible.len());
+        eprintln!("BENCH primary rows {shown}");
+        view.update(cx, |this, _| this.sorting.tab = categories::Tab::All);
+        time("set_messages(clone)", &view, cx, &|this, cx| {
+            let ms = this.messages.clone();
+            this.set_messages(ms, cx)
+        });
+        time("clone messages", &view, cx, &|this, _| drop(this.messages.clone()));
+        time("with_readable_previews", &view, cx, &|this, _| {
+            drop(this.backend.with_readable_previews(this.messages.clone()))
+        });
+        time("replace_account_lists", &view, cx, &|this, cx| {
+            let Some(first) = this.scope.accounts.first().cloned() else { return };
+            let mine: Vec<Mail> = this.messages.iter().filter(|m| m.account == first).cloned().collect();
+            let generation = this.load_generation;
+            let ok = this.replace_account_lists(generation, vec![(first, (0, 0), mine)], cx);
+            assert!(ok || this.listed.is_none());
+        });
+        time("refresh_counts", &view, cx, &|this, cx| this.refresh_counts(cx));
+        time("note_inbox", &view, cx, &|this, _| {
+            let Some(a) = this.accounts.first().cloned() else { return };
+            let ms: Vec<Mail> = this.messages.iter().filter(|m| m.account == a.id).take(100).cloned().collect();
+            drop(this.note_inbox(&a.id, &ms));
+        });
+        for _ in 0..3 {
+            let t = std::time::Instant::now();
+            frame(cx);
+            eprintln!("BENCH frame {:?}", t.elapsed());
+        }
+        // Sort the inbox into categories, off and on again.
+        for round in 0..2 {
+            let t = std::time::Instant::now();
+            view.update_in(cx, |this, w, cx| {
+                this.handle(Action::Categories(categories::CatAction::ToggleEnabled), w, cx)
+            });
+            let toggled = t.elapsed();
+            let t = std::time::Instant::now();
+            frame(cx);
+            let drawn = t.elapsed();
+            let t = std::time::Instant::now();
+            cx.run_until_parked();
+            let parked = t.elapsed();
+            let t = std::time::Instant::now();
+            frame(cx);
+            eprintln!(
+                "BENCH toggle {round}: handle {toggled:?}, frame {drawn:?}, parked {parked:?}, frame {:?}, on {}",
+                t.elapsed(),
+                view.read_with(cx, |this, _| this.sorting.prefs().enabled)
+            );
+        }
+        // The same while the inbox category model looks closely at the
+        // list in the background, as after launch.
+        let (wanted, ai) = view.read_with(cx, |this, _| {
+            let wanted: Vec<Mail> = this.messages.iter().take(20_000).cloned().collect();
+            (Arc::new(wanted), this.sorting.sorter.model())
+        });
+        eprintln!("BENCH model {}", ai.is_some());
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let looking = (0..2)
+            .map(|_| {
+                let (wanted, ai, stop) = (wanted.clone(), ai.clone(), stop.clone());
+                std::thread::spawn(move || {
+                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        for part in wanted.chunks(4000) {
+                            drop(crate::manage::categories::look_closely(part, ai.as_deref()));
+                            if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                                break;
+                            }
+                        }
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        std::thread::sleep(Duration::from_millis(500));
+        time("LOOKING apply_filter", &view, cx, &|this, cx| this.apply_filter(cx));
+        time("LOOKING set_messages(clone)", &view, cx, &|this, cx| {
+            let ms = this.messages.clone();
+            this.set_messages(ms, cx)
+        });
+        time("LOOKING clone messages", &view, cx, &|this, _| drop(this.messages.clone()));
+        for _ in 0..3 {
+            let t = std::time::Instant::now();
+            frame(cx);
+            eprintln!("BENCH LOOKING frame {:?}", t.elapsed());
+        }
+        let t = std::time::Instant::now();
+        crate::manage::memory::release_unused();
+        eprintln!("BENCH LOOKING malloc_trim {:?}", t.elapsed());
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        for t in looking {
+            let _ = t.join();
+        }
+        let t = std::time::Instant::now();
+        crate::manage::memory::release_unused();
+        eprintln!("BENCH malloc_trim {:?}", t.elapsed());
+    }
     /// Filtering on several threads finds exactly what one thread does, in
     /// the list's order, at sizes around where it starts.
     #[test]
@@ -14033,9 +14704,24 @@ mod tests {
             assert_eq!(matching_rows(&messages, false, keep), expected, "{n} messages");
         }
     }
+    /// A new, empty store. Its inbox isn't sorted into categories: tests
+    /// of everything else count every inbox row, and the sample mail's
+    /// newsletters would be in other tabs. Categories' own tests
+    /// (`categories_tests.rs`) turn them on.
     pub(super) fn store() -> Arc<Store> {
         let dir = std::env::temp_dir().join(format!("mail-ui-{}", uuid::Uuid::new_v4()));
-        Arc::new(Store::open(&dir).unwrap())
+        let store = Arc::new(Store::open(&dir).unwrap());
+        let off = crate::manage::categories::Categorizing {
+            enabled: false,
+            ..Default::default()
+        };
+        store
+            .set_preference(
+                crate::manage::categories::PREFERENCE,
+                &serde_json::to_string(&off).unwrap(),
+            )
+            .unwrap();
+        store
     }
     pub(super) fn act(view: &Entity<MailApp>, action: Action, cx: &mut VisualTestContext) {
         view.update_in(cx, |this, w, cx| this.handle(action, w, cx));
@@ -15106,6 +15792,130 @@ mod tests {
             frame(cx);
             assert!(cx.debug_bounds("closing-cover").is_some(), "{kind:?}");
         }
+    }
+
+    /// The cover's spinner keeps turning while Picacho closes: the window
+    /// is drawn again on the spinner's clock.
+    #[gpui::test]
+    fn the_closing_cover_keeps_turning(cx: &mut TestAppContext) {
+        let (view, cx, _store) = two_accounts(cx);
+        frame(cx);
+        view.update(cx, |this, cx| {
+            this.closing = Some(Closing::Quit);
+            cx.notify();
+        });
+        frame(cx);
+        let drawn = std::rc::Rc::new(std::cell::Cell::new(0));
+        let counted = drawn.clone();
+        let _counting = cx.update(|_, cx| {
+            cx.observe(&view, move |_, _| counted.set(counted.get() + 1))
+        });
+        for _ in 0..4 {
+            cx.executor().advance_clock(SPIN_STEP);
+            cx.run_until_parked();
+        }
+        assert!(drawn.get() >= 3, "drawn again {} times", drawn.get());
+    }
+
+    /// Adding Proton's own aliases says it's loading the account's Proton
+    /// addresses and aliases while it does, with a spinner, instead of
+    /// showing the emptied form again.
+    #[gpui::test]
+    fn adding_protons_aliases_says_it_is_loading(cx: &mut TestAppContext) {
+        let (view, cx, _store) = two_accounts(cx);
+        act(&view, Action::Settings, cx);
+        act(&view, Action::SettingsPage(Page::Forwarding), cx);
+        act(&view, Action::AddForwarding, cx);
+        act(&view, Action::ForwardingService(ForwardingService::Proton), cx);
+        frame(cx);
+        assert!(cx.debug_bounds("forwarding-proton-loading").is_none());
+        view.update(cx, |this, cx| {
+            this.fwd_busy.insert("connect".into());
+            cx.notify();
+        });
+        frame(cx);
+        assert!(cx.debug_bounds("forwarding-proton-loading").is_some());
+        assert!(cx.debug_bounds("forwarding-pass-password").is_none(), "not the form again");
+    }
+
+    /// Deleting a draft offers Undo, which keeps it; otherwise it's
+    /// discarded once Undo is no longer offered.
+    #[gpui::test]
+    fn a_deleted_draft_can_be_kept(cx: &mut TestAppContext) {
+        let (view, cx, store) = two_accounts(cx);
+        let account = view.read_with(cx, |this, _| this.accounts[0].id.clone());
+        for id in ["d-kept", "d-gone"] {
+            store
+                .save_draft(&Draft {
+                    id: id.into(),
+                    account: account.clone(),
+                    subject: id.into(),
+                    ..Default::default()
+                })
+                .unwrap();
+        }
+        act(&view, Action::OpenMailbox(account.clone(), Folder::Drafts.into()), cx);
+        cx.run_until_parked();
+        let listed = |view: &Entity<MailApp>, cx: &mut VisualTestContext, id: &str| {
+            view.read_with(cx, |this, _| this.messages.iter().any(|m| m.id == id))
+        };
+        assert!(listed(&view, cx, "d-kept") && listed(&view, cx, "d-gone"));
+        act(&view, Action::DeleteDraft("d-kept".into()), cx);
+        assert!(!listed(&view, cx, "d-kept"), "gone from the list at once");
+        assert!(view.read_with(cx, |this, _| this.undo.is_some()));
+        act(&view, Action::Undo, cx);
+        cx.run_until_parked();
+        assert!(listed(&view, cx, "d-kept"), "back");
+        act(&view, Action::DeleteDraft("d-gone".into()), cx);
+        cx.executor().advance_clock(UNDO_SHOWN + Duration::from_secs(1));
+        cx.run_until_parked();
+        composer::wait_for_draft_writes(None);
+        assert!(store.draft("d-gone").unwrap().is_none(), "discarded");
+        assert!(store.draft("d-kept").unwrap().is_some(), "kept");
+        assert!(!listed(&view, cx, "d-gone"));
+    }
+
+    /// A tapped notification for mail that's cached but not in the list
+    /// (listed before it arrived) opens it, rather than leaving the inbox.
+    #[gpui::test]
+    fn a_tapped_notification_opens_mail_the_list_lacks(cx: &mut TestAppContext) {
+        let (view, cx, _store) = two_accounts(cx);
+        frame(cx);
+        let m = view.read_with(cx, |this, _| {
+            this.visible.first().map(|&i| this.messages[i].clone()).expect("mail")
+        });
+        // Its own mailbox open, as when the notification is tapped.
+        act(&view, Action::OpenMailbox(m.account.clone(), m.mailbox()), cx);
+        cx.run_until_parked();
+        frame(cx);
+        let (m, mailbox) = view.update(cx, |this, cx| {
+            assert_eq!(this.account.as_deref(), Some(m.account.as_str()));
+            // As though listed before it came.
+            this.messages.retain(|x| x.id != m.id);
+            this.filter(cx);
+            this.selected = None;
+            (m.clone(), this.mailbox())
+        });
+        view.update_in(cx, |this, w, cx| {
+            this.open_notified(
+                crate::display::notify::Target {
+                    account: m.account.clone(),
+                    mailbox: mailbox.clone(),
+                    message: Some(m.id.clone()),
+                    messages: Vec::new(),
+                    action: None,
+                },
+                w,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        frame(cx);
+        view.read_with(cx, |this, _| {
+            assert_eq!(this.selected.as_deref(), Some(m.id.as_str()), "opened");
+            assert!(this.messages.iter().any(|x| x.id == m.id), "listed");
+            assert!(this.open_listed.is_none(), "no longer waited for");
+        });
     }
 
     /// Settings → Reading: saying the system's proxy blocks the local

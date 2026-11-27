@@ -481,6 +481,16 @@ manage-extras-this-server-doesnt-share-mailboxes-no = This server doesn't share 
 
 # src/manage/forwarding.rs
 
+manage-forwarding-proton-aliases-use-the-accounts-sign-in = Proton's aliases (hide-my-email aliases, kept in Proton Pass) use the Proton account's own sign-in: no API key.
+
+manage-forwarding-proton-address = Proton address
+
+manage-forwarding-premium-address = Premium address
+
+manage-forwarding-external-address = External address
+
+manage-forwarding-proton-aliases-need-a-proton-account = { $email } isn't signed in to Proton directly, so its Proton aliases can't be listed here.
+
 manage-forwarding-reading-the-aliass-activity-failed = Reading the alias's activity failed
 
 manage-forwarding-is-turned-off-at-turn-it = { $email } is turned off at { $label }. Turn it on in Forwarding settings, or choose another address in From.
@@ -618,6 +628,8 @@ manage-local-ai-couldnt-delete-2 = Couldn't delete { $dir }
 # src/manage/local_ai/replies.rs
 
 manage-local-ai-replies-the-reply-model-has-outputs-but = The reply model has { $classes } outputs, but { $count } replies are expected
+
+manage-local-ai-categories-the-model-has-outputs-but = The inbox category model has { $classes } outputs, but { $count } categories are expected
 
 # src/manage/local_ai/runtime.rs
 
@@ -861,6 +873,8 @@ manage-parcels-summary-probably-delivered = Probably delivered
 
 # src/manage/proton.rs
 
+manage-proton-the-proton-account-its-aliases-come = The Proton account these aliases come from is no longer in Picacho.
+
 manage-proton-choose-one-of-the-accounts-folders = Choose one of the account's folders.
 
 manage-proton-the-folder-no-longer-exists-at = The folder “{ $name }” no longer exists at Proton.
@@ -998,6 +1012,28 @@ manage-smime-revocation-the-answer-isnt-about-this-certificate = the answer isn'
 manage-smime-revocation-the-answer-is-out-of-date = the answer is out of date
 
 manage-smime-revocation-the-responder-doesnt-know-this-certificate = the responder doesn't know this certificate
+
+# src/manage/follow_up.rs
+
+manage-follow-up-in-a-day = In a day
+
+manage-follow-up-in-days = In { $count } days
+
+manage-follow-up-in-a-week = In a week
+
+manage-follow-up-in-two-weeks = In two weeks
+
+manage-follow-up-tomorrow = Tomorrow
+
+manage-follow-up-no-message-id = This message has no Message-ID, so replies to it can't be recognized.
+
+manage-follow-up-another-account = Message belongs to another account
+
+manage-follow-up-choose-a-time-in-the-future = Choose a time in the future.
+
+manage-follow-up-already-replied = { $sender } already replied.
+
+manage-follow-up-not-noted = No reminder was set for it: { $error }
 
 # src/manage/snooze.rs
 
@@ -1228,3 +1264,23 @@ manage-backend-it-went-as-inline-pgp = It went as inline PGP, each file protecte
 manage-model-the-exchange-address-must-start-with = The Exchange (EWS) address must start with https://.
 
 manage-calendar-only-exchange-accounts = Only Exchange accounts keep calendars and contacts here this way.
+
+manage-calendar-not-a-google-calendar = That isn't one of your Google calendars.
+
+manage-calendar-not-a-proton-calendar = That isn't one of your Proton calendars.
+
+manage-calendar-only-google-accounts = Only Google accounts signed in with Google keep calendars and contacts here this way.
+
+manage-calendar-only-proton-accounts = Only Proton accounts signed in without Bridge keep calendars and contacts here this way.
+
+manage-calendar-proton-calendar-doesnt-send-invitations = Proton Calendar's invitations are sent from Proton's own apps.
+
+manage-calendar-proton-calendars-are-made-in-proton = Proton calendars are made, renamed and deleted in Proton Calendar.
+
+manage-calendar-subscribed-calendars-are-read-only = A subscribed calendar is read-only: its events are its publisher's.
+
+manage-calendar-this-calendar-cant-say-when-people = This calendar can't say when people are busy.
+
+manage-calendar-this-calendar-is-no-longer-on = This calendar is no longer there; read your calendars again.
+
+manage-pim-sources-couldnt-read = Couldn't read { $source }

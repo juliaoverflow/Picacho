@@ -10,8 +10,10 @@ mod manage;
 mod sync;
 
 fn main() -> anyhow::Result<()> {
-    // Before any other thread starts.
-    manage::memory::configure();
+    // Before any other thread starts. The background process (see below)
+    // keeps fewer of the allocator's arenas than the window's.
+    let background = std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new(display::resident::FLAG));
+    manage::memory::configure(!background);
     // Before any window, tray icon or notification.
     #[cfg(windows)]
     display::windows::set_app_identity();

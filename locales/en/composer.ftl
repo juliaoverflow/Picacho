@@ -58,6 +58,19 @@ composer-scheduled-to-send-it-waits-in = Scheduled to send { $when }. It waits i
 
 composer-dont-send-later = Don't Send Later
 
+composer-remind-me-if-no-reply = Remind me if no reply
+
+composer-reminds-you-if-no-reply = { $days ->
+        [1] If nobody replies within a day, Picacho reminds you.
+        [7] If nobody replies within a week, Picacho reminds you.
+        [14] If nobody replies within two weeks, Picacho reminds you.
+       *[other] If nobody replies within { $days } days, Picacho reminds you.
+    }
+
+composer-remind-me-if-nobody-replies = REMIND ME IF NOBODY REPLIES
+
+composer-dont-remind-me = Don't Remind Me
+
 composer-rich-text = Rich text
 
 composer-send-later = Send Later

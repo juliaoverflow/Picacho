@@ -111,6 +111,8 @@ impl MailApp {
                 cx,
                 move |b| {
                     b.snooze(&a, &mails, until)?;
+                    // Other computers show it snoozed too.
+                    let _ = b.share_snoozed(&a, true);
                     Ok(b.snoozed(&a.id))
                 },
                 move |this, result, cx| {
@@ -157,6 +159,48 @@ impl MailApp {
             .find(|s| s.message_id == m.message_id)
             .map(|s| s.until)
     }
+    /// Reads what other computers snoozed or woke (`Backend::share_snoozed`,
+    /// which decides when the server is asked), every minute at most.
+    pub(super) fn share_snoozed(&mut self, cx: &mut Context<Self>) {
+        if self.snooze_shared.is_some_and(|at| at.elapsed() < Duration::from_secs(60)) {
+            return;
+        }
+        self.snooze_shared = Some(std::time::Instant::now());
+        let accounts: Vec<Account> = self
+            .accounts
+            .iter()
+            .filter(|a| a.provider != Provider::Pop3 && !self.account_blocked(&a.id))
+            .cloned()
+            .collect();
+        if accounts.is_empty() {
+            return;
+        }
+        self.task(
+            cx,
+            move |b| {
+                let mut changed = Vec::new();
+                for a in accounts {
+                    if b.share_snoozed(&a, false).unwrap_or(false) {
+                        changed.push((a.id.clone(), b.snoozed(&a.id)));
+                    }
+                }
+                Ok(changed)
+            },
+            move |this, result: anyhow::Result<Vec<(String, Vec<Snoozed>)>>, cx| {
+                let Ok(changed) = result else {
+                    return;
+                };
+                let shown = changed.iter().any(|(id, _)| this.shows(id));
+                for (id, list) in changed {
+                    this.snoozed.insert(id, list);
+                }
+                if shown {
+                    this.reload_cached(cx);
+                }
+                cx.notify();
+            },
+        );
+    }
     /// Brings back snoozed messages whose time has come (checked with the
     /// regular timer; accounts that may have some snoozed on another
     /// computer are asked now and then too).
@@ -187,11 +231,16 @@ impl MailApp {
         self.task(
             cx,
             move |b| {
+                let asked = !now.is_empty();
                 let woken: Vec<Snoozed> = if now.is_empty() {
                     b.wake_due(&a)?
                 } else {
                     b.unsnooze(&a, &now)?
                 };
+                // Back here: no longer snoozed on other computers either.
+                if asked || !woken.is_empty() {
+                    let _ = b.share_snoozed(&a, true);
+                }
                 Ok((woken, b.snoozed(&a.id)))
             },
             move |this, result, cx| {

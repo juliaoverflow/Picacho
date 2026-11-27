@@ -287,3 +287,54 @@ fn exchange_streams_new_mail_and_says_how_much_it_takes() -> Result<()> {
     let _ = std::fs::remove_dir_all(path);
     Ok(())
 }
+
+/// Follow-up reminders at Exchange: an out-of-office reply is told by its
+/// item class; a reply not downloaded is found in the conversation
+/// (GetConversationItems) before reminding; the list is kept in a note in a
+/// Picacho folder, which another computer reads.
+#[test]
+fn exchange_follow_ups_find_replies_and_share_through_a_note() -> Result<()> {
+    use crate::manage::backend::FollowUp;
+    let mut fake = Fake::new("secret");
+    let sent = fake.add("Question", "f-sent", 120);
+    fake.add("Question", "f-archive", 30);
+    let away = fake.add("Out of office", "f-inbox", 10);
+    fake.classes.push((away, "IPM.Note.Rules.OofTemplate.Microsoft".into()));
+    let (server, fake) = serve(fake);
+    let (b, a, path) = setup(server.port)?;
+    let inbox = b.sync(&a, Folder::Inbox, 50)?;
+    assert!(inbox.iter().all(|m| m.automatic() == (m.subject == "Out of office")));
+    b.sync(&a, Folder::Sent, 50)?;
+    let now = chrono::Utc::now().timestamp();
+    let waiting = |id: &str, subject: &str, due: i64| FollowUp {
+        message_id: id.into(),
+        subject: subject.into(),
+        to: "bo@example.se".into(),
+        sent: now - 7200,
+        due,
+        ..Default::default()
+    };
+    b.note_follow_up(&a.id, waiting(&format!("<{sent}@corp.example>"), "Question", now - 60))?;
+    b.note_follow_up(&a.id, waiting("<later@corp.example>", "Later", now + 86400))?;
+    let check = b.check_follow_ups_online(&a, true)?;
+    assert!(check.due.is_empty(), "{check:?}");
+    assert_eq!(check.replied.iter().map(|(f, who)| (f.message_id.as_str(), who.as_str())).collect::<Vec<_>>(),
+        [(format!("<{sent}@corp.example>").as_str(), "Bo Berg")]);
+    let notes = fake
+        .lock()
+        .unwrap()
+        .items
+        .iter()
+        .filter(|i| i.subject == "Picacho: follow-up reminders")
+        .count();
+    assert_eq!(notes, 1);
+    // Another computer learns of the wait still on.
+    let (b2, a2, path2) = setup(server.port)?;
+    assert!(b2.sync_follow_ups(&a2, true)?);
+    let ids: Vec<String> = b2.follow_ups(&a2.id).into_iter().map(|f| f.message_id).collect();
+    assert_eq!(ids, ["<later@corp.example>"]);
+    drop((b, b2));
+    let _ = std::fs::remove_dir_all(path);
+    let _ = std::fs::remove_dir_all(path2);
+    Ok(())
+}

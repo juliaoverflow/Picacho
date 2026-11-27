@@ -60,6 +60,10 @@ ui-pinal-password-or-recovery-key = Pinal password or recovery key
 
 ui-api-key = API key
 
+ui-proton-pass-extra-password = Extra password (optional)
+
+ui-sign-in-to-proton-pass = Sign In to Proton Pass
+
 ui-user-name = User name
 
 ui-password-or-app-password = Password or app password
@@ -256,6 +260,10 @@ ui-unsnooze = Unsnooze
 
 ui-snooze-2 = Snooze…
 
+ui-remind-me-if-no-reply-2 = Remind Me If No Reply…
+
+ui-stop-waiting-for-a-reply = Stop Waiting for a Reply
+
 ui-move-to-folder-2 = Move to Folder…
 
 ui-labels = Labels…
@@ -293,6 +301,8 @@ ui-moved-messages-back = { $count ->
     }
 
 ui-couldnt-undo = Couldn't undo: { $e }
+
+ui-draft-deleted = Draft deleted
 
 ui-new-label = New Label…
 
@@ -715,6 +725,14 @@ ui-alias-no-longer-exists = Alias No Longer Exists
 ui-snooze-messages = Snooze Messages
 
 ui-snooze-3 = Snooze
+
+ui-remind-me-if-no-reply = Remind Me If No Reply
+
+ui-waiting-for = Waiting For
+
+ui-nothing-waiting-for-a-reply = Nothing waiting for a reply
+
+ui-nothing-waiting-for-a-reply-detail = When you send a message, choose “Remind me if no reply” and it waits here until someone answers.
 
 ui-check-this-link = Check This Link
 

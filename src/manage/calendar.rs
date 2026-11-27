@@ -9,6 +9,7 @@
 use super::*;
 use crate::sync::caldav::{self, Stored};
 use crate::sync::ical::{self, Event, PartStat};
+use super::pim_sources::{self, Pim};
 
 const SERVER: &str = "calendar_server";
 const CALENDARS: &str = "calendars";
@@ -54,16 +55,144 @@ const PASSWORD: &str = "calendar:caldav";
 const BEHIND: i64 = 31 * 86_400;
 const AHEAD: i64 = 366 * 86_400;
 
+/// Which subscribed feed (or other source) new events go to by default,
+/// when several sources are set up: a source id (`pim_sources`).
+const DEFAULT_SOURCE: &str = "calendar_default_source";
+/// A feed's version when last read (ETag and Last-Modified, `feed::fetch`).
+const FEED_STATE: &str = "calendar_feed_state";
+/// When a feed was last tried, read or not (Unix seconds).
+const FEED_TRIED: &str = "calendar_feed_tried";
+/// Every key a source keeps, emptied when it's disconnected.
+const SOURCE_KEYS: &[&str] = &[SERVER, CALENDARS, EVENTS, SYNCED, DEFAULT, TASKS, TASK_LISTS, TASK_STATE, JMAP_STATE, NOTICES, PARTICIPANTS, FEED_STATE, FEED_TRIED];
+
+/// One source's parsed events, shared.
+type Events = Arc<Vec<Stored>>;
+
+/// The parsed events of each source, by the key their text is kept under,
+/// and every source's put together (`cached_events`).
+#[derive(Default)]
+pub struct EventCache {
+    by_key: HashMap<String, (Arc<str>, Events)>,
+    /// Each source's events it was made from (the same `Arc`s, so an
+    /// unchanged source is told apart by them), and the events together.
+    merged: Option<(Vec<Events>, Events)>,
+}
+
+/// `base`'s key in the calendar source worked within (`pim_sources`).
+fn key(base: &str) -> String {
+    pim_sources::key(Pim::Calendar, base)
+}
+/// Whether this thread works within one calendar source, rather than
+/// outside all of them (where reading puts them together).
+fn within_one() -> bool {
+    pim_sources::inside(Pim::Calendar)
+}
+
 impl Backend {
+    fn cal_pref(&self, base: &str) -> Option<String> {
+        self.store.preference(&key(base))
+    }
+    fn set_cal_pref(&self, base: &str, value: &str) -> Result<()> {
+        self.store.set_preference(&key(base), value)
+    }
+    /// Runs `work` within calendar source `id`.
+    pub fn in_calendar_source<T>(&self, id: &str, work: impl FnOnce() -> T) -> T {
+        pim_sources::within(Pim::Calendar, id, work)
+    }
+    /// Every calendar source's id: the first (""), then the others.
+    pub fn calendar_source_ids(&self) -> Vec<String> {
+        pim_sources::source_ids(&self.store, Pim::Calendar)
+    }
+    /// The sources set up besides the first: (id, server, when last read).
+    pub fn calendar_sources(&self) -> Vec<(String, caldav::Server, Option<i64>)> {
+        pim_sources::extra_sources(&self.store, Pim::Calendar)
+            .into_iter()
+            .filter_map(|id| {
+                let (server, synced) = self.in_calendar_source(&id, || (self.calendar_server(), self.calendar_synced()));
+                Some((id, server?, synced))
+            })
+            .collect()
+    }
+    /// The first calendar source's server, as Settings shows it.
+    pub fn primary_calendar_server(&self) -> Option<caldav::Server> {
+        self.in_calendar_source("", || self.calendar_server())
+    }
+    /// The source that has the event `uid`, if any does.
+    fn calendar_source_of_event(&self, uid: &str) -> Option<String> {
+        if uid.is_empty() {
+            return None;
+        }
+        self.calendar_source_ids().into_iter().find(|id| {
+            self.in_calendar_source(id, || {
+                self.cached_events().iter().any(|s| s.event.uid == uid) || self.calendar_tasks().iter().any(|t| t.event.uid == uid)
+            })
+        })
+    }
+    /// The source that has calendar (or task list) `href`, if any does.
+    fn calendar_source_of(&self, href: &str) -> Option<String> {
+        self.calendar_source_ids().into_iter().find(|id| {
+            self.in_calendar_source(id, || self.calendars().iter().chain(self.task_lists().iter()).any(|c| c.href == href))
+        })
+    }
+    /// The source new events go to: the one chosen (`set_default_calendar`),
+    /// else the first that can take them: the first source, else another.
+    /// Feeds take none.
+    pub fn default_calendar_source(&self) -> String {
+        let writable: Vec<String> = self
+            .calendar_source_ids()
+            .into_iter()
+            .filter(|id| self.in_calendar_source(id, || self.calendar_server().is_some_and(|s| !s.feed)))
+            .collect();
+        let chosen = self.store.preference(DEFAULT_SOURCE).unwrap_or_default();
+        if writable.contains(&chosen) {
+            return chosen;
+        }
+        writable.into_iter().next().unwrap_or_default()
+    }
+    /// Outside any source: the one to work on event `uid` within (the one
+    /// that has it, else where new events go). `None` within one already.
+    fn route_event(&self, uid: &str) -> Option<String> {
+        (!within_one()).then(|| self.calendar_source_of_event(uid).unwrap_or_else(|| self.default_calendar_source()))
+    }
+    /// Outside any source: the one that has calendar `href`.
+    fn route_calendar(&self, href: &str) -> Option<String> {
+        (!within_one()).then(|| self.calendar_source_of(href).unwrap_or_else(|| self.default_calendar_source()))
+    }
+    /// Outside any source: where new events go.
+    fn route_default(&self) -> Option<String> {
+        (!within_one()).then(|| self.default_calendar_source())
+    }
+    /// Outside any source: the first one (set up in Settings as always).
+    fn route_first(&self) -> Option<String> {
+        (!within_one()).then(String::new)
+    }
+    /// Within each source with a server, `work`'s answers.
+    fn each_calendar_source<T>(&self, work: impl Fn() -> T) -> Vec<(String, T)> {
+        self.calendar_source_ids()
+            .into_iter()
+            .filter_map(|id| self.in_calendar_source(&id, || self.calendar_server().is_some().then(&work)).map(|t| (id, t)))
+            .collect()
+    }
+
+    /// The server calendars come from. Outside any source, the first one
+    /// set up.
     pub fn calendar_server(&self) -> Option<caldav::Server> {
-        self.store
-            .preference(SERVER)
+        if !within_one() {
+            return self
+                .calendar_source_ids()
+                .into_iter()
+                .find_map(|id| self.in_calendar_source(&id, || self.calendar_server()));
+        }
+        self.cal_pref(SERVER)
             .and_then(|j| serde_json::from_str(&j).ok())
             .filter(|s: &caldav::Server| !s.url.is_empty())
     }
+    /// The calendars; outside any source, every source's.
     pub fn calendars(&self) -> Vec<caldav::Calendar> {
-        self.store
-            .preference(CALENDARS)
+        if !within_one() {
+            return self.calendar_source_ids().into_iter().flat_map(|id| self.in_calendar_source(&id, || self.calendars())).collect();
+        }
+        self.cal_pref(CALENDARS)
             .and_then(|j| serde_json::from_str(&j).ok())
             .unwrap_or_default()
     }
@@ -73,33 +202,65 @@ impl Backend {
     }
     /// The events, parsed only when their saved text changed (see
     /// `calendar_cache`): whatever wrote it, the text read now decides.
+    /// Outside any source, every source's together.
     fn cached_events(&self) -> Arc<Vec<Stored>> {
-        let text = self.store.preference(EVENTS).unwrap_or_default();
+        if !within_one() {
+            let parts: Vec<Arc<Vec<Stored>>> = self
+                .calendar_source_ids()
+                .into_iter()
+                .map(|id| self.in_calendar_source(&id, || self.cached_events()))
+                .collect();
+            if parts.len() == 1 {
+                return parts[0].clone();
+            }
+            let mut cache = self.calendar_cache.lock().unwrap();
+            if let Some((from, merged)) = &cache.merged
+                && from.len() == parts.len()
+                && from.iter().zip(&parts).all(|(a, b)| Arc::ptr_eq(a, b))
+            {
+                return merged.clone();
+            }
+            let mut all: Vec<Stored> = parts.iter().flat_map(|p| p.iter().cloned()).collect();
+            all.sort_by_key(|s| s.event.start);
+            let merged = Arc::new(all);
+            cache.merged = Some((parts, merged.clone()));
+            return merged;
+        }
+        let at = key(EVENTS);
+        let text = self.store.preference(&at).unwrap_or_default();
         let mut cache = self.calendar_cache.lock().unwrap();
-        if let Some((saved, events)) = cache.as_ref()
+        if let Some((saved, events)) = cache.by_key.get(&at)
             && **saved == *text
         {
             return events.clone();
         }
         let events: Arc<Vec<Stored>> = Arc::new(serde_json::from_str(&text).unwrap_or_default());
-        *cache = Some((text.into(), events.clone()));
+        cache.by_key.insert(at, (text.into(), events.clone()));
         events
     }
     fn save_events(&self, mut events: Vec<Stored>) -> Result<()> {
+        // Outside any source, every source's events would be read together
+        // and written into the first.
+        ensure!(
+            within_one() || pim_sources::extra_sources(&self.store, Pim::Calendar).is_empty(),
+            "events were saved outside any calendar source"
+        );
         events.sort_by_key(|s| s.event.start);
-        self.store
-            .set_preference(EVENTS, &serde_json::to_string(&events)?)?;
+        self.set_cal_pref(EVENTS, &serde_json::to_string(&events)?)?;
         crate::manage::widgets::publish_soon(self.store.clone());
         Ok(())
     }
     pub fn calendar_synced(&self) -> Option<i64> {
-        self.store.preference(SYNCED)?.parse().ok()
+        self.cal_pref(SYNCED)?.parse().ok()
     }
     /// The calendar new events go to: the one chosen, or the first that
-    /// can be written.
+    /// can be written (in the source new events go to, outside any).
     pub fn default_calendar(&self) -> Option<caldav::Calendar> {
+        if let Some(id) = self.route_default() {
+            return self.in_calendar_source(&id, || self.default_calendar());
+        }
         let cals = self.calendars();
-        let chosen = self.store.preference(DEFAULT).unwrap_or_default();
+        let chosen = self.cal_pref(DEFAULT).unwrap_or_default();
         // One that takes events: not a calendar for tasks alone.
         let events = |c: &&caldav::Calendar| {
             c.writable && (c.components.is_empty() || c.components.iter().any(|k| k == "VEVENT"))
@@ -115,8 +276,19 @@ impl Backend {
     /// Over JMAP, tasks are in task lists of their own: the default one,
     /// else the first writable one.
     pub fn task_calendar(&self) -> Option<caldav::Calendar> {
-        if self.calendar_server().is_some_and(|s| !s.jmap_account.is_empty()) {
+        if !within_one() {
+            let first = self.default_calendar_source();
+            return self.in_calendar_source(&first, || self.task_calendar()).or_else(|| {
+                self.calendar_source_ids().into_iter().find_map(|id| self.in_calendar_source(&id, || self.task_calendar()))
+            });
+        }
+        let server = self.calendar_server();
+        if server.as_ref().is_some_and(|s| !s.jmap_account.is_empty()) {
             return self.task_lists().into_iter().find(|l| l.writable);
+        }
+        // Google, Exchange, Proton and feeds keep no tasks here.
+        if server.as_ref().is_some_and(|s| !s.dav()) {
+            return None;
         }
         let takes = |c: &caldav::Calendar| {
             c.writable && (c.components.is_empty() || c.components.iter().any(|k| k == "VTODO"))
@@ -127,13 +299,22 @@ impl Backend {
     }
     /// A JMAP server's task lists, as calendars that take only tasks.
     pub fn task_lists(&self) -> Vec<caldav::Calendar> {
-        self.store
-            .preference(TASK_LISTS)
+        if !within_one() {
+            return self.calendar_source_ids().into_iter().flat_map(|id| self.in_calendar_source(&id, || self.task_lists())).collect();
+        }
+        self.cal_pref(TASK_LISTS)
             .and_then(|j| serde_json::from_str(&j).ok())
             .unwrap_or_default()
     }
+    /// Makes `href` the calendar new events go to, and its source the one
+    /// they go to.
     pub fn set_default_calendar(&self, href: &str) -> Result<()> {
-        self.store.set_preference(DEFAULT, href)
+        if !within_one() {
+            let id = self.calendar_source_of(href).unwrap_or_default();
+            self.store.set_preference(DEFAULT_SOURCE, &id)?;
+            return self.in_calendar_source(&id, || self.set_default_calendar(href));
+        }
+        self.set_cal_pref(DEFAULT, href)
     }
     fn calendar_password(&self) -> Result<String> {
         #[cfg(test)]
@@ -147,33 +328,49 @@ impl Backend {
         {
             return self.mail_account_secret(&server.mail_account);
         }
-        store::read_secret_text(PASSWORD)?
+        store::read_secret_text(&key(PASSWORD))?
             .with_context(|| t!("manage-calendar-the-calendar-servers-password-is-missing"))
+    }
+    /// Adds another calendar source beside those set up, set up by `work`
+    /// (one of the `connect_…` functions, or `subscribe_calendar_feed`)
+    /// within it. Returns what `work` did.
+    pub fn add_calendar_source<T>(&self, work: impl FnOnce() -> Result<T>) -> Result<T> {
+        self.add_source(Pim::Calendar, work)
+    }
+    /// Disconnects one of the sources added besides the first.
+    pub fn remove_calendar_source(&self, id: &str) -> Result<()> {
+        ensure!(!id.is_empty(), "the first calendar source is disconnected with disconnect_calendar");
+        self.in_calendar_source(id, || self.disconnect_calendar())?;
+        if self.store.preference(DEFAULT_SOURCE).as_deref() == Some(id) {
+            self.store.set_preference(DEFAULT_SOURCE, "")?;
+        }
+        self.forget_source(Pim::Calendar, id)
     }
     /// Signs in to a CalDAV server and reads its calendars and events.
     pub fn connect_calendar(&self, server: caldav::Server, password: &str) -> Result<usize> {
+        if let Some(id) = self.route_first() {
+            return self.in_calendar_source(&id, || self.connect_calendar(server, password));
+        }
         let cals = caldav::calendars(&server, password, self.tls_connector()?)?;
         // Shared with a mail account: its sign-in is read from it each time.
         #[cfg(not(test))]
         if server.mail_account.is_empty() {
-            store::write_secret_text(PASSWORD, password)?;
+            store::write_secret_text(&key(PASSWORD), password)?;
         }
-        self.store
-            .set_preference(SERVER, &serde_json::to_string(&server)?)?;
-        self.store
-            .set_preference(CALENDARS, &serde_json::to_string(&cals)?)?;
+        self.set_cal_pref(SERVER, &serde_json::to_string(&server)?)?;
+        self.set_cal_pref(CALENDARS, &serde_json::to_string(&cals)?)?;
         // Who you are to the server (RFC 6638 §2.4.1), for telling your
         // own events, and where it puts accepted invitations (§9.2), as
         // the calendar new events go to unless one was chosen. Not every
         // server schedules: not worth failing for.
         if let Ok((addresses, default)) = caldav::scheduling_identity(&server, password, self.tls_connector()?) {
             if !addresses.is_empty() {
-                self.store.set_preference(PARTICIPANTS, &serde_json::to_string(&addresses)?)?;
+                self.set_cal_pref(PARTICIPANTS, &serde_json::to_string(&addresses)?)?;
             }
             if let Some(href) = default.filter(|h| cals.iter().any(|c| &c.href == h))
-                && self.store.preference(DEFAULT).is_none_or(|d| d.is_empty())
+                && self.cal_pref(DEFAULT).is_none_or(|d| d.is_empty())
             {
-                self.store.set_preference(DEFAULT, &href)?;
+                self.set_cal_pref(DEFAULT, &href)?;
             }
         }
         self.sync_calendar()
@@ -183,12 +380,18 @@ impl Backend {
     /// again. Turning it on asks the server first: one that doesn't
     /// schedule is refused, so invitations aren't silently lost.
     pub fn set_server_scheduling(&self, on: bool) -> Result<()> {
+        if let Some(id) = self.route_first() {
+            return self.in_calendar_source(&id, || self.set_server_scheduling(on));
+        }
         let mut server = self
             .calendar_server()
             .with_context(|| t!("manage-calendar-no-calendar-server-is-set-up"))?;
+        ensure!(!server.feed, t!("manage-calendar-subscribed-calendars-are-read-only"));
+        // Proton's invitations are Proton Calendar's to send.
+        ensure!(!on || server.proton_account.is_empty(), t!("manage-calendar-proton-calendar-doesnt-send-invitations"));
         // A JMAP server sends them where it names the addresses it sends
         // as (ParticipantIdentity); CalDAV, where it auto-schedules.
-        if self.calendar_graph(&server)?.is_some() || self.calendar_ews(&server)?.is_some() {
+        if self.calendar_graph(&server)?.is_some() || self.calendar_ews(&server)?.is_some() || !server.google_account.is_empty() {
             // Exchange sends them itself, always.
             ensure!(on, t!("manage-calendar-exchange-always-sends-invitations"));
         } else if on && let Some(a) = self.calendar_jmap(&server)? {
@@ -203,8 +406,7 @@ impl Backend {
             );
         }
         server.server_schedules = on;
-        self.store
-            .set_preference(SERVER, &serde_json::to_string(&server)?)
+        self.set_cal_pref(SERVER, &serde_json::to_string(&server)?)
     }
     /// Whether an event is one you organize (or has no organizer): with
     /// server scheduling, the server sends its invitations. Invitations
@@ -212,9 +414,7 @@ impl Backend {
     /// answered twice.
     fn organized_here(&self, e: &Event) -> bool {
         let Some(o) = &e.organizer else { return true };
-        let known: Vec<String> = self
-            .store
-            .preference(PARTICIPANTS)
+        let known: Vec<String> = self.cal_pref(PARTICIPANTS)
             .and_then(|j| serde_json::from_str(&j).ok())
             .unwrap_or_default();
         if known.iter().any(|k| k.eq_ignore_ascii_case(&o.email)) {
@@ -229,11 +429,17 @@ impl Backend {
     }
     /// Whether invitations for events you organize are the server's to send.
     pub fn server_schedules(&self) -> bool {
+        if let Some(id) = self.route_first() {
+            return self.in_calendar_source(&id, || self.server_schedules());
+        }
         self.calendar_server().is_some_and(|s| s.server_schedules)
     }
     /// Uses the calendars of a JMAP account's server (JMAP for Calendars)
     /// instead of a CalDAV server: its sign-in is the account's own.
     pub fn connect_jmap_calendar(&self, a: &Account) -> Result<usize> {
+        if let Some(id) = self.route_first() {
+            return self.in_calendar_source(&id, || self.connect_jmap_calendar(a));
+        }
         ensure!(
             a.provider == Provider::Jmap,
             t!("manage-calendar-only-jmap-accounts-keep-calendars-this")
@@ -246,14 +452,13 @@ impl Backend {
             server_schedules: false,
             ..Default::default()
         };
-        self.store
-            .set_preference(SERVER, &serde_json::to_string(&server)?)?;
-        self.store.set_preference(CALENDARS, "[]")?;
-        self.store.set_preference(JMAP_STATE, "")?;
+        self.set_cal_pref(SERVER, &serde_json::to_string(&server)?)?;
+        self.set_cal_pref(CALENDARS, "[]")?;
+        self.set_cal_pref(JMAP_STATE, "")?;
         // The last server's tasks aren't this one's.
-        self.store.set_preference(TASKS, "[]")?;
-        self.store.set_preference(TASK_LISTS, "[]")?;
-        self.store.set_preference(TASK_STATE, "")?;
+        self.set_cal_pref(TASKS, "[]")?;
+        self.set_cal_pref(TASK_LISTS, "[]")?;
+        self.set_cal_pref(TASK_STATE, "")?;
         let count = self.sync_calendar()?;
         // Tasks aren't worth failing the calendars for.
         let _ = self.sync_tasks();
@@ -286,6 +491,9 @@ impl Backend {
     /// Microsoft 365 through Microsoft Graph: its sign-in is the account's.
     /// Exchange sends invitations for events with guests itself.
     pub fn connect_graph_calendar(&self, a: &Account) -> Result<usize> {
+        if let Some(id) = self.route_first() {
+            return self.in_calendar_source(&id, || self.connect_graph_calendar(a));
+        }
         ensure!(a.graph(), t!("manage-calendar-only-accounts-that-use-microsoft"));
         let server = caldav::Server {
             url: crate::sync::graph::BASE.to_owned(),
@@ -294,14 +502,17 @@ impl Backend {
             server_schedules: true,
             ..Default::default()
         };
-        self.store.set_preference(SERVER, &serde_json::to_string(&server)?)?;
-        self.store.set_preference(CALENDARS, "[]")?;
+        self.set_cal_pref(SERVER, &serde_json::to_string(&server)?)?;
+        self.set_cal_pref(CALENDARS, "[]")?;
         self.sync_calendar()
     }
     /// Uses the calendars of an Exchange Server account's mailbox (EWS):
     /// its sign-in is the account's. Exchange sends invitations for events
     /// with guests itself.
     pub fn connect_ews_calendar(&self, a: &Account) -> Result<usize> {
+        if let Some(id) = self.route_first() {
+            return self.in_calendar_source(&id, || self.connect_ews_calendar(a));
+        }
         ensure!(a.ews(), t!("manage-calendar-only-exchange-accounts"));
         let server = caldav::Server {
             url: a.ews_endpoint(),
@@ -310,8 +521,8 @@ impl Backend {
             server_schedules: true,
             ..Default::default()
         };
-        self.store.set_preference(SERVER, &serde_json::to_string(&server)?)?;
-        self.store.set_preference(CALENDARS, "[]")?;
+        self.set_cal_pref(SERVER, &serde_json::to_string(&server)?)?;
+        self.set_cal_pref(CALENDARS, "[]")?;
         self.sync_calendar()
     }
     /// The Exchange account calendars come from, if they come from one.
@@ -332,14 +543,14 @@ impl Backend {
         let now = chrono::Utc::now().timestamp();
         let (calendars, events) = self.ews_events(a, now - BEHIND)?;
         if let Some(first) = calendars.first()
-            && self.store.preference(DEFAULT).is_none_or(|d| d.is_empty())
+            && self.cal_pref(DEFAULT).is_none_or(|d| d.is_empty())
         {
-            self.store.set_preference(DEFAULT, &first.href)?;
+            self.set_cal_pref(DEFAULT, &first.href)?;
         }
         let count = events.len();
         self.save_events(events)?;
-        self.store.set_preference(CALENDARS, &serde_json::to_string(&calendars)?)?;
-        self.store.set_preference(SYNCED, &now.to_string())?;
+        self.set_cal_pref(CALENDARS, &serde_json::to_string(&calendars)?)?;
+        self.set_cal_pref(SYNCED, &now.to_string())?;
         Ok(count)
     }
     /// The Graph account calendars come from, if they come from one.
@@ -370,9 +581,9 @@ impl Backend {
             Ok((cals, events))
         })?;
         if let Some(default) = cals.iter().find(|c| c.default)
-            && self.store.preference(DEFAULT).is_none_or(|d| d.is_empty())
+            && self.cal_pref(DEFAULT).is_none_or(|d| d.is_empty())
         {
-            self.store.set_preference(DEFAULT, &format!("graph:{}", default.id))?;
+            self.set_cal_pref(DEFAULT, &format!("graph:{}", default.id))?;
         }
         let calendars: Vec<caldav::Calendar> = cals
             .into_iter()
@@ -398,12 +609,386 @@ impl Backend {
             .collect();
         let count = stored.len();
         self.save_events(stored)?;
-        self.store.set_preference(CALENDARS, &serde_json::to_string(&calendars)?)?;
-        self.store.set_preference(SYNCED, &now.to_string())?;
+        self.set_cal_pref(CALENDARS, &serde_json::to_string(&calendars)?)?;
+        self.set_cal_pref(SYNCED, &now.to_string())?;
         Ok(count)
+    }
+    /// The mail account `server` signs in as through `field`, if it does.
+    fn calendar_account(&self, id: &str) -> Result<Option<Account>> {
+        if id.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(
+            self.store
+                .accounts()?
+                .into_iter()
+                .find(|a| a.id == id)
+                .with_context(|| t!("manage-calendar-the-account-your-calendars-come-from"))?,
+        ))
+    }
+    /// The Google account calendars come from (Google Calendar API), if any.
+    fn calendar_google(&self, server: &caldav::Server) -> Result<Option<Account>> {
+        self.calendar_account(&server.google_account)
+    }
+    /// The Proton account calendars come from (Proton Calendar), if any.
+    fn calendar_proton(&self, server: &caldav::Server) -> Result<Option<Account>> {
+        self.calendar_account(&server.proton_account)
+    }
+    /// What a calendar source is called in Settings and messages: the name
+    /// given, its account's address, or its server.
+    pub fn calendar_source_label(&self, id: &str) -> String {
+        self.in_calendar_source(id, || {
+            let Some(server) = self.calendar_server() else {
+                return String::new();
+            };
+            if !server.label.is_empty() {
+                return server.label;
+            }
+            if server.feed
+                && let Some(c) = self.calendars().into_iter().next()
+                && !c.name.is_empty()
+            {
+                return c.name;
+            }
+            if let Some(a) = server
+                .account()
+                .and_then(|id| self.store.accounts().ok()?.into_iter().find(|a| a.id == id))
+            {
+                return a.email;
+            }
+            url::Url::parse(&server.url)
+                .ok()
+                .and_then(|u| u.host_str().map(str::to_owned))
+                .unwrap_or(server.url)
+        })
+    }
+    /// Starts a source afresh for `server`: what the last one kept goes.
+    fn start_source(&self, server: &caldav::Server) -> Result<()> {
+        self.set_cal_pref(SERVER, &serde_json::to_string(server)?)?;
+        for base in [CALENDARS, TASKS, TASK_LISTS] {
+            self.set_cal_pref(base, "[]")?;
+        }
+        for base in [DEFAULT, TASK_STATE, JMAP_STATE, FEED_STATE] {
+            self.set_cal_pref(base, "")?;
+        }
+        Ok(())
+    }
+
+    /// Uses the calendars of a Google account signed in with OAuth, through
+    /// the Google Calendar API: its sign-in is the account's. Google sends
+    /// invitations for events with guests itself.
+    pub fn connect_google_calendar(&self, a: &Account) -> Result<usize> {
+        if let Some(id) = self.route_first() {
+            return self.in_calendar_source(&id, || self.connect_google_calendar(a));
+        }
+        ensure!(
+            crate::manage::backend::dav_accounts::MailProvider::of(a) == Some(crate::manage::backend::dav_accounts::MailProvider::Google),
+            t!("manage-calendar-only-google-accounts")
+        );
+        self.start_source(&caldav::Server {
+            url: crate::sync::google::CALENDAR_BASE.to_owned(),
+            user: a.email.clone(),
+            google_account: a.id.clone(),
+            server_schedules: true,
+            ..Default::default()
+        })?;
+        self.sync_calendar()
+    }
+    /// Reads Google's calendars and their events in the range shown.
+    fn sync_google_calendar(&self, a: &Account) -> Result<usize> {
+        let now = chrono::Utc::now().timestamp();
+        let (cals, events) = self.with_google(a, |s| {
+            let cals = s.calendars()?;
+            let events = s.events_in(&cals, now - BEHIND, now + AHEAD)?;
+            Ok((cals, events))
+        })?;
+        if let Some(own) = cals.iter().find(|c| c.primary && c.writable)
+            && self.cal_pref(DEFAULT).is_none_or(|d| d.is_empty())
+        {
+            self.set_cal_pref(DEFAULT, &format!("google:{}", own.id))?;
+        }
+        let calendars: Vec<caldav::Calendar> = cals
+            .into_iter()
+            .map(|c| caldav::Calendar {
+                href: format!("google:{}", c.id),
+                name: c.name,
+                writable: c.writable,
+                color: c.color,
+                components: vec!["VEVENT".into()],
+                ..Default::default()
+            })
+            .collect();
+        let stored: Vec<Stored> = events
+            .into_iter()
+            .map(|e| Stored {
+                event: e.event,
+                overrides: e.overrides,
+                calendar: format!("google:{}", e.calendar),
+                href: format!("google:{}", e.id),
+                etag: e.etag,
+                schedule_tag: String::new(),
+            })
+            .collect();
+        let count = stored.len();
+        self.save_events(stored)?;
+        self.set_cal_pref(CALENDARS, &serde_json::to_string(&calendars)?)?;
+        self.set_cal_pref(SYNCED, &now.to_string())?;
+        Ok(count)
+    }
+    /// Saves an event to a Google calendar: the series, then each
+    /// occurrence changed on its own since it was read.
+    fn google_save_event(&self, a: &Account, calendar: &str, stored: &Stored, invite: bool) -> Result<Stored> {
+        use crate::sync::google;
+        let calendar_id = calendar.strip_prefix("google:").with_context(|| t!("manage-calendar-not-a-google-calendar"))?;
+        let event_id = stored.href.strip_prefix("google:").filter(|i| !i.is_empty());
+        let before = self.stored_event(&stored.event.uid).filter(|b| b.href == stored.href);
+        let mut saved = stored.clone();
+        self.with_google(a, |s| {
+            let (id, etag) = s.save_event(calendar_id, event_id, &stored.event, true, invite)?;
+            saved.calendar = calendar.to_owned();
+            saved.href = format!("google:{id}");
+            saved.etag = etag;
+            let old = before.map(|b| b.overrides).unwrap_or_default();
+            for o in saved.overrides.iter_mut().filter(|o| !old.contains(o)) {
+                let Some(at) = o.recurrence_id else { continue };
+                let known = google::occurrence_id(o).map(str::to_owned);
+                let Some(occurrence) = known.map_or_else(|| s.occurrence_at(calendar_id, &id, at), |k| Ok(Some(k)))? else {
+                    continue;
+                };
+                s.save_event(calendar_id, Some(&occurrence), &Event { recurrence: String::new(), ..o.clone() }, false, invite)?;
+                if google::occurrence_id(o).is_none() {
+                    o.kept.push_str(&format!("{}{occurrence}\r\n", google::GOOGLE_ID));
+                }
+            }
+            Ok(())
+        })?;
+        Ok(saved)
+    }
+
+    /// Uses the Proton Calendar calendars of a Proton account signed in
+    /// without Bridge: its session and keys are the account's.
+    pub fn connect_proton_calendar(&self, a: &Account) -> Result<usize> {
+        if let Some(id) = self.route_first() {
+            return self.in_calendar_source(&id, || self.connect_proton_calendar(a));
+        }
+        ensure!(a.provider == Provider::Proton, t!("manage-calendar-only-proton-accounts"));
+        self.start_source(&caldav::Server {
+            url: "https://calendar.proton.me".to_owned(),
+            user: a.email.clone(),
+            proton_account: a.id.clone(),
+            ..Default::default()
+        })?;
+        self.sync_calendar()
+    }
+    fn with_proton_calendars<T>(&self, a: &Account, work: impl FnOnce(&crate::sync::proton::Session) -> Result<T>) -> Result<T> {
+        let lock = self.account_lock(&a.id);
+        let _operation = lock.lock().unwrap();
+        self.with_proton(a, work)
+    }
+    /// The Proton calendar `href` names, as the account is its member.
+    fn proton_calendar(s: &crate::sync::proton::Session, href: &str) -> Result<crate::sync::proton::ProtonCalendar> {
+        let id = href.strip_prefix("proton:").with_context(|| t!("manage-calendar-not-a-proton-calendar"))?;
+        s.calendars()?
+            .into_iter()
+            .find(|c| c.id == id)
+            .with_context(|| t!("manage-calendar-this-calendar-is-no-longer-on"))
+    }
+    /// Reads Proton's calendars and their events in the range shown,
+    /// decrypted.
+    fn sync_proton_calendar(&self, a: &Account) -> Result<usize> {
+        let now = chrono::Utc::now().timestamp();
+        let (cals, events) = self.with_proton_calendars(a, |s| {
+            let cals = s.calendars()?;
+            let mut events = Vec::new();
+            for c in &cals {
+                events.extend(s.events_in(c, now - BEHIND, now + AHEAD)?);
+            }
+            Ok((cals, events))
+        })?;
+        if let Some(first) = cals.iter().find(|c| c.writable)
+            && self.cal_pref(DEFAULT).is_none_or(|d| d.is_empty())
+        {
+            self.set_cal_pref(DEFAULT, &format!("proton:{}", first.id))?;
+        }
+        let calendars: Vec<caldav::Calendar> = cals
+            .into_iter()
+            .map(|c| caldav::Calendar {
+                href: format!("proton:{}", c.id),
+                name: c.name,
+                writable: c.writable,
+                color: c.color,
+                components: vec!["VEVENT".into()],
+                ..Default::default()
+            })
+            .collect();
+        let stored: Vec<Stored> = events
+            .into_iter()
+            .map(|e| Stored {
+                event: e.event,
+                overrides: e.overrides,
+                calendar: format!("proton:{}", e.calendar),
+                href: format!("proton:{}", e.id),
+                etag: e.version,
+                schedule_tag: String::new(),
+            })
+            .collect();
+        let count = stored.len();
+        self.save_events(stored)?;
+        self.set_cal_pref(CALENDARS, &serde_json::to_string(&calendars)?)?;
+        self.set_cal_pref(SYNCED, &now.to_string())?;
+        Ok(count)
+    }
+    /// The Proton ids of an event as kept: its series', and each changed
+    /// occurrence's.
+    fn proton_ids(stored: &Stored) -> Vec<String> {
+        stored
+            .href
+            .strip_prefix("proton:")
+            .filter(|i| !i.is_empty())
+            .map(str::to_owned)
+            .into_iter()
+            .chain(stored.overrides.iter().filter_map(|o| crate::sync::proton::proton_occurrence_id(o).map(str::to_owned)))
+            .collect()
+    }
+    /// Saves an event to a Proton calendar, encrypted and signed, in place
+    /// of what it was there.
+    fn proton_save_event(&self, a: &Account, calendar: &str, stored: &Stored) -> Result<Stored> {
+        let replacing = if stored.calendar == calendar { Self::proton_ids(stored) } else { Vec::new() };
+        let (id, occurrences) = self.with_proton_calendars(a, |s| {
+            let cal = Self::proton_calendar(s, calendar)?;
+            s.save_event(&cal, &replacing, &stored.event, &stored.overrides)
+        })?;
+        let mut saved = stored.clone();
+        saved.calendar = calendar.to_owned();
+        saved.href = format!("proton:{id}");
+        saved.etag = String::new();
+        for (o, own) in saved.overrides.iter_mut().zip(occurrences) {
+            o.kept = o
+                .kept
+                .lines()
+                .filter(|l| !l.starts_with(crate::sync::proton::PROTON_ID))
+                .map(|l| format!("{l}\r\n"))
+                .collect();
+            o.kept.push_str(&format!("{}{own}\r\n", crate::sync::proton::PROTON_ID));
+        }
+        Ok(saved)
+    }
+    fn proton_delete_event(&self, a: &Account, stored: &Stored) -> Result<()> {
+        let ids = Self::proton_ids(stored);
+        if ids.is_empty() {
+            return Ok(());
+        }
+        self.with_proton_calendars(a, |s| {
+            let cal = Self::proton_calendar(s, &stored.calendar)?;
+            s.delete_events(&cal, &ids)
+        })
+    }
+
+    /// Subscribes to a calendar feed (`webcal://`, or an `.ics` address),
+    /// read again every `minutes` (0: every six hours) and never written,
+    /// as a source of its own beside those set up. `name`, when given, is
+    /// what it's called instead of the feed's own name.
+    pub fn subscribe_calendar_feed(&self, url: &str, name: &str, minutes: u32) -> Result<usize> {
+        if !within_one() {
+            return self.add_calendar_source(|| self.subscribe_calendar_feed(url, name, minutes));
+        }
+        let address = crate::sync::feed::address(url)?;
+        self.start_source(&caldav::Server {
+            url: address.to_string(),
+            feed: true,
+            refresh_minutes: if minutes == 0 { 0 } else { minutes.max(crate::sync::feed::SHORTEST_MINUTES) },
+            label: name.trim().to_owned(),
+            ..Default::default()
+        })?;
+        self.sync_calendar()
+    }
+    /// Changes how often a feed (source `id`) is read again.
+    pub fn set_feed_interval(&self, id: &str, minutes: u32) -> Result<()> {
+        self.in_calendar_source(id, || {
+            let mut server = self
+                .calendar_server()
+                .filter(|s| s.feed)
+                .with_context(|| t!("manage-calendar-no-calendar-server-is-set-up"))?;
+            server.refresh_minutes = if minutes == 0 { 0 } else { minutes.max(crate::sync::feed::SHORTEST_MINUTES) };
+            self.set_cal_pref(SERVER, &serde_json::to_string(&server)?)
+        })
+    }
+    /// Reads the feed this source subscribes to: all of it, unless the
+    /// feed's server says it's unchanged.
+    fn sync_feed(&self, server: &caldav::Server) -> Result<usize> {
+        use crate::sync::feed;
+        let id = pim_sources::current(Pim::Calendar).unwrap_or_default();
+        let href = format!("feed:{}", if id.is_empty() { "first" } else { id.as_str() });
+        let now = chrono::Utc::now().timestamp();
+        // Nothing kept yet: read whole, whatever was read before.
+        let validators = if self.calendars().is_empty() { String::new() } else { self.cal_pref(FEED_STATE).unwrap_or_default() };
+        self.set_cal_pref(FEED_TRIED, &now.to_string())?;
+        match feed::fetch(&server.url, &validators, self.tls_connector()?)? {
+            feed::Fetched::Unchanged => {
+                self.set_cal_pref(SYNCED, &now.to_string())?;
+                Ok(self.cached_events().len())
+            }
+            feed::Fetched::Changed { text, validators } => {
+                let read = feed::read(&text, &href, now - BEHIND);
+                let host = url::Url::parse(&server.url).ok().and_then(|u| u.host_str().map(str::to_owned)).unwrap_or_default();
+                let name = [server.label.clone(), read.name, host].into_iter().find(|n| !n.is_empty()).unwrap_or_default();
+                let calendars = vec![caldav::Calendar {
+                    href,
+                    name,
+                    writable: false,
+                    color: read.color,
+                    components: vec!["VEVENT".into()],
+                    ..Default::default()
+                }];
+                let count = read.events.len();
+                self.save_events(read.events)?;
+                self.set_cal_pref(CALENDARS, &serde_json::to_string(&calendars)?)?;
+                self.set_cal_pref(FEED_STATE, &validators)?;
+                self.set_cal_pref(SYNCED, &now.to_string())?;
+                Ok(count)
+            }
+        }
+    }
+    /// Reads again each subscribed feed whose interval has passed since it
+    /// was last read (or tried: a feed that can't be reached is tried again
+    /// at its next interval, not at every check). Returns how many changed
+    /// what's kept.
+    pub fn sync_due_feeds(&self) -> usize {
+        let now = chrono::Utc::now().timestamp();
+        let mut read = 0;
+        for id in self.calendar_source_ids() {
+            let due = self.in_calendar_source(&id, || {
+                let Some(server) = self.calendar_server().filter(|s| s.feed) else {
+                    return false;
+                };
+                let minutes = if server.refresh_minutes == 0 {
+                    crate::sync::feed::DEFAULT_MINUTES
+                } else {
+                    server.refresh_minutes.max(crate::sync::feed::SHORTEST_MINUTES)
+                };
+                let last = self
+                    .calendar_synced()
+                    .into_iter()
+                    .chain(self.cal_pref(FEED_TRIED).and_then(|t| t.parse().ok()))
+                    .max();
+                last.is_none_or(|t| now - t >= i64::from(minutes) * 60)
+            });
+            if due && self.in_calendar_source(&id, || self.sync_calendar()).is_ok() {
+                read += 1;
+            }
+        }
+        read
     }
     /// Saves an event where the calendars are: CalDAV, or a JMAP server.
     fn calendar_save(&self, server: &caldav::Server, calendar: &str, stored: &Stored) -> Result<Stored> {
+        ensure!(!server.feed, t!("manage-calendar-subscribed-calendars-are-read-only"));
+        if let Some(a) = self.calendar_google(server)? {
+            let invite = !stored.event.attendees.is_empty() && self.organized_here(&stored.event);
+            return self.google_save_event(&a, calendar, stored, invite);
+        }
+        if let Some(a) = self.calendar_proton(server)? {
+            return self.proton_save_event(&a, calendar, stored);
+        }
         if let Some(a) = self.calendar_ews(server)? {
             let invite = !stored.event.attendees.is_empty() && self.organized_here(&stored.event);
             return self.ews_save_event(&a, calendar, stored, invite);
@@ -503,6 +1088,18 @@ impl Backend {
     }
     /// Removes an event where the calendars are.
     fn calendar_delete(&self, server: &caldav::Server, stored: &Stored) -> Result<()> {
+        ensure!(!server.feed, t!("manage-calendar-subscribed-calendars-are-read-only"));
+        if let Some(a) = self.calendar_google(server)? {
+            let Some(id) = stored.href.strip_prefix("google:").filter(|i| !i.is_empty()) else {
+                return Ok(());
+            };
+            let calendar = stored.calendar.strip_prefix("google:").unwrap_or_default().to_owned();
+            let tell = !stored.event.attendees.is_empty() && self.organized_here(&stored.event);
+            return self.with_google(&a, |s| s.delete_event(&calendar, id, tell));
+        }
+        if let Some(a) = self.calendar_proton(server)? {
+            return self.proton_delete_event(&a, stored);
+        }
         if let Some(a) = self.calendar_ews(server)? {
             let Some(id) = stored.href.strip_prefix("ews:").filter(|i| !i.is_empty()) else {
                 return Ok(());
@@ -550,10 +1147,31 @@ impl Backend {
             !name.trim().is_empty(),
             t!("manage-calendar-give-the-calendar-a-name")
         );
+        if let Some(id) = self.route_default() {
+            return self.in_calendar_source(&id, || self.create_calendar(name, color));
+        }
         let server = self
             .calendar_server()
             .with_context(|| t!("manage-calendar-set-up-a-calendar-server-in"))?;
-        let made = if let Some(a) = self.calendar_ews(&server)? {
+        ensure!(!server.feed, t!("manage-calendar-subscribed-calendars-are-read-only"));
+        ensure!(server.proton_account.is_empty(), t!("manage-calendar-proton-calendars-are-made-in-proton"));
+        let made = if let Some(a) = self.calendar_google(&server)? {
+            let id = self.with_google(&a, |s| {
+                let id = s.create_calendar(name.trim())?;
+                if !color.is_empty() {
+                    s.update_calendar(&id, name.trim(), color)?;
+                }
+                Ok(id)
+            })?;
+            caldav::Calendar {
+                href: format!("google:{id}"),
+                name: name.trim().to_owned(),
+                writable: true,
+                color: color.to_owned(),
+                components: vec!["VEVENT".into()],
+                ..Default::default()
+            }
+        } else if let Some(a) = self.calendar_ews(&server)? {
             let id = self.with_ews_locked(&a, |s| s.create_calendar(name.trim()))?;
             caldav::Calendar {
                 href: format!("ews:{id}"),
@@ -597,8 +1215,7 @@ impl Backend {
         } };
         let mut cals = self.calendars();
         cals.push(made.clone());
-        self.store
-            .set_preference(CALENDARS, &serde_json::to_string(&cals)?)?;
+        self.set_cal_pref(CALENDARS, &serde_json::to_string(&cals)?)?;
         Ok(made)
     }
     /// Reads a JMAP server's calendars and their events: once read, only
@@ -606,9 +1223,7 @@ impl Backend {
     /// range has to move on or the server can't say; then all again.
     fn sync_jmap_calendar(&self, a: &Account) -> Result<usize> {
         let now = chrono::Utc::now().timestamp();
-        let (saved_state, until) = self
-            .store
-            .preference(JMAP_STATE)
+        let (saved_state, until) = self.cal_pref(JMAP_STATE)
             .and_then(|p| {
                 let (state, until) = p.rsplit_once('@')?;
                 Some((state.to_owned(), until.parse::<i64>().ok()?))
@@ -626,9 +1241,7 @@ impl Backend {
             };
             // Neither is worth failing the sync over.
             if let Ok(people) = crate::sync::jscal::participant_identities(s) {
-                let _ = self
-                    .store
-                    .set_preference(PARTICIPANTS, &serde_json::to_string(&people).unwrap_or_default());
+                let _ = self.set_cal_pref(PARTICIPANTS, &serde_json::to_string(&people).unwrap_or_default());
             }
             if let Ok(found) = crate::sync::jscal::notices(s)
                 && !found.is_empty()
@@ -637,9 +1250,7 @@ impl Backend {
                 kept.extend(found.iter().map(|n| n.text.clone()));
                 keep_recent(&mut kept);
                 // Shown here from now on; the server's copies go.
-                if self
-                    .store
-                    .set_preference(NOTICES, &serde_json::to_string(&kept).unwrap_or_default())
+                if self.set_cal_pref(NOTICES, &serde_json::to_string(&kept).unwrap_or_default())
                     .is_ok()
                 {
                     let _ = crate::sync::jscal::dismiss_notices(s, &found);
@@ -694,42 +1305,57 @@ impl Backend {
             None => events,
         };
         self.save_events(all)?;
-        self.store
-            .set_preference(CALENDARS, &serde_json::to_string(&cals)?)?;
-        self.store
-            .set_preference(JMAP_STATE, &format!("{state}@{read_until}"))?;
-        self.store.set_preference(SYNCED, &now.to_string())?;
+        self.set_cal_pref(CALENDARS, &serde_json::to_string(&cals)?)?;
+        self.set_cal_pref(JMAP_STATE, &format!("{state}@{read_until}"))?;
+        self.set_cal_pref(SYNCED, &now.to_string())?;
         Ok(count)
     }
     /// What a JMAP server said about shared calendars and events (shared
     /// with you, changed by someone else…), not yet dismissed.
     pub fn calendar_notices(&self) -> Vec<String> {
-        self.store
-            .preference(NOTICES)
+        if !within_one() {
+            return self.calendar_source_ids().into_iter().flat_map(|id| self.in_calendar_source(&id, || self.calendar_notices())).collect();
+        }
+        self.cal_pref(NOTICES)
             .and_then(|j| serde_json::from_str(&j).ok())
             .unwrap_or_default()
     }
     /// Forgets the notices once read.
     pub fn dismiss_calendar_notices(&self) -> Result<()> {
-        self.store.set_preference(NOTICES, "[]")
+        if !within_one() {
+            for id in self.calendar_source_ids() {
+                self.in_calendar_source(&id, || self.dismiss_calendar_notices())?;
+            }
+            return Ok(());
+        }
+        self.set_cal_pref(NOTICES, "[]")
     }
     /// Open tasks from the calendar server, soonest due first.
     pub fn calendar_tasks(&self) -> Vec<Stored> {
-        self.store
-            .preference(TASKS)
+        if !within_one() {
+            let mut all: Vec<Stored> =
+                self.calendar_source_ids().into_iter().flat_map(|id| self.in_calendar_source(&id, || self.calendar_tasks())).collect();
+            caldav::sort_tasks(&mut all);
+            return all;
+        }
+        self.cal_pref(TASKS)
             .and_then(|j| serde_json::from_str(&j).ok())
             .unwrap_or_default()
     }
     /// Reads the open tasks again: CalDAV servers' VTODOs, or a JMAP
     /// server's tasks (JMAP for Task Lists), where it keeps them.
     pub fn sync_tasks(&self) -> Result<usize> {
+        if !within_one() {
+            return together(self.each_calendar_source(|| self.sync_tasks()), |id| self.calendar_source_label(id));
+        }
         let server = self
             .calendar_server()
             .with_context(|| t!("manage-calendar-no-calendar-server-is-set-up"))?;
         if let Some(a) = self.calendar_jmap(&server)? {
             return self.sync_jmap_tasks(&a);
         }
-        if self.calendar_graph(&server)?.is_some() || self.calendar_ews(&server)?.is_some() {
+        // Exchange's, Google's and Proton's tasks aren't kept here; feeds have none.
+        if !server.dav() {
             return Ok(0);
         }
         let tasks = caldav::tasks(
@@ -739,8 +1365,7 @@ impl Backend {
             &self.calendars(),
         )?;
         let count = tasks.len();
-        self.store
-            .set_preference(TASKS, &serde_json::to_string(&tasks)?)?;
+        self.set_cal_pref(TASKS, &serde_json::to_string(&tasks)?)?;
         Ok(count)
     }
     /// Reads a JMAP server's task lists and the tasks still to do in them;
@@ -748,7 +1373,7 @@ impl Backend {
     fn sync_jmap_tasks(&self, a: &Account) -> Result<usize> {
         use crate::sync::jscal;
         let now = chrono::Utc::now().timestamp();
-        let saved = self.store.preference(TASK_STATE).unwrap_or_default();
+        let saved = self.cal_pref(TASK_STATE).unwrap_or_default();
         let (saved_lists, saved_state) = saved.split_once('@').unwrap_or_default();
         let known = self.calendar_tasks();
         // Repeating tasks are read again each time: the occurrence to do
@@ -802,10 +1427,8 @@ impl Backend {
         };
         caldav::sort_tasks(&mut tasks);
         let count = tasks.len();
-        self.store
-            .set_preference(TASKS, &serde_json::to_string(&tasks)?)?;
-        self.store
-            .set_preference(TASK_STATE, &if state.is_empty() { String::new() } else { format!("{fingerprint}@{state}") })?;
+        self.set_cal_pref(TASKS, &serde_json::to_string(&tasks)?)?;
+        self.set_cal_pref(TASK_STATE, &if state.is_empty() { String::new() } else { format!("{fingerprint}@{state}") })?;
         Ok(count)
     }
     /// Keeps a JMAP server's task lists that are shown: the default one
@@ -826,8 +1449,7 @@ impl Backend {
                 ..Default::default()
             })
             .collect();
-        self.store
-            .set_preference(TASK_LISTS, &serde_json::to_string(&lists)?)
+        self.set_cal_pref(TASK_LISTS, &serde_json::to_string(&lists)?)
     }
     /// The task list new tasks go to on a JMAP server, made where the
     /// account has none it can write to. One that is hidden or not
@@ -870,6 +1492,9 @@ impl Backend {
     }
     /// Marks a task done (or not) on the server.
     pub fn complete_task(&self, uid: &str, done: bool) -> Result<()> {
+        if let Some(id) = self.route_event(uid) {
+            return self.in_calendar_source(&id, || self.complete_task(uid, done));
+        }
         let server = self
             .calendar_server()
             .with_context(|| t!("manage-calendar-no-calendar-server-is-set-up"))?;
@@ -887,8 +1512,7 @@ impl Backend {
         if done {
             tasks.retain(|t| t.event.uid != uid);
         }
-        self.store
-            .set_preference(TASKS, &serde_json::to_string(&tasks)?)?;
+        self.set_cal_pref(TASKS, &serde_json::to_string(&tasks)?)?;
         // A repeating JMAP task: only that occurrence is done (or not), so
         // the one to do next is read.
         if repeats && self.calendar_jmap(&server)?.is_some() {
@@ -906,6 +1530,9 @@ impl Backend {
         due: i64,
         all_day: bool,
     ) -> Result<Stored> {
+        if let Some(id) = self.route_event(uid) {
+            return self.in_calendar_source(&id, || self.edit_task(uid, summary, notes, due, all_day));
+        }
         ensure!(
             !summary.trim().is_empty(),
             t!("manage-calendar-give-the-task-a-name")
@@ -933,8 +1560,7 @@ impl Backend {
         }
         let saved = task.clone();
         caldav::sort_tasks(&mut tasks);
-        self.store
-            .set_preference(TASKS, &serde_json::to_string(&tasks)?)?;
+        self.set_cal_pref(TASKS, &serde_json::to_string(&tasks)?)?;
         // A repeating JMAP task's occurrence moved: the one to do may be
         // another now.
         if !saved.event.recurrence.is_empty() && self.calendar_jmap(&server)?.is_some() {
@@ -944,6 +1570,9 @@ impl Backend {
     }
     /// Deletes a task from the server.
     pub fn delete_task(&self, uid: &str) -> Result<()> {
+        if let Some(id) = self.route_event(uid) {
+            return self.in_calendar_source(&id, || self.delete_task(uid));
+        }
         let server = self
             .calendar_server()
             .with_context(|| t!("manage-calendar-no-calendar-server-is-set-up"))?;
@@ -952,12 +1581,25 @@ impl Backend {
             self.calendar_delete(&server, task)?;
         }
         tasks.retain(|t| t.event.uid != uid);
-        self.store
-            .set_preference(TASKS, &serde_json::to_string(&tasks)?)
+        self.set_cal_pref(TASKS, &serde_json::to_string(&tasks)?)
     }
     /// Adds a task due at `due` (0: no due date), in the calendar new
     /// events go to.
     pub fn add_task(&self, summary: &str, due: i64) -> Result<Stored> {
+        if !within_one() {
+            // Where new events go, where it keeps tasks; else the first that does.
+            let takes = |id: &String| {
+                self.in_calendar_source(id, || {
+                    self.calendar_server().is_some_and(|s| !s.jmap_account.is_empty()) || self.task_calendar().is_some()
+                })
+            };
+            let first = self.default_calendar_source();
+            let id = std::iter::once(first.clone())
+                .chain(self.calendar_source_ids())
+                .find(takes)
+                .unwrap_or(first);
+            return self.in_calendar_source(&id, || self.add_task(summary, due));
+        }
         ensure!(
             !summary.trim().is_empty(),
             t!("manage-calendar-give-the-task-a-name")
@@ -989,8 +1631,7 @@ impl Backend {
         let mut tasks = self.calendar_tasks();
         tasks.push(saved.clone());
         caldav::sort_tasks(&mut tasks);
-        self.store
-            .set_preference(TASKS, &serde_json::to_string(&tasks)?)?;
+        self.set_cal_pref(TASKS, &serde_json::to_string(&tasks)?)?;
         Ok(saved)
     }
     /// The reminders due by `now` that haven't been shown: (event, start of
@@ -1051,9 +1692,16 @@ impl Backend {
             !attendees.is_empty(),
             t!("manage-calendar-add-someone-to-see-when-theyre")
         );
+        if let Some(id) = self.route_default() {
+            return self.in_calendar_source(&id, || self.free_busy(organizer, attendees, from, to));
+        }
         let server = self
             .calendar_server()
             .with_context(|| t!("manage-calendar-set-up-a-calendar-server-in"))?;
+        ensure!(!server.feed && server.proton_account.is_empty(), t!("manage-calendar-this-calendar-cant-say-when-people"));
+        if let Some(a) = self.calendar_google(&server)? {
+            return self.with_google(&a, |s| s.free_busy(attendees, from, to));
+        }
         if let Some(a) = self.calendar_jmap(&server)? {
             return self.with_jmap_calendars(&a, |s| {
                 crate::sync::jscal::free_busy(s, attendees, from, to)
@@ -1083,9 +1731,21 @@ impl Backend {
     }
     /// Reads the calendars and their events again.
     pub fn sync_calendar(&self) -> Result<usize> {
+        if !within_one() {
+            return together(self.each_calendar_source(|| self.sync_calendar()), |id| self.calendar_source_label(id));
+        }
         let server = self
             .calendar_server()
             .with_context(|| t!("manage-calendar-no-calendar-server-is-set-up"))?;
+        if server.feed {
+            return self.sync_feed(&server);
+        }
+        if let Some(a) = self.calendar_google(&server)? {
+            return self.sync_google_calendar(&a);
+        }
+        if let Some(a) = self.calendar_proton(&server)? {
+            return self.sync_proton_calendar(&a);
+        }
         if let Some(a) = self.calendar_jmap(&server)? {
             return self.sync_jmap_calendar(&a);
         }
@@ -1112,9 +1772,8 @@ impl Backend {
         )?;
         let count = events.len();
         self.save_events(events)?;
-        self.store
-            .set_preference(CALENDARS, &serde_json::to_string(&cals)?)?;
-        self.store.set_preference(SYNCED, &now.to_string())?;
+        self.set_cal_pref(CALENDARS, &serde_json::to_string(&cals)?)?;
+        self.set_cal_pref(SYNCED, &now.to_string())?;
         // With the server scheduling, what it delivered: not worth failing
         // the sync over.
         if server.server_schedules {
@@ -1175,8 +1834,7 @@ impl Backend {
             }
         }
         keep_recent(&mut notes);
-        self.store
-            .set_preference(NOTICES, &serde_json::to_string(&notes)?)?;
+        self.set_cal_pref(NOTICES, &serde_json::to_string(&notes)?)?;
         let tls = self.tls_connector()?;
         for item in &handled {
             let _ = caldav::remove_from_inbox(server, password, tls.clone(), item);
@@ -1190,10 +1848,23 @@ impl Backend {
             !name.trim().is_empty(),
             t!("manage-calendar-give-the-calendar-a-name")
         );
+        if let Some(id) = self.route_calendar(href) {
+            return self.in_calendar_source(&id, || self.rename_calendar(href, name, color));
+        }
         let server = self
             .calendar_server()
             .with_context(|| t!("manage-calendar-no-calendar-server-is-set-up"))?;
-        if let Some(a) = self.calendar_ews(&server)? {
+        if server.feed {
+            // A feed's name is the person's to choose; nothing is written.
+            let mut server = server;
+            server.label = name.trim().to_owned();
+            self.set_cal_pref(SERVER, &serde_json::to_string(&server)?)?;
+        } else if !server.proton_account.is_empty() {
+            bail!(t!("manage-calendar-proton-calendars-are-made-in-proton"));
+        } else if let Some(a) = self.calendar_google(&server)? {
+            let id = href.strip_prefix("google:").with_context(|| t!("manage-calendar-not-a-google-calendar"))?;
+            self.with_google(&a, |s| s.update_calendar(id, name.trim(), color))?;
+        } else if let Some(a) = self.calendar_ews(&server)? {
             let id = href.strip_prefix("ews:").with_context(|| t!("manage-calendar-not-an-exchange-calendar"))?;
             self.with_ews_locked(&a, |s| s.rename_any_folder(id, name.trim()))?;
         } else if let Some(a) = self.calendar_graph(&server)? {
@@ -1224,15 +1895,26 @@ impl Backend {
                 c.color = color.to_owned();
             }
         }
-        self.store
-            .set_preference(CALENDARS, &serde_json::to_string(&cals)?)
+        self.set_cal_pref(CALENDARS, &serde_json::to_string(&cals)?)
     }
     /// Deletes a calendar and its events from the server.
     pub fn delete_calendar(&self, href: &str) -> Result<()> {
+        if let Some(id) = self.route_calendar(href) {
+            return self.in_calendar_source(&id, || self.delete_calendar(href));
+        }
         let server = self
             .calendar_server()
             .with_context(|| t!("manage-calendar-no-calendar-server-is-set-up"))?;
-        if let Some(a) = self.calendar_ews(&server)? {
+        if server.feed {
+            // Unsubscribing: the feed goes, as a source of its own.
+            let id = pim_sources::current(Pim::Calendar).unwrap_or_default();
+            return if id.is_empty() { self.disconnect_calendar() } else { self.remove_calendar_source(&id) };
+        }
+        ensure!(server.proton_account.is_empty(), t!("manage-calendar-proton-calendars-are-made-in-proton"));
+        if let Some(a) = self.calendar_google(&server)? {
+            let id = href.strip_prefix("google:").with_context(|| t!("manage-calendar-not-a-google-calendar"))?;
+            self.with_google(&a, |s| s.delete_calendar(id))?;
+        } else if let Some(a) = self.calendar_ews(&server)? {
             let id = href.strip_prefix("ews:").with_context(|| t!("manage-calendar-not-an-exchange-calendar"))?;
             self.with_ews_locked(&a, |s| s.delete_any_folder(id))?;
         } else if let Some(a) = self.calendar_graph(&server)? {
@@ -1254,23 +1936,25 @@ impl Backend {
         } }
         let mut cals = self.calendars();
         cals.retain(|c| c.href != href);
-        self.store
-            .set_preference(CALENDARS, &serde_json::to_string(&cals)?)?;
+        self.set_cal_pref(CALENDARS, &serde_json::to_string(&cals)?)?;
         let mut events = self.calendar_events();
         events.retain(|e| e.calendar != href);
         self.save_events(events)?;
-        if self.store.preference(DEFAULT).as_deref() == Some(href) {
-            self.store.set_preference(DEFAULT, "")?;
+        if self.cal_pref(DEFAULT).as_deref() == Some(href) {
+            self.set_cal_pref(DEFAULT, "")?;
         }
         Ok(())
     }
     /// The calendar server's storage, used and left in octets, where it
     /// says (CalDAV's RFC 4331 quota).
     pub fn calendar_quota(&self) -> Result<Option<(u64, u64)>> {
+        if let Some(id) = self.route_first() {
+            return self.in_calendar_source(&id, || self.calendar_quota());
+        }
         let server = self
             .calendar_server()
             .with_context(|| t!("manage-calendar-no-calendar-server-is-set-up"))?;
-        if self.calendar_jmap(&server)?.is_some() || (self.calendar_graph(&server)?.is_some() || self.calendar_ews(&server)?.is_some()) {
+        if !server.dav() {
             return Ok(None);
         }
         caldav::quota(&server, &self.calendar_password()?, self.tls_connector()?)
@@ -1278,11 +1962,14 @@ impl Backend {
     /// Attaches a file to an event on a calendar that keeps attachments
     /// itself (RFC 8607), then reads the calendar again to show it.
     pub fn attach_to_event(&self, uid: &str, path: &std::path::Path) -> Result<()> {
+        if let Some(id) = self.route_event(uid) {
+            return self.in_calendar_source(&id, || self.attach_to_event(uid, path));
+        }
         let server = self
             .calendar_server()
             .with_context(|| t!("manage-calendar-no-calendar-server-is-set-up"))?;
         ensure!(
-            self.calendar_jmap(&server)?.is_none() && (self.calendar_graph(&server)?.is_none() && self.calendar_ews(&server)?.is_none()),
+            server.dav(),
             t!("manage-calendar-attach-files-to-events-on-a")
         );
         let stored = self
@@ -1295,11 +1982,14 @@ impl Backend {
     /// Takes a file the calendar server keeps (its MANAGED-ID, RFC 8607
     /// §3.6) off an event, then reads the calendar again.
     pub fn remove_event_attachment(&self, uid: &str, managed_id: &str) -> Result<()> {
+        if let Some(id) = self.route_event(uid) {
+            return self.in_calendar_source(&id, || self.remove_event_attachment(uid, managed_id));
+        }
         let server = self
             .calendar_server()
             .with_context(|| t!("manage-calendar-no-calendar-server-is-set-up"))?;
         ensure!(
-            self.calendar_jmap(&server)?.is_none() && (self.calendar_graph(&server)?.is_none() && self.calendar_ews(&server)?.is_none()),
+            server.dav(),
             t!("manage-calendar-attachments-are-kept-on-caldav-calendars")
         );
         let stored = self
@@ -1309,12 +1999,16 @@ impl Backend {
         self.sync_calendar()?;
         Ok(())
     }
+    /// Disconnects the calendar source worked within (the first, outside
+    /// any), forgetting what it kept here.
     pub fn disconnect_calendar(&self) -> Result<()> {
-        for key in [SERVER, CALENDARS, EVENTS, SYNCED, DEFAULT, TASKS, TASK_LISTS, TASK_STATE, JMAP_STATE, NOTICES, PARTICIPANTS] {
-            self.store.set_preference(key, "")?;
+        if let Some(id) = self.route_first() {
+            return self.in_calendar_source(&id, || self.disconnect_calendar());
         }
+        let id = pim_sources::current(Pim::Calendar).unwrap_or_default();
+        self.clear_source_keys(&id, SOURCE_KEYS)?;
         #[cfg(not(test))]
-        store::delete_secret(PASSWORD)?;
+        store::delete_secret(&key(PASSWORD))?;
         crate::manage::widgets::publish_soon(self.store.clone());
         Ok(())
     }
@@ -1328,6 +2022,24 @@ impl Backend {
             event.end >= event.start,
             t!("manage-calendar-the-event-ends-before-it-starts")
         );
+        if !within_one() {
+            let from = self.calendar_source_of_event(&event.uid);
+            let to = calendar
+                .and_then(|c| self.calendar_source_of(c))
+                .or_else(|| from.clone())
+                .unwrap_or_else(|| self.default_calendar_source());
+            if let Some(from) = from.filter(|f| *f != to) {
+                // To another account's calendar: made there, then taken out
+                // of the one it was in.
+                let uid = event.uid.clone();
+                let mut fresh = event;
+                fresh.source.clear();
+                let saved = self.in_calendar_source(&to, || self.save_event(fresh, calendar))?;
+                self.in_calendar_source(&from, || self.delete_event(&uid))?;
+                return Ok(saved);
+            }
+            return self.in_calendar_source(&to, || self.save_event(event, calendar));
+        }
         let server = self
             .calendar_server()
             .with_context(|| t!("manage-calendar-set-up-a-calendar-server-in"))?;
@@ -1401,11 +2113,7 @@ impl Backend {
     /// (MOVE, RFC 4918 §9.9), returning it there. `None` where it can't
     /// be (JMAP), so it is saved anew instead.
     fn calendar_move(&self, server: &caldav::Server, stored: &Stored, target: &str) -> Result<Option<Stored>> {
-        if self.calendar_jmap(server)?.is_some()
-            || target.starts_with("jmap:")
-            || self.calendar_graph(server)?.is_some()
-            || self.calendar_ews(server)?.is_some()
-        {
+        if !server.dav() || target.starts_with("jmap:") {
             return Ok(None);
         }
         caldav::move_event(server, &self.calendar_password()?, self.tls_connector()?, stored, target).map(Some)
@@ -1425,6 +2133,9 @@ impl Backend {
     /// Changes one repeat of a repeating event (the one that started at
     /// `occurrence`), leaving the others as they are.
     pub fn save_occurrence(&self, uid: &str, occurrence: i64, mut changed: Event) -> Result<()> {
+        if let Some(id) = self.route_event(uid) {
+            return self.in_calendar_source(&id, || self.save_occurrence(uid, occurrence, changed));
+        }
         ensure!(
             !changed.summary.trim().is_empty(),
             t!("manage-calendar-give-the-event-a-title")
@@ -1463,6 +2174,9 @@ impl Backend {
     }
     /// Takes one repeat of a repeating event out (EXDATE), leaving the others.
     pub fn delete_occurrence(&self, uid: &str, occurrence: i64) -> Result<()> {
+        if let Some(id) = self.route_event(uid) {
+            return self.in_calendar_source(&id, || self.delete_occurrence(uid, occurrence));
+        }
         let server = self
             .calendar_server()
             .with_context(|| t!("manage-calendar-no-calendar-server-is-set-up"))?;
@@ -1485,6 +2199,9 @@ impl Backend {
         self.save_events(events)
     }
     pub fn delete_event(&self, uid: &str) -> Result<()> {
+        if let Some(id) = self.route_event(uid) {
+            return self.in_calendar_source(&id, || self.delete_event(uid));
+        }
         let mut events = self.calendar_events();
         if let Some(stored) = events.iter().find(|s| s.event.uid == uid)
             && let Some(server) = self.calendar_server()
@@ -1576,7 +2293,7 @@ impl Backend {
         // declining, which takes the event out, is refused.
         let mut take_version = true;
         if self.calendar_server().is_some()
-            && !self.exchange_calendar()?
+            && !self.exchange_calendar(&event.uid)?
             && let Some(kept) = self.stored_event(&event.uid)
         {
             match &kept.event.organizer {
@@ -1621,6 +2338,26 @@ impl Backend {
     /// is saved with your answer in it: the invitation's version of it when
     /// `take_version`, else the calendar's own copy, where it has one.
     pub(super) fn file_answer(&self, event: &Event, me: &str, status: PartStat, take_version: bool) -> Result<()> {
+        if let Some(id) = self.route_event(&event.uid) {
+            return self.in_calendar_source(&id, || self.file_answer(event, me, status, take_version));
+        }
+        // Google put the invitation in the calendar itself, as Exchange does.
+        if let Some(server) = self.calendar_server()
+            && let Some(a) = self.calendar_google(&server)?
+        {
+            let Some(stored) = self.stored_event(&event.uid).filter(|s| s.href.starts_with("google:")) else {
+                return Ok(());
+            };
+            let calendar = stored.calendar.strip_prefix("google:").unwrap_or_default().to_owned();
+            let id = match event.recurrence_id {
+                Some(at) => self
+                    .with_google(&a, |s| s.occurrence_at(&calendar, &stored.href["google:".len()..], at))?
+                    .unwrap_or_else(|| stored.href["google:".len()..].to_owned()),
+                None => stored.href["google:".len()..].to_owned(),
+            };
+            self.with_google(&a, |s| s.respond_event(&calendar, &id, status))?;
+            return self.sync_calendar().map(drop);
+        }
         // Exchange put the invitation in the calendar itself: it is
         // answered there (the reply already went by mail).
         if let Some(server) = self.calendar_server()
@@ -1675,6 +2412,9 @@ impl Backend {
     }
     /// Saves an invitation's event as the organizer sent it.
     fn save_invited(&self, event: Event) -> Result<()> {
+        if let Some(id) = self.route_event(&event.uid) {
+            return self.in_calendar_source(&id, || self.save_invited(event));
+        }
         let server = self
             .calendar_server()
             .with_context(|| t!("manage-calendar-no-calendar-server-is-set-up"))?;
@@ -2040,6 +2780,9 @@ impl Backend {
     /// Takes one occurrence out of a repeating event (an EXDATE), keeping
     /// the rest of the series.
     fn cancel_occurrence(&self, uid: &str, at: i64) -> Result<()> {
+        if let Some(id) = self.route_event(uid) {
+            return self.in_calendar_source(&id, || self.cancel_occurrence(uid, at));
+        }
         let Some(mut stored) = self.stored_event(uid) else {
             return Ok(());
         };
@@ -2157,6 +2900,9 @@ impl Backend {
     }
     /// Saves a changed event to the server and here.
     fn store_updated(&self, stored: Stored) -> Result<()> {
+        if let Some(id) = self.route_event(&stored.event.uid) {
+            return self.in_calendar_source(&id, || self.store_updated(stored));
+        }
         let server = self
             .calendar_server()
             .with_context(|| t!("manage-calendar-no-calendar-server-is-set-up"))?;
@@ -2197,6 +2943,9 @@ impl Backend {
     /// REQUEST to all of them, from `a` as the organizer. Returns how many
     /// were told.
     pub fn send_invitations(&self, a: &Account, uid: &str) -> Result<usize> {
+        if let Some(id) = self.route_event(uid) {
+            return self.in_calendar_source(&id, || self.send_invitations(a, uid));
+        }
         if self.server_schedules() {
             // Saving it told the server, which invites the guests.
             return Ok(self
@@ -2216,6 +2965,9 @@ impl Backend {
     /// matters. For guests whose invitation got lost (SCHEDULE-STATUS 3.x
     /// or 5.x, `Attendee::delivery_failed`).
     pub fn resend_invitations(&self, a: &Account, uid: &str) -> Result<usize> {
+        if let Some(id) = self.route_event(uid) {
+            return self.in_calendar_source(&id, || self.resend_invitations(a, uid));
+        }
         if !self.server_schedules()
             || self
                 .calendar_jmap(
@@ -2260,6 +3012,9 @@ impl Backend {
     }
     /// Tells an event's guests it's cancelled (before deleting it).
     pub fn cancel_invitations(&self, a: &Account, uid: &str) -> Result<usize> {
+        if let Some(id) = self.route_event(uid) {
+            return self.in_calendar_source(&id, || self.cancel_invitations(a, uid));
+        }
         if self.server_schedules() {
             // Deleting it tells the server, which tells the guests.
             return Ok(self
@@ -2391,6 +3146,26 @@ impl Backend {
                 )
             }
         }
+    }
+}
+
+/// Each source's count, added up (`each_calendar_source`, and contacts'
+/// alike). A source that failed is said by name, once the others were
+/// read; none set up at all is an error too.
+pub(super) fn together(results: Vec<(String, Result<usize>)>, label: impl Fn(&str) -> String) -> Result<usize> {
+    ensure!(!results.is_empty(), t!("manage-calendar-no-calendar-server-is-set-up"));
+    let mut total = 0;
+    let mut failed = None;
+    for (id, result) in results {
+        match result {
+            Ok(n) => total += n,
+            Err(e) if failed.is_none() => failed = Some(e.context(t!("manage-pim-sources-couldnt-read", source = label(&id)))),
+            Err(_) => {}
+        }
+    }
+    match failed {
+        Some(e) => Err(e),
+        None => Ok(total),
     }
 }
 
@@ -2592,13 +3367,17 @@ impl Backend {
         self.require_vouched(a, m)
     }
 
-    /// Whether the calendar is Exchange's (Web Services or Graph): it files
-    /// invitations itself, and an answer only answers its own copy.
-    fn exchange_calendar(&self) -> Result<bool> {
+    /// Whether the calendar event `uid` is in (or would go to) is
+    /// Exchange's (Web Services or Graph) or Google's: they file invitations
+    /// themselves, and an answer only answers their own copy.
+    fn exchange_calendar(&self, uid: &str) -> Result<bool> {
+        if let Some(id) = self.route_event(uid) {
+            return self.in_calendar_source(&id, || self.exchange_calendar(uid));
+        }
         let Some(server) = self.calendar_server() else {
             return Ok(false);
         };
-        Ok(self.calendar_ews(&server)?.is_some() || self.calendar_graph(&server)?.is_some())
+        Ok(self.calendar_ews(&server)?.is_some() || self.calendar_graph(&server)?.is_some() || !server.google_account.is_empty())
     }
 
     /// Adds an event an email carries (an invitation or a published event,

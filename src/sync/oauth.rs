@@ -1165,6 +1165,8 @@ pub fn authorize(account: &Account, cancel: Arc<AtomicBool>) -> Result<Grant> {
 /// contacts, never at sign-in.
 pub const GOOGLE_CALENDAR: &str = "https://www.googleapis.com/auth/calendar";
 pub const GOOGLE_CONTACTS: &str = "https://www.googleapis.com/auth/carddav";
+/// Google's contacts through the People API (`sync/google.rs`).
+pub const GOOGLE_PEOPLE: &str = "https://www.googleapis.com/auth/contacts";
 
 /// As `authorize`, asking for `more` scopes besides the mail ones (Google's
 /// incremental authorization, `include_granted_scopes`): the token that
@@ -1419,7 +1421,7 @@ pub fn redeem(account: &Account, grant: &Grant) -> Result<(Secret, Identity)> {
             grant
                 .scope
                 .split_whitespace()
-                .filter(|s| [GOOGLE_CALENDAR, GOOGLE_CONTACTS].contains(s)),
+                .filter(|s| [GOOGLE_CALENDAR, GOOGLE_CONTACTS, GOOGLE_PEOPLE].contains(s)),
         );
         let missing: Vec<&str> = needed
             .into_iter()

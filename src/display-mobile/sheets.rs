@@ -424,7 +424,7 @@ impl MailApp {
         let size = window.viewport_size();
         let tall = matches!(
             modal,
-            Modal::Connect | Modal::Reconnect(_) | Modal::Original | Modal::Snooze(_)
+            Modal::Connect | Modal::Reconnect(_) | Modal::Original | Modal::Snooze(_) | Modal::FollowUp(_)
         );
         let wide = Self::mobile_split(window);
         let max_h = f32::from(size.height) * SHEET_MAX;

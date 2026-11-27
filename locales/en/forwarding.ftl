@@ -29,6 +29,28 @@ forwarding-add-a-service = Add a Service
 
 forwarding-api-key = API key
 
+forwarding-proton-account = Proton account
+
+forwarding-proton-pass-extra-password = Proton Pass extra password
+
+forwarding-proton-password = Proton password
+
+forwarding-sign-in-to-proton-pass-to-manage = Proton ended the Proton Pass session. Sign in to Proton Pass again to manage these aliases.
+
+forwarding-proton-ended-the-pass-session-sign-in = Proton keeps these aliases in Proton Pass, which signs in on its own. Sign in with the account's Proton password.
+
+forwarding-sign-in = Sign In…
+
+forwarding-sign-in-to-proton-pass-again = Sign In to Proton Pass…
+
+forwarding-signed-in-to-proton-pass = Signed in to Proton Pass
+
+forwarding-proton-pass-signs-in-on-its-own = Proton Pass, where Proton keeps these aliases, signs in on its own: Proton gives the mail sign-in no access to it. Only the Pass session is kept, in the system keychain; the password isn't.
+
+forwarding-only-if-you-protect-proton-pass = Only if you protect Proton Pass with an extra password. It's kept in the system keychain, like API keys.
+
+forwarding-no-proton-account = No Proton account here is signed in directly, or each one's aliases are already listed. Add a Proton account (not through Proton Mail Bridge) first.
+
 forwarding-open = Open
 
 forwarding-server = Server
@@ -36,6 +58,7 @@ forwarding-server = Server
 forwarding-only-for-a-self-hosted-server = Only for a self-hosted server. Blank uses { $default_server }.
 
 forwarding-connecting = Connecting…
+forwarding-loading-proton-addresses = Loading your Proton addresses and aliases…
 
 forwarding-connect = Connect
 
@@ -152,7 +175,7 @@ forwarding-add = Add
 
 forwarding-delete-the-contact-its-reverse-alias = Delete the contact { $title }? Its reverse alias stops working.
 
-forwarding-none-yet-simplelogin-makes-one-for = None yet. SimpleLogin makes one for each person who writes to this alias, or whom you write to from it; add one above to write to someone new.
+forwarding-none-yet-simplelogin-makes-one-for = None yet. { $label } makes one for each person who writes to this alias, or whom you write to from it; add one above to write to someone new.
 
 forwarding-no-contact-matches = No contact matches.
 
@@ -212,5 +235,7 @@ forwarding-show-in-its-mailbox = Show in Its Mailbox
 forwarding-show-as-its-own-account = Show as Its Own Account
 
 forwarding-delete-alias = Delete Alias…
+
+forwarding-delete-address = Delete Address…
 
 forwarding-the-mailbox-you-write-from = the mailbox you write from

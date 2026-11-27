@@ -901,18 +901,32 @@ fn truncate_chars(s: &str, max: usize) -> String {
 /// Reads cached calendar events from `store` and expands upcoming occurrences
 /// from the start of today (local time) through `AGENDA_DAYS` ahead.
 fn calendar_agenda(store: &Store, now: i64) -> (bool, Vec<WidgetEvent>) {
-    let server: Option<caldav::Server> = store
-        .preference("calendar_server")
-        .and_then(|j| serde_json::from_str(&j).ok())
-        .filter(|s: &caldav::Server| !s.url.is_empty());
-    let calendars: Vec<caldav::Calendar> = store
-        .preference("calendars")
-        .and_then(|j| serde_json::from_str(&j).ok())
-        .unwrap_or_default();
-    let stored: Vec<caldav::Stored> = store
-        .preference("calendar_events")
-        .and_then(|j| serde_json::from_str(&j).ok())
-        .unwrap_or_default();
+    use crate::manage::backend::pim_sources::{Pim, key_in, source_ids};
+    // Every calendar source's (`pim_sources`): the first under the keys it
+    // always had, the others under keys of their own.
+    let mut server: Option<caldav::Server> = None;
+    let mut calendars: Vec<caldav::Calendar> = Vec::new();
+    let mut stored: Vec<caldav::Stored> = Vec::new();
+    for id in source_ids(store, Pim::Calendar) {
+        server = server.or_else(|| {
+            store
+                .preference(&key_in("calendar_server", &id))
+                .and_then(|j| serde_json::from_str(&j).ok())
+                .filter(|s: &caldav::Server| !s.url.is_empty())
+        });
+        calendars.extend(
+            store
+                .preference(&key_in("calendars", &id))
+                .and_then(|j| serde_json::from_str::<Vec<caldav::Calendar>>(&j).ok())
+                .unwrap_or_default(),
+        );
+        stored.extend(
+            store
+                .preference(&key_in("calendar_events", &id))
+                .and_then(|j| serde_json::from_str::<Vec<caldav::Stored>>(&j).ok())
+                .unwrap_or_default(),
+        );
+    }
 
     let connected = server.is_some() || !calendars.is_empty() || !stored.is_empty();
     if stored.is_empty() {
@@ -1262,6 +1276,8 @@ pub fn publish_soon(store: Arc<Store>) {
     let spawned = std::thread::Builder::new()
         .name("picacho-widgets".into())
         .spawn(move || {
+            // Scanning every account's mail at launch: after the window.
+            crate::manage::memory::lower_priority();
             loop {
                 std::thread::sleep(PUBLISH_DELAY);
                 publish(&store);

@@ -90,6 +90,9 @@ pub(super) struct Mobile {
     pub(super) pan: Option<String>,
     /// When the last swipe ended; its fling must not start another.
     pub(super) swipe_ended: Option<std::time::Instant>,
+    /// How far the row being swiped must go for letting go to act (see
+    /// `list::swipe_reach`).
+    pub(super) swipe_reach: f32,
     /// How far a pull-to-refresh has been dragged down at the list's top.
     pub(super) pull: f32,
     /// The current touch began with the list at its top, so pulling past
@@ -150,6 +153,8 @@ pub(super) struct Mobile {
     pub(super) sheet_scroll: ScrollHandle,
     /// The filter chips' sideways scroll.
     pub(super) filters_scroll: ScrollHandle,
+    /// The inbox's category chips, sideways.
+    pub(super) categories_scroll: ScrollHandle,
     /// Stands in for the system's insets in tests.
     #[cfg(test)]
     pub(super) fake_insets: Option<Insets>,
@@ -166,6 +171,7 @@ impl Mobile {
             split: false,
             swipe: None,
             swipe_ended: None,
+            swipe_reach: 88.,
             pan: None,
             pull: 0.,
             pull_armed: false,
@@ -194,6 +200,7 @@ impl Mobile {
             settings_scroll: ScrollHandle::new(),
             sheet_scroll: ScrollHandle::new(),
             filters_scroll: ScrollHandle::new(),
+            categories_scroll: ScrollHandle::new(),
             #[cfg(test)]
             fake_insets: None,
         }
@@ -559,7 +566,24 @@ impl MailApp {
             self.mobile.settings_page = false;
             return false;
         }
-        if self.modal.is_some() || self.selecting || self.search_open {
+        if self.modal.is_some() {
+            return false;
+        }
+        // An open message goes back to the list, even with a search or
+        // a find open: Back used to close the search under the message
+        // (or the find in it, after sliding away as though going back),
+        // leaving the message where it was.
+        if self.mobile_screen() == Screen::Reader && !self.selecting {
+            if self.find.open {
+                self.tool_action(super::tools::ToolAction::FindClose, w, cx);
+                return true;
+            }
+            self.mobile_popped(cx);
+            self.handle(Action::BackToList, w, cx);
+            cx.notify();
+            return true;
+        }
+        if self.selecting || self.search_open {
             return false;
         }
         match self.mobile_screen() {
@@ -697,7 +721,12 @@ impl MailApp {
             }
             // A sheet or the keyboard (no drag for those), or the button.
             Back::Go if self.mobile.back_release.is_none() => self.close(w, cx),
-            Back::Go => {}
+            // Pressed again while the last one's slide finishes: that one
+            // goes back now, and this one too. It used to be dropped.
+            Back::Go => {
+                self.mobile_finish_release(w, cx);
+                self.close(w, cx);
+            }
             Back::Cancelled => {
                 self.mobile_back_gesture(&gesture(BackGesturePhase::Cancelled, 0.), w, cx);
             }
@@ -730,7 +759,8 @@ impl MailApp {
     /// Whether a back drag can start here: a screen to go back to, and
     /// nothing (a sheet, a composer) over it.
     fn mobile_can_go_back(&self, cx: &App) -> bool {
-        !matches!(self.mobile_screen(), Screen::Mailboxes | Screen::Setup)
+        let screen = self.mobile_screen();
+        !matches!(screen, Screen::Mailboxes | Screen::Setup)
             && !self.mobile_split_frame()
             && !self.mobile_split_settings()
             && self.menu.is_none()
@@ -739,7 +769,8 @@ impl MailApp {
             && self.mobile.back_release.is_none()
             && self.links.confirm.is_none()
             && !self.selecting
-            && !self.search_open
+            // A message opened from search results goes back to them.
+            && (!self.search_open || (screen == Screen::Reader && !self.find.open))
     }
 
     /// Listens, before anything under the finger, for pans that start at
@@ -858,6 +889,19 @@ impl MailApp {
             });
         })
         .detach();
+    }
+
+    /// Ends a let-go back drag's slide at once, going back if it was to.
+    #[cfg_attr(not(target_os = "android"), allow(dead_code))]
+    fn mobile_finish_release(&mut self, w: &mut Window, cx: &mut Context<Self>) {
+        if let Some((_, commit, _)) = self.mobile.back_release.take() {
+            if commit {
+                self.close(w, cx);
+                self.mobile.slide = Slide::None;
+                self.mobile.push_anim += 1;
+            }
+            cx.notify();
+        }
     }
 
     /// Goes back as a back button does: the screen slides away over the one
@@ -1081,7 +1125,7 @@ impl MailApp {
         add(&self.fwd_contact_new, Keys::Email);
         // Masked, so the password keyboard (see `add`): not listed before,
         // they got the platform's plain keyboard.
-        for state in [&self.calendar_password, &self.contacts_password, &self.key_passphrase] {
+        for state in [&self.calendar_password, &self.contacts_password, &self.key_passphrase, &self.fwd_pass_password] {
             add(state, Keys::Password);
         }
         for state in [&self.cal.interval, &self.cal.month_day, &self.cal.count, &self.cal.until] {

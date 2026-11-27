@@ -178,7 +178,8 @@ impl MailApp {
             && self.account.as_deref() == Some(account)
             && self.mailbox() == mailbox
             && !self.subs_open
-            && !self.summary_open;
+            && !self.summary_open
+            && !self.waiting_open;
         let count = self.unread_for(account, &mailbox);
         let selector = format!("mobile-nav-{account}-{}", mailbox.key());
         let menu_account = account.to_owned();
@@ -220,6 +221,35 @@ impl MailApp {
             cx,
         )
         .into_any_element()
+    }
+
+    /// The row opening the sent mail an account (or every account) waits
+    /// on a reply to: there while something is waited on, or it is open.
+    fn mobile_waiting_cell(&self, id: &str, cx: &Context<Self>) -> Option<AnyElement> {
+        let c = self.colors();
+        let open = self.waiting_open && self.account.as_deref() == Some(id);
+        let (all, overdue) = self.waiting_counts(id);
+        if all == 0 && !open {
+            return None;
+        }
+        let account = id.to_owned();
+        Some(
+            self.cell(
+                format!("mobile-waiting-{id}"),
+                icon_el("waiting", 22., c.accent).into_any_element(),
+                t!("mobile-mailboxes-waiting-for"),
+                self.badge(if overdue > 0 { overdue } else { all }),
+                true,
+                self.mobile.split && open,
+                Rc::new(move |this, w, cx| {
+                    this.mobile.mailboxes = false;
+                    this.handle(Action::OpenWaiting(account.clone()), w, cx);
+                    this.mobile_pushed(cx);
+                }),
+                cx,
+            )
+            .into_any_element(),
+        )
     }
 
     /// The row opening an account's Summary.
@@ -276,6 +306,7 @@ impl MailApp {
         if a.provider != Provider::Pop3 {
             rows.push(self.mobile_subscriptions_cell(&id, cx));
         }
+        rows.extend(self.mobile_waiting_cell(&id, cx));
         let menu_id = id.clone();
         let header = div()
             .id(SharedString::from(format!("mobile-account-{id}")))
@@ -372,6 +403,7 @@ impl MailApp {
                 .map_or(0, |i| i + 1);
             rows.insert(inbox.min(rows.len()), self.mobile_summary_cell(id, cx));
             rows.push(self.mobile_subscriptions_cell(id, cx));
+            rows.extend(self.mobile_waiting_cell(id, cx));
         }
         let menu_id = id.to_owned();
         div()

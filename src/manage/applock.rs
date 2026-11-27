@@ -148,7 +148,7 @@ impl PasscodeHash {
         let hash = derive(passcode, &salt, m, t, p)?;
         Ok(Self {
             salt: B64.encode(salt),
-            hash: B64.encode(hash.as_ref()),
+            hash: B64.encode(&hash[..]),
             memory_kib: m,
             iterations: t,
             parallelism: p,

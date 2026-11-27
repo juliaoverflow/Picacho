@@ -17,6 +17,9 @@ pub(super) struct Place {
     pub subscriptions: bool,
     #[serde(default)]
     pub sender: Option<MailSubscription>,
+    /// Waiting For (over Sent).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub waiting: bool,
 }
 /// What a message list was built from: the view, and each of its accounts'
 /// revisions read before it was (`Backend::list_revision`), in the order of
@@ -210,6 +213,7 @@ impl MailApp {
             mailbox: self.mailbox(),
             subscriptions: self.subs_open,
             sender: self.subs_open.then(|| self.subs_sender.clone()).flatten(),
+            waiting: self.waiting_open,
         };
         if let Ok(json) = serde_json::to_string(&place) {
             self.backend.store.set_preference_soon(PLACE_PREFERENCE, &json);
@@ -226,7 +230,9 @@ impl MailApp {
         }
         // Subscriptions are listed per account and for All Accounts.
         let subscriptions_listed = !place.subscriptions || id == ALL_MAIL || !fwd::is_view(id);
-        subscriptions_listed.then_some(place)
+        // So is Waiting For.
+        let waiting_listed = !place.waiting || id == ALL_MAIL || !fwd::is_view(id);
+        (subscriptions_listed && waiting_listed).then_some(place)
     }
     /// Whether mailbox `mailbox` of account or view `id` is listed in the
     /// sidebar, to be opened again.
@@ -261,6 +267,8 @@ impl MailApp {
             if let Some(sender) = place.sender {
                 self.open_subscription(sender, cx);
             }
+        } else if place.waiting {
+            self.open_waiting(place.account, w, cx);
         } else {
             self.open_mailbox(Some(place.account), place.mailbox, w, cx);
         }
@@ -327,7 +335,7 @@ impl MailApp {
             let Some((account, a)) = self
                 .forwarding
                 .iter()
-                .filter(|f| f.service == ForwardingService::SimpleLogin)
+                .filter(|f| f.service.has_contacts())
                 .find_map(|f| {
                     let a = f.aliases.iter().find(|a| a.email.eq_ignore_ascii_case(&alias))?;
                     Some((f.clone(), a.clone()))
@@ -340,7 +348,7 @@ impl MailApp {
             }
             self.task(
                 cx,
-                move |b| fwd::learn_contacts(&b.store, &account, &a),
+                move |b| fwd::learn_contacts(&b, &account, &a),
                 |this, result, cx| {
                     if result.is_ok() {
                         this.reverse_contacts = Arc::new(fwd::reverse_contacts(&this.backend.store));
@@ -371,6 +379,7 @@ impl MailApp {
         let accounts = self.scope.accounts.clone();
         let generation = self.load_generation;
         let key = mailbox.key();
+        let waiting = self.waiting_open;
         move |b| {
             // Read first: a change committed while listing makes the key
             // stale, so the next check builds the list again.
@@ -380,6 +389,10 @@ impl MailApp {
                 accounts: accounts.clone(),
                 revisions: accounts.iter().map(|id| b.list_revision(id)).collect(),
             };
+            // Waiting For: only the sent mail waited on.
+            if waiting {
+                return Ok((super::follow_up::waiting_list(&b, &accounts)?, None, key));
+            }
             if let [id] = accounts.as_slice() {
                 let (messages, layout) = b.listed(id, &mailbox)?;
                 return Ok((messages, layout, key));
@@ -777,6 +790,13 @@ impl MailApp {
                     div().child(self.stagger(nav, Self::next_row(row))),
                     Self::view_folders(id).len() + 2,
                 ));
+                if let Some(nav) = self.waiting_nav(id, cx) {
+                    block = block.child(self.reveal(
+                        id,
+                        div().child(self.stagger(nav, Self::next_row(row))),
+                        Self::view_folders(id).len() + 3,
+                    ));
+                }
             }
         }
         // All Accounts stands apart from the accounts below it.
@@ -862,7 +882,8 @@ impl MailApp {
                 let active = current
                     && self.mailbox() == mailbox
                     && !self.subs_open
-                    && !self.summary_open;
+                    && !self.summary_open
+                    && !self.waiting_open;
                 let count = self.unread_for(id, &mailbox);
                 let button = self.rail_button(
                     format!("rail-{id}-{}", folder.key()),
@@ -915,6 +936,13 @@ impl MailApp {
                     div().child(self.stagger(button, Self::next_row(row))),
                     Self::view_folders(id).len() + 1,
                 ));
+                if let Some(button) = self.waiting_rail(id, cx) {
+                    block = block.child(self.reveal(
+                        id,
+                        div().child(self.stagger(button, Self::next_row(row))),
+                        Self::view_folders(id).len() + 2,
+                    ));
+                }
             }
         }
         if !movable {
@@ -998,6 +1026,12 @@ impl MailApp {
         }
     }
     pub(super) fn connect_forwarding(&mut self, w: &mut Window, cx: &mut Context<Self>) {
+        // Proton's own aliases, in a build with a Pass registration: a
+        // sign-in to Proton Pass first, step by step as Proton Mail's.
+        if self.fwd_service == ForwardingService::Proton && crate::sync::proton::pass_sign_in() {
+            self.continue_pass_sign_in(w, cx);
+            return;
+        }
         if !self.fwd_busy.insert("connect".into()) {
             return;
         }
@@ -1005,31 +1039,121 @@ impl MailApp {
         let key = Self::value(&self.fwd_key, cx);
         let server = Self::value(&self.fwd_server, cx);
         let accounts = self.accounts.clone();
+        // Proton's own aliases come with a Proton account's sign-in, and
+        // Pass's extra password where the account has one.
+        let proton = self.forwarding_proton_account().cloned();
+        let sign_in = fwd::ProtonSignIn {
+            pass: None,
+            extra_password: zeroize::Zeroizing::new(Self::value(&self.fwd_pass_password, cx)),
+        };
         self.fwd_error = None;
         self.task(
             cx,
-            move |_| fwd::connect(service, &server, &key, &accounts),
-            move |this, result, cx| {
-                this.fwd_busy.remove("connect");
-                match result {
-                    Ok(account) => {
-                        let count = account.aliases.len();
-                        this.notice(
-                            t!("views-connected-alias", label = account.service.label(), count = count),
-                            false,
-                            cx,
-                        );
-                        this.fwd_adding = false;
-                        this.fwd_open.insert(account.id.clone());
-                        this.forwarding.push(account);
-                        this.views_changed(cx);
-                    }
-                    Err(e) => this.fwd_error = Some(format!("{e:#}")),
+            move |b| match service {
+                ForwardingService::Proton => {
+                    let account = proton.ok_or_else(|| anyhow::anyhow!(t!("views-sign-in-to-proton-directly-first")))?;
+                    fwd::connect_proton(&b, &account, &accounts, &sign_in)
                 }
+                _ => fwd::connect(service, &server, &key, &accounts),
             },
+            move |this, result, cx| this.forwarding_connected(result, cx),
         );
-        // The key is not kept in the field once sent.
+        // The key is not kept in the field once sent, nor the password.
         Self::set(&self.fwd_key, "", w, cx);
+        Self::set(&self.fwd_pass_password, "", w, cx);
+    }
+    /// A service just connected, or why it couldn't be.
+    fn forwarding_connected(&mut self, result: anyhow::Result<ForwardingAccount>, cx: &mut Context<Self>) {
+        self.fwd_busy.remove("connect");
+        match result {
+            Ok(account) => {
+                let count = account.aliases.len();
+                self.notice(
+                    t!("views-connected-alias", label = account.service.label(), count = count),
+                    false,
+                    cx,
+                );
+                self.fwd_adding = false;
+                self.fwd_open.insert(account.id.clone());
+                self.forwarding.push(account);
+                self.views_changed(cx);
+            }
+            Err(e) => self.fwd_error = Some(format!("{e:#}")),
+        }
+    }
+    /// Whether the Forwarding add form is signing in to Proton Pass, so
+    /// Enter in the shared sign-in fields continues it.
+    pub(super) fn pass_form_active(&self) -> bool {
+        self.fwd_adding
+            && self.fwd_service == ForwardingService::Proton
+            && crate::sync::proton::pass_sign_in()
+            && !matches!(self.modal, Some(Modal::Connect | Modal::Reconnect(_)))
+    }
+    /// The next step of the Proton Pass sign-in: the password (with the
+    /// account picked), then whatever Proton asks for, as signing in to
+    /// Proton Mail does (`proton_continue`, `start_proton`).
+    fn continue_pass_sign_in(&mut self, w: &mut Window, cx: &mut Context<Self>) {
+        if self.connecting || self.fwd_busy.contains("connect") {
+            return;
+        }
+        self.fwd_error = None;
+        if self.proton_stage.is_some() && self.fwd_pass_login.is_some() {
+            self.proton_continue(None, cx);
+            return;
+        }
+        let Some(account) = self.forwarding_proton_account().cloned() else {
+            self.fwd_error = Some(t!("views-sign-in-to-proton-directly-first").into());
+            return;
+        };
+        let password = Self::value(&self.form[PASSWORD], cx);
+        if password.is_empty() {
+            self.notice(t!("proton-login-enter-your-proton-password"), true, cx);
+            return;
+        }
+        // Neither password stays in its field once sent.
+        self.fwd_pending_extra = zeroize::Zeroizing::new(Self::value(&self.fwd_pass_password, cx));
+        Self::set(&self.form[PASSWORD], "", w, cx);
+        Self::set(&self.fwd_pass_password, "", w, cx);
+        for i in [TOTP, MAILBOX_PASSWORD, KEY_PIN] {
+            Self::set(&self.form[i], "", w, cx);
+        }
+        self.fwd_pass_login = Some(account.id.clone());
+        self.start_proton(None, cx, move |b, cancel| b.proton_pass_begin(&account, password, cancel));
+    }
+    /// Lists Proton's aliases with the Proton Pass session just signed in.
+    pub(super) fn connect_proton_aliases(&mut self, cx: &mut Context<Self>) {
+        let Some(id) = self.fwd_pass_login.take() else {
+            return;
+        };
+        let Some(account) = self.accounts.iter().find(|a| a.id == id).cloned() else {
+            return;
+        };
+        if !self.fwd_busy.insert("connect".into()) {
+            return;
+        }
+        let accounts = self.accounts.clone();
+        let extra = std::mem::take(&mut self.fwd_pending_extra);
+        self.task(
+            cx,
+            move |b| {
+                let sign_in = fwd::ProtonSignIn {
+                    pass: b.take_proton_pass_session(&account.id),
+                    extra_password: extra,
+                };
+                fwd::connect_proton(&b, &account, &accounts, &sign_in)
+            },
+            move |this, result, cx| this.forwarding_connected(result, cx),
+        );
+    }
+    /// The Proton account whose own aliases the add form would list: the
+    /// one picked, else the first not listed yet.
+    pub(super) fn forwarding_proton_account(&self) -> Option<&Account> {
+        let open = fwd::proton_accounts(&self.forwarding, &self.accounts);
+        self.fwd_proton
+            .as_ref()
+            .and_then(|id| open.iter().find(|a| &a.id == id))
+            .or(open.first())
+            .copied()
     }
     /// Fetches a service's aliases again. `quiet` ones (made by Picacho on
     /// its own) don't report failures.
@@ -1044,7 +1168,7 @@ impl MailApp {
             .insert(id.clone(), std::time::Instant::now());
         self.task(
             cx,
-            move |_| fwd::refresh(&account),
+            move |b| fwd::refresh(&b, &account),
             move |this, result, cx| {
                 this.fwd_busy.remove(&id);
                 match result {
@@ -1067,8 +1191,11 @@ impl MailApp {
                             this.views_changed(cx);
                         }
                     }
-                    Err(_) if quiet => {}
-                    Err(e) => this.notice(format!("{e:#}"), true, cx),
+                    Err(e) if quiet => this.note_pass_sign_in(&id, &e),
+                    Err(e) => {
+                        this.note_pass_sign_in(&id, &e);
+                        this.notice(format!("{e:#}"), true, cx)
+                    }
                 }
             },
         );
@@ -1143,7 +1270,7 @@ impl MailApp {
         self.fwd_busy.insert(id.clone());
         self.task(
             cx,
-            move |_| fwd::create(&account, &new),
+            move |b| fwd::create(&b, &account, &new),
             move |this, result, cx| {
                 this.fwd_busy.remove(&id);
                 match result {
@@ -1157,7 +1284,10 @@ impl MailApp {
                         let _ = fwd::save(&this.backend.store, &this.forwarding);
                         this.update_composer_aliases(cx);
                     }
-                    Err(e) => this.notice(format!("{e:#}"), true, cx),
+                    Err(e) => {
+                        this.note_pass_sign_in(&id, &e);
+                        this.notice(format!("{e:#}"), true, cx)
+                    }
                 }
             },
         );
@@ -1205,7 +1335,7 @@ impl MailApp {
         }
         self.task(
             cx,
-            move |_| fwd::options(&account),
+            move |b| fwd::options(&b, &account),
             move |this, result, cx| {
                 this.fwd_busy.remove(&busy);
                 this.fwd_options
@@ -1346,7 +1476,7 @@ impl MailApp {
             .as_ref()
             .and_then(|id| self.forwarding.iter().find(|f| &f.id == id))
             .map(|f| f.service);
-        if service == Some(ForwardingService::SimpleLogin) {
+        if service.is_some_and(|s| s.takes_prefix()) {
             self.fwd_format = None;
             Self::set(&self.fwd_prefix, fwd::random_prefix(format), w, cx);
         } else {
@@ -1375,11 +1505,12 @@ impl MailApp {
         self.set_alias_flag(&id, &alias_id, on);
         self.task(
             cx,
-            move |_| fwd::set_enabled(&account, &alias, on),
+            move |b| fwd::set_enabled(&b, &account, &alias, on),
             move |this, result, cx| {
                 this.fwd_busy.remove(&busy);
                 if let Err(e) = result {
                     this.set_alias_flag(&id, &alias_id, !on);
+                    this.note_pass_sign_in(&id, &e);
                     this.notice(format!("{e:#}"), true, cx);
                 }
                 let _ = fwd::save(&this.backend.store, &this.forwarding);
@@ -1414,7 +1545,7 @@ impl MailApp {
         }
         self.task(
             cx,
-            move |_| fwd::delete(&account, &alias),
+            move |b| fwd::delete(&b, &account, &alias),
             move |this, result, cx| {
                 this.fwd_busy.remove(&busy);
                 match result {
@@ -1425,7 +1556,10 @@ impl MailApp {
                         this.views_changed(cx);
                         this.notice(t!("views-alias-deleted"), false, cx);
                     }
-                    Err(e) => this.notice(format!("{e:#}"), true, cx),
+                    Err(e) => {
+                        this.note_pass_sign_in(&id, &e);
+                        this.notice(format!("{e:#}"), true, cx)
+                    }
                 }
             },
         );
@@ -1892,6 +2026,41 @@ mod tests {
         });
         act(&view, Action::CancelForwardingConfirm, cx);
         view.read_with(cx, |this, _| assert!(this.fwd_confirm.is_none()));
+    }
+
+    #[gpui::test]
+    fn an_ended_pass_session_offers_to_sign_in_again(cx: &mut TestAppContext) {
+        let (view, cx, _) = setup(cx);
+        view.update(cx, |this, _| {
+            let account = this.accounts[0].id.clone();
+            this.forwarding.push(ForwardingAccount {
+                id: "pp".into(),
+                service: ForwardingService::Proton,
+                proton_account: account,
+                ..ForwardingAccount::default()
+            });
+            this.fwd_pass_expired.insert("pp".into());
+        });
+        act(&view, Action::Settings, cx);
+        act(&view, Action::SettingsPage(Page::Forwarding), cx);
+        frame(cx);
+        assert!(cx.debug_bounds("forwarding-pass-sign-in-pp").is_some(), "its card offers to sign in");
+        act(&view, Action::PassSignIn("pp".into()), cx);
+        frame(cx);
+        view.update(cx, |this, _| {
+            assert!(this.modal == Some(Modal::PassSignIn("pp".into())));
+            assert!(this.proton_stage.is_none(), "it starts at the password");
+        });
+        // The password, as Proton Mail's sign-in asks for it, and the extra password.
+        assert_eq!(PASSWORD, 1, "the field below is form-{{PASSWORD}}");
+        assert!(cx.debug_bounds("form-1").is_some());
+        assert!(cx.debug_bounds("pass-sign-in-submit").is_some());
+        // An empty password isn't sent.
+        act(&view, Action::SubmitPassSignIn("pp".into()), cx);
+        view.update(cx, |this, _| assert!(!this.connecting && this.fwd_pass_again.is_none()));
+        // Closing it gives the sign-in up.
+        act(&view, Action::Close, cx);
+        view.update(cx, |this, _| assert!(this.modal.is_none() && this.fwd_pass_again.is_none()));
     }
 
     #[gpui::test]

@@ -8,6 +8,9 @@ pub mod backend;
 /// service). iOS only reads its preferences.
 #[cfg_attr(target_os = "ios", allow(dead_code))]
 pub mod background;
+/// The inbox's categories (Primary, Promotions, Social…) and sorting mail
+/// into them.
+pub mod categories;
 pub mod composing;
 pub mod crypto;
 pub mod forwarding;

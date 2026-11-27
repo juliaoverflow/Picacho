@@ -353,3 +353,38 @@ calendar-nothing-coming-up = Nothing coming up.
 
 # When the server hasn't been read yet ("Read never")
 calendar-never-read = never
+
+calendar-more-calendars = More Calendars
+
+calendar-add-another-account = Add another account's calendars beside these: a mail account's provider, signed in as it already is, or another calendar server.
+
+calendar-add-calendars = Add Calendars
+
+calendar-calendar-removed = Calendar removed
+
+calendar-calendars-google = Calendars (Google)
+
+calendar-calendars-proton = Calendars (Proton)
+
+calendar-source-caption = { $kind ->
+        [feed] Subscribed feed, read-only · Read { $synced }
+        [google] Google Calendar · Read { $synced }
+        [proton] Proton Calendar · Read { $synced }
+        [exchange] Exchange · Read { $synced }
+        [jmap] JMAP · Read { $synced }
+       *[caldav] CalDAV · Read { $synced }
+    }
+
+calendar-subscribe-caption = Subscribe to a calendar published at an address (webcal:// or .ics): holidays, sports fixtures, a team's schedule. It is shown beside your calendars, read again as often as you choose, and never changed here.
+
+calendar-subscribe = Subscribe
+
+calendar-write-the-feeds-address = Write the calendar's address (webcal:// or https://…ics) first.
+
+calendar-every-hour = Hourly
+
+calendar-every-6-hours = Every 6 Hours
+
+calendar-every-day = Daily
+
+calendar-every-week = Weekly

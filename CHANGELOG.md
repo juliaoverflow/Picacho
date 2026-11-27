@@ -13,6 +13,56 @@ same version in `Cargo.toml`.
 
 ### Added
 
+- Snoozed mail is shared with Picacho on your other computers on every
+  kind of account, not only IMAP servers with METADATA: a message
+  snoozed on one shows as snoozed on the others and comes back there at
+  its time, and one woken or unsnoozed on one is no longer snoozed on the
+  others (before, another computer's older copy could bring it back).
+  Without METADATA the times are kept in a message in the Picacho folder.
+- Follow-up reminders: **Remind me if no reply** in the composer (in a day,
+  2 or 3 days, a week or two weeks), or on a message already sent (its
+  menu, or the reader's button in Sent), waits on a reply to it. If
+  nobody answers in time, Picacho reminds you (a notification, also from
+  the background monitor with no window open), and the message shows a
+  banner offering to follow up, be reminded again, or stop waiting. A reply
+  stops the wait by itself: any message naming it in References or
+  In-Reply-To, or in the same Gmail, Microsoft, JMAP or OBJECTID
+  conversation, that isn't yours and isn't an automatic reply or bounce.
+  **Waiting For** in the sidebar (under each account and All Accounts,
+  while something is waited on) lists that sent mail, with how many are
+  overdue.
+  What's waited on is shared with Picacho on your other computers (an
+  IMAP METADATA annotation, or else a message in a Picacho folder, on
+  every kind of account); before reminding, the server is asked for a
+  reply not downloaded yet, on every kind of account; and automatic
+  replies are told apart by their headers, Exchange's message classes,
+  Proton's automatic flag, and common subjects in several languages.
+- Inbox categories: an inbox (or All Accounts' inbox) is sorted into
+  Primary, Transactions, Travel, Finance, Updates, Newsletters, Promotions
+  and Social, shown as tabs above it with each one's unread count, then All
+  Mail, the whole inbox with each message tagged with its category
+  (**Open the inbox on All Mail** in Settings makes it the first tab and
+  the one the inbox opens on); Forums can be turned on too. A category without a tab shows in the one it
+  belongs to (Travel in Transactions; Finance and Newsletters in Updates).
+  Where the tabs don't fit, the row scrolls (the wheel scrolls it
+  sideways), and an end with more tabs past it fades out under an arrow;
+  on phones the chips fade at their ends as the filters do. Mail is
+  sorted on this computer from its sender, list headers and words, so it
+  works for every kind of account, and follows Gmail's own categories and
+  Outlook's Focused Inbox on accounts that use their APIs. Mail from people
+  you write to, mail you replied to and sign-in codes stay in Primary.
+  **Move to Category…** in a message's menu, or dragging messages onto a
+  tab, sorts their sender there from now on. Searches look in every tab, and
+  `category:promotions` finds a category's mail. Settings → Rules & Layout
+  turns categories or single tabs off (their mail shows in Primary), lists
+  sorted senders, and can announce only Primary's new mail. **Show
+  Categories** in the filter menu turns them off and on.
+- Sort the inbox (Settings → Local AI): a 1.2 MB model that runs on this
+  computer helps sort mail into the inbox's categories where the rules
+  aren't sure, in the same 37 languages as the other local models (as do
+  the rules), and learns from the mail you move to another category, on
+  this computer only (**Forget** clears what it learned). It never takes
+  mail out of Primary unless it's very sure.
 - Start in the background when you sign in (Settings → General): Picacho
   starts with your computer without a window, showing its tray icon and
   checking for mail. Turning off running in the background turns it off too.
@@ -76,9 +126,91 @@ same version in `Cargo.toml`.
   SOAP Autodiscover where the older form is off.
 - Exchange Server and Microsoft Graph accounts show how much space their
   mail takes.
+- Several calendar and address-book sources side by side: a work account
+  (Exchange through Microsoft Graph or EWS) beside a personal one (JMAP,
+  iCloud, Nextcloud, any CalDAV/CardDAV server, Google or Proton). Settings
+  → Calendar → **More Calendars** and Settings → Contacts → **More Address
+  Books** add another account's calendars or contacts (a mail account's
+  provider, or another server), each read again or removed on its own;
+  every source's events, calendars, tasks and contacts show together.
+  **New events go to** chooses among every source's calendars; an event
+  moved to another account's calendar is made there and taken out of the
+  one it was in, and each event, task and contact is changed where it is.
+  What was set up before stays the first source, as it was.
+- Google calendars and contacts through Google's own APIs: the Google
+  Calendar API (repeating events with their changed and cancelled
+  occurrences, reminders, guests, when people are busy; Google sends
+  invitations itself, and invitations answered from mail are answered in
+  the calendar too) and the People API for contacts. Google asks once for
+  calendar or contacts access on top of mail.
+- Subscribed calendar feeds (Settings → Calendar → **Subscribe**):
+  `webcal://` and `.ics` addresses (holidays, sports, a team's schedule)
+  read again hourly, every 6 hours, daily or weekly (chosen per feed), shown
+  beside your calendars and never changed; an unchanged feed isn't
+  downloaded again (ETag, Last-Modified).
+- Proton Calendar and Proton Contacts for Proton accounts signed in
+  without Bridge, end-to-end encrypted with the account's own keys:
+  contacts read, added, edited and deleted; calendars read, and events
+  without guests added, changed and deleted (events with guests are left to
+  Proton Calendar, which sends their invitations).
+- Proton's own aliases (hide-my-email aliases, kept in Proton Pass) in
+  Settings → Forwarding, for Proton accounts signed in without Bridge:
+  choose **Proton** and the account, with no API key. Aliases are listed,
+  made (with a chosen domain and prefix, or random), turned on and off,
+  described, named, pinned, pointed at mailboxes and deleted; their
+  contacts' reverse aliases are listed, added, blocked and deleted; and
+  mail can be sent as an alias, as with SimpleLogin. An account that has
+  never used Proton Pass gets a vault for its aliases when it makes one,
+  and Pass's extra password is asked for where the account has one.
+  The account's own Proton addresses (but its original one) are listed
+  with its aliases: turned on and off, named, shown on their own, deleted,
+  and sent as directly.
 
 ### Fixed
 
+- The window no longer stops responding for a few seconds at launch while
+  mail is checked: sorting a long list into its inbox tabs is done on
+  several threads, a whole look at the first check's unread mail is only
+  taken for mail that's announced, and the background look at listed mail
+  goes a part at a time, newest first. That look (with the inbox category
+  model) waits until mail checks are done, uses a quarter of the cores at
+  a lower priority, and allocates far less; the widgets' scans run at a
+  lower priority too, and the window's process keeps more allocator
+  arenas, so its thread no longer waits on theirs.
+- The inbox category model (Settings → Local AI → Sort the inbox) is
+  published as [pinaltech/sift-categories](https://huggingface.co/pinaltech/sift-categories)
+  and downloaded from there, checked against its size and SHA-256, like
+  the other models.
+- Sorting the inbox into categories no longer holds up the window at
+  launch, or when sorting (or the category model) is turned on or off:
+  what each message was found to be is kept in the cache instead of being
+  worked out again for every message each time; the window looks at only
+  a few newly arrived messages itself, the rest in the background; and
+  turning the model off keeps what the rules found.
+- Adding Proton's own aliases says it's signing in, then loading the
+  account's Proton addresses and aliases, with a spinner, rather than
+  showing the emptied form with a faded button.
+- Closing Picacho: the window goes as soon as its closing cover is done,
+  rather than staying on screen, frozen, until the process had ended
+  (Wayland only took it away then). The cover's logo breathes and its
+  spinner turns, and where Picacho draws its own title bar the bar stays
+  clear and its window buttons keep working.
+- Moving mail (archiving, deleting, a swipe on a phone) says so at once
+  with Undo, rather than once the server is done (seconds later, if at
+  all); Undo pressed before then waits for the move and puts the mail
+  back. Deleting a draft offers Undo too.
+- Phones: a row swipes only when the pan is clearly sideways, and archives
+  or deletes only once it has crossed a good part of the row (not a fixed
+  88 points), so a brush on the way to scrolling no longer moves mail.
+- Phones: Back from a message opened in search results goes back to the
+  results, rather than closing the search under the message and leaving
+  it open; Back pressed again while the screen slides away is no longer
+  dropped.
+- Tapping a notification opens its message even when it isn't listed yet:
+  it's taken from the cache, or fetched from Proton, rather than leaving
+  you in the inbox until the next check. Proton's pushes also fetch the
+  message they announce (with its text, where mail is kept offline), so
+  it's in the inbox before it's tapped.
 - Mobile view tests no longer take one another's launch requests (they
   failed now and then when run together).
 - Inline PGP can be sent, not only read: with OpenPGP, the composer's

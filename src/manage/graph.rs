@@ -206,6 +206,10 @@ impl Backend {
         if !m.conversation_id.is_empty() {
             mail.set_thread_id(format!("graph:{}", m.conversation_id));
         }
+        // An out-of-office reply or a report, as Exchange classes it.
+        if crate::sync::mime::automatic_class(&m.item_class) {
+            mail.set_automatic(true);
+        }
         mail.folder = folder;
         mail.remote_folder = remote;
         mail.unread = !m.read;
@@ -218,6 +222,9 @@ impl Backend {
         let mut labels = m.categories.clone();
         labels.sort();
         mail.set_labels(labels);
+        // The Focused Inbox's sorting, where the mailbox has it.
+        let sorted = crate::manage::categories::outlook_category(&m.classification);
+        mail.set_server_category(sorted);
         Ok(mail)
     }
 
@@ -244,7 +251,7 @@ impl Backend {
                         format!(
                             "/v1.0/me/messages?$top={}&$select={}&$orderby=receivedDateTime%20desc&$filter={}",
                             top.clamp(1, 1000),
-                            "id,conversationId,parentFolderId,subject,from,toRecipients,ccRecipients,replyTo,receivedDateTime,isRead,flag,categories,hasAttachments,bodyPreview,internetMessageId,isDraft",
+                            "id,conversationId,parentFolderId,subject,from,toRecipients,ccRecipients,replyTo,receivedDateTime,isRead,flag,categories,hasAttachments,bodyPreview,internetMessageId,isDraft,inferenceClassification",
                             crate::sync::rest::escape(&f)
                         )
                     }
@@ -671,6 +678,63 @@ fn moved_paths(before: &[MailFolder], after: &[MailFolder]) -> Vec<(String, Stri
             (new.path != old.path).then(|| (old.path.clone(), new.path.clone()))
         })
         .collect()
+}
+
+// Follow-up reminders and notes (`follow_up`, `notes`).
+impl Backend {
+    /// Picacho's folder at Microsoft (made with `create`), by id.
+    fn picacho_folder_graph(&self, a: &Account, s: &Session, create: bool) -> Result<Option<String>> {
+        let parent = super::snooze::PARENT;
+        if let Ok(id) = folder_id(&s.folders()?, parent) {
+            return Ok(Some(id));
+        }
+        if !create {
+            return Ok(None);
+        }
+        let id = s.create_folder(None, parent)?;
+        let _ = self.store.save_folders(&a.id, &remote_folders(&s.reload_folders()?));
+        Ok(Some(id))
+    }
+    /// The notes in Picacho's folder, by message id.
+    pub(super) fn read_notes_graph(&self, a: &Account, kind: &str) -> Result<super::notes::NoteSources> {
+        self.with_graph(a, |s| {
+            let Some(folder) = self.picacho_folder_graph(a, s, false)? else {
+                return Ok(None);
+            };
+            let ids = s.ids_where(&folder, "", 50)?;
+            let mut out = Vec::new();
+            for m in s.messages(&ids)? {
+                if super::notes::titled(&m.subject, kind) {
+                    out.push((m.id.clone(), s.raw(&m.id)?));
+                }
+            }
+            Ok(Some(out))
+        })
+    }
+    /// Puts a note (read) in Picacho's folder, then deletes `old`.
+    pub(super) fn write_note_graph(&self, a: &Account, raw: &[u8], old: &[String]) -> Result<()> {
+        self.with_graph(a, |s| {
+            let folder = self
+                .picacho_folder_graph(a, s, true)?
+                .with_context(|| t!("manage-snooze-the-server-didnt-keep-the-new"))?;
+            s.import(raw, &folder, true, false)?;
+            for id in old {
+                match s.delete_message(id) {
+                    Ok(()) => {}
+                    Err(e) if not_found(&e) => {}
+                    Err(e) => return Err(e),
+                }
+            }
+            Ok(())
+        })
+    }
+    /// The messages of a Microsoft conversation, as rows (not saved).
+    pub(super) fn graph_conversation(&self, a: &Account, conversation: &str) -> Result<Vec<Mail>> {
+        self.with_graph(a, |s| {
+            let folders = s.folders()?;
+            s.conversation(conversation)?.iter().map(|m| self.graph_mail(a, &folders, m, None)).collect()
+        })
+    }
 }
 
 #[cfg(test)]

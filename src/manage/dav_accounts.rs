@@ -6,22 +6,21 @@
 //!
 //! - a JMAP account: its server's calendars and contacts (JMAP for
 //!   Calendars and Contacts; see `connect_jmap_calendar`);
-//! - a Google account: Google's CalDAV and CardDAV, with the account's
-//!   OAuth token (RFC 6750 Bearer). Google asks once for calendar or
-//!   contacts access on top of mail (incremental authorization);
+//! - an Outlook account on Microsoft Graph, or an Exchange Server account
+//!   (EWS): Exchange's calendars and contacts, and its directory;
+//! - a Google account: the Google Calendar and People APIs, with the
+//!   account's OAuth token. Google asks once for calendar or contacts
+//!   access on top of mail (incremental authorization);
+//! - a Proton account signed in without Bridge: Proton Calendar and Proton
+//!   Contacts, end-to-end encrypted with the account's own keys;
 //! - any other mail account with a password: its domain's CalDAV and
 //!   CardDAV, found as for any server (SRV and `.well-known`, RFC 6764),
 //!   with the account's password. iCloud, Fastmail, mailbox.org,
 //!   Nextcloud and others serve both.
 //!
-//! Microsoft has neither CalDAV nor CardDAV, and Proton offers no calendar
-//! or contacts protocol to other apps, so they aren't offered.
+//! Each can be the first source or one more beside it (`pim_sources`).
 use super::*;
 use crate::sync::{caldav, carddav};
-
-/// Google's CalDAV and CardDAV endpoints. Discovery starts from these.
-const GOOGLE_CALDAV: &str = "https://apidata.googleusercontent.com/caldav/v2/";
-const GOOGLE_CARDDAV: &str = "https://www.googleapis.com/carddav/v1/principals/";
 
 /// What a mail account can be for calendars and contacts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -32,8 +31,10 @@ pub enum MailProvider {
     Graph,
     /// Exchange Server's, through Exchange Web Services.
     Ews,
-    /// Google's CalDAV and CardDAV, with the OAuth token.
+    /// Google's Calendar and People APIs, with the OAuth token.
     Google,
+    /// Proton Calendar and Proton Contacts, with the account's session.
+    Proton,
     /// The domain's CalDAV and CardDAV, with the account's password.
     Dav,
 }
@@ -46,7 +47,8 @@ impl MailProvider {
             Provider::Outlook if a.graph() => Some(Self::Graph),
             Provider::Ews => Some(Self::Ews),
             Provider::Gmail if a.sso.is_none() => Some(Self::Google),
-            Provider::Outlook | Provider::Proton => None,
+            Provider::Proton => Some(Self::Proton),
+            Provider::Outlook => None,
             Provider::Imap | Provider::Pop3 if !a.oauth && !a.kerberos => Some(Self::Dav),
             _ => None,
         }
@@ -75,13 +77,8 @@ impl Backend {
             MailProvider::Jmap => bail!("JMAP calendars are set up with connect_jmap_calendar."),
             MailProvider::Graph => bail!("Exchange calendars are set up with connect_graph_calendar."),
             MailProvider::Ews => bail!("Exchange calendars are set up with connect_ews_calendar."),
-            MailProvider::Google => caldav::Server {
-                url: format!("{GOOGLE_CALDAV}{}/", a.email),
-                user: a.email.clone(),
-                mail_account: a.id.clone(),
-                bearer: true,
-                ..Default::default()
-            },
+            MailProvider::Google => bail!("Google calendars are set up with connect_google_calendar."),
+            MailProvider::Proton => bail!("Proton calendars are set up with connect_proton_calendar."),
             MailProvider::Dav => caldav::Server {
                 url: mail_domain(a)?,
                 user: a.login().to_owned(),
@@ -98,13 +95,8 @@ impl Backend {
             MailProvider::Jmap => bail!("JMAP contacts are set up with connect_jmap_contacts."),
             MailProvider::Graph => bail!("Exchange contacts are set up with connect_graph_contacts."),
             MailProvider::Ews => bail!("Exchange contacts are set up with connect_ews_contacts."),
-            MailProvider::Google => carddav::Server {
-                url: format!("{GOOGLE_CARDDAV}{}/", a.email),
-                user: a.email.clone(),
-                mail_account: a.id.clone(),
-                bearer: true,
-                ..Default::default()
-            },
+            MailProvider::Google => bail!("Google contacts are set up with connect_google_contacts."),
+            MailProvider::Proton => bail!("Proton contacts are set up with connect_proton_contacts."),
             MailProvider::Dav => carddav::Server {
                 url: mail_domain(a)?,
                 user: a.login().to_owned(),
@@ -143,54 +135,53 @@ impl Backend {
 
     /// Uses mail account `a` as the calendar provider (see the module
     /// comment), signed in as it is. `cancel` stops Google's browser step.
+    /// Within a calendar source (`add_calendar_source`), it is that one's.
     pub fn use_mail_account_for_calendar(&self, a: &Account, cancel: Arc<AtomicBool>) -> Result<usize> {
-        if MailProvider::of(a) == Some(MailProvider::Jmap) {
-            return self.connect_jmap_calendar(a);
+        match MailProvider::of(a) {
+            Some(MailProvider::Jmap) => self.connect_jmap_calendar(a),
+            Some(MailProvider::Graph) => self.connect_graph_calendar(a),
+            Some(MailProvider::Ews) => self.connect_ews_calendar(a),
+            Some(MailProvider::Google) => {
+                self.grant_google(a, crate::sync::oauth::GOOGLE_CALENDAR, cancel)?;
+                self.connect_google_calendar(a)
+            }
+            Some(MailProvider::Proton) => self.connect_proton_calendar(a),
+            _ => {
+                let server = self.mail_caldav(a)?;
+                let secret = self.mail_account_secret(&a.id)?;
+                self.connect_calendar(server, &secret)
+            }
         }
-        if MailProvider::of(a) == Some(MailProvider::Graph) {
-            return self.connect_graph_calendar(a);
-        }
-        if MailProvider::of(a) == Some(MailProvider::Ews) {
-            return self.connect_ews_calendar(a);
-        }
-        let server = self.mail_caldav(a)?;
-        if server.bearer {
-            self.grant_google(a, crate::sync::oauth::GOOGLE_CALENDAR, cancel)?;
-        }
-        let secret = self.mail_account_secret(&a.id)?;
-        self.connect_calendar(server, &secret)
     }
 
     /// As `use_mail_account_for_calendar`, for contacts.
     pub fn use_mail_account_for_contacts(&self, a: &Account, cancel: Arc<AtomicBool>) -> Result<usize> {
-        if MailProvider::of(a) == Some(MailProvider::Jmap) {
-            return self.connect_jmap_contacts(a);
+        match MailProvider::of(a) {
+            Some(MailProvider::Jmap) => self.connect_jmap_contacts(a),
+            Some(MailProvider::Graph) => self.connect_graph_contacts(a),
+            Some(MailProvider::Ews) => self.connect_ews_contacts(a),
+            Some(MailProvider::Google) => {
+                self.grant_google(a, crate::sync::oauth::GOOGLE_PEOPLE, cancel)?;
+                self.connect_google_contacts(a)
+            }
+            Some(MailProvider::Proton) => self.connect_proton_contacts(a),
+            _ => {
+                let server = self.mail_carddav(a)?;
+                let secret = self.mail_account_secret(&a.id)?;
+                self.connect_contacts(server, &secret)
+            }
         }
-        if MailProvider::of(a) == Some(MailProvider::Graph) {
-            return self.connect_graph_contacts(a);
-        }
-        if MailProvider::of(a) == Some(MailProvider::Ews) {
-            return self.connect_ews_contacts(a);
-        }
-        let server = self.mail_carddav(a)?;
-        if server.bearer {
-            self.grant_google(a, crate::sync::oauth::GOOGLE_CONTACTS, cancel)?;
-        }
-        let secret = self.mail_account_secret(&a.id)?;
-        self.connect_contacts(server, &secret)
     }
 
-    /// The mail account calendars sign in with, if they share one's.
+    /// The mail account the first calendar source signs in with, if it
+    /// shares one's.
     pub fn calendar_mail_account(&self) -> Option<String> {
-        self.calendar_server()
-            .map(|s| [s.mail_account, s.jmap_account, s.graph_account, s.ews_account].into_iter().find(|id| !id.is_empty()).unwrap_or_default())
-            .filter(|id| !id.is_empty())
+        self.primary_calendar_server().and_then(|s| s.account().map(str::to_owned))
     }
-    /// The mail account contacts sign in with, if they share one's.
+    /// The mail account the first contacts source signs in with, if it
+    /// shares one's.
     pub fn contacts_mail_account(&self) -> Option<String> {
-        self.contacts_server()
-            .map(|s| [s.mail_account, s.jmap_account, s.graph_account, s.ews_account].into_iter().find(|id| !id.is_empty()).unwrap_or_default())
-            .filter(|id| !id.is_empty())
+        self.primary_contacts_server().and_then(|s| s.account().map(str::to_owned))
     }
 }
 
@@ -228,28 +219,26 @@ mod tests {
         let gmail = Account { oauth: true, ..account(Provider::Gmail) };
         assert_eq!(MailProvider::of(&gmail), Some(MailProvider::Google));
         assert_eq!(MailProvider::of(&account(Provider::Imap)), Some(MailProvider::Dav));
-        // Microsoft and Proton offer neither to other apps.
+        // Proton without Bridge: Proton Calendar and Contacts. Outlook over
+        // IMAP has neither (Microsoft Graph has both).
         assert_eq!(MailProvider::of(&account(Provider::Outlook)), None);
-        assert_eq!(MailProvider::of(&account(Provider::Proton)), None);
+        assert_eq!(MailProvider::of(&account(Provider::Proton)), Some(MailProvider::Proton));
         // An organization's sign-in or a Kerberos ticket has no password
         // a DAV server would take.
         let kerberos = Account { kerberos: true, ..account(Provider::Imap) };
         assert_eq!(MailProvider::of(&kerberos), None);
     }
 
-    /// Google: its endpoints, signed in with the account's token; others:
-    /// the address's domain, discovered as any server is, with its
-    /// password. Either way the server names the mail account.
+    /// A DAV server: the address's domain, discovered as any server is,
+    /// with its password, naming the mail account. Google's and Proton's
+    /// have APIs of their own (`connect_google_calendar`…), not DAV.
     #[test]
     fn servers_from_mail_accounts_name_them_and_how_to_sign_in() -> Result<()> {
         let path = std::env::temp_dir().join(format!("picacho-dav-accounts-{}", uuid::Uuid::new_v4()));
         let b = Backend::new(Arc::new(Store::open(&path)?));
         let gmail = Account { oauth: true, id: "g".into(), ..account(Provider::Gmail) };
-        let cal = b.mail_caldav(&gmail)?;
-        assert!(cal.bearer && cal.mail_account == "g", "{cal:?}");
-        assert!(cal.url.starts_with("https://apidata.googleusercontent.com/caldav/v2/ana@example.org"));
-        let cards = b.mail_carddav(&gmail)?;
-        assert!(cards.bearer && cards.url.starts_with("https://www.googleapis.com/carddav/v1/"));
+        assert!(b.mail_caldav(&gmail).is_err() && b.mail_carddav(&gmail).is_err());
+        assert!(b.mail_caldav(&account(Provider::Proton)).is_err());
         let imap = Account { id: "i".into(), username: "ana".into(), ..account(Provider::Imap) };
         let cal = b.mail_caldav(&imap)?;
         assert_eq!((cal.url.as_str(), cal.user.as_str(), cal.bearer), ("example.org", "ana", false));

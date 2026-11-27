@@ -8,8 +8,9 @@
 //! The window does this itself while it is open (`MailApp`); the monitor is
 //! the same work without any interface: it keeps an IDLE (or Proton events)
 //! watch on each inbox, checks inboxes on their schedule, and announces new
-//! unread mail. It also sends scheduled mail (Send Later) once due and
-//! brings snoozed messages back to the inbox, announcing both. It runs on a
+//! unread mail. It also sends scheduled mail (Send Later) once due,
+//! brings snoozed messages back to the inbox, and reminds about sent mail
+//! nobody replied to (follow-up reminders), announcing each. It runs on a
 //! thread of its own, so it needs no GPUI, and shares the app's `Backend`
 //! (its account locks, connections and sessions).
 //!
@@ -98,6 +99,16 @@ pub enum Announcement<'a> {
         account_id: &'a str,
         message_id: &'a str,
         sender: &'a str,
+        subject: &'a str,
+        count: usize,
+    },
+    /// Sent messages waited on got no reply by their reminder's time: the
+    /// latest's recipients, subject and Message-ID, and how many.
+    NoReply {
+        account: &'a str,
+        account_id: &'a str,
+        message_id: &'a str,
+        to: &'a str,
         subject: &'a str,
         count: usize,
     },
@@ -270,6 +281,7 @@ pub fn check_once(backend: Arc<Backend>, announce: &Announce, cancel: Arc<Atomic
     {
         return false;
     }
+    remind_follow_ups(&shared, &accounts, &mut later, &mut codes, announce);
     let mut all = later.sends.is_empty() && later.wakes.is_empty();
     let mut checked = false;
     for a in &accounts {
@@ -329,6 +341,17 @@ fn arrived(
     }
     if !a.sync.notify || (pushed && a.pushes_new_mail()) || shared.stopped() {
         return;
+    }
+    // Where only Primary's new mail is announced, mail sorted into the
+    // inbox's other tabs arrives quietly.
+    let categories = super::categories::Categorizing::load(store);
+    if categories.notify_primary_only && categories.sorting() && !fresh.is_empty() {
+        let known = super::categories::Known::load(backend, std::slice::from_ref(a));
+        // As the window sorts it: with the inbox category model where it's on.
+        let ai = super::local_ai::categories_enabled(store)
+            .then(|| super::local_ai::category_ai(store).ok())
+            .flatten();
+        fresh.retain(|m| categories.announces_with(m, &known, ai.as_ref()));
     }
     if let Some(latest) = fresh.iter().max_by_key(|m| m.date) {
         // The preview gives the model the message's context, as the window
@@ -406,6 +429,7 @@ fn run(shared: &Shared, wake: mpsc::Sender<Wake>, woken: mpsc::Receiver<Wake>, a
         {
             return;
         }
+        remind_follow_ups(shared, &accounts, &mut later, &mut codes, &announce);
         // Accounts with mail back from snooze are checked now, so it lists.
         pushed.extend(later.returning.keys().cloned());
         let now = Instant::now();
@@ -489,6 +513,64 @@ struct Later {
     wakes: HashMap<String, Instant>,
     /// Message-IDs back from snooze, by account.
     returning: HashMap<String, HashSet<String>>,
+    /// Each account's mail as last looked through for replies to what it
+    /// waits on (`Backend::list_revision`), and when.
+    replies: HashMap<String, ((u64, u64), Instant)>,
+}
+
+/// How often the monitor looks for replies to what's waited on even when
+/// nothing changed here: another process (the window's) may have synced.
+const REPLIES_AGAIN: Duration = Duration::from_secs(10 * 60);
+
+/// Reminds about sent messages waited on that got no reply by their time,
+/// and stops waiting on those answered (`MailApp::check_follow_ups`). Only
+/// the cache is read: no network.
+fn remind_follow_ups(
+    shared: &Shared,
+    accounts: &[Account],
+    later: &mut Later,
+    codes: &mut Codes,
+    announce: &Announce,
+) {
+    let backend = &shared.backend;
+    later.replies.retain(|id, _| accounts.iter().any(|a| &a.id == id));
+    let now = chrono::Utc::now().timestamp();
+    for a in accounts {
+        if shared.stopped() {
+            return;
+        }
+        // Shared with other computers now and then (a no-op otherwise).
+        let _ = backend.sync_follow_ups(a, false);
+        let waiting = backend.follow_ups(&a.id);
+        if waiting.is_empty() {
+            continue;
+        }
+        let revision = backend.list_revision(&a.id);
+        let replies = later
+            .replies
+            .get(&a.id)
+            .is_none_or(|(seen, at)| *seen != revision || at.elapsed() >= REPLIES_AGAIN);
+        if !replies && !waiting.iter().any(|f| !f.reminded && f.overdue(now)) {
+            continue;
+        }
+        let Ok(check) = backend.check_follow_ups_online(a, replies) else {
+            continue;
+        };
+        if replies {
+            later.replies.insert(a.id.clone(), (revision, Instant::now()));
+        }
+        if let Some(latest) = check.due.iter().max_by_key(|f| f.due) {
+            let subject = codes.hide(&backend.store, &latest.subject, "");
+            announce(Announcement::NoReply {
+                account: &a.email,
+                account_id: &a.id,
+                message_id: &latest.message_id,
+                to: &latest.to,
+                subject: &subject,
+                count: check.due.len(),
+            });
+        }
+    }
 }
 
 /// Sends the scheduled drafts whose time has come (`MailApp::send_due`).
@@ -582,6 +664,10 @@ fn wake_snoozed(
     let now = chrono::Utc::now().timestamp();
     later.wakes.retain(|_, t| *t > Instant::now());
     for a in accounts {
+        // What other computers snoozed or woke (a no-op until it's time).
+        if a.provider != Provider::Pop3 && !refused.contains(&a.id) {
+            let _ = backend.share_snoozed(a, false);
+        }
         if a.provider == Provider::Pop3
             || refused.contains(&a.id)
             || later.wakes.contains_key(&a.id)
@@ -597,6 +683,8 @@ fn wake_snoozed(
                 let Some(latest) = woken.iter().max_by_key(|s| s.until) else {
                     continue;
                 };
+                // Back here: no longer snoozed on other computers either.
+                let _ = backend.share_snoozed(a, true);
                 let subject = codes.hide(&backend.store, &latest.subject, "");
                 announce(Announcement::BackFromSnooze {
                     account: &a.email,
@@ -824,6 +912,38 @@ mod tests {
             send_at: Some(at),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn sent_mail_without_a_reply_is_announced_once() {
+        let (shared, announce, said, dir) = quiet();
+        let backend = &shared.backend;
+        let mut a = Account::new(Provider::Imap);
+        a.id = "acct".into();
+        a.email = "me@example.com".into();
+        let now = chrono::Utc::now().timestamp();
+        let waited = |message_id: &str, due: i64| super::super::backend::FollowUp {
+            message_id: message_id.into(),
+            subject: "Plans".into(),
+            to: "ana@example.org".into(),
+            sent: now - 7200,
+            due,
+            reminded: false,
+            changed: 0,
+        };
+        backend.note_follow_up(&a.id, waited("<due@me>", now - 60)).unwrap();
+        backend.note_follow_up(&a.id, waited("<later@me>", now + 3600)).unwrap();
+        let (mut later, mut codes) = (Later::default(), Codes::default());
+        let accounts = [a];
+        remind_follow_ups(&shared, &accounts, &mut later, &mut codes, &announce);
+        remind_follow_ups(&shared, &accounts, &mut later, &mut codes, &announce);
+        let said = said.lock().unwrap().clone();
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert!(said[0].starts_with("NoReply") && said[0].contains("<due@me>"));
+        // Both still wait: one overdue, one not yet.
+        assert_eq!(backend.follow_ups("acct").len(), 2);
+        drop(shared);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

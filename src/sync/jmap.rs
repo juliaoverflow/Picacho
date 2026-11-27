@@ -82,6 +82,7 @@ pub const LIST_PROPERTIES: &[&str] = &[
     "header:List-Unsubscribe:asURLs",
     "header:List-Unsubscribe-Post:asText",
     "header:Disposition-Notification-To:asText",
+    "header:Auto-Submitted:asText",
 ];
 
 /// How long an ordinary request may take, and a download.
@@ -232,6 +233,8 @@ pub struct Email {
     pub list_unsubscribe_post: Option<String>,
     #[serde(default, rename = "header:Disposition-Notification-To:asText")]
     pub receipt_to: Option<String>,
+    #[serde(default, rename = "header:Auto-Submitted:asText")]
+    pub auto_submitted: Option<String>,
 }
 impl Email {
     /// The List-Unsubscribe header as mail carries it: each address in

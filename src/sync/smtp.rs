@@ -35,6 +35,19 @@ fn sender<'a>(
             )
         })?),
     };
+    // One of the account's own addresses at its provider, routed to as an
+    // alias (a Proton address): From names it, and the provider sends it.
+    if !d.from_address.trim().is_empty() {
+        let name = Some(d.from_name.trim()).filter(|n| !n.is_empty()).map_or_else(|| a.name.clone(), str::to_owned);
+        let from = Mailbox::new(
+            Some(name),
+            d.from_address
+                .trim()
+                .parse()
+                .with_context(|| t!("sync-smtp-the-address-in-from-isnt-valid"))?,
+        );
+        return Ok((None, from));
+    }
     let from = match identity {
         Some(i) => Mailbox::new(
             Some(if i.name.trim().is_empty() {

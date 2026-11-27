@@ -166,6 +166,8 @@ pub(super) struct Composer {
     later_open: bool,
     /// The templates menu is open.
     templates_open: bool,
+    /// The "Remind me if no reply" menu is open.
+    follow_up_open: bool,
     /// Send Later's date and time picker, while its menu is open.
     later_picker: Option<Entity<DateTimePicker>>,
     later_subscription: Option<Subscription>,
@@ -352,6 +354,7 @@ impl Composer {
             from_filter,
             later_open: false,
             templates_open: false,
+            follow_up_open: false,
             later_picker: None,
             later_subscription: None,
             when: None,
@@ -1487,6 +1490,117 @@ impl Composer {
                     .child(t!("composer-send-later-2")),
             )
             .children(self.later_picker.clone())
+    }
+
+    /// Sets how long after sending to remind if nobody replies (`None`: not at all).
+    fn set_follow_up(&mut self, wait: Option<i64>, cx: &mut Context<Self>) {
+        self.follow_up_open = false;
+        self.draft.follow_up = wait;
+        self.changed(cx);
+        cx.notify();
+    }
+
+    /// "Remind me if no reply"'s menu: how long to wait, or not to.
+    fn follow_up_menu(&self, cx: &Context<Self>) -> Stateful<Div> {
+        let c = self.colors;
+        let chosen = self.draft.follow_up;
+        let row = |id: String, label: String, on: bool| {
+            div()
+                .id(SharedString::from(id.clone()))
+                .debug_selector(move || id.clone())
+                .h(px(if self.mobile { super::mobile::TOUCH } else { 30. }))
+                .px_2()
+                .flex()
+                .items_center()
+                .gap_2()
+                .rounded(px(6.))
+                .cursor_pointer()
+                .text_size(px(13.))
+                .when(on, |d| d.text_color(rgb(c.accent)).font_weight(FontWeight::SEMIBOLD))
+                .hover(move |s| s.bg(rgb(c.soft)))
+                .child(div().flex_1().min_w_0().truncate().child(label))
+        };
+        let mut menu = div()
+            .id("follow-up-menu")
+            .debug_selector(|| "follow-up-menu".into())
+            .absolute()
+            .bottom(px(48.))
+            .left(px(12.))
+            .w(px(300.))
+            .p_2()
+            .rounded(px(12.))
+            .border_1()
+            .border_color(rgb(c.border))
+            .bg(rgb(c.raised))
+            .shadow_lg()
+            .occlude()
+            .flex()
+            .flex_col()
+            .gap(px(2.))
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                this.follow_up_open = false;
+                cx.notify();
+            }))
+            .child(
+                div()
+                    .px_2()
+                    .pb_1()
+                    .text_size(px(11.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(rgb(c.muted))
+                    .child(t!("composer-remind-me-if-nobody-replies")),
+            );
+        for (i, (label, wait)) in crate::manage::backend::follow_up::wait_choices().into_iter().enumerate() {
+            menu = menu.child(
+                row(format!("follow-up-{i}"), label, chosen == Some(wait))
+                    .on_click(cx.listener(move |this, _, _, cx| this.set_follow_up(Some(wait), cx))),
+            );
+        }
+        menu.child(div().h(px(1.)).my_1().bg(rgb(c.border))).child(
+            row("follow-up-none".into(), t!("composer-dont-remind-me").into(), chosen.is_none())
+                .on_click(cx.listener(|this, _, _, cx| this.set_follow_up(None, cx))),
+        )
+    }
+
+    /// While a reminder is set: when it comes, and a way to drop it.
+    fn follow_up_banner(&self, cx: &Context<Self>) -> Option<Div> {
+        let wait = self.draft.follow_up?;
+        let c = self.colors;
+        Some(
+            div()
+                .flex_shrink_0()
+                .px_4()
+                .py_2()
+                .flex()
+                .items_center()
+                .gap_2()
+                .border_b_1()
+                .border_color(rgb(c.border))
+                .bg(rgb(c.soft))
+                .text_size(px(12.))
+                .child(icon_el("waiting", 14., c.accent))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .child(t!("composer-reminds-you-if-no-reply", days = wait_days(wait))),
+                )
+                .child(
+                    div()
+                        .id("compose-no-follow-up")
+                        .debug_selector(|| "compose-no-follow-up".into())
+                        .px_2()
+                        .py(px(3.))
+                        .rounded(px(5.))
+                        .flex_shrink_0()
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(rgb(c.accent))
+                        .cursor_pointer()
+                        .hover(move |s| s.bg(rgb(c.border)))
+                        .child(t!("composer-dont-remind-me"))
+                        .on_click(cx.listener(|this, _, _, cx| this.set_follow_up(None, cx))),
+                ),
+        )
     }
 
     /// The templates menu: each template, then keeping this message as one.
@@ -3045,6 +3159,23 @@ impl Composer {
             .when(self.templates_open, |d| {
                 d.child(deferred(self.templates_menu(cx)).with_priority(2))
             })
+            .child(self.icon_button(
+                "follow-up",
+                "waiting",
+                match self.draft.follow_up {
+                    Some(wait) => t!("composer-reminds-you-if-no-reply", days = wait_days(wait)),
+                    None => t!("composer-remind-me-if-no-reply").to_owned(),
+                },
+                self.draft.follow_up.is_some() || self.follow_up_open,
+                cx,
+                |t, _, cx| {
+                    t.follow_up_open = !t.follow_up_open;
+                    cx.notify();
+                },
+            ))
+            .when(self.follow_up_open, |d| {
+                d.child(deferred(self.follow_up_menu(cx)).with_priority(2))
+            })
             .child(if self.mobile {
                 self.rich_text_toggle(cx)
             } else {
@@ -3248,6 +3379,7 @@ impl Render for Composer {
             return root;
         }
         root = root.children(self.schedule_banner(cx));
+        root = root.children(self.follow_up_banner(cx));
         root = root.children(self.sender_row(cx));
         root = root.child(self.recipient_row(TO, cx));
         if self.show_cc {
@@ -3418,6 +3550,11 @@ fn wait_on_thread(limit: Option<Duration>) -> bool {
             .map(|(_, timeout)| !timeout.timed_out())
             .unwrap_or(false),
     }
+}
+
+/// How many days a reminder waits, rounded.
+fn wait_days(wait: i64) -> i64 {
+    ((wait + 43_199) / 86_400).max(1)
 }
 
 #[cfg(test)]

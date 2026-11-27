@@ -370,3 +370,144 @@ fn exchange_holds_scheduled_mail_and_takes_large_mail_in_pieces() -> Result<()> 
     let _ = std::fs::remove_dir_all(path);
     Ok(())
 }
+
+/// The Focused Inbox's sorting comes with each message, and changes as
+/// Outlook's does: Other is never Primary, Focused always is.
+#[test]
+fn the_focused_inbox_sorts_the_categories() -> Result<()> {
+    use crate::manage::categories::{Categorizing, Category, Known};
+    let mut fake = Fake::new();
+    let focused = fake.add("Budget", "inbox", 5);
+    let other = fake.add("Weekly digest", "inbox", 10);
+    for m in fake.messages.iter_mut() {
+        m.classification = if m.id == focused { "focused" } else { "other" }.into();
+    }
+    let (server, fake) = serve(fake);
+    let (b, a, path) = setup(server.port)?;
+    let inbox = b.sync(&a, Folder::Inbox, 50)?;
+    let prefs = Categorizing::default();
+    let category = |id: &str| {
+        let m = b.store.message(&graph::row_id(&a, id)).unwrap().unwrap();
+        (
+            m.server_category().to_owned(),
+            prefs.category(&m, &Known::default()),
+        )
+    };
+    assert_eq!(inbox.len(), 2);
+    assert_eq!(category(&focused), ("focused".into(), Category::Primary));
+    assert_eq!(category(&other), ("other".into(), Category::Updates));
+    // Moved to Focused in Outlook: the next look says so.
+    let mut f = fake.lock().unwrap();
+    let moved = f.messages.iter_mut().find(|m| m.id == other).unwrap();
+    moved.classification = "focused".into();
+    drop(f);
+    b.sync(&a, Folder::Inbox, 50)?;
+    assert_eq!(category(&other), ("focused".into(), Category::Primary));
+    drop(b);
+    let _ = std::fs::remove_dir_all(path);
+    Ok(())
+}
+
+/// Follow-up reminders at Microsoft: an out-of-office reply is told by its
+/// message class; a reply not downloaded is found in the message's
+/// conversation before reminding; and the list is shared with another
+/// computer through one note in a Picacho folder.
+#[test]
+fn graph_follow_ups_find_replies_and_share_through_a_note() -> Result<()> {
+    use crate::manage::backend::FollowUp;
+    let mut fake = Fake::new();
+    let sent = fake.add("Question", "sentitems", 120);
+    let _reply = fake.add("Question", "archive", 30);
+    let away = fake.add("Out of office", "inbox", 10);
+    fake.classes.push((away, "IPM.Note.Rules.OofTemplate.Microsoft".into()));
+    let (server, fake) = serve(fake);
+    let (b, a, path) = setup(server.port)?;
+    let inbox = b.sync(&a, Folder::Inbox, 50)?;
+    let auto: Vec<(&str, bool)> = inbox.iter().map(|m| (m.subject.as_str(), m.automatic())).collect();
+    assert_eq!(auto, [("Out of office", true)]);
+    // Its copy in Sent listed: its conversation is known.
+    b.sync(&a, Folder::Sent, 50)?;
+    let now = chrono::Utc::now().timestamp();
+    let waiting = |id: &str, due: i64| FollowUp {
+        message_id: id.into(),
+        subject: "Question".into(),
+        to: "bo@example.se".into(),
+        sent: now - 7200,
+        due,
+        ..Default::default()
+    };
+    b.note_follow_up(&a.id, waiting(&format!("<{sent}@example.se>"), now - 60))?;
+    let check = b.check_follow_ups_online(&a, true)?;
+    assert!(check.due.is_empty(), "{check:?}");
+    assert_eq!(check.replied.len(), 1);
+    assert_eq!(check.replied[0].1, "Bo Berg");
+    assert!(b.follow_ups(&a.id).is_empty());
+    let notes = |fake: &Arc<Mutex<Fake>>| {
+        let f = fake.lock().unwrap();
+        let folder = f.folders.iter().find(|x| x.name == "Picacho").map(|x| x.id.clone());
+        f.messages
+            .iter()
+            .filter(|m| Some(&m.folder) == folder.as_ref() && m.subject == "Picacho: follow-up reminders")
+            .count()
+    };
+    assert_eq!(notes(&fake), 1, "the stop is kept, in a folder made for it");
+
+    // Another computer with the same account.
+    let (b2, a2, path2) = setup(server.port)?;
+    b2.sync(&a2, Folder::Inbox, 50)?;
+    b.note_follow_up(&a.id, waiting("<later@example.com>", now + 86400))?;
+    b.sync_follow_ups(&a, true)?;
+    assert!(b2.sync_follow_ups(&a2, true)?, "it learns of the wait");
+    let ids = |b: &Backend, a: &Account| b.follow_ups(&a.id).into_iter().map(|f| f.message_id).collect::<Vec<_>>();
+    assert_eq!(ids(&b2, &a2), ["<later@example.com>"]);
+    // Stopped there: stopped here too, and still one note.
+    b2.stop_waiting(&a2.id, &["<later@example.com>".into()])?;
+    b2.sync_follow_ups(&a2, true)?;
+    assert!(b.sync_follow_ups(&a, true)?);
+    assert!(ids(&b, &a).is_empty());
+    assert_eq!(notes(&fake), 1);
+    drop((b, b2));
+    let _ = std::fs::remove_dir_all(path);
+    let _ = std::fs::remove_dir_all(path2);
+    Ok(())
+}
+
+/// Snoozed mail at Microsoft is shared with another computer through a
+/// note in the Picacho folder: it shows there as snoozed; woken early
+/// there, it's no longer snoozed here either.
+#[test]
+fn graph_snoozes_are_shared_with_other_computers() -> Result<()> {
+    let mut fake = Fake::new();
+    let later = fake.add("Later", "inbox", 5);
+    let (server, fake) = serve(fake);
+    let (b, a, path) = setup(server.port)?;
+    let inbox = b.sync(&a, Folder::Inbox, 50)?;
+    let until = chrono::Utc::now().timestamp() + 86400;
+    b.snooze(&a, &inbox, until)?;
+    b.share_snoozed(&a, true)?;
+    let message_id = format!("<{later}@example.se>");
+    assert_eq!(b.snoozed(&a.id).iter().map(|s| s.message_id.clone()).collect::<Vec<_>>(), [message_id.clone()]);
+
+    // Another computer.
+    let (b2, a2, path2) = setup(server.port)?;
+    assert!(b2.share_snoozed(&a2, true)?, "it learns of the snooze");
+    let theirs = b2.snoozed(&a2.id);
+    assert_eq!(theirs.len(), 1);
+    assert_eq!((theirs[0].message_id.as_str(), theirs[0].until), (message_id.as_str(), until));
+    // Woken early there: back in the inbox, and no longer snoozed here.
+    let woken = b2.unsnooze(&a2, std::slice::from_ref(&message_id))?;
+    assert_eq!(woken.len(), 1);
+    b2.share_snoozed(&a2, true)?;
+    assert!(b.share_snoozed(&a, true)?);
+    assert!(b.snoozed(&a.id).is_empty());
+    let f = fake.lock().unwrap();
+    assert_eq!(f.message(&later).unwrap().folder, "f-inbox");
+    let picacho = f.folders.iter().find(|x| x.name == "Picacho").map(|x| x.id.clone());
+    let notes: Vec<_> = f.messages.iter().filter(|m| Some(&m.folder) == picacho.as_ref()).map(|m| m.subject.clone()).collect();
+    assert_eq!(notes, ["Picacho: snoozed messages"]);
+    drop(f);
+    drop((b, b2));
+    let _ = std::fs::remove_dir_all(path);
+    let _ = std::fs::remove_dir_all(path2);
+    Ok(())
+}

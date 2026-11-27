@@ -155,3 +155,21 @@ contacts-showing-200-of-type-to-narrow = Showing 200 of { $total }. Type to narr
 
 # When the server hasn't been read yet ("Read never")
 contacts-never = never
+
+contacts-more-address-books = More Address Books
+
+contacts-add-another-account = Add another account's contacts beside these: a mail account's provider, signed in as it already is, or another contacts server.
+
+contacts-add-address-books = Add Address Books
+
+contacts-address-book-removed = Address book removed
+
+contacts-remove = Remove
+
+contacts-source-caption = { $kind ->
+        [google] Google Contacts · Read { $synced }
+        [proton] Proton Contacts · Read { $synced }
+        [exchange] Exchange · Read { $synced }
+        [jmap] JMAP · Read { $synced }
+       *[carddav] CardDAV · Read { $synced }
+    }

@@ -7,7 +7,8 @@ impl MailApp {
     pub(super) fn contacts_page(&self, cx: &Context<Self>) -> AnyElement {
         let c = self.colors();
         let cards = self.backend.contacts();
-        let server = self.backend.contacts_server();
+        let server = self.backend.primary_contacts_server();
+        let first = server.is_some();
         let busy = self.contacts_busy;
         let labelled = |text: &'static str, id: &'static str, input: &Entity<InputState>| {
             div()
@@ -190,8 +191,93 @@ impl MailApp {
                     ),
             )
             .child(self.settings_group(t!("contacts-contacts-server-carddav"), server_rows))
+            .when(first || !self.backend.contacts_sources().is_empty(), |d| d.child(self.contacts_sources_group(first, cx)))
             .child(self.settings_group(t!("contacts-files"), files))
             .into_any_element()
+    }
+
+    /// Settings → Contacts: the address books beside the first (other
+    /// accounts'), each to read again or remove, and where more are added.
+    fn contacts_sources_group(&self, first: bool, cx: &Context<Self>) -> Div {
+        let c = self.colors();
+        let busy = self.contacts_busy;
+        let mut rows = Rows::new();
+        for (id, server, synced) in self.backend.contacts_sources() {
+            let when = synced
+                .and_then(|t| chrono::DateTime::from_timestamp(t, 0))
+                .map(|t| t.with_timezone(&chrono::Local).local(t!("dates-month-day-time")))
+                .unwrap_or_else(|| t!("contacts-never").to_owned());
+            let kind = if !server.google_account.is_empty() {
+                "google"
+            } else if !server.proton_account.is_empty() {
+                "proton"
+            } else if !server.graph_account.is_empty() || !server.ews_account.is_empty() {
+                "exchange"
+            } else if !server.jmap_account.is_empty() {
+                "jmap"
+            } else {
+                "carddav"
+            };
+            rows = rows.row(self.setting_row(
+                &self.backend.contacts_source_label(&id),
+                &t!("contacts-source-caption", kind = kind, synced = when),
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .gap_2()
+                    .child(self.button(
+                        SharedString::from(format!("contacts-source-sync-{id}")),
+                        t!("contacts-read-now"),
+                        "refresh",
+                        Action::SyncContactsSource(id.clone()),
+                        false,
+                        cx,
+                    ))
+                    .child(self.button(
+                        SharedString::from(format!("contacts-source-remove-{id}")),
+                        t!("contacts-remove"),
+                        "close",
+                        Action::RemoveContactsSource(id.clone()),
+                        false,
+                        cx,
+                    )),
+            ));
+        }
+        if first {
+            let labelled = |text: &'static str, id: &'static str, input: &Entity<InputState>| {
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(div().text_size(px(12.)).text_color(rgb(c.muted)).child(text))
+                    .child(div().id(id).child(field(Input::new(input), c, busy)))
+            };
+            rows = rows.row(
+                div()
+                    .id("contacts-add-account")
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .max_w(px(420.))
+                    .child(div().text_size(px(12.)).text_color(rgb(c.muted)).child(t!("contacts-add-another-account")))
+                    .children(self.jmap_sources("contacts-add-jmap", Action::ConnectJmapContacts, cx))
+                    .child(labelled(t!("contacts-server"), "contacts-url", &self.contacts_url))
+                    .child(labelled(t!("contacts-user-name"), "contacts-user", &self.contacts_user))
+                    .child(labelled(t!("contacts-password"), "contacts-password", &self.contacts_password))
+                    .child(div().flex().child(
+                        self.button(
+                            "contacts-connect",
+                            if busy { t!("contacts-connecting") } else { t!("contacts-add-address-books") },
+                            "plus",
+                            Action::ConnectContacts,
+                            false,
+                            cx,
+                        )
+                        .when(busy, |d| d.opacity(0.6)),
+                    )),
+            );
+        }
+        self.settings_group(t!("contacts-more-address-books"), rows)
     }
 
     /// Handles Contacts settings' actions.
@@ -212,9 +298,15 @@ impl MailApp {
                 // Not kept on screen; the keychain has it once it works.
                 self.contacts_password
                     .update(cx, |input, cx| input.set_text("", w, cx));
+                // With contacts set up already, this server goes beside them.
+                let another = self.backend.primary_contacts_server().is_some();
                 self.contacts_run(cx, move |b| {
-                    b.connect_contacts(server, &password)
-                        .map(|n| t!("contacts-read-contacts", n = n))
+                    let n = if another {
+                        b.add_contacts_source(|| b.connect_contacts(server, &password))?
+                    } else {
+                        b.connect_contacts(server, &password)?
+                    };
+                    Ok(t!("contacts-read-contacts", n = n))
                 });
             }
             Action::SyncContacts => {
@@ -272,10 +364,27 @@ impl MailApp {
                 let Some(a) = self.accounts.iter().find(|a| a.id == id).cloned() else {
                     return;
                 };
+                let another = self.backend.primary_contacts_server().is_some();
                 self.contacts_run(cx, move |b| {
                     let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-                    let n = b.use_mail_account_for_contacts(&a, cancel)?;
+                    let n = if another {
+                        b.add_contacts_source(|| b.use_mail_account_for_contacts(&a, cancel))?
+                    } else {
+                        b.use_mail_account_for_contacts(&a, cancel)?
+                    };
                     Ok(t!("contacts-read-contacts-from", n = n, email = a.email))
+                });
+            }
+            Action::SyncContactsSource(id) => {
+                self.contacts_run(cx, move |b| {
+                    let n = b.in_contacts_source(&id, || b.sync_contacts())?;
+                    Ok(t!("contacts-read-contacts", n = n))
+                });
+            }
+            Action::RemoveContactsSource(id) => {
+                self.contacts_run(cx, move |b| {
+                    b.remove_contacts_source(&id)?;
+                    Ok(t!("contacts-address-book-removed").into())
                 });
             }
             Action::SearchServerContacts => {
@@ -722,7 +831,13 @@ impl MailApp {
             // A CardDAV server can be asked for more (RFC 6352 §8.6).
             .when(
                 !filter.is_empty()
-                    && self.backend.contacts_server().is_some_and(|s| s.jmap_account.is_empty()),
+                    && self.backend.contacts_source_ids().iter().any(|id| {
+                        self.backend.in_contacts_source(id, || {
+                            self.backend
+                                .contacts_server()
+                                .is_some_and(|s| s.jmap_account.is_empty() && s.google_account.is_empty() && s.proton_account.is_empty())
+                        })
+                    }),
                 |d| {
                     d.child(div().px_4().pb_3().child(self.button(
                         "contacts-search-server",

@@ -206,7 +206,7 @@ pub fn parse_recovery_key(text: &str) -> Result<Zeroizing<[u8; 32]>> {
     key.copy_from_slice(&bytes[..32]);
     let sum = Sha256::new()
         .chain_update(b"pinal-mail/v1/recovery-checksum")
-        .chain_update(key.as_ref())
+        .chain_update(&key[..])
         .finalize();
     ensure!(
         sum[..3] == bytes[32..35],

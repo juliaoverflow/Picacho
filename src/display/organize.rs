@@ -1319,6 +1319,7 @@ impl MailApp {
         );
         self.settings_column()
             .child(self.settings_group(t!("organize-layout"), layout_rows))
+            .child(self.categories_settings(cx))
             .child(self.settings_group(t!("organize-saved-searches-2"), saved))
             .child(self.settings_group(t!("organize-blocked-senders"), blocked))
             .child(self.settings_group(t!("organize-rules"), rules))

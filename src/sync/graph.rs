@@ -26,10 +26,12 @@ const V: &str = "/v1.0";
 /// The most requests in one batch.
 const BATCH: usize = 20;
 /// What the message list shows of a message.
-const SELECT: &str = "id,conversationId,parentFolderId,subject,from,toRecipients,ccRecipients,replyTo,receivedDateTime,isRead,flag,categories,hasAttachments,bodyPreview,internetMessageId,isDraft";
+const SELECT: &str = "id,conversationId,parentFolderId,subject,from,toRecipients,ccRecipients,replyTo,receivedDateTime,isRead,flag,categories,hasAttachments,bodyPreview,internetMessageId,isDraft,inferenceClassification";
 /// Its size (PR_MESSAGE_SIZE) and what was last done with it
 /// (PR_LAST_VERB_EXECUTED: replied, replied to all, forwarded).
-const EXPAND: &str = "singleValueExtendedProperties($filter=id eq 'Integer 0x0E08' or id eq 'Integer 0x1081')";
+/// Its size, last verb (replied, forwarded) and message class (which tells
+/// out-of-office replies and reports).
+const EXPAND: &str = "singleValueExtendedProperties($filter=id eq 'Integer 0x0E08' or id eq 'Integer 0x1081' or id eq 'String 0x001A')";
 /// The largest MIME message one request may carry, base64 and all: 4 MB.
 pub const MIME_MOST: usize = 4 * 1024 * 1024 * 3 / 4 - 64 * 1024;
 
@@ -114,16 +116,24 @@ pub struct Message {
     pub size: u64,
     /// PR_LAST_VERB_EXECUTED: 102 replied, 103 replied to all, 104 forwarded.
     pub last_verb: Option<i64>,
+    /// The Focused Inbox's sorting: "focused" or "other" (empty where the
+    /// mailbox doesn't sort).
+    pub classification: String,
+    /// Its message class (PR_MESSAGE_CLASS): "IPM.Note", or what tells an
+    /// out-of-office reply or a report.
+    pub item_class: String,
 }
 impl Message {
     pub fn from_json(v: &Value) -> Self {
         let mut size = 0;
         let mut last_verb = None;
+        let mut item_class = String::new();
         for p in v["singleValueExtendedProperties"].as_array().into_iter().flatten() {
             let value = p["value"].as_str().and_then(|s| s.parse::<i64>().ok());
             match p["id"].as_str().unwrap_or_default().to_ascii_lowercase().as_str() {
                 "integer 0xe08" | "integer 0x0e08" => size = value.unwrap_or_default().max(0) as u64,
                 "integer 0x1081" => last_verb = value,
+                "string 0x1a" | "string 0x001a" => item_class = p["value"].as_str().unwrap_or_default().to_owned(),
                 _ => {}
             }
         }
@@ -149,6 +159,8 @@ impl Message {
             draft: v["isDraft"].as_bool().unwrap_or(false),
             size,
             last_verb,
+            classification: text(&v["inferenceClassification"]),
+            item_class,
         }
     }
 }
@@ -417,6 +429,16 @@ impl Session {
         let v = self.rest.get(&path)?;
         let messages = v["value"].as_array().map(|l| l.iter().map(Message::from_json).collect()).unwrap_or_default();
         Ok((messages, v["@odata.nextLink"].as_str().map(str::to_owned)))
+    }
+    /// A conversation's messages, wherever they are (up to 100).
+    pub fn conversation(&self, id: &str) -> Result<Vec<Message>> {
+        let path = format!(
+            "/me/messages?$top=100&$select={SELECT}&$expand={}&$filter={}",
+            escape(EXPAND),
+            escape(&format!("conversationId eq '{}'", id.replace('\'', "''")))
+        );
+        let v = self.rest.get(&Self::p(&path))?;
+        Ok(v["value"].as_array().map(|l| l.iter().map(Message::from_json).collect()).unwrap_or_default())
     }
     /// What the message list shows of each of `ids`; those gone are left out.
     pub fn messages(&self, ids: &[String]) -> Result<Vec<Message>> {

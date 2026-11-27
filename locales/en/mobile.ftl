@@ -84,6 +84,8 @@ mobile-mailboxes-add-account = Add Account
 
 mobile-mailboxes-subscriptions = Subscriptions
 
+mobile-mailboxes-waiting-for = Waiting For
+
 mobile-mailboxes-summary = Summary
 
 mobile-mailboxes-this-account-needs-attention = This account needs attention
@@ -127,6 +129,8 @@ mobile-reader-move-to-trash = Move to trash
 mobile-reader-move-to-folder = Move to folder
 
 mobile-reader-snooze = Snooze
+
+mobile-reader-remind-me-if-no-reply = Remind me if no reply
 
 mobile-reader-more = More
 

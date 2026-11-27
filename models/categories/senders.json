@@ -1,0 +1,4 @@
+{
+ "services": ["list-manage.com", "mcsv.net", "mcdlv.net", "rsgsv.net", "mailchimp", "klaviyo", "klclick", "exacttarget", "exct.net", "marketingcloud", "mktomail", "marketo", "hubspotemail", "hubspotlinks", "constantcontact", "ccsend.com", "createsend", "cmail19", "cmail20", "sendinblue", "sendibm", "brevo", "omnisend", "attentivemobile", "attn.tv", "emarsys", "rsys", "responsys", "sailthru", "bronto", "cheetahmail", "mailerlite", "convertkit", "ck.page", "iterable", "braze", "shopifyemail", "activehosted", "acemsrvc", "getresponse", "aweber", "drip.com", "moosend", "dotdigital", "dmdelivery", "listrak", "zetaglobal", "customeriomail", "campaign-archive"],
+ "automated": ["noreply", "donotreply", "dontreply", "noresponse", "mailerdaemon", "postmaster", "notification", "alert", "newsletter", "bounce", "mailer", "automated", "autoconfirm", "autoreply"]
+}

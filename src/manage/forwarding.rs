@@ -1,14 +1,17 @@
-//! Alias forwarding services (SimpleLogin, addy.io, Firefox Relay) and the
-//! mailbox views they add: an alias shown as an account of its own, and All
+//! Alias forwarding services (SimpleLogin, addy.io, Firefox Relay, and
+//! Proton's own aliases for a Proton account signed in without Bridge) and
+//! the mailbox views they add: an alias shown as an account of its own, and All
 //! Mail across every account.
 //!
 //! Forwarded mail arrives in an ordinary mailbox, still addressed to the
 //! alias. An alias shown on its own lists the mail addressed to it, and the
 //! mailbox it arrives in no longer does; one included with the email changes
 //! nothing. The service accounts are kept in preferences and their API keys
-//! in the system keychain, like mailbox passwords.
+//! in the system keychain, like mailbox passwords. Proton's aliases need no
+//! key: they use the Proton account's own session (`sync/proton/aliases.rs`).
 use crate::manage::{
-    model::{Account, Draft, Folder, Mail, Secret},
+    backend::Backend,
+    model::{Account, Draft, Folder, Mail, Provider, Secret},
     store::{self, Store},
 };
 use crate::sync::forwarding::Client;
@@ -31,14 +34,19 @@ pub enum ForwardingService {
     SimpleLogin,
     Addy,
     FirefoxRelay,
+    /// Proton's own aliases (hide-my-email aliases, kept in Proton Pass),
+    /// for a Proton account signed in without Bridge. SimpleLogin forwards
+    /// their mail, but they are Proton's, not a SimpleLogin account's.
+    Proton,
 }
 impl ForwardingService {
-    pub const ALL: [Self; 3] = [Self::SimpleLogin, Self::Addy, Self::FirefoxRelay];
+    pub const ALL: [Self; 4] = [Self::SimpleLogin, Self::Addy, Self::FirefoxRelay, Self::Proton];
     pub fn label(self) -> &'static str {
         match self {
             Self::SimpleLogin => "SimpleLogin",
             Self::Addy => "addy.io",
             Self::FirefoxRelay => "Firefox Relay",
+            Self::Proton => "Proton",
         }
     }
     pub fn default_server(self) -> &'static str {
@@ -46,7 +54,18 @@ impl ForwardingService {
             Self::SimpleLogin => "https://app.simplelogin.io",
             Self::Addy => "https://app.addy.io",
             Self::FirefoxRelay => "https://relay.firefox.com",
+            Self::Proton => "https://pass.proton.me",
         }
+    }
+    /// Whether it signs in with a Proton account here rather than an API
+    /// key and server.
+    pub fn uses_proton_account(self) -> bool {
+        matches!(self, Self::Proton)
+    }
+    /// Whether it takes a new alias's prefix as given, so a random one is
+    /// made here (addy.io makes its own).
+    pub fn takes_prefix(self) -> bool {
+        matches!(self, Self::SimpleLogin | Self::Proton)
     }
     /// Whether mail can be written as an alias, not only replied to.
     /// SimpleLogin does it with reverse aliases and addy.io with
@@ -64,18 +83,24 @@ impl ForwardingService {
         !matches!(self, Self::FirefoxRelay)
     }
     /// What the service calls the real addresses an alias forwards to
-    /// (SimpleLogin's mailboxes, addy.io's recipients), if it lets them be
-    /// chosen per alias.
+    /// (SimpleLogin's and Proton's mailboxes, addy.io's recipients), if it
+    /// lets them be chosen per alias.
     pub fn mailboxes_label(self) -> Option<&'static str> {
         match self {
-            Self::SimpleLogin => Some(t!("manage-forwarding-mailboxes")),
+            Self::SimpleLogin | Self::Proton => Some(t!("manage-forwarding-mailboxes")),
             Self::Addy => Some(t!("manage-forwarding-recipients")),
             Self::FirefoxRelay => None,
         }
     }
-    /// Whether aliases list their reverse aliases (contacts).
+    /// Whether aliases list their reverse aliases (contacts), and write
+    /// to people through them.
     pub fn has_contacts(self) -> bool {
-        matches!(self, Self::SimpleLogin)
+        matches!(self, Self::SimpleLogin | Self::Proton)
+    }
+    /// Whether an alias always forwards to at least one of its mailboxes
+    /// (addy.io's falls back to the default recipient).
+    pub fn needs_mailbox(self) -> bool {
+        matches!(self, Self::SimpleLogin | Self::Proton)
     }
     /// Where the API key is made, in one sentence, and the page.
     pub fn key_help(self) -> (&'static str, &'static str) {
@@ -91,6 +116,10 @@ impl ForwardingService {
             Self::FirefoxRelay => (
                 t!("manage-forwarding-copy-the-api-key-from-the"),
                 "https://relay.firefox.com/accounts/settings/",
+            ),
+            Self::Proton => (
+                t!("manage-forwarding-proton-aliases-use-the-accounts-sign-in"),
+                "https://pass.proton.me/",
             ),
         }
     }
@@ -133,6 +162,51 @@ pub struct Alias {
     /// its mailboxes has a key; `None` when that isn't possible.
     #[serde(default)]
     pub pgp: Option<bool>,
+    /// Proton: an address of the account's own (not a Pass alias), and its
+    /// kind. Proton sends from it itself; it has no reverse aliases.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proton_address: Option<ProtonAddressKind>,
+}
+impl Alias {
+    /// Whether it is one of a Proton account's own addresses.
+    pub fn is_address(&self) -> bool {
+        self.proton_address.is_some()
+    }
+}
+
+/// The kinds of Proton address listed as aliases (all but the account's
+/// original address).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ProtonAddressKind {
+    /// Another address at Proton's domains.
+    Alias,
+    /// At a domain of the account's own.
+    Custom,
+    /// A short premium address, such as `@pm.me`.
+    Premium,
+    /// An address elsewhere that signs in to Proton.
+    External,
+}
+impl ProtonAddressKind {
+    /// Proton's `Address.Type`; `None` for the original address (left out)
+    /// and kinds not known here.
+    pub fn of(kind: i64) -> Option<Self> {
+        match kind {
+            2 => Some(Self::Alias),
+            3 => Some(Self::Custom),
+            4 => Some(Self::Premium),
+            5 => Some(Self::External),
+            _ => None,
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Alias => t!("manage-forwarding-proton-address"),
+            Self::Custom => t!("manage-forwarding-your-domain"),
+            Self::Premium => t!("manage-forwarding-premium-address"),
+            Self::External => t!("manage-forwarding-external-address"),
+        }
+    }
 }
 
 /// How much mail an alias has handled, as its service counts it.
@@ -191,6 +265,10 @@ pub struct ForwardingAccount {
     /// write as themselves, and their address is shown as the alias used.
     #[serde(default)]
     pub aliases_only: bool,
+    /// Proton: the Picacho account (signed in to Proton without Bridge)
+    /// whose aliases these are.
+    #[serde(default)]
+    pub proton_account: String,
 }
 impl ForwardingAccount {
     fn secret_id(&self) -> String {
@@ -199,6 +277,23 @@ impl ForwardingAccount {
     fn client(&self) -> Result<Client> {
         let key = store::read_secret(&self.secret_id())?.password;
         Client::new(self.service, &self.server, &key)
+    }
+    /// What talks to the service: its API with the key in the keychain, or
+    /// for Proton's aliases, the Proton account's session.
+    fn api<'a>(&self, backend: &'a Backend) -> Result<Api<'a>> {
+        if self.service.uses_proton_account() {
+            // The Pass session and Pass's extra password, kept as other
+            // services' keys are.
+            let secret = store::read_secret(&self.secret_id()).unwrap_or_default();
+            return Ok(Api::Proton(ProtonApi {
+                backend,
+                account: self.proton_account.clone(),
+                secret_id: self.secret_id(),
+                extra: Some(zeroize::Zeroizing::new(secret.password.clone())).filter(|p| !p.is_empty()),
+                pass: Some(secret.proton()).filter(|p| !p.uid.is_empty()),
+            }));
+        }
+        self.client().map(Api::Http)
     }
     /// Aliases from the service, keeping how each one is shown here.
     fn merge(&self, fresh: Vec<Alias>) -> Vec<Alias> {
@@ -218,6 +313,135 @@ impl ForwardingAccount {
 }
 fn secret_id(id: &str) -> String {
     format!("forwarding:{id}")
+}
+
+/// A service to ask: one with its own API (`sync/forwarding.rs`), or
+/// Proton's aliases through a Proton account's session.
+enum Api<'a> {
+    Http(Client),
+    Proton(ProtonApi<'a>),
+}
+/// Proton's aliases of one account.
+struct ProtonApi<'a> {
+    /// The backend that keeps the account's session.
+    backend: &'a Backend,
+    /// The account's id.
+    account: String,
+    /// Where the Pass session and extra password are kept.
+    secret_id: String,
+    /// Pass's extra password, if the account protects Pass with one.
+    extra: Option<zeroize::Zeroizing<String>>,
+    /// The session signed in for Pass, in a build with a Pass registration.
+    pass: Option<crate::sync::proton::Saved>,
+}
+impl ProtonApi<'_> {
+    /// `work` with the account's session, set up for Pass: its Pass
+    /// session in use and Pass unlocked. Tokens Proton renewed for the Pass
+    /// session meanwhile are saved, since each refresh replaces the last.
+    fn run<T>(&self, work: impl FnOnce(&crate::sync::proton::Session) -> Result<T>) -> Result<T> {
+        self.backend.with_proton_account(&self.account, |s| {
+            if let Some(pass) = &self.pass {
+                s.use_pass_session(pass)?;
+            }
+            let result = (|| {
+                if let Some(extra) = &self.extra {
+                    s.unlock_proton_pass(extra)?;
+                }
+                work(s)
+            })();
+            if let Some(pass) = &self.pass
+                && let Some(renewed) = s.pass_renewed(pass)
+            {
+                let mut secret = store::read_secret(&self.secret_id).unwrap_or_default();
+                secret.set_proton(&renewed);
+                if store::write_secret(&self.secret_id, &secret).is_err() {
+                    eprintln!("Picacho: the renewed Proton Pass session couldn't be saved");
+                }
+            }
+            result
+        })
+    }
+}
+/// `$http` with the HTTP client as `$c`, or `$proton` with the Proton
+/// session as `$s`.
+macro_rules! ask {
+    ($api:expr, $c:ident => $http:expr, $s:ident => $proton:expr) => {
+        match $api {
+            Api::Http($c) => $http,
+            Api::Proton(p) => p.run(|$s| $proton),
+        }
+    };
+}
+impl Api<'_> {
+    /// Every alias; for Proton, its Pass aliases and then the account's
+    /// own addresses but its original one and the one it signs in with.
+    fn aliases(&self) -> Result<Vec<Alias>> {
+        match self {
+            Api::Http(c) => c.aliases(),
+            Api::Proton(p) => {
+                let own = p.backend.store.accounts()?.into_iter().find(|a| a.id == p.account).map(|a| a.email);
+                p.run(|s| proton_aliases_and_addresses(s, own.as_deref()))
+            }
+        }
+    }
+    fn mailboxes(&self) -> Result<Vec<ServiceMailbox>> {
+        ask!(self, c => c.mailboxes(), s => s.proton_alias_mailboxes())
+    }
+    fn options(&self) -> Result<AliasOptions> {
+        ask!(self, c => c.options(), s => s.proton_alias_options())
+    }
+    fn create(&self, new: &NewAlias) -> Result<Alias> {
+        ask!(self, c => c.create(new), s => s.create_proton_alias(new))
+    }
+    fn alias_exists(&self, alias: &Alias) -> Result<bool> {
+        ask!(self, c => c.alias_exists(alias), s => s.proton_alias_exists(alias))
+    }
+    fn set_note(&self, alias: &Alias, note: &str) -> Result<()> {
+        ask!(self, c => c.set_note(alias, note), s => s.set_proton_alias_note(alias, note))
+    }
+    fn set_enabled(&self, alias: &Alias, enabled: bool) -> Result<()> {
+        ask!(self, c => c.set_enabled(alias, enabled), s => s.set_proton_alias_enabled(alias, enabled))
+    }
+    fn set_name(&self, alias: &Alias, name: &str) -> Result<()> {
+        ask!(self, c => c.set_name(alias, name), s => s.set_proton_alias_name(alias, name))
+    }
+    fn set_pinned(&self, alias: &Alias, pinned: bool) -> Result<()> {
+        ask!(self, c => c.set_pinned(alias, pinned), s => s.set_proton_alias_pinned(alias, pinned))
+    }
+    fn set_mailboxes(&self, alias: &Alias, ids: &[String]) -> Result<()> {
+        ask!(self, c => c.set_mailboxes(alias, ids), s => s.set_proton_alias_mailboxes(alias, ids))
+    }
+    fn set_pgp(&self, alias: &Alias, enabled: bool) -> Result<()> {
+        match self {
+            Api::Http(c) => c.set_pgp(alias, enabled),
+            Api::Proton(..) => anyhow::bail!(t!("sync-forwarding-only-simplelogin-encrypts-forwarded-mail-per")),
+        }
+    }
+    /// An alias's contacts. Proton's come with their counts.
+    fn contacts(&self, alias: &Alias) -> Result<Vec<ReverseAlias>> {
+        ask!(self, c => c.contacts(alias), s => s.proton_alias_contacts(alias))
+    }
+    fn toggle_contact(&self, contact: &ReverseAlias) -> Result<bool> {
+        ask!(self, c => c.toggle_contact(contact), s => s.toggle_proton_alias_contact(contact))
+    }
+    fn delete_contact(&self, contact: &ReverseAlias) -> Result<()> {
+        ask!(self, c => c.delete_contact(contact), s => s.delete_proton_alias_contact(contact))
+    }
+    fn add_contact(&self, alias: &Alias, address: &str) -> Result<ReverseAlias> {
+        ask!(self, c => c.add_contact(alias, address), s => s.add_proton_alias_contact(alias, address))
+    }
+    /// The reverse alias for writing to `contact` as `alias`, made if it
+    /// does not exist yet.
+    fn reverse_alias(&self, alias: &Alias, contact: &str) -> Result<String> {
+        ask!(
+            self,
+            c => c.reverse_alias(alias, contact),
+            s => s.add_proton_alias_contact(alias, contact).map(|r| r.address)
+        )
+    }
+    fn delete(&self, alias: &Alias) -> Result<()> {
+        ask!(self, c => c.delete(alias), s => s.delete_proton_alias(alias))
+    }
 }
 
 pub fn load(store: &Store) -> Vec<ForwardingAccount> {
@@ -264,6 +488,7 @@ pub fn connect(
         aliases,
         mailboxes,
         aliases_only: false,
+        proton_account: String::new(),
     };
     store::write_secret(
         &account.secret_id(),
@@ -274,6 +499,154 @@ pub fn connect(
     )?;
     Ok(account)
 }
+/// A Proton account's Pass aliases, then its own addresses but `own` (the
+/// one it is signed in with here), each address after the aliases.
+fn proton_aliases_and_addresses(s: &crate::sync::proton::Session, own: Option<&str>) -> Result<Vec<Alias>> {
+    let mut all = s.proton_aliases()?;
+    let addresses: Vec<Alias> = s
+        .proton_addresses()?
+        .into_iter()
+        .filter(|a| own.is_none_or(|own| !a.email.eq_ignore_ascii_case(own)))
+        .filter(|a| !all.iter().any(|b| b.email == a.email))
+        .collect();
+    all.extend(addresses);
+    Ok(all)
+}
+
+/// Proton's aliases need Proton Pass signed in to again: Proton ended its
+/// session, or there is none (Forwarding settings offer to sign in).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PassSignInNeeded(pub String);
+impl std::fmt::Display for PassSignInNeeded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+impl std::error::Error for PassSignInNeeded {}
+
+/// Signs Proton's aliases in to Proton Pass again with `pass`, a session
+/// just signed in (`Backend::proton_pass_begin`): checked by listing the
+/// aliases, then kept in place of the old one, which is signed out. Pass's
+/// extra password is replaced when one is given. Returns what is listed.
+pub fn sign_in_to_pass_again(
+    backend: &Backend,
+    account: &ForwardingAccount,
+    pass: crate::sync::proton::Saved,
+    extra_password: &str,
+) -> Result<Refreshed> {
+    anyhow::ensure!(account.service.uses_proton_account(), t!("sync-proton-aliases-sign-in-to-proton-pass"));
+    let mut secret = store::read_secret(&account.secret_id()).unwrap_or_default();
+    let old = Some(secret.proton()).filter(|p| !p.uid.is_empty() && p.uid != pass.uid);
+    if !extra_password.is_empty() {
+        secret.password = extra_password.to_owned();
+    }
+    let extra = secret.password.clone();
+    let checked = backend.with_proton_account(&account.proton_account, |s| {
+        s.reset_pass_session();
+        s.use_pass_session(&pass)?;
+        s.unlock_proton_pass(&extra)?;
+        s.proton_aliases()?;
+        Ok(s.pass_renewed(&pass).unwrap_or(pass.clone()))
+    });
+    let kept = match checked {
+        Ok(kept) => kept,
+        Err(e) => {
+            crate::sync::proton::sign_out(&pass);
+            return Err(e);
+        }
+    };
+    secret.set_proton(&kept);
+    store::write_secret(&account.secret_id(), &secret)?;
+    if let Some(old) = old {
+        crate::sync::proton::sign_out(&old);
+    }
+    refresh(backend, account)
+}
+
+/// How Proton's aliases are signed in to: in a build with a Pass
+/// registration, the session signed in to Proton Pass for the account
+/// (`Backend::proton_pass_begin`; Proton gives Pass access only to a session
+/// signed in as an app with Pass); and Pass's extra password, if the
+/// account protects Pass with one.
+#[derive(Clone, Default)]
+pub struct ProtonSignIn {
+    pub pass: Option<crate::sync::proton::Saved>,
+    pub extra_password: zeroize::Zeroizing<String>,
+}
+
+/// Proton's own aliases of a Proton account signed in without Bridge:
+/// lists them with the account's session (or, in a build with a Pass
+/// registration, a Pass session signed in with `with`), keeping only that
+/// Pass session and Pass's extra password, if any, in the keychain.
+pub fn connect_proton(
+    backend: &Backend,
+    account: &Account,
+    accounts: &[Account],
+    with: &ProtonSignIn,
+) -> Result<ForwardingAccount> {
+    anyhow::ensure!(
+        account.provider == Provider::Proton,
+        t!("manage-forwarding-proton-aliases-need-a-proton-account", email = account.email)
+    );
+    let pass = with.pass.clone();
+    if pass.is_none() && crate::sync::proton::pass_sign_in() {
+        return Err(PassSignInNeeded(t!("sync-proton-aliases-sign-in-to-proton-pass").into()).into());
+    }
+    let listed = backend.with_proton_account(&account.id, |s| {
+        if let Some(pass) = &pass {
+            s.use_pass_session(pass)?;
+        }
+        s.unlock_proton_pass(&with.extra_password)?;
+        let (name, mailbox) = s.proton_alias_profile();
+        let aliases = proton_aliases_and_addresses(s, Some(&account.email))?;
+        let renewed = pass.as_ref().and_then(|p| s.pass_renewed(p));
+        Ok((name, mailbox, aliases, s.proton_alias_mailboxes().unwrap_or_default(), renewed))
+    });
+    let (name, mailbox, aliases, mailboxes, renewed) = match listed {
+        Ok(listed) => listed,
+        Err(e) => {
+            // Not kept, so not left signed in at Proton either.
+            if let Some(pass) = &pass {
+                crate::sync::proton::sign_out(pass);
+            }
+            return Err(e);
+        }
+    };
+    let id = uuid::Uuid::new_v4().to_string();
+    if pass.is_some() || !with.extra_password.is_empty() {
+        let mut secret = Secret {
+            password: with.extra_password.to_string(),
+            ..Secret::default()
+        };
+        if let Some(pass) = renewed.as_ref().or(pass.as_ref()) {
+            secret.set_proton(pass);
+        }
+        store::write_secret(&secret_id(&id), &secret)?;
+    }
+    Ok(ForwardingAccount {
+        id,
+        service: ForwardingService::Proton,
+        name: if name.is_empty() { account.email.clone() } else { name },
+        deliver_to: accounts
+            .iter()
+            .find(|a| a.email.eq_ignore_ascii_case(&mailbox))
+            .map(|a| a.id.clone())
+            .or_else(|| Some(account.id.clone())),
+        aliases,
+        mailboxes,
+        proton_account: account.id.clone(),
+        ..ForwardingAccount::default()
+    })
+}
+/// The Proton accounts signed in without Bridge whose aliases aren't
+/// listed here yet.
+pub fn proton_accounts<'a>(forwarding: &[ForwardingAccount], accounts: &'a [Account]) -> Vec<&'a Account> {
+    accounts
+        .iter()
+        .filter(|a| a.provider == Provider::Proton)
+        .filter(|a| !forwarding.iter().any(|f| f.service.uses_proton_account() && f.proton_account == a.id))
+        .collect()
+}
 /// What a service lists now: its aliases, and its mailboxes (None when
 /// they couldn't be listed, so the ones known are kept).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -282,51 +655,51 @@ pub struct Refreshed {
     pub mailboxes: Option<Vec<ServiceMailbox>>,
 }
 /// The account's aliases and mailboxes as the service lists them now.
-pub fn refresh(account: &ForwardingAccount) -> Result<Refreshed> {
-    let client = account.client()?;
+pub fn refresh(backend: &Backend, account: &ForwardingAccount) -> Result<Refreshed> {
+    let api = account.api(backend)?;
     Ok(Refreshed {
-        aliases: account.merge(client.aliases()?),
-        mailboxes: client.mailboxes().ok(),
+        aliases: account.merge(api.aliases()?),
+        mailboxes: api.mailboxes().ok(),
     })
 }
 /// Changes the name recipients see on mail from an alias; empty for none.
-pub fn set_name(account: &ForwardingAccount, alias: &Alias, name: &str) -> Result<()> {
-    account.client()?.set_name(alias, name)
+pub fn set_name(backend: &Backend, account: &ForwardingAccount, alias: &Alias, name: &str) -> Result<()> {
+    account.api(backend)?.set_name(alias, name)
 }
-pub fn set_pinned(account: &ForwardingAccount, alias: &Alias, pinned: bool) -> Result<()> {
-    account.client()?.set_pinned(alias, pinned)
+pub fn set_pinned(backend: &Backend, account: &ForwardingAccount, alias: &Alias, pinned: bool) -> Result<()> {
+    account.api(backend)?.set_pinned(alias, pinned)
 }
 /// Chooses which of the service's mailboxes an alias forwards to.
-pub fn set_mailboxes(account: &ForwardingAccount, alias: &Alias, ids: &[String]) -> Result<()> {
-    account.client()?.set_mailboxes(alias, ids)
+pub fn set_mailboxes(backend: &Backend, account: &ForwardingAccount, alias: &Alias, ids: &[String]) -> Result<()> {
+    account.api(backend)?.set_mailboxes(alias, ids)
 }
 /// SimpleLogin: turns PGP encryption of an alias's forwarded mail on or off.
-pub fn set_pgp(account: &ForwardingAccount, alias: &Alias, enabled: bool) -> Result<()> {
-    account.client()?.set_pgp(alias, enabled)
+pub fn set_pgp(backend: &Backend, account: &ForwardingAccount, alias: &Alias, enabled: bool) -> Result<()> {
+    account.api(backend)?.set_pgp(alias, enabled)
 }
 /// SimpleLogin: blocks or unblocks mail from a contact; returns whether it
 /// is blocked now.
-pub fn toggle_contact(account: &ForwardingAccount, contact: &ReverseAlias) -> Result<bool> {
-    account.client()?.toggle_contact(contact)
+pub fn toggle_contact(backend: &Backend, account: &ForwardingAccount, contact: &ReverseAlias) -> Result<bool> {
+    account.api(backend)?.toggle_contact(contact)
 }
-pub fn delete_contact(account: &ForwardingAccount, contact: &ReverseAlias) -> Result<()> {
-    account.client()?.delete_contact(contact)
+pub fn delete_contact(backend: &Backend, account: &ForwardingAccount, contact: &ReverseAlias) -> Result<()> {
+    account.api(backend)?.delete_contact(contact)
 }
 /// SimpleLogin: the reverse alias for writing to `address` as the alias,
 /// made unless it exists.
-pub fn add_contact(account: &ForwardingAccount, alias: &Alias, address: &str) -> Result<ReverseAlias> {
-    account.client()?.add_contact(alias, address)
+pub fn add_contact(backend: &Backend, account: &ForwardingAccount, alias: &Alias, address: &str) -> Result<ReverseAlias> {
+    account.api(backend)?.add_contact(alias, address)
 }
-pub fn create(account: &ForwardingAccount, new: &NewAlias) -> Result<Alias> {
-    account.client()?.create(new)
+pub fn create(backend: &Backend, account: &ForwardingAccount, new: &NewAlias) -> Result<Alias> {
+    account.api(backend)?.create(new)
 }
 /// The domains and prefixes the account can make aliases with.
-pub fn options(account: &ForwardingAccount) -> Result<AliasOptions> {
-    account.client()?.options()
+pub fn options(backend: &Backend, account: &ForwardingAccount) -> Result<AliasOptions> {
+    account.api(backend)?.options()
 }
 /// Changes an alias's description at the service.
-pub fn set_note(account: &ForwardingAccount, alias: &Alias, note: &str) -> Result<()> {
-    account.client()?.set_note(alias, note)
+pub fn set_note(backend: &Backend, account: &ForwardingAccount, alias: &Alias, note: &str) -> Result<()> {
+    account.api(backend)?.set_note(alias, note)
 }
 
 /// One of a SimpleLogin alias's contacts: someone it has mail with, and
@@ -434,8 +807,12 @@ pub fn tally(contacts: &mut [ReverseAlias], activity: &[Activity], partial: bool
 /// A SimpleLogin alias's reverse aliases, as the service lists them now,
 /// with how much mail each has had. Stats are left out, rather than the
 /// list failing, when the activity can't be read.
-pub fn reverse_aliases(account: &ForwardingAccount, alias: &Alias) -> Result<Vec<ReverseAlias>> {
-    let client = account.client()?;
+pub fn reverse_aliases(backend: &Backend, account: &ForwardingAccount, alias: &Alias) -> Result<Vec<ReverseAlias>> {
+    let client = match account.api(backend)? {
+        // Proton's contacts come with their counts.
+        api @ Api::Proton(..) => return api.contacts(alias),
+        Api::Http(client) => client,
+    };
     let (contacts, activity) = std::thread::scope(|scope| {
         let activity = scope.spawn(|| client.activity(alias));
         let contacts = client.contacts(alias);
@@ -581,14 +958,23 @@ pub fn clean_prefix(prefix: &str) -> String {
         .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
         .collect()
 }
-pub fn set_enabled(account: &ForwardingAccount, alias: &Alias, enabled: bool) -> Result<()> {
-    account.client()?.set_enabled(alias, enabled)
+pub fn set_enabled(backend: &Backend, account: &ForwardingAccount, alias: &Alias, enabled: bool) -> Result<()> {
+    account.api(backend)?.set_enabled(alias, enabled)
 }
-pub fn delete(account: &ForwardingAccount, alias: &Alias) -> Result<()> {
-    account.client()?.delete(alias)
+pub fn delete(backend: &Backend, account: &ForwardingAccount, alias: &Alias) -> Result<()> {
+    account.api(backend)?.delete(alias)
 }
-/// Forgets the account's key. Its aliases keep working at the service.
+/// Forgets the account's key (for Proton's aliases, Pass's extra password,
+/// if any; the Proton account keeps its sign-in). Its aliases keep working
+/// at the service.
 pub fn forget(account: &ForwardingAccount) {
+    // Proton's aliases: their Pass session is signed out as well.
+    if account.service.uses_proton_account()
+        && let Ok(secret) = store::read_secret(&account.secret_id())
+        && !secret.proton_uid.is_empty()
+    {
+        crate::sync::proton::sign_out(&secret.proton());
+    }
     let _ = store::secret_entry(&account.secret_id())
         .and_then(|e| e.delete_credential().map_err(Into::into));
 }
@@ -740,11 +1126,11 @@ impl std::error::Error for AliasGone {}
 /// Before sending as an alias, asks its service whether the alias still
 /// exists, since it can be deleted elsewhere. When the service can't be
 /// asked, sending goes ahead and reports any problem itself.
-pub fn verify_alias(store: &Store, draft: &Draft) -> Result<()> {
+pub fn verify_alias(backend: &Backend, draft: &Draft) -> Result<()> {
     if draft.send_as.is_empty() {
         return Ok(());
     }
-    let forwarding = load(store);
+    let forwarding = load(&backend.store);
     let Some((account, alias)) = find_sendable(&forwarding, &draft.send_as) else {
         return Err(AliasGone {
             email: draft.send_as.trim().to_lowercase(),
@@ -752,8 +1138,8 @@ pub fn verify_alias(store: &Store, draft: &Draft) -> Result<()> {
         }
         .into());
     };
-    if let Ok(client) = account.client()
-        && let Ok(false) = client.alias_exists(alias)
+    if let Ok(api) = account.api(backend)
+        && let Ok(false) = api.alias_exists(alias)
     {
         return Err(AliasGone {
             email: alias.email.clone(),
@@ -765,14 +1151,15 @@ pub fn verify_alias(store: &Store, draft: &Draft) -> Result<()> {
 }
 
 /// The draft with its recipients rewritten so the service sends it as
-/// `draft.send_as`: SimpleLogin's reverse aliases, or addy.io's
+/// `draft.send_as`: SimpleLogin's (and Proton's) reverse aliases, or addy.io's
 /// `alias+name=domain@alias-domain`. Addresses that already go through the
 /// alias (as in a reply to mail it forwarded) are kept. Unchanged when the
 /// draft is sent as its account.
-pub fn route(store: &Store, draft: &Draft) -> Result<Draft> {
+pub fn route(backend: &Backend, draft: &Draft) -> Result<Draft> {
     if draft.send_as.is_empty() {
         return Ok(draft.clone());
     }
+    let store = &backend.store;
     let forwarding = load(store);
     let Some((account, alias)) = find_sendable(&forwarding, &draft.send_as) else {
         return Err(AliasGone {
@@ -798,8 +1185,17 @@ pub fn route(store: &Store, draft: &Draft) -> Result<Draft> {
                     .collect::<Result<_>>()
             })
             .collect::<Result<_>>()?,
-        ForwardingService::SimpleLogin => {
-            let client = account.client()?;
+        // One of the account's own Proton addresses: Proton sends from it
+        // itself, so the recipients stay and From names it.
+        ForwardingService::Proton if alias.is_address() => {
+            return Ok(Draft {
+                from_address: alias.email.clone(),
+                from_name: alias.name.trim().to_owned(),
+                ..draft.clone()
+            });
+        }
+        ForwardingService::SimpleLogin | ForwardingService::Proton => {
+            let client = account.api(backend)?;
             let contacts = client.contacts(alias)?;
             let reverse: std::collections::HashSet<String> =
                 contacts.iter().map(|c| c.address.clone()).collect();
@@ -945,11 +1341,11 @@ pub fn remember_contacts<I: IntoIterator<Item = (String, String)>>(
     Ok(())
 }
 
-/// Fetches a SimpleLogin alias's contacts and notes who each of its
-/// reverse aliases stands for.
-pub fn learn_contacts(store: &Store, account: &ForwardingAccount, alias: &Alias) -> Result<()> {
-    let contacts = account.client()?.contacts(alias)?;
-    remember_contacts(store, contacts.into_iter().map(|c| (c.address, c.contact)))
+/// Fetches a SimpleLogin (or Proton) alias's contacts and notes who each
+/// of its reverse aliases stands for.
+pub fn learn_contacts(backend: &Backend, account: &ForwardingAccount, alias: &Alias) -> Result<()> {
+    let contacts = account.api(backend)?.contacts(alias)?;
+    remember_contacts(&backend.store, contacts.into_iter().map(|c| (c.address, c.contact)))
 }
 
 /// A recipient list with each known reverse alias in it replaced by the
@@ -1357,7 +1753,8 @@ mod tests {
     #[test]
     fn drafts_sent_as_an_alias_are_routed_and_others_unchanged() -> Result<()> {
         let p = std::env::temp_dir().join(format!("mail-test-{}", uuid::Uuid::new_v4()));
-        let store = Store::open(&p)?;
+        let store = std::sync::Arc::new(Store::open(&p)?);
+        let backend = Backend::new(store.clone());
         let alias = |email: &str, enabled| Alias {
             id: email.into(),
             email: email.into(),
@@ -1389,9 +1786,9 @@ mod tests {
             cc: "cy@example.com".into(),
             ..Draft::default()
         };
-        assert_eq!(route(&store, &draft)?.to, draft.to, "sent as the account");
+        assert_eq!(route(&backend, &draft)?.to, draft.to, "sent as the account");
         let routed = route(
-            &store,
+            &backend,
             &Draft {
                 send_as: "Shop@me.anonaddy.com".into(),
                 ..draft.clone()
@@ -1408,11 +1805,11 @@ mod tests {
                 send_as: send_as.into(),
                 ..draft.clone()
             };
-            assert!(route(&store, &draft).is_err(), "{send_as}");
+            assert!(route(&backend, &draft).is_err(), "{send_as}");
         }
         // An alias no longer listed is reported as gone, so From can be reset.
         let gone = route(
-            &store,
+            &backend,
             &Draft {
                 send_as: "Deleted@me.anonaddy.com".into(),
                 ..draft.clone()
@@ -1639,5 +2036,64 @@ mod tests {
         ]);
         assert_eq!(merged[0].display, AliasDisplay::Separate);
         assert_eq!(merged[1].display, AliasDisplay::Included);
+    }
+
+    #[test]
+    fn proton_addresses_send_as_themselves() -> Result<()> {
+        let p = std::env::temp_dir().join(format!("mail-test-{}", uuid::Uuid::new_v4()));
+        let store = std::sync::Arc::new(Store::open(&p)?);
+        let backend = Backend::new(store.clone());
+        save(
+            &store,
+            &[ForwardingAccount {
+                id: "proton".into(),
+                service: ForwardingService::Proton,
+                aliases: vec![Alias {
+                    id: "addr.a1".into(),
+                    email: "me@example.org".into(),
+                    enabled: true,
+                    name: "Jo".into(),
+                    proton_address: Some(ProtonAddressKind::Custom),
+                    ..Alias::default()
+                }],
+                ..ForwardingAccount::default()
+            }],
+        )?;
+        let draft = Draft {
+            to: "Ana <ana@example.org>".into(),
+            send_as: "Me@Example.org".into(),
+            ..Draft::default()
+        };
+        // No reverse aliases: the recipients stay, and From names the address.
+        let routed = route(&backend, &draft)?;
+        assert_eq!(routed.to, draft.to);
+        assert_eq!((routed.from_address.as_str(), routed.from_name.as_str()), ("me@example.org", "Jo"));
+        assert_eq!(sendable(&load(&store))[0].email, "me@example.org");
+        Ok(())
+    }
+
+    #[test]
+    fn proton_aliases_come_from_proton_accounts_signed_in_directly() {
+        let proton = |id: &str| Account {
+            id: id.into(),
+            email: format!("{id}@proton.me"),
+            ..Account::new(Provider::Proton)
+        };
+        let accounts = [account("imap"), proton("p1"), proton("p2")];
+        let listed = [ForwardingAccount {
+            id: "f".into(),
+            service: ForwardingService::Proton,
+            proton_account: "p1".into(),
+            ..ForwardingAccount::default()
+        }];
+        // Each Proton account's aliases are listed once; others aren't Proton.
+        let open: Vec<&str> = proton_accounts(&listed, &accounts).iter().map(|a| a.id.as_str()).collect();
+        assert_eq!(open, ["p2"]);
+        assert_eq!(proton_accounts(&[], &accounts).len(), 2);
+        // Proton's aliases never go through an API key.
+        assert!(Client::new(ForwardingService::Proton, "", "key").is_err());
+        let p = ForwardingService::Proton;
+        assert!(p.uses_proton_account() && p.can_send() && p.has_contacts() && p.needs_mailbox() && p.takes_prefix());
+        assert!(!ForwardingService::SimpleLogin.uses_proton_account());
     }
 }

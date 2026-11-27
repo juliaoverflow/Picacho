@@ -59,6 +59,8 @@ reader-archive-message = @Archive message
 
 reader-snooze-until = @Snooze until…
 
+reader-remind-me-if-no-reply = @Remind me if no reply…
+
 reader-mark-read-unread = @Mark read / unread
 
 reader-move-to-trash-2 = @Move to trash

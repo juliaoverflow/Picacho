@@ -388,6 +388,20 @@ impl MailApp {
                     ))
                 },
             )
+            // Sent mail: be reminded if nobody replies.
+            .when(
+                m.folder == Folder::Sent && !m.message_id.trim().is_empty(),
+                |d| {
+                    d.child(self.button(
+                        "follow-up",
+                        t!("reader-remind-me-if-no-reply"),
+                        "waiting",
+                        Action::FollowUpMenu(m.id.clone()),
+                        false,
+                        cx,
+                    ))
+                },
+            )
             .child(self.button(
                 "read",
                 &shortcuts::tip(t!("reader-mark-read-unread"), "toggle-read", cx),
@@ -568,6 +582,7 @@ impl MailApp {
             )
             .when(self.details_open, |d| d.child(self.details_panel(m, cx)))
             .children(self.snooze_banner(m, cx))
+            .children(self.follow_up_banner(m, cx))
             .children(self.receipt_banner(m, cx))
             .children(self.unsubscribe_banner(m, cx));
         let locked = m.body.is_none() && self.locked.contains(&m.account);

@@ -13,6 +13,12 @@ notify-back-from-snooze = Back from snooze
 
 notify-scheduled-message-sent = Scheduled message sent
 
+notify-no-reply-yet = No reply yet
+
+notify-a-message-without-a-reply = A message you're waiting on has no reply
+
+notify-messages-without-a-reply = { $count } messages you're waiting on have no reply
+
 notify-to = { $subject } — to { $to }
 
 notify-a-scheduled-message-wasnt-sent = A scheduled message wasn't sent

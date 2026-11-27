@@ -282,6 +282,11 @@ impl Fake {
                 self.changed(&id, false);
                 ok(json!({"id": id}))
             }
+            ("GET", p) if p.starts_with(&format!("{base}/threads/")) => {
+                let id = &p[base.len() + 9..];
+                let messages: Vec<Value> = self.messages.iter().filter(|m| m.thread == id).map(|m| json!({"id": m.id})).collect();
+                if messages.is_empty() { missing() } else { ok(json!({"id": id, "messages": messages})) }
+            }
             ("GET", p) if p.starts_with(&format!("{base}/messages/")) => {
                 let id = &p[base.len() + 10..];
                 match self.message(id) {

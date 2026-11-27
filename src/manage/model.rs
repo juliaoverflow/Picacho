@@ -992,6 +992,13 @@ pub struct MailExtra {
     /// The server's id for the message itself (OBJECTID's EMAILID, RFC
     /// 8474 §5.1): the same in every mailbox of the account.
     email_id: String,
+    /// The inbox category the server sorted it into, where it does
+    /// (`categories::gmail_category`, `categories::outlook_category`).
+    category: String,
+    /// Sent by a machine, as its headers say (Auto-Submitted, X-Autoreply,
+    /// X-Autorespond, Precedence: auto_reply): an out-of-office answer, a
+    /// report, a notification.
+    automatic: bool,
 }
 impl MailExtra {
     fn is_empty(&self) -> bool {
@@ -1005,6 +1012,8 @@ impl MailExtra {
             && self.list_id.is_empty()
             && self.list_links.is_empty()
             && self.email_id.is_empty()
+            && self.category.is_empty()
+            && !self.automatic
     }
 }
 
@@ -1083,6 +1092,22 @@ impl Mail {
     pub fn set_email_id(&mut self, email_id: impl Into<String>) {
         let email_id = email_id.into();
         self.change_extra(email_id.is_empty(), |e| e.email_id = email_id);
+    }
+    /// The inbox category the server sorted it into ("promotions",
+    /// "focused"…); empty where it doesn't say.
+    pub fn server_category(&self) -> &str {
+        self.extra.as_ref().map_or("", |e| &e.category)
+    }
+    pub fn set_server_category(&mut self, category: impl Into<String>) {
+        let category = category.into();
+        self.change_extra(category.is_empty(), |e| e.category = category);
+    }
+    /// Sent by a machine, as its headers say (see `MailExtra::automatic`).
+    pub fn automatic(&self) -> bool {
+        self.extra.as_ref().is_some_and(|e| e.automatic)
+    }
+    pub fn set_automatic(&mut self, automatic: bool) {
+        self.change_extra(!automatic, |e| e.automatic = automatic);
     }
     /// Takes the attachments out, leaving none.
     pub fn take_attachments(&mut self) -> Vec<Attachment> {
@@ -1168,6 +1193,10 @@ struct MailRecord {
     #[serde(default)]
     email_id: String,
     #[serde(default)]
+    category: String,
+    #[serde(default)]
+    automatic: bool,
+    #[serde(default)]
     mdn_sent: bool,
     #[serde(default)]
     partial: bool,
@@ -1222,6 +1251,10 @@ struct MailRecordRef<'a> {
     list_links: &'a [crate::manage::list_headers::ListLink],
     #[serde(skip_serializing_if = "no_text")]
     email_id: &'a str,
+    #[serde(skip_serializing_if = "no_text")]
+    category: &'a str,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    automatic: bool,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     mdn_sent: bool,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
@@ -1246,6 +1279,8 @@ impl From<MailRecord> for Mail {
             list_id: r.list_id,
             list_links: r.list_links,
             email_id: r.email_id,
+            category: r.category,
+            automatic: r.automatic,
         };
         Mail {
             id: r.id,
@@ -1317,6 +1352,8 @@ impl Serialize for Mail {
             list_id: self.list_id(),
             list_links: self.list_links(),
             email_id: self.email_id(),
+            category: self.server_category(),
+            automatic: self.automatic(),
             mdn_sent: self.mdn_sent,
             partial: self.partial,
         }
@@ -1564,6 +1601,14 @@ pub struct Draft {
     /// sent as; empty to send as the account (or `send_as`).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub identity: String,
+    /// Set only while sending: the address From names, when routing made
+    /// it one of the account's own addresses at its provider (a Proton
+    /// address listed as an alias), which the provider sends from itself.
+    #[serde(skip)]
+    pub from_address: String,
+    /// The name From gives `from_address`; empty for the account's.
+    #[serde(skip)]
+    pub from_name: String,
     /// When to send it (seconds since the epoch), for a message scheduled
     /// with Send Later; it waits in Drafts until then.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1571,6 +1616,10 @@ pub struct Draft {
     /// Why it couldn't be sent when it was scheduled to be, if it couldn't.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub send_error: String,
+    /// "Remind me if no reply": how long after it is sent (seconds) to
+    /// remind, if nobody has replied by then (`backend::follow_up`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub follow_up: Option<i64>,
     pub to: String,
     #[serde(default)]
     pub cc: String,
@@ -1817,7 +1866,7 @@ pub fn demo_mail() -> Vec<Mail> {
             "Figma",
             "news@figma.com",
             "Made for your next big idea",
-            "A fresh set of tools to help you bring your next idea to life. Here's what's new.",
+            "A fresh set of tools to help you bring your next idea to life. Here's what's new, and 30% off Professional this month.",
             true,
         ),
         (

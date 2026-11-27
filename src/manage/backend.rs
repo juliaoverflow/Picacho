@@ -26,6 +26,13 @@ pub(crate) mod offline;
 #[path = "snooze.rs"]
 pub(crate) mod snooze;
 pub use snooze::Snoozed;
+#[path = "follow_up.rs"]
+pub mod follow_up;
+#[path = "notes.rs"]
+pub(crate) mod notes;
+#[path = "shared.rs"]
+pub(crate) mod shared;
+pub use follow_up::FollowUp;
 #[path = "undo.rs"]
 mod undo;
 pub use undo::Moved;
@@ -48,6 +55,10 @@ pub mod opened;
 pub mod contacts;
 #[path = "calendar.rs"]
 pub mod calendar;
+#[path = "pim_sources.rs"]
+pub mod pim_sources;
+#[path = "google_pim.rs"]
+mod google_pim;
 #[path = "proton.rs"]
 mod proton;
 #[path = "proton_push.rs"]
@@ -104,6 +115,9 @@ mod gmail_tests;
 #[cfg(test)]
 #[path = "graph_tests.rs"]
 mod graph_tests;
+#[cfg(test)]
+#[path = "pim_tests.rs"]
+mod pim_tests;
 #[cfg(test)]
 #[path = "ews_tests.rs"]
 mod ews_tests;
@@ -318,7 +332,7 @@ impl<V: Clone> Recent<V> {
 }
 
 /// The saved text of the calendar's events, and the events read from it.
-type CalendarCache = (Arc<str>, Arc<Vec<crate::sync::caldav::Stored>>);
+type CalendarCache = calendar::EventCache;
 
 pub struct Backend {
     pub store: Arc<Store>,
@@ -344,7 +358,7 @@ pub struct Backend {
     /// The calendar's events as last read, with the saved text they were
     /// read from: the calendar and invitations ask for them as they draw,
     /// and every event was parsed again for each.
-    calendar_cache: Mutex<Option<CalendarCache>>,
+    calendar_cache: Mutex<CalendarCache>,
     /// Signed-in IMAP connections by account; see `connection.rs`.
     connections: Mutex<HashMap<String, Connection>>,
     limits: Mutex<Limits>,
@@ -376,6 +390,9 @@ pub struct Backend {
     /// A Proton sign-in between its steps (password, second factor,
     /// mailbox password); see `proton_begin`.
     proton_login: Mutex<Option<proton::ProtonLogin>>,
+    /// A Proton Pass session just signed in (`proton_pass_begin`), with its
+    /// account's id, until the Forwarding settings take it.
+    proton_pass_session: Mutex<Option<(String, crate::sync::proton::Saved)>>,
     /// What a security key or phone is waiting for during a sign-in.
     proton_prompt: Arc<Mutex<KeyPrompt>>,
     /// Called with Proton's account notices; see `on_proton_notice`.
@@ -438,7 +455,7 @@ impl Backend {
             verdicts: Mutex::new(Recent::new()),
             certificates: Mutex::new(None),
             smime_verdicts: Mutex::new(Recent::new()),
-            calendar_cache: Mutex::new(None),
+            calendar_cache: Mutex::new(CalendarCache::default()),
             connections: Mutex::new(HashMap::new()),
             limits: Mutex::new(Limits::default()),
             layouts: Mutex::new(HashMap::new()),
@@ -452,6 +469,7 @@ impl Backend {
             proton: Mutex::new(HashMap::new()),
             proton_opening: Mutex::new(HashMap::new()),
             proton_login: Mutex::new(None),
+            proton_pass_session: Mutex::new(None),
             proton_prompt: Arc::new(Mutex::new(KeyPrompt::Idle)),
             proton_notice: Mutex::new(None),
             proton_push: Mutex::new(None),
@@ -2844,6 +2862,9 @@ impl Backend {
             if next.references().is_empty() {
                 next.set_references(parsed.references());
             }
+            if parsed.automatic() {
+                next.set_automatic(true);
+            }
             if next.receipt_to().is_empty() {
                 next.set_receipt_to(parsed.receipt_to());
             }
@@ -4393,8 +4414,8 @@ impl Backend {
                 t!("manage-backend-sends-only-as-its-aliases-settings", email = a.email)
             );
         }
-        crate::manage::forwarding::verify_alias(&self.store, d)?;
-        let routed = crate::manage::forwarding::route(&self.store, d)?;
+        crate::manage::forwarding::verify_alias(self, d)?;
+        let routed = crate::manage::forwarding::route(self, d)?;
         let d = &routed;
         // Encrypting: look up keys not yet known for its recipients first,
         // and note those whose key nobody checked.
@@ -4617,6 +4638,29 @@ impl Backend {
         }
         // SMTP acceptance is the delivery boundary. Do not report a send failure
         // after this point, which could encourage a duplicate transmission.
+        // Sent with "Remind me if no reply": waited on from now (or from
+        // when the server sends it), by its Message-ID.
+        if let Some(wait) = d.follow_up.filter(|w| *w > 0) {
+            let message_id = message_id_of(&sent_raw);
+            if !message_id.is_empty() {
+                let sent = hold_until.unwrap_or_else(|| chrono::Utc::now().timestamp());
+                let waited = self.note_follow_up(
+                    &a.id,
+                    FollowUp {
+                        message_id,
+                        subject: d.subject.clone(),
+                        to: d.to.clone(),
+                        sent,
+                        due: sent + wait,
+                        reminded: false,
+                        changed: 0,
+                    },
+                );
+                if let Err(e) = waited {
+                    notes.push(t!("manage-follow-up-not-noted", error = format!("{:#}", e)));
+                }
+            }
+        }
         if a.provider == Provider::Pop3 {
             let raw = sent_raw;
             let id = format!("{}:sent:{}", a.id, d.id);

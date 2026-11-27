@@ -1571,6 +1571,38 @@ fn slow_smtp(
     Ok((port, server))
 }
 
+/// Sent with "Remind me if no reply", a message is waited on by the
+/// Message-ID it went with, from when it went.
+#[test]
+fn mail_sent_with_a_reminder_is_waited_on() -> Result<()> {
+    let (cert, acceptor) = tls_fixture()?;
+    let (port, server) = slow_smtp(acceptor, Duration::from_millis(0))?;
+    let (b, mut a, _path) = backend(&cert)?;
+    a.provider = Provider::Pop3;
+    a.smtp_port = port;
+    b.store.save_account(&a)?;
+    let d = Draft {
+        id: "follow-up-test".into(),
+        account: a.id.clone(),
+        to: "Recipient <recipient@example.com>".into(),
+        subject: "Any news?".into(),
+        body: "Checking in.".into(),
+        follow_up: Some(3 * 86400),
+        ..Default::default()
+    };
+    let before = chrono::Utc::now().timestamp();
+    b.send(&a, &d)?;
+    let delivered = String::from_utf8_lossy(&server.join().unwrap().expect("delivered")).into_owned();
+    let waiting = b.follow_ups(&a.id);
+    assert_eq!(waiting.len(), 1);
+    let f = &waiting[0];
+    assert!(delivered.contains(&f.message_id), "{} not in what was sent", f.message_id);
+    assert_eq!((f.subject.as_str(), f.to.as_str()), ("Any news?", "Recipient <recipient@example.com>"));
+    assert!(f.due >= before + 3 * 86400 && f.due <= chrono::Utc::now().timestamp() + 3 * 86400);
+    assert!(!f.reminded);
+    Ok(())
+}
+
 /// With no window open, the background monitor sends a scheduled message
 /// once due, removes it from Drafts and says so; the window, opening while
 /// it is being sent, finds it taken and doesn't send it again.
@@ -1649,6 +1681,7 @@ fn the_background_monitor_waits_before_waking_snoozes_again() -> Result<()> {
         until: chrono::Utc::now().timestamp() - 5,
         folder: folder.into(),
         ids: vec![],
+        changed: 0,
     };
     for id in [&a.id, &pop.id] {
         b.store.set_preference(

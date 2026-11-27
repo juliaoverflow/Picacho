@@ -2776,3 +2776,316 @@ fn utf8_messages_are_appended_as_utf8() -> Result<()> {
     std::fs::remove_dir_all(path)?;
     Ok(())
 }
+
+/// Follow-up reminders on a server with METADATA: the list merges with what
+/// another computer shared there (its new wait kept, a wait it stopped
+/// stopped here too) and goes back merged; and before reminding, the
+/// server is asked whether the overdue message was answered, so a reply
+/// not downloaded still ends the wait.
+#[test]
+fn follow_ups_are_shared_and_replies_found_on_the_server() -> Result<()> {
+    use crate::manage::backend::FollowUp;
+    let (cert, acceptor) = tls_fixture()?;
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let port = listener.local_addr()?.port();
+    let now = chrono::Utc::now().timestamp();
+    let ms = chrono::Utc::now().timestamp_millis();
+    let waiting = |id: &str, due: i64, changed: i64| FollowUp {
+        message_id: id.into(),
+        subject: format!("About {id}"),
+        to: "ana@example.org".into(),
+        sent: now - 3 * 86400,
+        due,
+        reminded: false,
+        changed,
+    };
+    // Shared by another computer: a new wait, and one it stopped since this
+    // computer last saw it.
+    let theirs = serde_json::json!({
+        "waiting": [waiting("<theirs@me>", now + 86400, ms - 1000)],
+        "gone": [{ "message_id": "<stopped@me>", "at": ms + 60_000 }],
+    })
+    .to_string();
+    let server = std::thread::spawn(move || {
+        let mut stored = Some(theirs);
+        let mut searches = Vec::new();
+        while let Some(mut p) = Peer::accept(&listener, &acceptor) {
+            while let Some((tag, command, literal)) = p.command() {
+                let upper = command.to_ascii_uppercase();
+                if upper == "CAPABILITY" {
+                    p.send("* CAPABILITY IMAP4rev1 METADATA\r\n");
+                } else if upper.starts_with("LIST") {
+                    p.send("* LIST () \"/\" INBOX\r\n* LIST (\\Archive) \"/\" \"Archive\"\r\n");
+                } else if upper.starts_with("GETMETADATA") {
+                    match &stored {
+                        Some(v) => p.send(&format!(
+                            "* METADATA \"INBOX\" (/private/vendor/tech.pinal.picacho/follow-ups {{{}}}\r\n{v})\r\n",
+                            v.len()
+                        )),
+                        None => p.send("* METADATA \"INBOX\" (/private/vendor/tech.pinal.picacho/follow-ups NIL)\r\n"),
+                    }
+                } else if upper.starts_with("SETMETADATA") {
+                    stored = if !literal.is_empty() {
+                        Some(String::from_utf8_lossy(&literal).into_owned())
+                    } else if command.trim_end().ends_with("NIL)") {
+                        None
+                    } else {
+                        let start = command.find("follow-ups \"").unwrap() + "follow-ups \"".len();
+                        let end = command.rfind("\")").unwrap();
+                        Some(command[start..end].replace("\\\"", "\"").replace("\\\\", "\\"))
+                    };
+                } else if upper.starts_with("SELECT") || upper.starts_with("EXAMINE") {
+                    p.send("* 1 EXISTS\r\n* OK [UIDVALIDITY 7] ok\r\n* OK [UIDNEXT 6] ok\r\n");
+                } else if upper.starts_with("UID SEARCH") {
+                    searches.push(command.clone());
+                    // Ana's answer to the overdue one is in the inbox.
+                    if command.contains("<overdue@me>") && searches.len() == 1 {
+                        p.send("* SEARCH 5\r\n");
+                    } else {
+                        p.send("* SEARCH\r\n");
+                    }
+                } else if upper.starts_with("UID FETCH") {
+                    let header = "From: Ana Lima <ana@example.org>\r\nSubject: Re: About it\r\n\r\n";
+                    p.send(&format!(
+                        "* 1 FETCH (UID 5 BODY[HEADER.FIELDS (FROM SUBJECT AUTO-SUBMITTED X-AUTOREPLY X-AUTORESPOND PRECEDENCE)] {{{}}}\r\n{header})\r\n",
+                        header.len()
+                    ));
+                } else if upper == "LOGOUT" {
+                    p.send(&format!("* BYE\r\n{tag} OK done\r\n"));
+                    break;
+                }
+                p.ok(&tag);
+            }
+        }
+        (stored, searches)
+    });
+    let (b, mut a, path) = backend(&cert)?;
+    a.incoming_port = port;
+    b.store.save_account(&a)?;
+    b.note_follow_up(&a.id, waiting("<overdue@me>", now - 60, 0))?;
+    b.note_follow_up(&a.id, waiting("<stopped@me>", now + 86400, 0))?;
+    let check = b.check_follow_ups_online(&a, true)?;
+    // Answered on the server: not reminded of, no longer waited on.
+    assert!(check.due.is_empty(), "{check:?}");
+    assert_eq!(check.replied.len(), 1);
+    assert_eq!(check.replied[0].0.message_id, "<overdue@me>");
+    assert_eq!(check.replied[0].1, "Ana Lima");
+    let ids: Vec<String> = b.follow_ups(&a.id).into_iter().map(|f| f.message_id).collect();
+    assert_eq!(ids, ["<theirs@me>"]);
+    b.disconnect(&a.id);
+    drop(listener_closer(port));
+    let (stored, searches) = server.join().unwrap();
+    // What went back: the other computer's wait, and both stops.
+    let stored: serde_json::Value = serde_json::from_str(&stored.expect("shared"))?;
+    let waiting: Vec<&str> = stored["entries"].as_array().unwrap().iter().map(|f| f["message_id"].as_str().unwrap()).collect();
+    assert_eq!(waiting, ["<theirs@me>"]);
+    let mut gone: Vec<&str> = stored["gone"].as_array().unwrap().iter().map(|g| g["message_id"].as_str().unwrap()).collect();
+    gone.sort();
+    assert_eq!(gone, ["<overdue@me>", "<stopped@me>"]);
+    // The server's search leaves out mail of the account's own and automatic mail.
+    assert!(searches[0].contains("HEADER In-Reply-To \"<overdue@me>\""), "{searches:?}");
+    assert!(searches[0].contains("NOT FROM \"") && searches[0].contains("NOT HEADER Auto-Submitted auto"));
+    drop(b);
+    std::fs::remove_dir_all(path)?;
+    Ok(())
+}
+
+/// Ends a fixture's accept loop: one last connection that closes at once.
+fn listener_closer(port: u16) -> Option<TcpStream> {
+    TcpStream::connect(("127.0.0.1", port)).ok()
+}
+
+/// Follow-up reminders on an IMAP server without METADATA: the list is
+/// kept in a note appended to a Picacho folder (made for it), replaced as
+/// it changes (one note at a time), and read by another computer.
+#[test]
+fn follow_ups_are_shared_through_a_note_without_metadata() -> Result<()> {
+    use crate::manage::backend::FollowUp;
+    let (cert, acceptor) = tls_fixture()?;
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let port = listener.local_addr()?.port();
+    let server = std::thread::spawn(move || {
+        let mut folder_made = false;
+        // The Picacho folder's messages: (uid, source, deleted).
+        let mut notes: Vec<(u32, Vec<u8>, bool)> = Vec::new();
+        let mut next = 1;
+        let mut selected = String::new();
+        while let Some(mut p) = Peer::accept(&listener, &acceptor) {
+            while let Some((tag, command, literal)) = p.command() {
+                let upper = command.to_ascii_uppercase();
+                if upper == "CAPABILITY" {
+                    p.send("* CAPABILITY IMAP4rev1 UIDPLUS\r\n");
+                } else if upper.starts_with("LIST") {
+                    p.send("* LIST () \"/\" INBOX\r\n");
+                    if folder_made {
+                        p.send("* LIST () \"/\" Picacho\r\n");
+                    }
+                } else if upper.starts_with("CREATE") {
+                    folder_made = command.contains("Picacho");
+                } else if upper.starts_with("SELECT") || upper.starts_with("EXAMINE") {
+                    selected = command.split_whitespace().nth(1).unwrap_or_default().trim_matches('"').to_owned();
+                    let count = if selected == "Picacho" { notes.iter().filter(|n| !n.2).count() } else { 0 };
+                    p.send(&format!("* {count} EXISTS\r\n* OK [UIDVALIDITY 3] ok\r\n* OK [UIDNEXT {next}] ok\r\n"));
+                    p.send(&format!("{tag} OK [READ-WRITE] done\r\n"));
+                    continue;
+                } else if upper.starts_with("APPEND") {
+                    assert!(command.contains("Picacho") && upper.contains("\\SEEN"), "{command}");
+                    notes.push((next, literal, false));
+                    p.send(&format!("{tag} OK [APPENDUID 3 {next}] done\r\n"));
+                    next += 1;
+                    continue;
+                } else if upper.starts_with("UID SEARCH") {
+                    if selected == "Picacho" && command.contains("X-Picacho-Note") {
+                        let uids: Vec<String> = notes.iter().filter(|n| !n.2).map(|n| n.0.to_string()).collect();
+                        p.send(&format!("* SEARCH {}\r\n", uids.join(" ")));
+                    } else {
+                        p.send("* SEARCH\r\n");
+                    }
+                } else if upper.starts_with("UID FETCH") {
+                    for (i, (uid, raw, _)) in notes.iter().filter(|n| !n.2).enumerate() {
+                        if command.contains(&uid.to_string()) {
+                            p.send(&format!("* {} FETCH (UID {uid} BODY[] {{{}}}\r\n", i + 1, raw.len()));
+                            p.send_bytes(raw);
+                            p.send(")\r\n");
+                        }
+                    }
+                } else if upper.starts_with("UID STORE") {
+                    let set = command.split_whitespace().nth(2).unwrap_or_default().to_owned();
+                    for n in &mut notes {
+                        if set.split(',').any(|u| u == n.0.to_string()) {
+                            n.2 = true;
+                        }
+                    }
+                } else if upper == "LOGOUT" {
+                    p.send(&format!("* BYE\r\n{tag} OK done\r\n"));
+                    break;
+                }
+                p.ok(&tag);
+            }
+        }
+        notes.into_iter().filter(|n| !n.2).collect::<Vec<_>>()
+    });
+    let now = chrono::Utc::now().timestamp();
+    let waiting = |id: &str| FollowUp {
+        message_id: id.into(),
+        subject: "Plans".into(),
+        to: "ana@example.org".into(),
+        sent: now - 3600,
+        due: now + 86400,
+        ..Default::default()
+    };
+    let (b, mut a, path) = backend(&cert)?;
+    a.incoming_port = port;
+    b.store.save_account(&a)?;
+    b.note_follow_up(&a.id, waiting("<one@me>"))?;
+    b.sync_follow_ups(&a, true)?;
+    b.note_follow_up(&a.id, waiting("<two@me>"))?;
+    b.sync_follow_ups(&a, true)?;
+    b.disconnect(&a.id);
+    // Another computer.
+    let (b2, mut a2, path2) = backend(&cert)?;
+    a2.incoming_port = port;
+    b2.store.save_account(&a2)?;
+    assert!(b2.sync_follow_ups(&a2, true)?);
+    let mut ids: Vec<String> = b2.follow_ups(&a2.id).into_iter().map(|f| f.message_id).collect();
+    ids.sort();
+    assert_eq!(ids, ["<one@me>", "<two@me>"]);
+    b2.disconnect(&a2.id);
+    drop(listener_closer(port));
+    let left = server.join().unwrap();
+    assert_eq!(left.len(), 1, "one note at a time");
+    drop((b, b2));
+    std::fs::remove_dir_all(path)?;
+    std::fs::remove_dir_all(path2)?;
+    Ok(())
+}
+
+/// Snoozed mail on a server with METADATA, as earlier versions keep it:
+/// their array of snoozed messages (without dates) is merged in and kept
+/// an array, which they still read; messages no longer snoozed go in an
+/// entry of their own beside it.
+#[test]
+fn snoozes_share_through_metadata_as_earlier_versions_read_them() -> Result<()> {
+    use crate::manage::backend::Snoozed;
+    let (cert, acceptor) = tls_fixture()?;
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let port = listener.local_addr()?.port();
+    let until = chrono::Utc::now().timestamp() + 86400;
+    let older = format!(r#"[{{"message_id":"<old@x>","subject":"Old","sender":"Ana","until":{until},"folder":"Picacho/Snoozed"}}]"#);
+    let server = std::thread::spawn(move || {
+        let mut values: Vec<(String, String)> =
+            vec![("/private/vendor/tech.pinal.picacho/snoozed".into(), older)];
+        while let Some(mut p) = Peer::accept(&listener, &acceptor) {
+            while let Some((tag, command, literal)) = p.command() {
+                let upper = command.to_ascii_uppercase();
+                if upper == "CAPABILITY" {
+                    p.send("* CAPABILITY IMAP4rev1 METADATA\r\n");
+                } else if upper.starts_with("LIST") {
+                    p.send("* LIST () \"/\" INBOX\r\n");
+                } else if upper.starts_with("GETMETADATA") {
+                    let asked: Vec<&str> = command.split(['(', ')', ' ']).filter(|w| w.starts_with("/private")).collect();
+                    let parts: Vec<String> = asked
+                        .iter()
+                        .map(|e| match values.iter().find(|(k, _)| k == e) {
+                            Some((_, v)) => format!("{e} {{{}}}\r\n{v}", v.len()),
+                            None => format!("{e} NIL"),
+                        })
+                        .collect();
+                    p.send(&format!("* METADATA \"INBOX\" ({})\r\n", parts.join(" ")));
+                } else if upper.starts_with("SETMETADATA") {
+                    let entry = command.split_whitespace().find(|w| w.starts_with("(/private")).unwrap().trim_start_matches('(').to_owned();
+                    values.retain(|(k, _)| *k != entry);
+                    let value = if !literal.is_empty() {
+                        Some(String::from_utf8_lossy(&literal).into_owned())
+                    } else if command.trim_end().ends_with("NIL)") {
+                        None
+                    } else {
+                        let start = command.find(&format!("{entry} \"")).unwrap() + entry.len() + 2;
+                        let end = command.rfind("\")").unwrap();
+                        Some(command[start..end].replace("\\\"", "\"").replace("\\\\", "\\"))
+                    };
+                    if let Some(v) = value {
+                        values.push((entry, v));
+                    }
+                } else if upper == "LOGOUT" {
+                    p.send(&format!("* BYE\r\n{tag} OK done\r\n"));
+                    break;
+                }
+                p.ok(&tag);
+            }
+        }
+        values
+    });
+    let (b, mut a, path) = backend(&cert)?;
+    a.incoming_port = port;
+    b.store.save_account(&a)?;
+    let snoozed = |id: &str| Snoozed {
+        message_id: id.into(),
+        subject: "Here".into(),
+        sender: "Bo".into(),
+        until,
+        folder: "Picacho/Snoozed".into(),
+        ids: vec![],
+        changed: 0,
+    };
+    // Snoozed here, and one woken here since.
+    b.save_snoozed(None, &a.id, &[snoozed("<here@x>"), snoozed("<woken@x>")])?;
+    b.save_snoozed(None, &a.id, &[snoozed("<here@x>")])?;
+    assert!(b.share_snoozed(&a, true)?);
+    let mut ids: Vec<String> = b.snoozed(&a.id).into_iter().map(|s| s.message_id).collect();
+    ids.sort();
+    assert_eq!(ids, ["<here@x>", "<old@x>"]);
+    b.disconnect(&a.id);
+    drop(listener_closer(port));
+    let values = server.join().unwrap();
+    let value = |e: &str| values.iter().find(|(k, _)| k.ends_with(e)).map(|(_, v)| serde_json::from_str::<serde_json::Value>(v).unwrap());
+    let entries = value("/snoozed").expect("kept");
+    let mut kept: Vec<&str> = entries.as_array().expect("an array, as before").iter().map(|s| s["message_id"].as_str().unwrap()).collect();
+    kept.sort();
+    assert_eq!(kept, ["<here@x>", "<old@x>"]);
+    let gone = value("/snoozed-gone").expect("removals beside it");
+    assert_eq!(gone[0]["message_id"], "<woken@x>");
+    drop(b);
+    std::fs::remove_dir_all(path)?;
+    Ok(())
+}

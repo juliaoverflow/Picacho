@@ -175,8 +175,26 @@ fn window_closed(cx: &mut App) {
     if let Some(view) = shell.view.take().and_then(|view| view.upgrade()) {
         view.update(cx, |this, _| this.retire());
     }
-    cx.quit();
+    // Quitting at once left the window on screen, frozen, until the process
+    // had ended: on Wayland its removal is only sent to the compositor as
+    // the event loop next goes to sleep, which a loop told to stop never
+    // does. A moment's wait lets it go first; the saving and handing over
+    // that quitting does then happen with nothing showing.
+    cx.spawn(async move |cx| {
+        cx.background_executor().timer(QUIT_AFTER_CLOSE).await;
+        cx.update(|cx| {
+            // Opened again meanwhile (a launch, the tray): it stays.
+            if cx.windows().is_empty() {
+                cx.quit();
+            }
+        });
+    })
+    .detach();
 }
+
+/// How long quitting waits once the last window has closed, so the system
+/// takes the window away first (see `window_closed`).
+const QUIT_AFTER_CLOSE: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// Shows or hides the tray icon with a window open, as Settings asks. (The
 /// background process shows its own.)

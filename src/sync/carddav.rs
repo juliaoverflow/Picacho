@@ -853,6 +853,24 @@ pub struct Server {
     /// The secret given is an OAuth access token, sent as Bearer.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub bearer: bool,
+    /// Contacts kept by Google, reached through the Google People API with
+    /// one of the mail accounts' OAuth sign-in: that account's id.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub google_account: String,
+    /// Contacts kept by Proton, reached through a Proton (without Bridge)
+    /// mail account's session and keys: that account's id.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub proton_account: String,
+}
+
+impl Server {
+    /// The mail account it signs in as, if it shares one's sign-in.
+    pub fn account(&self) -> Option<&str> {
+        [&self.mail_account, &self.jmap_account, &self.graph_account, &self.ews_account, &self.google_account, &self.proton_account]
+            .into_iter()
+            .find(|a| !a.is_empty())
+            .map(String::as_str)
+    }
 }
 /// The DAV client for `server`, signed in with `password`, or with it as a
 /// Bearer token where the server takes one.

@@ -110,6 +110,32 @@ fn a_phone_goes_from_mailboxes_to_a_message_and_back(cx: &mut TestAppContext) {
     assert_eq!(screen(&view, cx), Screen::List);
 }
 
+/// A message opened from search results goes back to them: Back used to
+/// close the search under the message and leave the message open.
+#[gpui::test]
+fn back_from_a_searched_message_returns_to_the_results(cx: &mut TestAppContext) {
+    let (view, cx) = phone(PHONE, cx);
+    act(&view, Action::OpenSearch, cx);
+    let id = first_message(&view, cx);
+    act(&view, Action::Select(id), cx);
+    assert_eq!(screen(&view, cx), Screen::Reader);
+    view.update_in(cx, |this, w, cx| this.close(w, cx));
+    assert_eq!(screen(&view, cx), Screen::List);
+    assert!(view.read_with(cx, |this, _| this.search_open), "the results are still there");
+    // The back chevron too, sliding over the results.
+    let id = first_message(&view, cx);
+    act(&view, Action::Select(id), cx);
+    assert_eq!(screen(&view, cx), Screen::Reader);
+    view.update_in(cx, |this, w, cx| this.mobile_animate_back(w, cx));
+    cx.executor().advance_clock(PUSH * 2);
+    cx.run_until_parked();
+    assert_eq!(screen(&view, cx), Screen::List);
+    assert!(view.read_with(cx, |this, _| this.search_open));
+    // Back again closes the search.
+    view.update_in(cx, |this, w, cx| this.close(w, cx));
+    assert!(view.read_with(cx, |this, _| !this.search_open));
+}
+
 #[gpui::test]
 fn bars_stay_out_of_the_notch_and_home_indicator(cx: &mut TestAppContext) {
     let (view, cx) = phone(PHONE, cx);
@@ -245,6 +271,13 @@ fn swiping_a_row_archives_it(cx: &mut TestAppContext) {
             .expect("the row follows the finger");
         assert_eq!(swiping, id);
         assert!(dx <= -100.);
+        // Not yet far enough to act: a good part of the row's width.
+        assert!(dx.abs() < this.mobile.swipe_reach, "{dx} of {}", this.mobile.swipe_reach);
+    });
+    pan(-60., TouchPhase::Moved, cx);
+    view.read_with(cx, |this, _| {
+        let (_, dx) = this.mobile.swipe.clone().expect("still swiping");
+        assert!(dx.abs() >= this.mobile.swipe_reach, "{dx} of {}", this.mobile.swipe_reach);
     });
     // Toward the leading edge archives; the other way marks read.
     view.read_with(cx, |this, _| {
@@ -275,6 +308,44 @@ fn swiping_a_row_archives_it(cx: &mut TestAppContext) {
                 .is_some_and(|issues| issues.contains_key(&IssueSource::Change)),
             "letting go past the threshold did not archive"
         );
+    });
+}
+
+/// A sideways brush on the way to scrolling, or a swipe let go of short of
+/// the row's middle, archives nothing.
+#[gpui::test]
+fn a_half_swipe_or_a_slanted_pan_archives_nothing(cx: &mut TestAppContext) {
+    let (view, cx) = phone(PHONE, cx);
+    let id = first_message(&view, cx);
+    let row: &'static str = Box::leak(format!("mobile-row-{id}").into_boxed_str());
+    let at = bounds(cx, row).center();
+    let pan = |dx: f32, dy: f32, phase: TouchPhase, cx: &mut VisualTestContext| {
+        cx.simulate_event(ScrollEvent {
+            position: at,
+            delta: ScrollDelta::Pixels(point(px(dx), px(dy))),
+            modifiers: Modifiers::none(),
+            touch_phase: phase,
+            source: ScrollSource::Touch,
+        });
+    };
+    // Mostly sideways, but not enough so: the list's.
+    pan(0., 0., TouchPhase::Started, cx);
+    pan(-30., -24., TouchPhase::Moved, cx);
+    assert!(view.read_with(cx, |this, _| this.mobile.swipe.is_none()));
+    pan(0., 0., TouchPhase::Ended, cx);
+    // A swipe past the old 88-point mark, short of the row's middle.
+    cx.run_until_parked();
+    view.update(cx, |this, _| this.mobile.swipe_ended = None);
+    pan(0., 0., TouchPhase::Started, cx);
+    pan(-60., 0., TouchPhase::Moved, cx);
+    pan(-50., 0., TouchPhase::Moved, cx);
+    assert!(view.read_with(cx, |this, _| this.mobile.swipe.is_some()));
+    pan(0., 0., TouchPhase::Ended, cx);
+    cx.run_until_parked();
+    view.read_with(cx, |this, _| {
+        assert!(this.mobile.swipe.is_none());
+        assert!(this.visible.iter().any(|&i| this.messages[i].id == id), "still listed");
+        assert!(this.undo.is_none(), "nothing was moved: {}", this.status);
     });
 }
 

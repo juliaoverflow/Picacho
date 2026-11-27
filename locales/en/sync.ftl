@@ -1302,6 +1302,8 @@ sync-pop-pop3-server-rejected-the-request = POP3 server rejected the request
 
 sync-proton-proton-ended-this-session-sign-in = Proton ended this session. Sign in again to keep using this account.
 
+sync-proton-this-build-has-no-pass-registration = This copy of Picacho was built without a Proton Pass registration (PICACHO_PROTON_PASS_APP_TOKEN).
+
 sync-proton-proton-wants-to-check-that-its = Proton wants to check that it's you. Sign in again to this account to pass its check.
 
 sync-proton-proton-didnt-accept-this-app-proton = Proton didn't accept this app ({ $message }). Proton Mail Bridge still works with this account.
@@ -1866,3 +1868,70 @@ sync-ews-basic-sign-in-is-only-sent-over-https = Basic sign-in sends your passwo
 sync-ews-exchange-wont-hold-the-stream-open = Exchange (or something on the way to it) keeps ending the wait for new mail at once; the inbox is checked every half minute instead.
 
 sync-ews-exchange-answered = Exchange answered { $status }: { $message }
+
+sync-feed-isnt-a-calendar-address = { $url } isn't a calendar's address: it starts with webcal://, https:// or http://.
+
+sync-feed-couldnt-reach = Couldn't reach { $host }
+
+sync-feed-answered = { $host } answered { $status }
+
+sync-feed-is-too-large = The calendar at { $host } is too large to subscribe to.
+
+sync-feed-isnt-a-calendar = What { $host } sent isn't a calendar.
+
+sync-google-youre-not-a-guest-of-this-event = Google doesn't list you as a guest of this event.
+
+sync-proton-pim-proton-answered = Proton answered { $status } (code { $code }): { $message }
+
+sync-proton-pim-this-contact-couldnt-be-read-whole = Part of this Proton contact couldn't be read or verified here, so it isn't changed here: saving it would lose that part. Edit it in Proton Mail.
+
+sync-proton-pim-proton-didnt-take-the-contact = Proton didn't take the contact: { $message }
+
+sync-proton-pim-proton-didnt-take-the-event = Proton didn't take the event: { $message }
+
+sync-proton-pim-this-calendars-keys-couldnt-be = This calendar's keys couldn't be unlocked.
+
+sync-proton-pim-this-proton-calendar-is-read-only = This Proton calendar is read-only.
+
+sync-proton-pim-events-with-guests-are-made-in = Events with guests are made and changed in Proton Calendar, which sends their invitations.
+
+sync-proton-pim-proton-didnt-delete-the-contact = Proton didn't delete the contact.
+
+# src/sync/proton/aliases.rs: Proton's own aliases (hide-my-email aliases,
+# kept in Proton Pass). "Proton Pass" stays as it is.
+
+sync-proton-aliases-this-sign-in-has-no-pass-access = Proton didn't give Picacho's sign-in access to Proton Pass, where Proton keeps its aliases (missing: { $missing }).
+
+sync-proton-aliases-pass-has-an-extra-password = Proton refused Proton Pass for this session (code 9108): it needs the account's Pass extra password (enter it with the Proton account in Settings → Forwarding), or, without one, a registration Proton gives Pass access to.
+
+sync-proton-aliases-the-pass-extra-password-is-wrong = Proton didn't accept the Proton Pass extra password.
+
+sync-proton-aliases-pass-is-locked = Proton Pass is locked with a PIN for this session. Unlock it in Proton Pass, then try again.
+
+sync-proton-aliases-this-registration-has-no-pass-access = Proton gives the session Picacho uses for Proton Pass ({ $app }) no Pass access, and the account has no Pass extra password that would. Its scopes: { $scopes }.
+
+sync-proton-aliases-sign-in-to-proton-pass = Sign in to Proton Pass to manage these aliases.
+
+sync-proton-aliases-proton-ended-the-pass-session = Proton ended the Proton Pass session. Sign in to Proton Pass again to manage these aliases.
+
+sync-proton-aliases-addresses-dont-have-that = { $email } is one of the account's own Proton addresses, which don't have that; only Proton Pass's aliases do.
+
+sync-proton-aliases-proton-doesnt-let-this-account-delete-addresses = Proton doesn't let this account delete addresses. Turn it off instead.
+
+sync-proton-aliases-not-a-proton-alias = { $email } isn't one of this Proton account's aliases.
+
+sync-proton-aliases-not-a-proton-contact = That contact isn't one of a Proton alias's.
+
+sync-proton-aliases-not-a-proton-mailbox = That isn't one of Proton's alias mailboxes.
+
+sync-proton-aliases-a-pass-key-wouldnt-open = A Proton Pass key couldn't be opened with this account's keys.
+
+sync-proton-aliases-proton-wont-make-more-aliases = Proton won't make more aliases on this plan.
+
+sync-proton-aliases-proton-no-longer-offers-that-domain = Proton no longer offers that domain. Choose another.
+
+sync-proton-aliases-proton-has-no-mailbox-to-forward = Proton has no mailbox to forward the alias to.
+
+sync-proton-aliases-the-new-alias-was-made-but = The new alias was made, but Proton's reply couldn't be read. Refresh to see it.
+
+sync-proton-aliases-proton-didnt-give-a-reverse-alias = Proton didn't give an address for writing to { $contact }.

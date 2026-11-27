@@ -133,6 +133,10 @@ impl MailApp {
         }
         self.key_method = None;
         self.key_prompt = KeyPrompt::Idle;
+        // A Proton Pass sign-in (Forwarding settings) ends with it.
+        self.fwd_pass_login = None;
+        self.fwd_pass_again = None;
+        self.fwd_pending_extra = Default::default();
         if self.proton_stage.take().is_some() {
             self.task(
                 cx,
@@ -158,7 +162,7 @@ impl MailApp {
             _ => None,
         }
     }
-    fn start_proton(
+    pub(super) fn start_proton(
         &mut self,
         reconnect: Option<String>,
         cx: &mut Context<Self>,
@@ -201,6 +205,14 @@ impl MailApp {
                     Ok(ProtonNext::MailboxPassword) => {
                         this.proton_stage = Some(ProtonStage::MailboxPassword);
                         this.anim += 1;
+                    }
+                    Ok(ProtonNext::PassSignedIn) => {
+                        this.proton_stage = None;
+                        this.anim += 1;
+                        match this.fwd_pass_again.take() {
+                            Some(service) => this.pass_signed_in_again(service, cx),
+                            None => this.connect_proton_aliases(cx),
+                        }
                     }
                     Ok(ProtonNext::Done(account)) => {
                         this.proton_stage = None;

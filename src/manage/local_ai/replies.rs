@@ -79,8 +79,17 @@ pub fn wording(intent: &str, language: &str) -> Option<&'static str> {
 
 /// The concepts named by the words, in lexicon order.
 pub(crate) fn concepts(words: &[String]) -> Vec<&'static str> {
+    concepts_in(&LEXICON, words)
+}
+
+/// The concepts of `lexicon` (as `models/replies/lexicon.json` writes
+/// them) named by the words, in its order.
+pub(crate) fn concepts_in<'a>(
+    lexicon: &'a [(String, Vec<String>)],
+    words: &[String],
+) -> Vec<&'a str> {
     let joined = format!(" {} ", words.join(" "));
-    LEXICON
+    lexicon
         .iter()
         .filter(|(_, stems)| {
             stems.iter().any(|st| {
@@ -88,7 +97,11 @@ pub(crate) fn concepts(words: &[String]) -> Vec<&'static str> {
                     words.iter().any(|w| w == whole)
                 } else if let Some(start) = st.strip_prefix('^') {
                     if start.contains(' ') {
-                        joined.contains(&format!(" {start}"))
+                        // At a word's start; without a string made for each
+                        // stem of each message (the inbox category model
+                        // asks this of every message listed).
+                        let bytes = joined.as_bytes();
+                        joined.match_indices(start).any(|(i, _)| i > 0 && bytes[i - 1] == b' ')
                     } else {
                         words.iter().any(|w| w.starts_with(start))
                     }

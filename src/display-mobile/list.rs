@@ -13,8 +13,15 @@ use super::*;
 
 /// Each row's height: three lines of text at phone sizes.
 pub(super) const ROW: f32 = 98.;
-/// How far a row swipes (or the list pulls) before letting go acts.
+/// How far the list pulls before letting go refreshes, and the least a
+/// row swipes before letting go acts.
 const COMMIT: f32 = 88.;
+/// How much of the row's width a swipe must cross to act: a short
+/// sideways brush on the way to scrolling archived mail too easily.
+const SWIPE_SHARE: f32 = 0.4;
+/// How much more sideways than up or down a pan must start to swipe a row
+/// rather than scroll the list.
+const SWIPE_SLANT: f32 = 1.5;
 /// After a swipe ends, the fling's own momentum must not start another.
 const SWIPE_REST: Duration = Duration::from_millis(450);
 /// The pull-to-refresh box's height.
@@ -175,7 +182,8 @@ impl MailApp {
             .bg(rgb(c.bg))
             .child(self.nav_bar("mobile-list-bar", insets, back, title, subtitle, trailing))
             .when(!self.selecting, |d| {
-                d.child(self.mobile_filter_chips(insets, cx))
+                d.children(self.mobile_category_chips(insets, cx))
+                    .child(self.mobile_filter_chips(insets, cx))
             })
             .when(self.search_open, |d| {
                 d.child(
@@ -309,6 +317,71 @@ impl MailApp {
             })
     }
 
+    /// An inbox's category tabs as chips above the filters, while nothing
+    /// is searched for, All Mail last; the open one is filled. Scrolls
+    /// sideways when they don't fit, an edge with chips past it fading out,
+    /// as the filters' do.
+    fn mobile_category_chips(&self, insets: Insets, cx: &Context<Self>) -> Option<AnyElement> {
+        if !self.shows_categories() || !Self::value(&self.search, cx).trim().is_empty() {
+            return None;
+        }
+        let c = self.colors();
+        let scroll = &self.mobile.categories_scroll;
+        let (offset, max) = (
+            -f32::from(scroll.offset().x),
+            f32::from(scroll.max_offset().x),
+        );
+        let chips = div()
+            .id("mobile-categories")
+            .debug_selector(|| "mobile-categories".into())
+            .role(Role::TabList)
+            .aria_label(t!("categories-tabs"))
+            .track_scroll(scroll)
+            .overflow_x_scroll()
+            .pl(px(insets.left + GUTTER))
+            .pr(px(insets.right + GUTTER))
+            .flex()
+            .items_center()
+            .gap_2()
+            .children(self.sorting.tabs().into_iter().map(|tab| {
+                use super::categories::{CatAction, Tab};
+                let unread = self.sorting.unread_in(tab);
+                let spoken = if unread > 0 {
+                    let shown = fmt_count(unread);
+                    let count = t!("categories-unread", shown = shown, count = unread);
+                    format!("{}, {count}", tab.label())
+                } else {
+                    tab.label().to_owned()
+                };
+                self.chip(
+                    format!("mobile-category-{}", tab.key()),
+                    tab.label(),
+                    self.sorting.tab == tab,
+                    act(Action::Categories(match tab {
+                        Tab::Is(category) => CatAction::Tab(category),
+                        Tab::All => CatAction::AllMail,
+                    })),
+                    cx,
+                )
+                .role(Role::Tab)
+                .aria_label(spoken)
+                .aria_selected(self.sorting.tab == tab)
+            }));
+        Some(
+            div()
+                .relative()
+                .flex_shrink_0()
+                .child(chips)
+                .when(offset > 0.5, |d| {
+                    d.child(edge_fade("mobile-categories-fade-leading", true, c.bg))
+                })
+                .when(max - offset > 0.5, |d| {
+                    d.child(edge_fade("mobile-categories-fade-trailing", false, c.bg))
+                })
+                .into_any_element(),
+        )
+    }
+
     /// A message's row, sized for a fingertip, sliding under a swipe.
     fn mobile_row(&self, index: usize, cx: &Context<Self>) -> AnyElement {
         let c = self.colors();
@@ -436,10 +509,15 @@ impl MailApp {
                                     .font_weight(weight)
                                     .child(self.hide_codes(m, &m.subject).into_owned()),
                             )
+                            .children(self.row_category(m, 12.))
                             .when(m.answered, |d| d.child(icon_el("answered", 14., c.muted)))
                             .when(m.forwarded, |d| d.child(icon_el("forwarded", 14., c.muted)))
                             .when(self.snoozed_until(m).is_some(), |d| {
                                 d.child(icon_el("snooze", 14., c.accent))
+                            })
+                            .when_some(self.follow_up_of(m), |d, f| {
+                                let overdue = f.overdue(chrono::Utc::now().timestamp());
+                                d.child(icon_el("waiting", 14., if overdue { c.danger } else { c.accent }))
                             })
                             .when(m.has_attachments(), |d| {
                                 d.child(icon_el("paperclip", 14., c.muted))
@@ -460,7 +538,7 @@ impl MailApp {
                 SwipeAct::Archive => 0x2f9e6e,
                 _ => 0xd64545,
             };
-            let reached = offset.abs() >= COMMIT;
+            let reached = offset.abs() >= self.mobile.swipe_reach;
             div()
                 .absolute()
                 .inset_0()
@@ -557,17 +635,18 @@ impl MailApp {
                 cx.stop_propagation();
                 let (_, offset) = self.mobile.swipe.take().unwrap_or_default();
                 self.mobile.swipe_ended = Some(std::time::Instant::now());
-                if offset.abs() >= COMMIT {
+                if offset.abs() >= self.mobile.swipe_reach {
                     self.mobile_swiped(id, offset > 0., w, cx);
                 }
                 cx.notify();
             }
             TouchPhase::Started | TouchPhase::Moved if swiping => {
                 cx.stop_propagation();
+                let reach = self.mobile.swipe_reach;
                 if let Some((_, offset)) = &mut self.mobile.swipe {
-                    let before = offset.abs() >= COMMIT;
+                    let before = offset.abs() >= reach;
                     *offset += dx;
-                    if before != (offset.abs() >= COMMIT) {
+                    if before != (offset.abs() >= reach) {
                         platform::haptic(platform::Haptic::Selection);
                     }
                 }
@@ -576,6 +655,7 @@ impl MailApp {
             // A pan starting on this row: undecided until it moves.
             TouchPhase::Started if self.mobile.swipe.is_none() => {
                 self.mobile.pan = Some(id.to_owned());
+                self.mobile.swipe_reach = Self::swipe_reach(w);
                 self.mobile_decide_swipe(id, dx, dy, cx);
             }
             // Only the finger's own pan, decided on its first movement,
@@ -600,7 +680,7 @@ impl MailApp {
             .mobile
             .swipe_ended
             .is_none_or(|t| t.elapsed() > SWIPE_REST);
-        if self.selecting || !rested || dx.abs() <= dy.abs() {
+        if self.selecting || !rested || dx.abs() <= dy.abs() * SWIPE_SLANT {
             return;
         }
         let Some(m) = self.messages.iter().find(|m| m.id == id) else {
@@ -614,6 +694,14 @@ impl MailApp {
         cx.stop_propagation();
         self.mobile.swipe = Some((id.to_owned(), dx));
         cx.notify();
+    }
+
+    /// How far a row must be swiped to act: a good part of its width (the
+    /// list's, beside the reader on a wide screen), never less than `COMMIT`.
+    fn swipe_reach(w: &Window) -> f32 {
+        let width = f32::from(w.viewport_size().width);
+        let row = if Self::mobile_split(w) { width.min(420.) } else { width };
+        (row * SWIPE_SHARE).max(COMMIT)
     }
 
     /// What a swipe on message `id` does when let go past the threshold.

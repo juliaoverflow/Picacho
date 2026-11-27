@@ -25,6 +25,8 @@ pub(crate) struct FakeMessage {
     pub received: i64,
     pub draft: bool,
     pub verb: Option<i64>,
+    /// The Focused Inbox's "focused" or "other"; empty where it isn't on.
+    pub classification: String,
 }
 
 #[derive(Default)]
@@ -49,6 +51,8 @@ pub(crate) struct Fake {
     pub deferred: Vec<(String, String)>,
     /// Files uploaded in pieces: (message id, name, bytes so far, size).
     pub uploads: Vec<(String, String, Vec<u8>, usize)>,
+    /// Message classes (PR_MESSAGE_CLASS) other than IPM.Note, by id.
+    pub classes: Vec<(String, String)>,
 }
 
 const ROOT: &str = "root";
@@ -108,6 +112,7 @@ impl Fake {
             received,
             draft: false,
             verb: None,
+            classification: String::new(),
         });
         id
     }
@@ -119,6 +124,8 @@ impl Fake {
         if let Some(v) = m.verb {
             props.push(json!({"id": "Integer 0x1081", "value": v.to_string()}));
         }
+        let class = self.classes.iter().find(|(id, _)| *id == m.id).map_or("IPM.Note", |(_, c)| c.as_str());
+        props.push(json!({"id": "String 0x1A", "value": class}));
         json!({
             "id": m.id, "conversationId": format!("c-{}", m.subject), "parentFolderId": m.folder,
             "subject": m.subject,
@@ -130,6 +137,7 @@ impl Fake {
             "categories": m.categories, "hasAttachments": false, "bodyPreview": format!("About {}.", m.subject),
             "internetMessageId": format!("<{}@example.se>", m.id), "isDraft": m.draft,
             "singleValueExtendedProperties": props,
+            "inferenceClassification": m.classification,
         })
     }
     fn folder_json(&self, f: &FakeFolder) -> Value {
@@ -263,6 +271,8 @@ impl Fake {
                     .filter(|m| !filter.contains("isRead eq false") || !m.read)
                     .filter(|m| !filter.contains("flagStatus eq 'flagged'") || m.flagged)
                     .filter(|m| search.as_ref().is_none_or(|s| m.subject.to_lowercase().contains(s)))
+                    // A conversation: its id is "c-" and the subject here.
+                    .filter(|m| !filter.contains("conversationId eq") || filter == format!("conversationId eq 'c-{}'", m.subject))
                     .collect();
                 found.sort_by_key(|m| std::cmp::Reverse(m.received));
                 let items = found.iter().map(|m| self.message_json(m)).collect();
@@ -293,6 +303,7 @@ impl Fake {
                         read: v["isRead"].as_bool().unwrap_or(false),
                         flagged: v["flag"]["flagStatus"] == "flagged", categories: Vec::new(),
                         received: chrono::Utc::now().timestamp(), draft: !delivered, verb: None,
+                        classification: String::new(),
                     });
                     self.attachments.push((id.clone(), v["attachments"].as_array().map_or(0, |a| a.len())));
                     return ok(json!({"id": id}));
@@ -304,6 +315,7 @@ impl Fake {
                 self.messages.push(FakeMessage {
                     id: id.clone(), folder, raw, subject, read: true, flagged: false, categories: Vec::new(),
                     received: chrono::Utc::now().timestamp(), draft: true, verb: None,
+                    classification: String::new(),
                 });
                 ok(json!({"id": id}))
             }

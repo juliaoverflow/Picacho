@@ -843,6 +843,7 @@ impl MailApp {
         };
         self.sending = true;
         let account_id = a.id.clone();
+        let follow_up = draft.follow_up;
         self.task(
             cx,
             move |b| {
@@ -868,7 +869,9 @@ impl MailApp {
                         this.reverse_contacts =
                             Arc::new(fwd::reverse_contacts(&this.backend.store));
                         this.outbox.retain(|o| o.id != id);
-                        if notes.is_empty() {
+                        if notes.is_empty() && follow_up.is_some() {
+                            this.notice(t!("compose-message-sent-waiting"), false, cx);
+                        } else if notes.is_empty() {
                             this.notice(t!("compose-message-sent"), false, cx);
                         } else {
                             this.notice(
@@ -879,6 +882,10 @@ impl MailApp {
                         }
                         this.refresh_drafts(cx);
                         this.sync_drafts_soon(&account_id, cx);
+                        // Waited on for a reply: Waiting For lists it.
+                        if follow_up.is_some() {
+                            this.recheck_follow_ups(cx);
+                        }
                     }
                     (Err(_), Some(gone)) => this.alias_gone(id, gone, cx),
                     (Err(e), None) => this.send_failed(id, format!("{e:#}"), cx),
@@ -920,11 +927,14 @@ impl MailApp {
                 move |b| b.hand_to_server(&a, &handed),
                 move |this, result, cx| {
                     match result {
-                        Ok(true) => this.notice(
-                            t!("compose-handed-to-the-server-which-sends", when = when),
-                            false,
-                            cx,
-                        ),
+                        Ok(true) => {
+                            this.notice(
+                                t!("compose-handed-to-the-server-which-sends", when = when),
+                                false,
+                                cx,
+                            );
+                            this.recheck_follow_ups(cx);
+                        }
                         Ok(false) => {}
                         Err(e) => this.notice(
                             t!(
@@ -1025,6 +1035,7 @@ impl MailApp {
                         this.alias_routes = fwd::routes(&this.backend.store);
                         this.refresh_drafts(cx);
                         this.sync_drafts_soon(&account_id, cx);
+                        this.recheck_follow_ups(cx);
                     }
                     // Offline, or the server's away: nothing went; try again
                     // in a few minutes.

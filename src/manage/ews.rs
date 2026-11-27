@@ -201,6 +201,10 @@ impl Backend {
         if !m.conversation_id.is_empty() {
             mail.set_thread_id(format!("ews:{}", m.conversation_id));
         }
+        // An out-of-office reply or a report, as Exchange classes it.
+        if crate::sync::mime::automatic_class(&m.item_class) {
+            mail.set_automatic(true);
+        }
         mail.folder = folder;
         mail.remote_folder = remote;
         mail.unread = !m.read;
@@ -908,4 +912,60 @@ fn contact_xml(c: &Card) -> String {
     }
     x.push_str("</t:Contact>");
     x
+}
+
+// Follow-up reminders and notes (`follow_up`, `notes`).
+impl Backend {
+    /// Picacho's folder at Exchange (made with `create`), by id.
+    fn picacho_folder_ews(&self, a: &Account, s: &Session, create: bool) -> Result<Option<String>> {
+        let parent = super::snooze::PARENT;
+        if let Ok(id) = folder_id(&s.folders()?, parent) {
+            return Ok(Some(id));
+        }
+        if !create {
+            return Ok(None);
+        }
+        let id = s.create_folder("msgfolderroot", parent)?;
+        let _ = self.store.save_folders(&a.id, &remote_folders(&s.reload_folders()?));
+        Ok(Some(id))
+    }
+    /// The notes in Picacho's folder, by item id.
+    pub(super) fn read_notes_ews(&self, a: &Account, kind: &str) -> Result<super::notes::NoteSources> {
+        self.with_ews(a, |s| {
+            let Some(folder) = self.picacho_folder_ews(a, s, false)? else {
+                return Ok(None);
+            };
+            let ids = s.ids_in(&folder, false, 50)?;
+            let notes: Vec<String> = s
+                .messages(&ids)?
+                .into_iter()
+                .filter(|m| super::notes::titled(&m.subject, kind))
+                .map(|m| m.id)
+                .collect();
+            if notes.is_empty() {
+                return Ok(Some(Vec::new()));
+            }
+            s.mimes(&notes).map(Some)
+        })
+    }
+    /// Puts a note (read) in Picacho's folder, then deletes `old`.
+    pub(super) fn write_note_ews(&self, a: &Account, raw: &[u8], old: &[String]) -> Result<()> {
+        self.with_ews(a, |s| {
+            let folder = self
+                .picacho_folder_ews(a, s, true)?
+                .with_context(|| t!("manage-snooze-the-server-didnt-keep-the-new"))?;
+            s.import(raw, &folder, true)?;
+            if !old.is_empty() {
+                s.delete(old)?;
+            }
+            Ok(())
+        })
+    }
+    /// The messages of an Exchange conversation, as rows (not saved).
+    pub(super) fn ews_conversation(&self, a: &Account, conversation: &str) -> Result<Vec<Mail>> {
+        self.with_ews(a, |s| {
+            let folders = s.folders()?;
+            s.conversation(conversation)?.iter().map(|m| self.ews_mail(a, &folders, m, None)).collect()
+        })
+    }
 }

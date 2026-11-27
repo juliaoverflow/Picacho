@@ -59,8 +59,8 @@ fn derivations_match_the_web_app_known_answers() {
     );
     // Passwords typed in either Unicode form derive the same key.
     assert_eq!(
-        argon2("Café", &salt, &kdf).unwrap().as_ref(),
-        argon2("Cafe\u{301}", &salt, &kdf).unwrap().as_ref()
+        &argon2("Café", &salt, &kdf).unwrap()[..],
+        &argon2("Cafe\u{301}", &salt, &kdf).unwrap()[..]
     );
 }
 
@@ -69,7 +69,7 @@ fn opens_a_bundle_made_by_the_web_app_and_reads_stalwart_mail() {
     let f = fixture();
     let mk = unlock_with_password(&f.bundle, &f.password).unwrap();
     let by_recovery = unlock_with_recovery_key(&f.bundle, &f.recovery_key.to_lowercase()).unwrap();
-    assert_eq!(mk.as_ref(), by_recovery.as_ref());
+    assert_eq!(&mk[..], &by_recovery[..]);
     let keys = open_keys(&f.bundle, &mk).unwrap();
     let (protection, plain) = open_message(&bytes(&f.stored), &keys).unwrap();
     assert_eq!(protection, Protection::Pinal);
@@ -194,7 +194,7 @@ fn altered_foreign_and_disguised_mail_is_never_called_protected() {
 fn master_keys_round_trip_through_the_keychain_encoding() {
     let mk = [7u8; 32];
     assert_eq!(
-        decode_master_key(&encode_master_key(&mk)).unwrap().as_ref(),
+        &decode_master_key(&encode_master_key(&mk)).unwrap()[..],
         &mk
     );
     assert!(decode_master_key("short").is_none());

@@ -267,6 +267,10 @@ impl Store {
             -- the whole queue was one preference, read and written again for
             -- every change.
             CREATE TABLE IF NOT EXISTS offline_changes (seq INTEGER PRIMARY KEY AUTOINCREMENT, account TEXT NOT NULL, messages INTEGER NOT NULL, data TEXT NOT NULL);
+            -- What sorting each message into its inbox tab found (see
+            -- `save_looks`), kept so it isn't worked out again each launch.
+            CREATE TABLE IF NOT EXISTS looks (id TEXT PRIMARY KEY, data TEXT NOT NULL);
+            CREATE TRIGGER IF NOT EXISTS looks_forget AFTER DELETE ON messages BEGIN DELETE FROM looks WHERE id=OLD.id; END;
             CREATE INDEX IF NOT EXISTS offline_changes_account ON offline_changes(account, seq);")?;
         // Compressed sources get a column of their own (see `pack`), so a
         // build from before them finds `raw` empty and downloads the
@@ -687,6 +691,14 @@ impl Store {
             format!("traffic:{id}"),
             format!("folder_order:{id}"),
             format!("jmap_submissions:{id}"),
+            // Sent mail waited on for a reply.
+            format!("follow_ups:{id}"),
+            format!("follow_ups_gone:{id}"),
+            format!("follow_ups_synced:{id}"),
+            // Snoozed mail, as shared with other computers.
+            format!("snoozed:{id}"),
+            format!("snoozed_gone:{id}"),
+            format!("snoozed_synced:{id}"),
         ] {
             tx.execute("DELETE FROM preferences WHERE key=?1", [key])?;
         }
@@ -1341,6 +1353,26 @@ impl Store {
             }
         }
         Ok(grouping.finish())
+    }
+    /// Everyone `accounts` have written to: the addresses in their sent
+    /// mail's To and Cc, lowercase (`categories::Known`).
+    pub fn correspondents(&self, accounts: &[String]) -> Result<HashSet<String>> {
+        let db = self.read();
+        let mut q = db.prepare_cached(
+            "SELECT json_extract(data,'$.to'), json_extract(data,'$.cc') FROM messages WHERE account=?1 AND folder='sent'",
+        )?;
+        let mut out = HashSet::new();
+        for account in accounts {
+            let mut rows = q.query([account])?;
+            while let Some(row) = rows.next()? {
+                for i in 0..2 {
+                    if let Some(list) = row.get_ref(i)?.as_str_or_null()? {
+                        out.extend(crate::manage::categories::addresses_in(list));
+                    }
+                }
+            }
+        }
+        Ok(out)
     }
     /// The text of messages, lowercase, for searching the Summary's
     /// packages by what their emails say: by message id, as `parcels`
@@ -2181,6 +2213,74 @@ impl Store {
         json.map(|s| serde_json::from_str(&s).map_err(Into::into))
             .transpose()
     }
+    /// Every cached copy of `account`'s message with this Message-ID (one
+    /// per mailbox it is in), newest first.
+    pub fn copies_of(&self, account: &str, message_id: &str) -> Result<Vec<Mail>> {
+        let db = self.read();
+        let mut q = db.prepare_cached(
+            "SELECT data FROM messages WHERE json_extract(data,'$.message_id')=?2 AND account=?1 ORDER BY date DESC",
+        )?;
+        let rows = q.query_map(params![account, message_id], |r| r.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for json in rows {
+            if let Ok(m) = serde_json::from_str(&json?) {
+                out.push(m);
+            }
+        }
+        Ok(out)
+    }
+    /// `account`'s cached Sent mail dated from `from` to `to` (seconds).
+    pub fn sent_between(&self, account: &str, from: i64, to: i64) -> Result<Vec<Mail>> {
+        let db = self.read();
+        let mut q = db.prepare_cached(
+            "SELECT data FROM messages WHERE account=?1 AND folder='sent' AND date BETWEEN ?2 AND ?3",
+        )?;
+        let rows = q.query_map(params![account, from, to], |r| r.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for json in rows {
+            if let Ok(m) = serde_json::from_str(&json?) {
+                out.push(m);
+            }
+        }
+        Ok(out)
+    }
+    /// The server conversation id of `account`'s message with this
+    /// Message-ID, where a copy of it has one.
+    pub fn thread_of(&self, account: &str, message_id: &str) -> Result<Option<String>> {
+        use rusqlite::OptionalExtension;
+        Ok(self
+            .read()
+            .query_row(
+                "SELECT json_extract(data,'$.thread_id') FROM messages WHERE json_extract(data,'$.message_id')=?2 AND account=?1 AND coalesce(json_extract(data,'$.thread_id'),'')<>'' LIMIT 1",
+                params![account, message_id],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+    /// `account`'s messages dated `since` or later that name `message_id` in
+    /// their References or In-Reply-To, or are in server conversation
+    /// `thread` (when not empty): the replies to it and the rest of its
+    /// conversation, its own copies too (`follow_up`).
+    pub fn replies_to(
+        &self,
+        account: &str,
+        message_id: &str,
+        thread: &str,
+        since: i64,
+    ) -> Result<Vec<Mail>> {
+        let db = self.read();
+        let mut q = db.prepare_cached(
+            "SELECT data FROM messages WHERE account=?1 AND date>=?2 AND (instr(coalesce(json_extract(data,'$.references'),''),?3)>0 OR (?4<>'' AND json_extract(data,'$.thread_id')=?4))",
+        )?;
+        let rows = q.query_map(params![account, since, message_id, thread], |r| r.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for json in rows {
+            if let Ok(m) = serde_json::from_str(&json?) {
+                out.push(m);
+            }
+        }
+        Ok(out)
+    }
     /// Whether message `id`'s whole source is kept here, without reading it.
     pub fn has_source(&self, id: &str) -> Result<bool> {
         use rusqlite::OptionalExtension;
@@ -2920,6 +3020,40 @@ impl Store {
             &format!("folders:{account}"),
             &serde_json::to_string(folders)?,
         )
+    }
+    /// What sorting messages into the inbox's tabs found in them, kept:
+    /// (message id, fingerprint, what was found), as the window's sorter
+    /// keeps them (`categories::Sorter::keep`). A message whose fingerprint
+    /// changed since is looked at again; a deleted one's is forgotten with it.
+    pub fn looks(&self) -> Result<Vec<(String, u64, crate::manage::categories::Content)>> {
+        let db = self.read();
+        let mut q = db.prepare("SELECT id, data FROM looks")?;
+        let rows = q.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (id, data) = row?;
+            // One an older version wrote differently is looked at again.
+            if let Ok((fingerprint, content)) = serde_json::from_str(&data) {
+                out.push((id, fingerprint, content));
+            }
+        }
+        Ok(out)
+    }
+    /// Keeps `looks` (see `looks`), in one write.
+    pub fn save_looks(&self, looks: &[(String, u64, crate::manage::categories::Content)]) -> Result<()> {
+        if looks.is_empty() {
+            return Ok(());
+        }
+        let mut db = self.write();
+        let tx = db.transaction()?;
+        {
+            let mut q = tx.prepare("INSERT OR REPLACE INTO looks (id, data) SELECT ?1, ?2 WHERE EXISTS (SELECT 1 FROM messages WHERE id=?1)")?;
+            for (id, fingerprint, content) in looks {
+                q.execute(params![id, serde_json::to_string(&(fingerprint, content))?])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
     }
     pub fn save_draft(&self, d: &Draft) -> Result<()> {
         self.write().execute(
@@ -3965,6 +4099,7 @@ mod tests {
             until: 1,
             folder: old.into(),
             ids: vec![],
+            changed: 0,
         }];
         s.set_preference("snoozed:demo", &serde_json::to_string(&snoozed)?)?;
 

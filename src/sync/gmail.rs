@@ -37,6 +37,9 @@ const LIST_HEADERS: &[&str] = &[
     "List-Id",
     "Disposition-Notification-To",
     "Auto-Submitted",
+    "X-Autoreply",
+    "X-Autorespond",
+    "Precedence",
     "Content-Type",
 ];
 
@@ -384,6 +387,15 @@ impl Session {
                 None => bail!(t!("sync-gmail-gmail-left-a-request-unanswered")),
             })
             .collect()
+    }
+
+    /// The ids of a conversation's messages (its thread), wherever they are.
+    pub fn thread(&self, id: &str) -> Result<Vec<String>> {
+        let v = self.rest.get(&format!("{USER}/threads/{}?format=minimal", escape(id)))?;
+        Ok(v["messages"]
+            .as_array()
+            .map(|l| l.iter().filter_map(|m| m["id"].as_str()).map(str::to_owned).collect())
+            .unwrap_or_default())
     }
 
     /// A message's source.

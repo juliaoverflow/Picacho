@@ -1,4 +1,6 @@
 //! Alias forwarding services: SimpleLogin, addy.io and Firefox Relay.
+//! (Proton's own aliases use the Proton account's session instead:
+//! `sync/proton/aliases.rs`.)
 //!
 //! Each one forwards mail sent to an alias on to a real mailbox, and has a
 //! JSON API, authenticated with a key made in its web app, for listing,
@@ -53,6 +55,12 @@ pub fn server_url(service: ForwardingService, server: &str) -> Result<String> {
 
 impl Client {
     pub fn new(service: ForwardingService, server: &str, key: &str) -> Result<Self> {
+        // Proton's aliases go through the Proton account's session
+        // (`sync/proton/aliases.rs`), never this client.
+        ensure!(
+            !service.uses_proton_account(),
+            t!("manage-forwarding-proton-aliases-use-the-accounts-sign-in")
+        );
         let key = key.trim();
         ensure!(!key.is_empty(), t!("sync-forwarding-enter-an-api-key"));
         ensure!(
@@ -82,6 +90,7 @@ impl Client {
             ForwardingService::Addy => r
                 .bearer_auth(&self.key)
                 .header("X-Requested-With", "XMLHttpRequest"),
+            ForwardingService::Proton => unreachable!("Proton's aliases go through its session"),
             ForwardingService::FirefoxRelay => {
                 r.header("Authorization", format!("Token {}", self.key))
             }
@@ -133,6 +142,7 @@ impl Client {
                     mailbox: String::new(),
                 }
             }
+            ForwardingService::Proton => unreachable!("Proton's aliases go through its session"),
             ForwardingService::FirefoxRelay => {
                 let v = self.send(self.request(Method::GET, "/api/v1/profiles/"))?;
                 ensure!(v.is_array(), t!("sync-forwarding-firefox-relay-sent-an-unexpected-reply"));
@@ -171,6 +181,7 @@ impl Client {
                     }
                 }
             }
+            ForwardingService::Proton => unreachable!("Proton's aliases go through its session"),
             ForwardingService::FirefoxRelay => {
                 let v = self.send(self.request(Method::GET, "/api/v1/relayaddresses/"))?;
                 out.extend(parse_relay(&v));
@@ -198,6 +209,7 @@ impl Client {
                     .unwrap_or_default();
                 parse_addy_options(&v, &custom, &username)
             }
+            ForwardingService::Proton => unreachable!("Proton's aliases go through its session"),
             ForwardingService::FirefoxRelay => AliasOptions {
                 can_create: true,
                 ..AliasOptions::default()
@@ -277,6 +289,7 @@ impl Client {
                 let v = self.send(self.request(Method::POST, "/api/v1/aliases").json(&body))?;
                 parse_addy_alias(&v["data"])
             }
+            ForwardingService::Proton => unreachable!("Proton's aliases go through its session"),
             ForwardingService::FirefoxRelay => {
                 let v = self.send(
                     self.request(Method::POST, "/api/v1/relayaddresses/")
@@ -296,6 +309,7 @@ impl Client {
         let path = match self.service {
             ForwardingService::SimpleLogin => format!("/api/aliases/{id}"),
             ForwardingService::Addy => format!("/api/v1/aliases/{id}"),
+            ForwardingService::Proton => unreachable!("Proton's aliases go through its session"),
             ForwardingService::FirefoxRelay => format!("/api/v1/relayaddresses/{id}/"),
         };
         let response = self
@@ -331,6 +345,7 @@ impl Client {
                 format!("/api/v1/aliases/{id}"),
                 json!({ "description": note }),
             ),
+            ForwardingService::Proton => unreachable!("Proton's aliases go through its session"),
             ForwardingService::FirefoxRelay => (
                 format!("/api/v1/relayaddresses/{id}/"),
                 json!({ "description": note }),
@@ -368,6 +383,7 @@ impl Client {
                     )?;
                 }
             }
+            ForwardingService::Proton => unreachable!("Proton's aliases go through its session"),
             ForwardingService::FirefoxRelay => {
                 self.send(
                     self.request(Method::PATCH, &format!("/api/v1/relayaddresses/{id}/"))
@@ -529,6 +545,7 @@ impl Client {
                 Method::GET,
                 "/api/v1/recipients?filter[verified]=true&filter[alias_count]=false",
             ))?,
+            ForwardingService::Proton => unreachable!("Proton's aliases go through its session"),
             ForwardingService::FirefoxRelay => return Ok(Vec::new()),
         };
         Ok(parse_mailboxes(self.service, &v))
@@ -546,6 +563,7 @@ impl Client {
                 format!("/api/v1/aliases/{}", alias.id),
                 json!({ "from_name": value }),
             ),
+            ForwardingService::Proton => unreachable!("Proton's aliases go through its session"),
             ForwardingService::FirefoxRelay => bail!(t!("sync-forwarding-firefox-relay-aliases-have-no-display")),
         };
         self.send(self.request(Method::PATCH, &path).json(&body))?;
@@ -567,6 +585,7 @@ impl Client {
             ForwardingService::Addy => {
                 self.send(self.request(Method::DELETE, &format!("/api/v1/pinned-aliases/{id}")))?
             }
+            ForwardingService::Proton => unreachable!("Proton's aliases go through its session"),
             ForwardingService::FirefoxRelay => bail!(t!("sync-forwarding-firefox-relay-aliases-cant-be-pinned")),
         };
         Ok(())
@@ -593,6 +612,7 @@ impl Client {
                         .json(&json!({ "alias_id": alias.id, "recipient_ids": ids })),
                 )?;
             }
+            ForwardingService::Proton => unreachable!("Proton's aliases go through its session"),
             ForwardingService::FirefoxRelay => bail!(t!("sync-forwarding-firefox-relay-forwards-to-your-accounts")),
         }
         Ok(())
@@ -638,6 +658,7 @@ impl Client {
         let path = match self.service {
             ForwardingService::SimpleLogin => format!("/api/aliases/{id}"),
             ForwardingService::Addy => format!("/api/v1/aliases/{id}"),
+            ForwardingService::Proton => unreachable!("Proton's aliases go through its session"),
             ForwardingService::FirefoxRelay => format!("/api/v1/relayaddresses/{id}/"),
         };
         self.send(self.request(Method::DELETE, &path))?;
@@ -936,6 +957,7 @@ fn parse_mailboxes(service: ForwardingService, v: &Value) -> Vec<ServiceMailbox>
     let list = match service {
         ForwardingService::SimpleLogin => &v["mailboxes"],
         ForwardingService::Addy => &v["data"],
+        ForwardingService::Proton => unreachable!("Proton's aliases go through its session"),
         ForwardingService::FirefoxRelay => return Vec::new(),
     };
     list.as_array()

@@ -10,6 +10,8 @@ compose-connect-an-account-before-sending-your = Connect an account before sendi
 
 compose-message-sent = Message sent
 
+compose-message-sent-waiting = Message sent. It's in Waiting For until someone replies.
+
 compose-message-sent-2 = Message sent. { $notes }
 
 compose-scheduled-to-send = Scheduled to send { $when }.

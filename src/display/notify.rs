@@ -210,6 +210,26 @@ pub fn clicked(target: &str) {
     }
 }
 
+/// Mail a push told of was fetched and cached (`MailApp::on_arrival`), by
+/// account id.
+static ARRIVED: Mutex<Option<futures::channel::mpsc::UnboundedSender<String>>> = Mutex::new(None);
+
+/// Tells the window that mail a push announced is now in the cache, so its
+/// list shows it before the next check.
+pub fn arrived(account: &str) {
+    if let Some(arrived) = ARRIVED.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+        let _ = arrived.unbounded_send(account.to_owned());
+    }
+}
+
+/// Arrivals from now on (`arrived`), for the window. A window opened later
+/// takes them over.
+pub fn arrivals() -> futures::channel::mpsc::UnboundedReceiver<String> {
+    let (sender, receiver) = futures::channel::mpsc::unbounded();
+    *ARRIVED.lock().unwrap_or_else(|e| e.into_inner()) = Some(sender);
+    receiver
+}
+
 /// Buttons a new message's notification offers: their action keys and
 /// labels, for one message and for several.
 fn quick_one() -> [(&'static str, &'static str); 4] {
@@ -424,6 +444,31 @@ pub fn announce(announcement: crate::manage::background::Announcement<'_>) {
                 )),
             );
         }
+        NoReply {
+            account,
+            account_id,
+            message_id,
+            to,
+            subject,
+            count,
+        } => show(
+            format!("no-reply:{account}"),
+            t!("notify-no-reply-yet").to_owned(),
+            account.to_owned(),
+            if count > 1 {
+                t!("notify-messages-without-a-reply", count = count)
+            } else if crate::manage::applock::hiding() {
+                t!("notify-a-message-without-a-reply").to_owned()
+            } else {
+                t!("notify-to", subject = or_untitled(subject), to = to)
+            },
+            // One message opens, where it is in Sent; several, Sent.
+            Some(Target::new(
+                account_id,
+                Folder::Sent,
+                (count == 1).then_some(message_id),
+            )),
+        ),
         ScheduledSent {
             account,
             account_id,

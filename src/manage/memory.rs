@@ -12,22 +12,44 @@
 /// Arenas glibc may make: enough for the few threads busy at once.
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 const ARENAS: i32 = 4;
+/// The window's process: more, so that its thread doesn't wait on the
+/// allocator's locks while background work (sorting mail into tabs, on
+/// several threads, at launch) allocates at full speed. With four, the
+/// window's own allocations took several times as long meanwhile.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+const WINDOW_ARENAS: i32 = 8;
 
-/// Called first thing in `main`, before other threads start.
-pub fn configure() {
+/// Called first thing in `main`, before other threads start. `window`:
+/// this process shows the window (not the background one).
+pub fn configure(window: bool) {
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     {
         // Set by the person (or a packager): theirs wins.
         if std::env::var_os("MALLOC_ARENA_MAX").is_none() {
+            let arenas = if window { WINDOW_ARENAS } else { ARENAS };
             // Safety: mallopt only changes the allocator's settings.
-            unsafe { libc::mallopt(libc::M_ARENA_MAX, ARENAS) };
+            unsafe { libc::mallopt(libc::M_ARENA_MAX, arenas) };
         }
     }
+    #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+    let _ = window;
     // Tokio runtimes made without a size (zbus's, for D-Bus) start a worker
     // per core; D-Bus needs a couple. Picacho's own runtimes set theirs.
     if std::env::var_os("TOKIO_WORKER_THREADS").is_none() {
         // Safety: no other threads are running yet to read the environment.
         unsafe { std::env::set_var("TOKIO_WORKER_THREADS", "2") };
+    }
+}
+
+/// Lowers the calling thread's priority, for long background work (the
+/// whole look at listed mail, the widgets' scans): the window's thread,
+/// and a check's, go first when the cores are busy.
+pub fn lower_priority() {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    // Safety: setpriority with a thread id changes only that thread's
+    // niceness; a failure leaves it as it was.
+    unsafe {
+        let _ = libc::setpriority(libc::PRIO_PROCESS, libc::gettid() as libc::id_t, 10);
     }
 }
 

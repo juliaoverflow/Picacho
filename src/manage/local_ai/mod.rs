@@ -6,8 +6,10 @@
 //! The features: hiding sign-in and verification codes (see `otp`), and
 //! understanding dates and times typed where Picacho asks when ("tmrw at 6",
 //! see `when`), confirming tracking numbers found in mail (see `parcel`),
-//! and suggesting replies to received mail in its own language (see
-//! `replies`).
+//! suggesting replies to received mail in its own language (see
+//! `replies`), and sorting the inbox into its categories (see
+//! `categories`).
+pub mod categories;
 #[cfg(target_os = "macos")]
 mod coreml;
 pub mod otp;
@@ -35,6 +37,11 @@ pub const REPLIES_PREFERENCE: &str = "local_ai_replies";
 /// Preference: the suggested replies chosen and turned away (JSON,
 /// `replies::History`).
 pub const REPLY_HISTORY_PREFERENCE: &str = "local_ai_reply_history";
+/// Preference: the inbox category model sorts the inbox.
+pub const CATEGORIES_PREFERENCE: &str = "local_ai_categories";
+/// Preference: what was learned from the mail the person moved to another
+/// category (JSON, `categories::Learned`).
+pub const CATEGORIES_LEARNED_PREFERENCE: &str = "local_ai_categories_learned";
 
 /// Where the models are published: Picacho's model repositories on Hugging
 /// Face (in the pinaltech "Picacho Models" collection), one per model. Each
@@ -195,8 +202,26 @@ pub const REPLIES: Model = Model {
     threshold: 0.,
 };
 
+/// Sift Categories, the inbox category model (see
+/// `models/categories/train.py`): the same file on every platform, run by
+/// Picacho's own runtime, published as `pinaltech/sift-categories`.
+pub const CATEGORIES: Model = Model {
+    id: "categories",
+    label: "Inbox category model",
+    features: &["Sort the inbox"],
+    repo: "sift-categories",
+    kind: Kind::Tagger,
+    file: "categories-v1.bin",
+    local: false,
+    installed: "categories-v1.bin",
+    sha256: "29b1da62cddc59c0a02bfc8c669ac76ef5e16464bea0dc4db7c9372ef96dd6ea",
+    size: 1_180_984,
+    dim: categories::DIM,
+    threshold: 0.,
+};
+
 /// Every model Local AI can download.
-pub const MODELS: [&Model; 4] = [&OTP, &WHEN, &PARCEL, &REPLIES];
+pub const MODELS: [&Model; 5] = [&OTP, &WHEN, &PARCEL, &REPLIES, &CATEGORIES];
 
 /// The model with this id.
 pub fn model(id: &str) -> Option<&'static Model> {
@@ -224,6 +249,18 @@ pub fn replies_enabled(store: &Store) -> bool {
 pub fn reply_history(store: &Store) -> replies::History {
     store
         .preference(REPLY_HISTORY_PREFERENCE)
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+/// Whether the inbox category model sorts the inbox (Local AI on, and the
+/// feature on).
+pub fn categories_enabled(store: &Store) -> bool {
+    enabled(store) && store.preference(CATEGORIES_PREFERENCE).as_deref() == Some("true")
+}
+/// What was learned from the mail the person moved to another category.
+pub fn categories_learned(store: &Store) -> categories::Learned {
+    store
+        .preference(CATEGORIES_LEARNED_PREFERENCE)
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default()
 }
@@ -399,6 +436,12 @@ pub fn reply_suggester(store: &Store) -> Result<replies::Suggester> {
     replies::Suggester::new(REPLIES.load_tagger(store)?)
 }
 
+/// The inbox category model, with what was learned here.
+pub fn category_ai(store: &Store) -> Result<categories::Ai> {
+    let model = categories::Model::new(CATEGORIES.load_tagger(store)?)?;
+    Ok(categories::Ai::new(model, categories_learned(store)))
+}
+
 /// The date and time reader, with the installed model.
 pub fn when_parser(store: &Store) -> Result<when::Parser> {
     Ok(when::Parser::new(WHEN.load_tagger(store)?))
@@ -472,6 +515,7 @@ pub(crate) fn test_model(file: &str) -> PathBuf {
         &PARCEL_NATIVE,
         &PARCEL_COREML,
         &REPLIES,
+        &CATEGORIES,
     ]
     .into_iter()
     .find(|m| m.file == file)
@@ -526,7 +570,7 @@ mod tests {
     fn the_published_models_are_the_ones_the_app_expects() {
         // The files on Hugging Face (or just trained) match the sizes and
         // digests here; `test_model` checks both, downloading if needed.
-        for model in [OTP_NATIVE, OTP_COREML, WHEN, PARCEL_NATIVE, PARCEL_COREML] {
+        for model in [OTP_NATIVE, OTP_COREML, WHEN, PARCEL_NATIVE, PARCEL_COREML, CATEGORIES] {
             let bytes = std::fs::read(test_model(model.file)).unwrap();
             assert_eq!(hex(&Sha256::digest(&bytes)), model.sha256, "{}", model.file);
             assert_eq!(bytes.len() as u64, model.size, "{}", model.file);

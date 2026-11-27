@@ -334,6 +334,8 @@ gpui-mobile = { git = "https://github.com/pinaltech/Picacho-Patches", branch = "
 android-activity = { version = "0.6", features = ["native-activity"] }
 android_logger = "0.15"
 log = "0.4"
+# Long background work runs at a lower priority (`manage::memory`).
+libc = "0.2"
 # Android has no system OpenSSL; build it into the app.
 native-tls = { version = "0.2", features = ["vendored"] }
 # SQLCipher's crypto from that same built-in OpenSSL.

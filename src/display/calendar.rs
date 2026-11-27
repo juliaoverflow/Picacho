@@ -714,9 +714,15 @@ impl MailApp {
                 let password = self.calendar_password.read(cx).value().to_string();
                 self.calendar_password
                     .update(cx, |input, cx| input.set_text("", w, cx));
+                // With calendars set up already, this one goes beside them.
+                let another = self.backend.primary_calendar_server().is_some();
                 self.calendar_run(cx, move |b| {
-                    b.connect_calendar(server, &password)
-                        .map(|n| t!("calendar-read-events", n = n))
+                    let n = if another {
+                        b.add_calendar_source(|| b.connect_calendar(server, &password))?
+                    } else {
+                        b.connect_calendar(server, &password)?
+                    };
+                    Ok(t!("calendar-read-events", n = n))
                 });
             }
             Action::SyncCalendar => {
@@ -1041,10 +1047,47 @@ impl MailApp {
                 let Some(a) = self.accounts.iter().find(|a| a.id == id).cloned() else {
                     return;
                 };
+                let another = self.backend.primary_calendar_server().is_some();
                 self.calendar_run(cx, move |b| {
                     let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-                    let n = b.use_mail_account_for_calendar(&a, cancel)?;
+                    let n = if another {
+                        b.add_calendar_source(|| b.use_mail_account_for_calendar(&a, cancel))?
+                    } else {
+                        b.use_mail_account_for_calendar(&a, cancel)?
+                    };
                     Ok(t!("calendar-read-events-from", n = n, email = a.email))
+                });
+            }
+            Action::SubscribeCalendarFeed => {
+                let url = self.calendar_feed_url.read(cx).value().trim().to_owned();
+                if url.is_empty() {
+                    self.calendar_error = Some(t!("calendar-write-the-feeds-address").into());
+                    cx.notify();
+                    return;
+                }
+                self.calendar_feed_url.update(cx, |i, cx| i.set_text("", w, cx));
+                let minutes = self.feed_interval;
+                self.calendar_run(cx, move |b| {
+                    let n = b.subscribe_calendar_feed(&url, "", minutes)?;
+                    Ok(t!("calendar-read-events", n = n))
+                });
+            }
+            Action::NewFeedInterval(minutes) => self.feed_interval = minutes,
+            Action::FeedInterval(id, minutes) => {
+                if let Err(e) = self.backend.set_feed_interval(&id, minutes) {
+                    self.calendar_error = Some(format!("{e:#}"));
+                }
+            }
+            Action::SyncCalendarSource(id) => {
+                self.calendar_run(cx, move |b| {
+                    let n = b.in_calendar_source(&id, || b.sync_calendar())?;
+                    Ok(t!("calendar-read-events", n = n))
+                });
+            }
+            Action::RemoveCalendarSource(id) => {
+                self.calendar_run(cx, move |b| {
+                    b.remove_calendar_source(&id)?;
+                    Ok(t!("calendar-calendar-removed").into())
                 });
             }
             Action::RenameCalendar(href) => {
@@ -1329,6 +1372,154 @@ impl MailApp {
                 }
             },
         );
+        // Subscribed feeds whose interval has passed.
+        if self.backend.calendar_sources().iter().any(|(_, s, _)| s.feed) {
+            self.task(cx, |b| Ok(b.sync_due_feeds()), |_, read: anyhow::Result<usize>, cx| {
+                if read.is_ok_and(|n| n > 0) {
+                    cx.notify();
+                }
+            });
+        }
+    }
+
+    /// How often a feed can be read again: (minutes, words).
+    fn feed_intervals() -> [(u32, &'static str); 4] {
+        [
+            (60, t!("calendar-every-hour")),
+            (crate::sync::feed::DEFAULT_MINUTES, t!("calendar-every-6-hours")),
+            (24 * 60, t!("calendar-every-day")),
+            (7 * 24 * 60, t!("calendar-every-week")),
+        ]
+    }
+
+    /// Settings → Calendar: the sources beside the first (other accounts'
+    /// calendars, subscribed feeds), each to read again or remove, and
+    /// where more are added.
+    fn calendar_sources_group(&self, cx: &Context<Self>) -> Div {
+        let c = self.colors();
+        let busy = self.calendar_busy;
+        let first = self.backend.primary_calendar_server().is_some();
+        let mut rows = Rows::new();
+        for (id, server, synced) in self.backend.calendar_sources() {
+            let when = synced
+                .and_then(|t| chrono::DateTime::from_timestamp(t, 0))
+                .map(|t| t.with_timezone(&chrono::Local).local(t!("dates-month-day-time")))
+                .unwrap_or_else(|| t!("calendar-never-read").to_owned());
+            let kind = if server.feed {
+                "feed"
+            } else if !server.google_account.is_empty() {
+                "google"
+            } else if !server.proton_account.is_empty() {
+                "proton"
+            } else if !server.graph_account.is_empty() || !server.ews_account.is_empty() {
+                "exchange"
+            } else if !server.jmap_account.is_empty() {
+                "jmap"
+            } else {
+                "caldav"
+            };
+            let caption = t!("calendar-source-caption", kind = kind, synced = when);
+            let mut controls = div().flex().flex_wrap().items_center().gap_2();
+            if server.feed {
+                let every = if server.refresh_minutes == 0 { crate::sync::feed::DEFAULT_MINUTES } else { server.refresh_minutes };
+                controls = controls.child(
+                    self.segmented(
+                        &format!("calendar-feed-every-{id}"),
+                        Self::feed_intervals()
+                            .into_iter()
+                            .map(|(m, words)| (words.to_owned(), Action::FeedInterval(id.clone(), m), every == m))
+                            .collect(),
+                        cx,
+                    )
+                    .max_w(px(360.)),
+                );
+            }
+            controls = controls
+                .child(self.button(
+                    SharedString::from(format!("calendar-source-sync-{id}")),
+                    t!("calendar-read-now"),
+                    "refresh",
+                    Action::SyncCalendarSource(id.clone()),
+                    false,
+                    cx,
+                ))
+                .child(self.button(
+                    SharedString::from(format!("calendar-source-remove-{id}")),
+                    t!("calendar-remove"),
+                    "close",
+                    Action::RemoveCalendarSource(id.clone()),
+                    false,
+                    cx,
+                ));
+            rows = rows.row(self.setting_row(&self.backend.calendar_source_label(&id), &caption, controls));
+        }
+        // Another account, beside the first: as the first is set up.
+        if first {
+            let labelled = |text: &'static str, id: &'static str, input: &Entity<InputState>| {
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(div().text_size(px(12.)).text_color(rgb(c.muted)).child(text))
+                    .child(div().id(id).debug_selector(move || id.into()).child(field(Input::new(input), c, busy)))
+            };
+            rows = rows.row(
+                div()
+                    .id("calendar-add-account")
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .max_w(px(420.))
+                    .child(div().text_size(px(12.)).text_color(rgb(c.muted)).child(t!("calendar-add-another-account")))
+                    .children(self.jmap_sources("calendar-add-jmap", Action::ConnectJmapCalendar, cx))
+                    .child(labelled(t!("calendar-server"), "calendar-url", &self.calendar_url))
+                    .child(labelled(t!("calendar-user-name"), "calendar-user", &self.calendar_user))
+                    .child(labelled(t!("calendar-password"), "calendar-password", &self.calendar_password))
+                    .child(div().flex().child(
+                        self.button(
+                            "calendar-connect",
+                            if busy { t!("calendar-connecting") } else { t!("calendar-add-calendars") },
+                            "plus",
+                            Action::ConnectCalendar,
+                            false,
+                            cx,
+                        )
+                        .when(busy, |d| d.opacity(0.6)),
+                    )),
+            );
+        }
+        // A feed to subscribe to.
+        rows = rows.row(
+            div()
+                .id("calendar-subscribe")
+                .flex()
+                .flex_col()
+                .gap_2()
+                .max_w(px(480.))
+                .child(div().text_size(px(12.)).text_color(rgb(c.muted)).child(t!("calendar-subscribe-caption")))
+                .child(div().id("calendar-feed-url").debug_selector(|| "calendar-feed-url".into()).child(field(
+                    Input::new(&self.calendar_feed_url),
+                    c,
+                    busy,
+                )))
+                .child(self.segmented(
+                    "calendar-feed-every",
+                    Self::feed_intervals()
+                        .into_iter()
+                        .map(|(m, words)| (words.to_owned(), Action::NewFeedInterval(m), self.feed_interval == m))
+                        .collect(),
+                    cx,
+                ))
+                .child(div().flex().child(self.button(
+                    "calendar-subscribe-button",
+                    t!("calendar-subscribe"),
+                    "plus",
+                    Action::SubscribeCalendarFeed,
+                    false,
+                    cx,
+                ))),
+        );
+        self.settings_group(t!("calendar-more-calendars"), rows)
     }
 
     /// The account an event you organize is sent from: the one whose
@@ -1674,7 +1865,7 @@ impl MailApp {
                 )),
             )
         };
-        let Some(server) = self.backend.calendar_server() else {
+        let Some(server) = self.backend.primary_calendar_server() else {
             let form = Rows::new()
                 .row(
                     div()
@@ -1710,6 +1901,7 @@ impl MailApp {
             return self
                 .settings_column()
                 .child(self.settings_group(t!("calendar-calendar-server-caldav"), form))
+                .child(self.calendar_sources_group(cx))
                 .into_any_element();
         };
         let synced = self
@@ -1724,6 +1916,10 @@ impl MailApp {
         let over_jmap = !server.jmap_account.is_empty();
         let server_title = if over_jmap {
             t!("calendar-calendar-server-jmap")
+        } else if !server.google_account.is_empty() {
+            t!("calendar-calendars-google")
+        } else if !server.proton_account.is_empty() {
+            t!("calendar-calendars-proton")
         } else {
             t!("calendar-calendar-server-caldav")
         };
@@ -1817,7 +2013,8 @@ impl MailApp {
                 ),
             );
         }
-        if !over_jmap {
+        // Google sends them itself, always; Proton Calendar's are its own.
+        if !over_jmap && server.google_account.is_empty() && server.proton_account.is_empty() {
             server_rows = server_rows.row(self.switch_setting(
                 t!("calendar-let-the-server-send-invitations"),
                 "",
@@ -2388,6 +2585,7 @@ impl MailApp {
                 )
             })
             .child(self.settings_group(server_title, server_rows))
+            .child(self.calendar_sources_group(cx))
             .child(self.settings_group(t!("calendar-held-to-send-later"), held_rows))
             .into_any_element()
     }

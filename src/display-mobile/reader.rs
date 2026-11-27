@@ -130,6 +130,19 @@ impl MailApp {
                 .into_any_element(),
             );
         }
+        // Sent mail: be reminded if nobody replies.
+        if m.folder == Folder::Sent && !m.message_id.trim().is_empty() {
+            tools.push(
+                self.touch_icon(
+                    "mobile-reader-follow-up",
+                    "waiting",
+                    t!("mobile-reader-remind-me-if-no-reply"),
+                    act(Action::FollowUpMenu(id.clone())),
+                    cx,
+                )
+                .into_any_element(),
+            );
+        }
         tools.push(
             self.touch_icon(
                 "mobile-reader-reply",

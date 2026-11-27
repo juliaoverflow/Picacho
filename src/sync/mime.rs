@@ -172,10 +172,33 @@ pub fn parse_message(
     if !(automatic || report || null_path || required) {
         mail.set_receipt_to(receipt_addresses(&header("Disposition-Notification-To")));
     }
+    // Sent by a machine: told from someone answering (follow-up reminders).
+    // Delivery and disposition reports (multipart/report) are too.
+    mail.set_automatic(machine_sent(&header) || report);
     // A mailing list's identity and addresses (RFC 2919, RFC 2369).
     mail.set_list_id(crate::manage::list_headers::list_id(&header("List-Id")));
     mail.set_list_links(crate::manage::list_headers::links(&header));
     Ok(mail)
+}
+/// Whether a message's headers say a machine sent it: Auto-Submitted other
+/// than "no" (RFC 3834), the X-Autoreply and X-Autorespond that vacation
+/// responders add, or Precedence: auto_reply.
+pub(crate) fn machine_sent(header: &dyn Fn(&str) -> String) -> bool {
+    let auto = header("Auto-Submitted");
+    (!auto.trim().is_empty() && !auto.trim().eq_ignore_ascii_case("no"))
+        || !header("X-Autoreply").trim().is_empty()
+        || !header("X-Autorespond").trim().is_empty()
+        || header("Precedence").trim().eq_ignore_ascii_case("auto_reply")
+}
+/// Whether an Exchange message class (PR_MESSAGE_CLASS, EWS's ItemClass)
+/// is one a machine sends: an out-of-office or rule's automatic reply
+/// (`IPM.Note.Rules.OofTemplate.Microsoft`, `IPM.Note.Rules.ReplyTemplate…`)
+/// or a report (`REPORT.IPM.Note.NDR`, read and delivery receipts).
+pub(crate) fn automatic_class(class: &str) -> bool {
+    let class = class.trim().to_ascii_lowercase();
+    class.starts_with("report.")
+        || class.starts_with("ipm.note.rules.ooftemplate")
+        || class.starts_with("ipm.note.rules.replytemplate")
 }
 /// format=flowed text (RFC 3676 §4) as paragraphs: a line ending in a
 /// space continues on the next with the same quote depth (the space

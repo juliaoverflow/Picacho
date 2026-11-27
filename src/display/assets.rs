@@ -28,6 +28,10 @@ impl AssetSource for Assets {
             "mail/snooze.svg" => Some(
                 "<circle cx='12' cy='13' r='8'/><path d='M12 9v4l2 2M5 3 2 6M19 3l3 3M10 2h4'/>",
             ),
+            // Waiting for a reply: an hourglass.
+            "mail/waiting.svg" => Some(
+                "<path d='M6 2h12M6 22h12M7 2v4a5 5 0 0 0 5 5 5 5 0 0 0 5-5V2M7 22v-4a5 5 0 0 1 5-5 5 5 0 0 1 5 5v4'/>",
+            ),
             "mail/answered.svg" => Some("<path d='m9 6-6 6 6 6M3 12h11a7 7 0 0 1 7 7'/>"),
             "mail/forwarded.svg" => Some("<path d='m15 6 6 6-6 6M21 12H10a7 7 0 0 0-7 7'/>"),
             "mail/archive.svg" => Some(
@@ -191,6 +195,14 @@ impl AssetSource for Assets {
                 "<rect x='3' y='3' width='18' height='18' rx='2'/><path d='M3 9h18M9 21V9'/>",
             ),
             "mail/ban.svg" => Some("<circle cx='12' cy='12' r='9'/><path d='m5.6 5.6 12.8 12.8'/>"),
+            // Travel: a plane.
+            "mail/plane.svg" => Some(PLANE),
+            // Finance: a bank.
+            "mail/bank.svg" => Some(BANK),
+            // Social: two people.
+            "mail/people.svg" => Some(
+                "<circle cx='9' cy='8' r='3.5'/><path d='M2.5 20a6.5 6.5 0 0 1 13 0'/><path d='M16 4.6a3.5 3.5 0 0 1 0 6.8M18 14a6.5 6.5 0 0 1 3.5 6'/>",
+            ),
             "mail/tag.svg" => Some(
                 "<path d='M12.6 2.6A2 2 0 0 0 11.2 2H4a2 2 0 0 0-2 2v7.2a2 2 0 0 0 .6 1.4l8.7 8.7a2.4 2.4 0 0 0 3.4 0l6.6-6.6a2.4 2.4 0 0 0 0-3.4Z'/><circle cx='7.5' cy='7.5' r='.5'/>",
             ),
@@ -303,3 +315,8 @@ pub fn preset(name: &str) -> Option<&'static [u8]> {
         .find(|(n, ..)| *n == name)
         .map(|(_, _, b)| *b)
 }
+
+/// Travel's icon: a plane.
+const PLANE: &str = "<path d='M17.8 19.2 16 11l3.5-3.5C21 6 21.5 4 21 3c-1-.5-3 0-4.5 1.5L13 8 4.8 6.2c-.5-.1-.9.1-1.1.5l-.3.5c-.2.5-.1 1 .3 1.3L9 12l-2 3H4l-1 1 3 2 2 3 1-1v-3l3-2 3.5 5.3c.3.4.8.5 1.3.3l.5-.2c.4-.3.6-.7.5-1.2Z'/>";
+/// Finance's icon: a bank.
+const BANK: &str = "<path d='M3 10 12 4l9 6M5 10v8M9.5 10v8M14.5 10v8M19 10v8M3 21h18M3 18h18'/>";

@@ -168,6 +168,8 @@ pub struct Message {
     pub size: u64,
     /// PR_LAST_VERB_EXECUTED: 102 replied, 103 replied to all, 104 forwarded.
     pub last_verb: Option<i64>,
+    /// Its message class ("IPM.Note", "IPM.Note.Rules.OofTemplate.Microsoft"…).
+    pub item_class: String,
 }
 impl Message {
     fn of(n: Node) -> Self {
@@ -181,6 +183,7 @@ impl Message {
             read: text(n, "IsRead") == "true",
             has_attachments: text(n, "HasAttachments") == "true",
             message_id: text(n, "InternetMessageId"),
+            item_class: text(n, "ItemClass"),
             conversation_id: child(n, "ConversationId").and_then(|c| c.attribute("Id")).unwrap_or_default().to_owned(),
             size: text(n, "Size").parse().unwrap_or_default(),
             categories: child(n, "Categories")
@@ -887,6 +890,23 @@ impl Session {
         }
         out.truncate(most);
         Ok(out)
+    }
+    /// A conversation's messages in every folder but Deleted Items and
+    /// Drafts (GetConversationItems, Exchange 2013 and later), up to 100.
+    pub fn conversation(&self, id: &str) -> Result<Vec<Message>> {
+        let answer = self.call(
+            &format!(
+                r#"<m:GetConversationItems><m:ItemShape><t:BaseShape>IdOnly</t:BaseShape><t:AdditionalProperties>{ITEM_PROPERTIES}</t:AdditionalProperties></m:ItemShape><m:FoldersToIgnore><t:DistinguishedFolderId Id="deleteditems"/><t:DistinguishedFolderId Id="drafts"/></m:FoldersToIgnore><m:MaxItemsToReturn>100</m:MaxItemsToReturn><m:Conversations><t:Conversation><t:ConversationId Id="{}"/></t:Conversation></m:Conversations></m:GetConversationItems>"#,
+                esc(id)
+            ),
+            &[],
+        )?;
+        let doc = roxmltree::Document::parse(&answer)?;
+        Ok(doc
+            .descendants()
+            .filter(|n| named(*n, "Items"))
+            .flat_map(|items| items.children().filter(|n| n.is_element()).map(Message::of).collect::<Vec<_>>())
+            .collect())
     }
     /// What the message list shows of each of `ids`; those gone are left out.
     pub fn messages(&self, ids: &[String]) -> Result<Vec<Message>> {

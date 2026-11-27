@@ -542,6 +542,9 @@ impl Backend {
                         .is_some_and(|p| p.to_ascii_lowercase().contains("one-click")),
                     ..Default::default()
                 };
+                if let Some(auto) = e.auto_submitted.as_deref().map(str::trim) {
+                    m.set_automatic(!auto.is_empty() && !auto.eq_ignore_ascii_case("no"));
+                }
                 let references = e.references.as_ref().or(e.in_reply_to.as_ref());
                 if let Some(refs) = references {
                     m.set_references(
@@ -938,6 +941,9 @@ impl Backend {
                 }
                 if next.references().is_empty() {
                     next.set_references(parsed.references());
+                }
+                if parsed.automatic() {
+                    next.set_automatic(true);
                 }
                 self.store.save_messages(&[next])?;
             }
@@ -2022,6 +2028,76 @@ impl Backend {
             add(Mailbox::Standard(Folder::Inbox));
         }
         Ok((boxes, changes.new_state))
+    }
+}
+
+// Follow-up reminders and notes (`follow_up`, `notes`).
+impl Backend {
+    /// Picacho's mailbox on a JMAP server (made with `create`), by id.
+    fn picacho_mailbox(&self, a: &Account, s: &Session, create: bool) -> Result<Option<String>> {
+        let parent = super::snooze::PARENT;
+        let places = self.jmap_places(a, s, false)?;
+        if let Some(p) = places
+            .iter()
+            .find(|p| p.folder.is_none() && p.depth == 0 && p.path.eq_ignore_ascii_case(parent))
+        {
+            return Ok(Some(p.id.clone()));
+        }
+        if !create {
+            return Ok(None);
+        }
+        let id = s.create_mailbox(parent, None)?;
+        let _ = self.jmap_places(a, s, true);
+        Ok(Some(id))
+    }
+    /// The notes in Picacho's mailbox (found by the server), by email id.
+    pub(super) fn read_notes_jmap(&self, a: &Account, kind: &str) -> Result<super::notes::NoteSources> {
+        self.with_jmap(a, |s| {
+            let Some(mailbox) = self.picacho_mailbox(a, s, false)? else {
+                return Ok(None);
+            };
+            let filter = json!({
+                "operator": "AND",
+                "conditions": [{ "inMailbox": mailbox }, { "header": [super::notes::NOTE_HEADER, kind] }],
+            });
+            let mut out = Vec::new();
+            for id in s.query_ids(&filter, 0, 50)? {
+                out.push((id.clone(), s.source(&id, 1 << 20)?));
+            }
+            Ok(Some(out))
+        })
+    }
+    /// Puts a note (read) in Picacho's mailbox, then destroys `old`.
+    pub(super) fn write_note_jmap(&self, a: &Account, raw: &[u8], old: &[String]) -> Result<()> {
+        self.with_jmap(a, |s| {
+            let mailbox = self
+                .picacho_mailbox(a, s, true)?
+                .with_context(|| t!("manage-snooze-the-server-didnt-keep-the-new"))?;
+            s.import(raw, &[&mailbox], &["$seen"])?;
+            if !old.is_empty() {
+                s.destroy(old)?;
+            }
+            Ok(())
+        })
+    }
+    /// The account's messages that name `message_id` in In-Reply-To or
+    /// References, found by the server, as rows (not saved).
+    pub(super) fn jmap_replies(&self, a: &Account, message_id: &str) -> Result<Vec<Mail>> {
+        self.with_jmap(a, |s| {
+            let places = self.jmap_places(a, s, false)?;
+            let filter = json!({
+                "operator": "OR",
+                "conditions": [
+                    { "header": ["In-Reply-To", message_id] },
+                    { "header": ["References", message_id] },
+                ],
+            });
+            s.query(&filter, 0, 20, false)?
+                .emails
+                .iter()
+                .map(|e| self.jmap_mail(a, &places, e, None))
+                .collect()
+        })
     }
 }
 

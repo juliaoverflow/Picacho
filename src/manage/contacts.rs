@@ -8,6 +8,7 @@
 //! otherwise.
 use super::*;
 use crate::sync::carddav::{self, Card};
+use super::pim_sources::{self, Pim};
 
 /// The cards, as JSON.
 const CARDS: &str = "contacts";
@@ -27,28 +28,138 @@ pub fn from_server(card: &Card) -> bool {
 /// Where a JMAP server's ContactCard state is kept in `Server::states`.
 const JMAP_STATE_KEY: &str = "jmap";
 
+/// `base`'s key in the contacts source worked within (`pim_sources`).
+fn key(base: &str) -> String {
+    pim_sources::key(Pim::Contacts, base)
+}
+/// Whether this thread works within one contacts source, rather than
+/// outside all of them (where reading puts them together).
+fn within_one() -> bool {
+    pim_sources::inside(Pim::Contacts)
+}
+
 impl Backend {
-    /// Every card, the server's and this computer's.
+    fn card_pref(&self, base: &str) -> Option<String> {
+        self.store.preference(&key(base))
+    }
+    fn set_card_pref(&self, base: &str, value: &str) -> Result<()> {
+        self.store.set_preference(&key(base), value)
+    }
+    /// Runs `work` within contacts source `id`.
+    pub fn in_contacts_source<T>(&self, id: &str, work: impl FnOnce() -> T) -> T {
+        pim_sources::within(Pim::Contacts, id, work)
+    }
+    /// Every contacts source's id: the first (""), then the others.
+    pub fn contacts_source_ids(&self) -> Vec<String> {
+        pim_sources::source_ids(&self.store, Pim::Contacts)
+    }
+    /// The sources set up besides the first: (id, server, when last read).
+    pub fn contacts_sources(&self) -> Vec<(String, carddav::Server, Option<i64>)> {
+        pim_sources::extra_sources(&self.store, Pim::Contacts)
+            .into_iter()
+            .filter_map(|id| {
+                let (server, synced) = self.in_contacts_source(&id, || (self.contacts_server(), self.contacts_synced()));
+                Some((id, server?, synced))
+            })
+            .collect()
+    }
+    /// The first contacts source's server, as Settings shows it.
+    pub fn primary_contacts_server(&self) -> Option<carddav::Server> {
+        self.in_contacts_source("", || self.contacts_server())
+    }
+    /// What a contacts source is called: its account's address, or its server.
+    pub fn contacts_source_label(&self, id: &str) -> String {
+        self.in_contacts_source(id, || {
+            let Some(server) = self.contacts_server() else {
+                return String::new();
+            };
+            if let Some(a) = server
+                .account()
+                .and_then(|id| self.store.accounts().ok()?.into_iter().find(|a| a.id == id))
+            {
+                return a.email;
+            }
+            url::Url::parse(&server.url)
+                .ok()
+                .and_then(|u| u.host_str().map(str::to_owned))
+                .unwrap_or(server.url)
+        })
+    }
+    /// Outside any source: the one that has card `uid`, else where new
+    /// contacts go. `None` within one already.
+    fn route_card(&self, uid: &str) -> Option<String> {
+        if within_one() {
+            return None;
+        }
+        let holder = (!uid.is_empty())
+            .then(|| {
+                self.contacts_source_ids()
+                    .into_iter()
+                    .find(|id| self.in_contacts_source(id, || self.contacts().iter().any(|c| c.uid == uid)))
+            })
+            .flatten();
+        Some(holder.unwrap_or_else(|| self.default_contacts_source()))
+    }
+    /// Outside any source: the first one (set up in Settings as always, and
+    /// where contacts kept on this computer are).
+    fn route_first_book(&self) -> Option<String> {
+        (!within_one()).then(String::new)
+    }
+    /// Where new contacts go: the first source's server where it has one,
+    /// else another source's, else this computer.
+    pub fn default_contacts_source(&self) -> String {
+        self.contacts_source_ids()
+            .into_iter()
+            .find(|id| self.in_contacts_source(id, || self.contacts_server().is_some()))
+            .unwrap_or_default()
+    }
+    /// Adds another contacts source beside those set up, set up by `work`
+    /// (one of the `connect_…` functions) within it.
+    pub fn add_contacts_source<T>(&self, work: impl FnOnce() -> Result<T>) -> Result<T> {
+        self.add_source(Pim::Contacts, work)
+    }
+    /// Disconnects one of the sources added besides the first.
+    pub fn remove_contacts_source(&self, id: &str) -> Result<()> {
+        ensure!(!id.is_empty(), "the first contacts source is disconnected with disconnect_contacts");
+        self.in_contacts_source(id, || self.disconnect_contacts())?;
+        self.forget_source(Pim::Contacts, id)
+    }
+
+    /// Every card, the server's and this computer's (every source's,
+    /// outside any).
     pub fn contacts(&self) -> Vec<Card> {
-        self.store
-            .preference(CARDS)
+        if !within_one() {
+            return self.contacts_source_ids().into_iter().flat_map(|id| self.in_contacts_source(&id, || self.contacts())).collect();
+        }
+        self.card_pref(CARDS)
             .and_then(|json| serde_json::from_str(&json).ok())
             .unwrap_or_default()
     }
     fn save_contacts(&self, cards: &[Card]) -> Result<()> {
-        self.store
-            .set_preference(CARDS, &serde_json::to_string(cards)?)
+        // Outside any source, every source's cards would be read together
+        // and written into the first.
+        ensure!(
+            within_one() || pim_sources::extra_sources(&self.store, Pim::Contacts).is_empty(),
+            "contacts were saved outside any contacts source"
+        );
+        self.set_card_pref(CARDS, &serde_json::to_string(cards)?)
     }
-    /// The CardDAV server address book sync uses, if one is set up.
+    /// The CardDAV server address book sync uses, if one is set up
+    /// (outside any source, the first one set up).
     pub fn contacts_server(&self) -> Option<carddav::Server> {
-        self.store
-            .preference(SERVER)
+        if !within_one() {
+            return self
+                .contacts_source_ids()
+                .into_iter()
+                .find_map(|id| self.in_contacts_source(&id, || self.contacts_server()));
+        }
+        self.card_pref(SERVER)
             .and_then(|json| serde_json::from_str(&json).ok())
             .filter(|s: &carddav::Server| !s.url.is_empty())
     }
     /// When the address book was last read from the server.
     pub fn contacts_synced(&self) -> Option<i64> {
-        self.store.preference(SYNCED)?.parse().ok()
+        self.card_pref(SYNCED)?.parse().ok()
     }
     fn contacts_password(&self) -> Result<String> {
         #[cfg(test)]
@@ -61,12 +172,15 @@ impl Backend {
         {
             return self.mail_account_secret(&server.mail_account);
         }
-        store::read_secret_text(PASSWORD)?
+        store::read_secret_text(&key(PASSWORD))?
             .with_context(|| t!("manage-contacts-the-contacts-servers-password-is-missing"))
     }
     /// Signs in to a CardDAV server and reads its address books; the server
     /// and password are kept only once that works.
     pub fn connect_contacts(&self, mut server: carddav::Server, password: &str) -> Result<usize> {
+        if let Some(id) = self.route_first_book() {
+            return self.in_contacts_source(&id, || self.connect_contacts(server, password));
+        }
         let fetched = carddav::fetch_changes(&server, password, self.tls_connector()?, &[])?;
         let cards = fetched.cards;
         server.book = fetched.book;
@@ -76,15 +190,17 @@ impl Backend {
         server.books = fetched.books;
         #[cfg(not(test))]
         if server.mail_account.is_empty() {
-            store::write_secret_text(PASSWORD, password)?;
+            store::write_secret_text(&key(PASSWORD), password)?;
         }
-        self.store
-            .set_preference(SERVER, &serde_json::to_string(&server)?)?;
+        self.set_card_pref(SERVER, &serde_json::to_string(&server)?)?;
         self.replace_server_cards(cards)
     }
     /// Uses the address books of a JMAP account's server (JMAP for
     /// Contacts) instead of a CardDAV server: its sign-in is the account's.
     pub fn connect_jmap_contacts(&self, a: &Account) -> Result<usize> {
+        if let Some(id) = self.route_first_book() {
+            return self.in_contacts_source(&id, || self.connect_jmap_contacts(a));
+        }
         ensure!(a.provider == Provider::Jmap, t!("manage-contacts-only-jmap-accounts-keep-contacts-this"));
         self.with_jmap_contacts(a, crate::sync::jscal::ensure_contacts)?;
         let server = carddav::Server {
@@ -93,8 +209,7 @@ impl Backend {
             jmap_account: a.id.clone(),
             ..Default::default()
         };
-        self.store
-            .set_preference(SERVER, &serde_json::to_string(&server)?)?;
+        self.set_card_pref(SERVER, &serde_json::to_string(&server)?)?;
         self.sync_contacts()
     }
     fn with_jmap_contacts<T>(
@@ -110,6 +225,9 @@ impl Backend {
     /// Microsoft 365 through Microsoft Graph, and its organization's
     /// directory for finding people (`search_server_contacts`).
     pub fn connect_graph_contacts(&self, a: &Account) -> Result<usize> {
+        if let Some(id) = self.route_first_book() {
+            return self.in_contacts_source(&id, || self.connect_graph_contacts(a));
+        }
         ensure!(a.graph(), t!("manage-contacts-only-accounts-that-use-microsoft"));
         let server = carddav::Server {
             url: crate::sync::graph::BASE.to_owned(),
@@ -118,12 +236,15 @@ impl Backend {
             book: "graph:contacts".into(),
             ..Default::default()
         };
-        self.store.set_preference(SERVER, &serde_json::to_string(&server)?)?;
+        self.set_card_pref(SERVER, &serde_json::to_string(&server)?)?;
         self.sync_contacts()
     }
     /// Uses the contacts of an Exchange Server account's mailbox (EWS),
     /// and its organization's directory for finding people.
     pub fn connect_ews_contacts(&self, a: &Account) -> Result<usize> {
+        if let Some(id) = self.route_first_book() {
+            return self.in_contacts_source(&id, || self.connect_ews_contacts(a));
+        }
         ensure!(a.ews(), t!("manage-calendar-only-exchange-accounts"));
         let server = carddav::Server {
             url: a.ews_endpoint(),
@@ -132,7 +253,7 @@ impl Backend {
             book: "ews:contacts".into(),
             ..Default::default()
         };
-        self.store.set_preference(SERVER, &serde_json::to_string(&server)?)?;
+        self.set_card_pref(SERVER, &serde_json::to_string(&server)?)?;
         self.sync_contacts()
     }
     /// The Exchange account contacts come from, if they come from one.
@@ -179,14 +300,89 @@ impl Backend {
                 .with_context(|| t!("manage-contacts-the-account-your-contacts-come-from"))?,
         ))
     }
+    /// The mail account `id` names, for contacts that sign in as it.
+    fn contacts_account(&self, id: &str) -> Result<Option<Account>> {
+        if id.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(
+            self.store
+                .accounts()?
+                .into_iter()
+                .find(|a| a.id == id)
+                .with_context(|| t!("manage-contacts-the-account-your-contacts-come-from"))?,
+        ))
+    }
+    /// The Google account contacts come from (People API), if any.
+    fn contacts_google(&self, server: &carddav::Server) -> Result<Option<Account>> {
+        self.contacts_account(&server.google_account)
+    }
+    /// The Proton account contacts come from (Proton Contacts), if any.
+    fn contacts_proton(&self, server: &carddav::Server) -> Result<Option<Account>> {
+        self.contacts_account(&server.proton_account)
+    }
+    /// Why `server` has one address book only (Exchange's, Google's,
+    /// Proton's), if it does.
+    fn single_book(&self, server: &carddav::Server) -> Option<()> {
+        (!server.graph_account.is_empty()
+            || !server.ews_account.is_empty()
+            || !server.google_account.is_empty()
+            || !server.proton_account.is_empty())
+        .then_some(())
+    }
+    fn with_proton_contacts<T>(&self, a: &Account, work: impl FnOnce(&crate::sync::proton::Session) -> Result<T>) -> Result<T> {
+        let lock = self.account_lock(&a.id);
+        let _operation = lock.lock().unwrap();
+        self.with_proton(a, work)
+    }
+    /// Uses the contacts of a Google account signed in with OAuth, through
+    /// the People API: its sign-in is the account's.
+    pub fn connect_google_contacts(&self, a: &Account) -> Result<usize> {
+        if let Some(id) = self.route_first_book() {
+            return self.in_contacts_source(&id, || self.connect_google_contacts(a));
+        }
+        ensure!(
+            crate::manage::backend::dav_accounts::MailProvider::of(a) == Some(crate::manage::backend::dav_accounts::MailProvider::Google),
+            t!("manage-calendar-only-google-accounts")
+        );
+        let server = carddav::Server {
+            url: crate::sync::google::PEOPLE_BASE.to_owned(),
+            user: a.email.clone(),
+            google_account: a.id.clone(),
+            book: "google:contacts".into(),
+            ..Default::default()
+        };
+        self.set_card_pref(SERVER, &serde_json::to_string(&server)?)?;
+        self.sync_contacts()
+    }
+    /// Uses the Proton Contacts of a Proton account signed in without
+    /// Bridge: end-to-end encrypted with the account's own keys.
+    pub fn connect_proton_contacts(&self, a: &Account) -> Result<usize> {
+        if let Some(id) = self.route_first_book() {
+            return self.in_contacts_source(&id, || self.connect_proton_contacts(a));
+        }
+        ensure!(a.provider == Provider::Proton, t!("manage-calendar-only-proton-accounts"));
+        let server = carddav::Server {
+            url: "https://mail.proton.me".to_owned(),
+            user: a.email.clone(),
+            proton_account: a.id.clone(),
+            book: "proton:contacts".into(),
+            ..Default::default()
+        };
+        self.set_card_pref(SERVER, &serde_json::to_string(&server)?)?;
+        self.sync_contacts()
+    }
     /// Makes a new address book on the server (MKCOL, or AddressBook/set),
     /// which new contacts then go to.
     pub fn create_address_book(&self, name: &str) -> Result<()> {
         ensure!(!name.trim().is_empty(), t!("manage-contacts-give-the-address-book-a-name"));
+        if let Some(id) = self.route_first_book() {
+            return self.in_contacts_source(&id, || self.create_address_book(name));
+        }
         let mut server = self
             .contacts_server()
             .with_context(|| t!("manage-contacts-set-up-a-contacts-server-in"))?;
-        ensure!(self.contacts_graph(&server)?.is_none() && self.contacts_ews(&server)?.is_none(), t!("manage-contacts-exchange-contacts-have-one-address-book"));
+        ensure!(self.single_book(&server).is_none(), t!("manage-contacts-exchange-contacts-have-one-address-book"));
         server.book = match self.contacts_jmap(&server)? {
             Some(a) => format!(
                 "jmap:{}",
@@ -199,14 +395,19 @@ impl Backend {
                 name.trim(),
             )?,
         };
-        self.store
-            .set_preference(SERVER, &serde_json::to_string(&server)?)
+        self.set_card_pref(SERVER, &serde_json::to_string(&server)?)
     }
     /// The server's address books: (href, name, whether it can be written).
     pub fn address_books(&self) -> Result<Vec<(String, String, bool)>> {
+        if let Some(id) = self.route_first_book() {
+            return self.in_contacts_source(&id, || self.address_books());
+        }
         let server = self
             .contacts_server()
             .with_context(|| t!("manage-contacts-no-contacts-server-is-set-up"))?;
+        if !server.google_account.is_empty() || !server.proton_account.is_empty() {
+            return Ok(vec![(format!("{}:contacts", if server.google_account.is_empty() { "proton" } else { "google" }), t!("manage-contacts-contacts").into(), true)]);
+        }
         if self.contacts_graph(&server)?.is_some() || self.contacts_ews(&server)?.is_some() {
             return Ok(vec![("graph:contacts".into(), t!("manage-contacts-contacts").into(), true)]);
         }
@@ -225,8 +426,28 @@ impl Backend {
     /// here yet: for address books and directories that don't list all
     /// they hold. Returns how many were new.
     pub fn search_server_contacts(&self, text: &str) -> Result<usize> {
+        if !within_one() {
+            // Each source that searches (JMAP's, Google's and Proton's are
+            // read whole already).
+            let mut added = 0;
+            let mut searched = false;
+            for id in self.contacts_source_ids() {
+                let searches = self.in_contacts_source(&id, || {
+                    self.contacts_server().is_some_and(|s| s.jmap_account.is_empty() && s.google_account.is_empty() && s.proton_account.is_empty())
+                });
+                if searches {
+                    searched = true;
+                    added += self.in_contacts_source(&id, || self.search_server_contacts(text))?;
+                }
+            }
+            ensure!(searched, t!("manage-contacts-this-servers-contacts-are-all-read"));
+            return Ok(added);
+        }
         let server = self.contacts_server().with_context(|| t!("manage-contacts-no-contacts-server-is-set-up"))?;
-        ensure!(self.contacts_jmap(&server)?.is_none(), t!("manage-contacts-this-servers-contacts-are-all-read"));
+        ensure!(
+            self.contacts_jmap(&server)?.is_none() && server.google_account.is_empty() && server.proton_account.is_empty(),
+            t!("manage-contacts-this-servers-contacts-are-all-read")
+        );
         let found = match self.contacts_graph(&server)? {
             // The organization's directory, and people you work with.
             Some(a) => self.with_graph_contacts(&a, |s| s.search_directory(text.trim(), 50))?,
@@ -249,8 +470,13 @@ impl Backend {
     /// The account's storage on the contacts server (used, left), where
     /// it says (RFC 4331); JMAP servers don't.
     pub fn contacts_quota(&self) -> Result<Option<(u64, u64)>> {
+        if let Some(id) = self.route_first_book() {
+            return self.in_contacts_source(&id, || self.contacts_quota());
+        }
         let server = self.contacts_server().with_context(|| t!("manage-contacts-no-contacts-server-is-set-up"))?;
-        if self.contacts_jmap(&server)?.is_some() || self.contacts_graph(&server)?.is_some() || self.contacts_ews(&server)?.is_some() {
+        // Only CardDAV servers say (RFC 4331).
+        let api = [&server.jmap_account, &server.graph_account, &server.ews_account, &server.google_account, &server.proton_account];
+        if api.iter().any(|a| !a.is_empty()) {
             return Ok(None);
         }
         carddav::quota(&server, &self.contacts_password()?, self.tls_connector()?)
@@ -258,10 +484,13 @@ impl Backend {
     /// Renames an address book on the server.
     pub fn rename_address_book(&self, href: &str, name: &str) -> Result<()> {
         ensure!(!name.trim().is_empty(), t!("manage-contacts-give-the-address-book-a-name"));
+        if let Some(id) = self.route_first_book() {
+            return self.in_contacts_source(&id, || self.rename_address_book(href, name));
+        }
         let server = self
             .contacts_server()
             .with_context(|| t!("manage-contacts-no-contacts-server-is-set-up"))?;
-        ensure!(self.contacts_graph(&server)?.is_none() && self.contacts_ews(&server)?.is_none(), t!("manage-contacts-exchange-contacts-have-one-address-book"));
+        ensure!(self.single_book(&server).is_none(), t!("manage-contacts-exchange-contacts-have-one-address-book"));
         match self.contacts_jmap(&server)? {
             Some(a) => {
                 let id = href.strip_prefix("jmap:").with_context(|| t!("manage-contacts-not-a-jmap-address-book"))?;
@@ -281,10 +510,13 @@ impl Backend {
     /// Deletes an address book and its cards from the server, then reads
     /// what's left.
     pub fn delete_address_book(&self, href: &str) -> Result<usize> {
+        if let Some(id) = self.route_first_book() {
+            return self.in_contacts_source(&id, || self.delete_address_book(href));
+        }
         let mut server = self
             .contacts_server()
             .with_context(|| t!("manage-contacts-no-contacts-server-is-set-up"))?;
-        ensure!(self.contacts_graph(&server)?.is_none() && self.contacts_ews(&server)?.is_none(), t!("manage-contacts-exchange-contacts-have-one-address-book"));
+        ensure!(self.single_book(&server).is_none(), t!("manage-contacts-exchange-contacts-have-one-address-book"));
         match self.contacts_jmap(&server)? {
             Some(a) => {
                 let id = href.strip_prefix("jmap:").with_context(|| t!("manage-contacts-not-a-jmap-address-book"))?;
@@ -304,8 +536,7 @@ impl Backend {
         if server.book == href {
             server.book.clear();
         }
-        self.store
-            .set_preference(SERVER, &serde_json::to_string(&server)?)?;
+        self.set_card_pref(SERVER, &serde_json::to_string(&server)?)?;
         // Its cards go from here too.
         let kept: Vec<Card> = self
             .contacts()
@@ -317,9 +548,29 @@ impl Backend {
     }
     /// Reads the address books again from the server set up before.
     pub fn sync_contacts(&self) -> Result<usize> {
+        if !within_one() {
+            let results: Vec<(String, Result<usize>)> = self
+                .contacts_source_ids()
+                .into_iter()
+                .filter_map(|id| {
+                    self.in_contacts_source(&id, || self.contacts_server().is_some().then(|| self.sync_contacts())).map(|r| (id, r))
+                })
+                .collect();
+            ensure!(!results.is_empty(), t!("manage-contacts-no-contacts-server-is-set-up"));
+            return super::calendar::together(results, |id| self.contacts_source_label(id));
+        }
         let mut server = self
             .contacts_server()
             .with_context(|| t!("manage-contacts-no-contacts-server-is-set-up"))?;
+        if let Some(a) = self.contacts_google(&server)? {
+            let cards = self.with_google(&a, |s| s.contacts())?;
+            return self.replace_server_cards(cards);
+        }
+        if let Some(a) = self.contacts_proton(&server)? {
+            let known: Vec<Card> = self.contacts().into_iter().filter(from_server).collect();
+            let cards = self.with_proton_contacts(&a, |s| s.contacts(&known))?;
+            return self.replace_server_cards(cards);
+        }
         if let Some(a) = self.contacts_ews(&server)? {
             let cards = self.ews_contacts(&a)?;
             return self.replace_server_cards(cards);
@@ -364,8 +615,7 @@ impl Backend {
                 changed = true;
             }
             if changed {
-                self.store
-                    .set_preference(SERVER, &serde_json::to_string(&server)?)?;
+                self.set_card_pref(SERVER, &serde_json::to_string(&server)?)?;
             }
             return self.replace_server_cards(cards);
         }
@@ -389,8 +639,7 @@ impl Backend {
             server.vcard4 = fetched.vcard4;
             server.max_size = fetched.max_size;
             server.books = fetched.books;
-            self.store
-                .set_preference(SERVER, &serde_json::to_string(&server)?)?;
+            self.set_card_pref(SERVER, &serde_json::to_string(&server)?)?;
         }
         self.replace_server_cards(fetched.cards)
     }
@@ -406,21 +655,29 @@ impl Backend {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_secs());
-        self.store.set_preference(SYNCED, &now.to_string())?;
+        self.set_card_pref(SYNCED, &now.to_string())?;
         Ok(count)
     }
     /// Stops reading contacts from the server, forgetting its cards.
     pub fn disconnect_contacts(&self) -> Result<()> {
+        if let Some(id) = self.route_first_book() {
+            return self.in_contacts_source(&id, || self.disconnect_contacts());
+        }
         let kept: Vec<Card> = self
             .contacts()
             .into_iter()
             .filter(|c| !from_server(c))
             .collect();
         self.save_contacts(&kept)?;
-        self.store.set_preference(SERVER, "")?;
-        self.store.set_preference(SYNCED, "")?;
+        self.set_card_pref(SERVER, "")?;
+        self.set_card_pref(SYNCED, "")?;
         #[cfg(not(test))]
-        store::delete_secret(PASSWORD)?;
+        store::delete_secret(&key(PASSWORD))?;
+        // Another source's keys aren't read again: gone.
+        let id = pim_sources::current(Pim::Contacts).unwrap_or_default();
+        if !id.is_empty() {
+            self.clear_source_keys(&id, &[CARDS, SERVER, SYNCED])?;
+        }
         Ok(())
     }
     /// Adds a contact, or saves changes to one (found by UID): on the
@@ -450,14 +707,22 @@ impl Backend {
                 t!("manage-contacts-isnt-a-valid-email-address", email = email)
             );
         }
+        if let Some(id) = self.route_card(&card.uid) {
+            return self.in_contacts_source(&id, || self.save_contact(card));
+        }
         if card.uid.is_empty() {
             card.uid = uuid::Uuid::new_v4().to_string();
         }
+        let card_uid = card.uid.clone();
         let saved = match self.contacts_server() {
             // Found in the directory: kept here, not written to it.
             Some(_) if card.href.starts_with("graph-directory:") || card.href.starts_with("ews-directory:") => Card { href: String::new(), ..card },
             Some(server) if from_server(&card) || !server.book.is_empty() => {
-                if let Some(a) = self.contacts_ews(&server)? {
+                if let Some(a) = self.contacts_google(&server)? {
+                    self.with_google(&a, |s| s.save_contact(&card))?
+                } else if let Some(a) = self.contacts_proton(&server)? {
+                    self.with_proton_contacts(&a, |s| s.save_contact(&card))?
+                } else if let Some(a) = self.contacts_ews(&server)? {
                     self.ews_save_contact(&a, &card)?
                 } else if let Some(a) = self.contacts_graph(&server)? {
                     self.with_graph_contacts(&a, |s| s.save_contact(&card))?
@@ -476,13 +741,17 @@ impl Backend {
             _ => card,
         };
         let mut all = self.contacts();
-        all.retain(|c| c.uid != saved.uid);
+        // Google and Proton name a new card themselves.
+        all.retain(|c| c.uid != saved.uid && c.uid != card_uid);
         all.push(saved.clone());
         self.save_contacts(&all)?;
         Ok(saved)
     }
     /// Removes a contact, from the server too when it's there.
     pub fn delete_contact(&self, uid: &str) -> Result<()> {
+        if let Some(id) = self.route_card(uid) {
+            return self.in_contacts_source(&id, || self.delete_contact(uid));
+        }
         let mut all = self.contacts();
         let Some(card) = all.iter().find(|c| c.uid == uid).cloned() else {
             return Ok(());
@@ -492,6 +761,16 @@ impl Backend {
             && !card.href.starts_with("ews-directory:")
             && let Some(server) = self.contacts_server()
         {
+            if let Some(a) = self.contacts_google(&server)? {
+                self.with_google(&a, |s| s.delete_contact(&card))?;
+                all.retain(|c| c.uid != uid);
+                return self.save_contacts(&all);
+            }
+            if let Some(a) = self.contacts_proton(&server)? {
+                self.with_proton_contacts(&a, |s| s.delete_contact(&card))?;
+                all.retain(|c| c.uid != uid);
+                return self.save_contacts(&all);
+            }
             if let Some(a) = self.contacts_ews(&server)? {
                 self.ews_delete_contact(&a, &card)?;
                 all.retain(|c| c.uid != uid);
@@ -517,6 +796,10 @@ impl Backend {
     }
     /// Adds the cards in vCard files; a card with the same UID is replaced.
     pub fn import_contacts(&self, paths: &[std::path::PathBuf]) -> Result<usize> {
+        // Kept on this computer, with the first source's cards.
+        if let Some(id) = self.route_first_book() {
+            return self.in_contacts_source(&id, || self.import_contacts(paths));
+        }
         let mut added = Vec::new();
         for path in paths {
             // Address books are megabytes at most (photos included): a file
@@ -568,6 +851,9 @@ impl Backend {
     }
     /// Forgets the contacts kept on this computer (the server's stay).
     pub fn clear_imported_contacts(&self) -> Result<()> {
+        if let Some(id) = self.route_first_book() {
+            return self.in_contacts_source(&id, || self.clear_imported_contacts());
+        }
         let kept: Vec<Card> = self.contacts().into_iter().filter(from_server).collect();
         self.save_contacts(&kept)
     }

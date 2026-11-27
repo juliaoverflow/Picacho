@@ -12,6 +12,9 @@
 //! - `has:receipt` — a receipt or a refund's (`has:receipts`,
 //!   `has:invoice`, `has:purchase`). Which mail is which kind is in
 //!   `mail_kinds`.
+//! - `category:promotions` — mail the inbox sorts into a category
+//!   (`primary`, `transactions`, `updates`, `promotions`, `social`,
+//!   `forums`; see `categories`).
 //! - `newer:7d`, `older:1y` — received within, or longer ago than, so many
 //!   days (`d`), weeks (`w`), months (`m`) or years (`y`) (`newer_than:`,
 //!   `older_than:` too).
@@ -20,6 +23,7 @@
 //!
 //! Matching ignores case. Anything not understood as a term (`http://x`,
 //! `from:` with nothing after it) is searched for as written.
+use super::categories::{Category, Sorter};
 use super::mail_kinds::Kinds;
 use super::model::Mail;
 use std::sync::Arc;
@@ -53,6 +57,8 @@ enum Field {
     /// In the server's conversation `value` (as `Mail::thread_id` keeps
     /// it: "oid:…" or "gm:…"), case kept.
     Thread,
+    /// Sorted into an inbox category (`value` is its key).
+    Category,
 }
 
 impl Field {
@@ -60,6 +66,11 @@ impl Field {
     /// (`Store::mail_kinds`), which a server's search can't tell.
     fn kind(&self) -> bool {
         matches!(self, Self::Code | Self::Package | Self::Receipt)
+    }
+    /// Whether only this computer can tell (the kinds of mail, inbox
+    /// categories): checked here on what a server's search finds.
+    fn local(&self) -> bool {
+        self.kind() || *self == Self::Category
     }
 }
 
@@ -79,6 +90,9 @@ pub struct Search {
     /// out from the cache; without it (or for mail not looked at), its
     /// subject, preview and sender decide.
     kinds: Option<Arc<Kinds>>,
+    /// How the inbox is sorted into categories, for `category:`; without
+    /// it, as it is sorted at first.
+    sorter: Option<Arc<Sorter>>,
 }
 
 /// The fields the search understands, for hints: (operator, what it finds).
@@ -94,6 +108,7 @@ pub const OPERATORS: &[(&str, &str)] = &[
     ("has:otp", "Sign-in and verification codes"),
     ("has:package-update", "News of where a package is"),
     ("has:receipt", "Receipts and refunds"),
+    ("category:", "An inbox category (primary, social…)"),
     ("newer:", "Received within a time (7d, 2w, 3m, 1y)"),
     ("older:", "Received longer ago (7d, 2w, 3m, 1y)"),
 ];
@@ -142,7 +157,11 @@ impl Search {
             .into_iter()
             .filter_map(|(raw, quoted)| term(&raw, quoted))
             .collect();
-        Self { terms, kinds: None }
+        Self {
+            terms,
+            kinds: None,
+            sorter: None,
+        }
     }
     /// The search, telling code mail, package updates and receipts by
     /// `kinds`.
@@ -155,10 +174,17 @@ impl Search {
     pub fn wants_kinds(&self) -> bool {
         self.terms.iter().any(|t| t.field.kind())
     }
+    /// The search, telling inbox categories by `sorter`.
+    pub fn with_sorter(mut self, sorter: Option<Arc<Sorter>>) -> Self {
+        self.sorter = sorter;
+        self
+    }
+    /// Whether it asks for an inbox category (`category:`).
+    pub fn wants_categories(&self) -> bool {
+        self.terms.iter().any(|t| t.field == Field::Category)
+    }
     pub fn matches(&self, m: &Mail) -> bool {
-        self.terms
-            .iter()
-            .all(|t| t.matches(m, self.kinds.as_deref()) != t.negated)
+        self.terms.iter().all(|t| t.matches(m, self) != t.negated)
     }
     /// The words and phrases searched for anywhere (not `field:` terms),
     /// for the local full-text index: those a message must hold, and those
@@ -182,7 +208,7 @@ impl Search {
         self.terms
             .iter()
             .filter(|t| t.field != Field::Any)
-            .all(|t| t.matches(m, self.kinds.as_deref()) != t.negated)
+            .all(|t| t.matches(m, self) != t.negated)
     }
     /// The search's words and phrases alone (`-word` too), written as a
     /// query: what a server is asked for, for mail whose text isn't here to
@@ -203,13 +229,13 @@ impl Search {
             .join(" ")
     }
     /// Whether a message is the kinds of mail asked for (`has:otp`,
-    /// `has:package-update`, `has:receipt`): what a server's search can't
-    /// tell, checked on what it found.
+    /// `has:package-update`, `has:receipt`) and in the categories asked
+    /// for: what a server's search can't tell, checked on what it found.
     pub fn matches_kinds(&self, m: &Mail) -> bool {
         self.terms
             .iter()
-            .filter(|t| t.field.kind())
-            .all(|t| t.matches(m, self.kinds.as_deref()) != t.negated)
+            .filter(|t| t.field.local())
+            .all(|t| t.matches(m, self) != t.negated)
     }
     /// The search as IMAP SEARCH criteria, for asking the server to search
     /// the whole mailbox. `string` makes a search string (quoted, or a
@@ -231,6 +257,11 @@ impl Search {
         let mut parts = Vec::new();
         for t in &self.terms {
             let v = || string(&t.value);
+            // No server sorts mail as this computer does: what it finds is
+            // narrowed down here (`matches_kinds`).
+            if t.field == Field::Category {
+                continue;
+            }
             if t.field == Field::Thread {
                 // A server's own conversation: THREADID (RFC 8474 §6) or
                 // Gmail's X-GM-THRID, where the id is that kind; elsewhere
@@ -270,7 +301,7 @@ impl Search {
                 Field::Code => any_subject(CODE_SUBJECT_WORDS, string)?,
                 Field::Package => any_subject(PACKAGE_SUBJECT_WORDS, string)?,
                 Field::Receipt => any_subject(RECEIPT_SUBJECT_WORDS, string)?,
-                Field::Thread => unreachable!("handled above"),
+                Field::Thread | Field::Category => unreachable!("handled above"),
             };
             parts.push(if t.negated { format!("NOT ({part})") } else { part });
         }
@@ -282,9 +313,10 @@ impl Search {
         use serde_json::json;
         self.terms
             .iter()
-            // JMAP's filter has no conversation (RFC 8621 §4.4.1); the
-            // term is matched here, on what is found.
-            .filter(|t| t.field != Field::Thread)
+            // JMAP's filter has no conversation (RFC 8621 §4.4.1), nor
+            // this computer's categories; those terms are matched here, on
+            // what is found.
+            .filter(|t| !matches!(t.field, Field::Thread | Field::Category))
             .map(|t| {
                 let v = &t.value;
                 let c = match t.field {
@@ -312,7 +344,7 @@ impl Search {
                             json!({ "before": at })
                         }
                     }
-                    Field::Thread => unreachable!("filtered out above"),
+                    Field::Thread | Field::Category => unreachable!("filtered out above"),
                     Field::Code | Field::Package | Field::Receipt => {
                         let words = match t.field {
                             Field::Code => CODE_SUBJECT_WORDS,
@@ -378,7 +410,8 @@ fn any_subject(
 }
 
 impl Term {
-    fn matches(&self, m: &Mail, kinds: Option<&Kinds>) -> bool {
+    fn matches(&self, m: &Mail, search: &Search) -> bool {
+        let kinds = search.kinds.as_deref();
         // Most text is ASCII: compared without a lowercase copy of each
         // field, for each term, of every message searched.
         let has = |s: &str| {
@@ -410,6 +443,16 @@ impl Term {
             Field::Package => Kinds::package(kinds, m),
             Field::Receipt => Kinds::receipt(kinds, m),
             Field::Thread => m.thread_id() == self.value,
+            Field::Category => {
+                let Some(wanted) = Category::parse(&self.value) else {
+                    return false;
+                };
+                let sorter = search.sorter.clone().unwrap_or_default();
+                // Its own category, or the tab it shows under (Primary
+                // holds those without a tab).
+                let category = sorter.category(m);
+                category == wanted || sorter.prefs.fold(category) == wanted
+            }
             Field::Newer | Field::Older => {
                 let cutoff = chrono::Utc::now().timestamp() - self.value.parse::<i64>().unwrap_or(0);
                 if self.field == Field::Newer {
@@ -505,6 +548,7 @@ fn term(raw: &str, phrase: bool) -> Option<Term> {
         "cc" => Field::Cc,
         "subject" => Field::Subject,
         "label" | "tag" | "keyword" => Field::Label,
+        "category" | "in" if Category::parse(value).is_some() => Field::Category,
         // Backend-only until the UI calls it: a conversation's messages on
         // the server. Ids are case-sensitive, so the typed one is kept.
         "thread" => {
@@ -590,6 +634,51 @@ mod tests {
         m.set_thread_id("oid:T64b478a75b7ea9");
         assert!(Search::parse("thread:oid:T64b478a75b7ea9").matches(&m));
         assert!(!Search::parse("thread:oid:t64b478a75b7ea9").matches(&m), "case kept");
+    }
+
+    #[test]
+    fn categories_are_searched_here() {
+        let quote = |s: &str| Ok(format!("\"{s}\""));
+        let promo = Mail {
+            from: "news@shop.example".into(),
+            subject: "Up to 70% off".into(),
+            list_unsubscribe: "<https://shop.example/u>".into(),
+            ..Mail::default()
+        };
+        let person = Mail {
+            from: "ana@example.com".into(),
+            subject: "Lunch?".into(),
+            ..Mail::default()
+        };
+        let s = Search::parse("category:promotions");
+        assert!(s.wants_categories() && !s.wants_kinds());
+        assert!(s.matches(&promo) && !s.matches(&person));
+        assert!(Search::parse("in:promo").matches(&promo));
+        assert!(Search::parse("-category:promotions").matches(&person));
+        assert!(Search::parse("category:primary").matches(&person));
+        // Sorted as the person chose.
+        let mut prefs = crate::manage::categories::Categorizing::default();
+        prefs.set_sender("news@shop.example", Some(Category::Primary));
+        let sorter = Some(Arc::new(Sorter::new(prefs)));
+        let primary = Search::parse("category:primary").with_sorter(sorter.clone());
+        assert!(primary.matches(&promo));
+        // A tab turned off: its mail is in Primary too, and still found by
+        // its own name.
+        let mut prefs = crate::manage::categories::Categorizing::default();
+        prefs.toggle_tab(Category::Promotions);
+        let sorter = Some(Arc::new(Sorter::new(prefs)));
+        let primary = Search::parse("category:primary").with_sorter(sorter.clone());
+        assert!(primary.matches(&promo));
+        let promotions = Search::parse("category:promotions").with_sorter(sorter);
+        assert!(promotions.matches(&promo));
+        // Servers can't tell: nothing is sent, and what they find is
+        // narrowed down here.
+        assert_eq!(s.imap_criteria(&quote).unwrap(), "ALL");
+        assert!(s.jmap_conditions().is_empty());
+        assert!(s.matches_kinds(&promo) && !s.matches_kinds(&person));
+        // Not a category: searched for as written.
+        assert!(!Search::parse("category:nothing").wants_categories());
+        assert!(!Search::parse("in:sent").wants_categories());
     }
 
     #[test]

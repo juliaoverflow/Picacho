@@ -25,7 +25,7 @@ use anyhow::{Context, Result, anyhow};
 use protected_email_bridge::{
     api::ApiClient,
     push::{
-        DeviceKeyManager, DeviceRegistrationRecord, Presentation, PushEnvelope, Registrar,
+        DeviceKeyManager, DeviceRegistrationRecord, EmailAction, Notification, PushEnvelope, Registrar, Sender,
         SecureStore,
         fcm::{FcmAndroidApp, FcmConfig, FcmPushProvider},
         registration::{
@@ -292,6 +292,43 @@ fn report(account: &str, result: std::result::Result<(), String>) {
 }
 
 /// Shows a push: the account's id and what to show.
+/// What a push shows (Proton's library hands over the notification itself
+/// and leaves showing it to the app, §14.5).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Presentation {
+    /// Show (or replace) the notification for (account, `message_id`).
+    ShowEmail { subject: String, sender: Sender, message_id: String },
+    /// Take away the notification for (account, `message_id`): read elsewhere.
+    Dismiss { message_id: String },
+    /// A notice from Proton; `url` only where it is HTTPS, else tapping
+    /// opens nothing.
+    ShowNotice { content: String, sender: Sender, url: Option<String> },
+    /// Nothing to show (an action this app doesn't know).
+    Ignore,
+}
+
+impl Presentation {
+    /// What `n` shows (§14.5.2, §14.5.3).
+    pub fn of(n: &Notification) -> Self {
+        match n {
+            Notification::Email(e) => match &e.action {
+                EmailAction::MessageCreated => Presentation::ShowEmail {
+                    subject: e.body.clone(),
+                    sender: e.sender.clone(),
+                    message_id: e.message_id.clone(),
+                },
+                EmailAction::MessageTouched => Presentation::Dismiss { message_id: e.message_id.clone() },
+                EmailAction::Other(_) => Presentation::Ignore,
+            },
+            Notification::OpenUrl(o) => Presentation::ShowNotice {
+                content: o.body.clone(),
+                sender: o.sender.clone(),
+                url: protected_email_bridge::push::payload::is_safe_url(&o.url).then(|| o.url.clone()),
+            },
+        }
+    }
+}
+
 pub type Deliver = Arc<dyn Fn(&str, Presentation) + Send + Sync>;
 /// Hears whether an account's session was registered with Proton for
 /// pushes: the account's id, and the error if Proton refused it.

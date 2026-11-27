@@ -69,6 +69,16 @@ const APP_PLATFORM: Option<&str> = option_env!("PICACHO_PROTON_APP_PLATFORM_OVER
 const PUSH_APP_TOKEN: Option<&str> = option_env!("PICACHO_PROTON_PUSH_APP_TOKEN");
 const PUSH_APP_VERSION: Option<&str> = option_env!("PICACHO_PROTON_PUSH_APP_VERSION");
 const PUSH_APP_PLATFORM: Option<&str> = option_env!("PICACHO_PROTON_PUSH_APP_PLATFORM");
+/// The same three for Proton Pass, where Proton keeps its own aliases
+/// (`proton/aliases.rs`): `PICACHO_PROTON_PASS_APP_TOKEN`,
+/// `PICACHO_PROTON_PASS_APP_VERSION` and `PICACHO_PROTON_PASS_APP_PLATFORM`.
+/// Proton gives Pass access by registration, which a mail app's may not
+/// have; with a token or version set, Pass's requests go through a session
+/// forked from the account's for that registration. Each one unset is the
+/// general one; with neither token nor version, the account's own session.
+const PASS_APP_TOKEN: Option<&str> = option_env!("PICACHO_PROTON_PASS_APP_TOKEN");
+const PASS_APP_VERSION: Option<&str> = option_env!("PICACHO_PROTON_PASS_APP_VERSION");
+const PASS_APP_PLATFORM: Option<&str> = option_env!("PICACHO_PROTON_PASS_APP_PLATFORM");
 
 fn set(value: Option<&'static str>) -> Option<&'static str> {
     value.filter(|v| !v.trim().is_empty())
@@ -115,9 +125,43 @@ fn config() -> Arc<DeploymentConfig> {
                 push_app_platform: set(PUSH_APP_PLATFORM).map(|p| p.trim().to_owned()),
                 product_name: "Picacho".into(),
                 api_tls_pins: Vec::new(),
+                // No pins, so no pin-violation reports.
+                tls_report_url: None,
             })
         })
         .clone()
+}
+
+/// The deployment Proton Pass's session identifies as, when this build has
+/// a Pass registration (`PASS_APP_TOKEN`, `PASS_APP_VERSION`).
+fn pass_config() -> Option<Arc<DeploymentConfig>> {
+    static CONFIG: OnceLock<Option<Arc<DeploymentConfig>>> = OnceLock::new();
+    CONFIG
+        .get_or_init(|| {
+            registered(PASS_APP_TOKEN, PASS_APP_VERSION).then(|| {
+                let general = config();
+                Arc::new(DeploymentConfig {
+                    app_product_token: set(PASS_APP_TOKEN)
+                        .map(|t| t.trim().to_owned())
+                        .unwrap_or_else(|| general.app_product_token.clone()),
+                    app_version: set(PASS_APP_VERSION)
+                        .map(|v| v.trim().to_owned())
+                        .unwrap_or_else(|| general.app_version.clone()),
+                    app_platform: set(PASS_APP_PLATFORM)
+                        .map(|p| p.trim().to_owned())
+                        .or_else(|| general.app_platform.clone()),
+                    ..(*general).clone()
+                })
+            })
+        })
+        .clone()
+}
+
+/// Whether this build signs in to Proton Pass separately (it has a Pass
+/// registration): Proton gives a session Pass access only when it signed
+/// in as an app with Pass, which a fork of a mail session doesn't gain.
+pub fn pass_sign_in() -> bool {
+    pass_config().is_some()
 }
 
 /// The deployment every Proton client here uses (push's too).
@@ -200,6 +244,10 @@ fn explain_sign_in(e: ProtonError, step: &str) -> anyhow::Error {
     })
 }
 
+mod aliases;
+mod pim;
+pub use pim::{PROTON_ID, ProtonCalendar, occurrence_id as proton_occurrence_id};
+
 trait Explained<T> {
     fn explained(self) -> Result<T>;
 }
@@ -229,14 +277,14 @@ impl std::fmt::Debug for Saved {
     }
 }
 impl Saved {
-    fn tokens(&self) -> SessionTokens {
+    pub(crate) fn tokens(&self) -> SessionTokens {
         SessionTokens {
             uid: self.uid.clone(),
             access_token: self.access_token.clone(),
             refresh_token: self.refresh_token.clone(),
         }
     }
-    fn with_tokens(&self, t: &SessionTokens) -> Self {
+    pub(crate) fn with_tokens(&self, t: &SessionTokens) -> Self {
         Self {
             uid: t.uid.clone(),
             access_token: t.access_token.clone(),
@@ -442,8 +490,28 @@ impl Login {
         cancel: &AtomicBool,
         verifying: &dyn Fn(),
     ) -> Result<Self> {
+        Self::begin_as(config(), username, password, cancel, verifying)
+    }
+    /// The same, signing in as this build's Pass registration
+    /// (`PICACHO_PROTON_PASS_APP_*`), for a session with Pass access.
+    pub fn begin_for_pass(
+        username: &str,
+        password: &str,
+        cancel: &AtomicBool,
+        verifying: &dyn Fn(),
+    ) -> Result<Self> {
+        let config = pass_config().with_context(|| t!("sync-proton-this-build-has-no-pass-registration"))?;
+        Self::begin_as(config, username, password, cancel, verifying)
+    }
+    fn begin_as(
+        config: Arc<DeploymentConfig>,
+        username: &str,
+        password: &str,
+        cancel: &AtomicBool,
+        verifying: &dyn Fn(),
+    ) -> Result<Self> {
         block_on(async {
-            let client = ApiClient::new(config()).explained()?;
+            let client = ApiClient::new(config).explained()?;
             let mut hv = None;
             let mut checks = 0;
             loop {
@@ -624,6 +692,24 @@ impl Login {
                 .collect(),
         })
     }
+    /// The session alone, once Proton needs nothing more from the person
+    /// (no second factor left), without unlocking the keys: a Pass session
+    /// opens vaults with the mail session's keys, so its own aren't needed,
+    /// nor the mailbox password. The session is kept, not signed out.
+    pub fn session_only(&mut self) -> Result<Saved> {
+        let pending = self.pending()?;
+        ensure!(!pending.needs_second_factor(), t!("sync-proton-enter-the-code-from-your-authenticator"));
+        let saved = Saved {
+            uid: pending.auth.uid.clone(),
+            access_token: pending.auth.access_token.clone(),
+            refresh_token: pending.auth.refresh_token.clone(),
+            key: String::new(),
+        };
+        // Let go without `abort` (which `Drop` would do): the session is
+        // the caller's now.
+        self.pending = None;
+        Ok(saved)
+    }
     /// Gives up, signing the session out.
     pub fn abort(mut self) {
         if let Some(p) = self.pending.take() {
@@ -701,6 +787,16 @@ pub struct Session {
     /// Set when Proton issued new tokens (each refresh replaces the
     /// refresh token), until `renewed` hands them to the keychain.
     renewed: Arc<Mutex<Option<SessionTokens>>>,
+    /// The account's Proton Pass client, made on first use (`aliases.rs`),
+    /// and the vault new aliases go in once it is opened.
+    pass: Mutex<Option<protected_email_bridge::pass::VaultClient>>,
+    pass_vault: Mutex<Option<String>>,
+    /// Whether Pass's extra password was verified for this session's Pass
+    /// requests (`aliases.rs`).
+    pass_unlocked: AtomicBool,
+    /// New tokens of a Pass session signed in separately (`aliases.rs`),
+    /// until `pass_renewed` hands them over to be saved.
+    pass_tokens: Arc<Mutex<Option<SessionTokens>>>,
 }
 
 /// A folder or label of the account.
@@ -769,6 +865,10 @@ impl Session {
             ctx,
             saved: Mutex::new(saved.clone()),
             renewed,
+            pass: Mutex::new(None),
+            pass_vault: Mutex::new(None),
+            pass_unlocked: AtomicBool::new(false),
+            pass_tokens: Arc::new(Mutex::new(None)),
         })
     }
     /// New tokens to save, if Proton issued any since the last call.
@@ -841,6 +941,15 @@ impl Session {
         };
         let n = block_on(self.ctx.client.count_messages(&filter)).explained()?;
         Ok(usize::try_from(n).unwrap_or(0))
+    }
+    /// The messages with this Message-ID (`<…>` or bare).
+    pub fn by_message_id(&self, message_id: &str) -> Result<Vec<MessageMetadata>> {
+        let filter = MessageFilter {
+            external_id: message_id.trim().trim_matches(['<', '>']).to_owned(),
+            desc: true,
+            ..Default::default()
+        };
+        block_on(self.ctx.client.list_messages(&filter, 0, 10)).explained()
     }
     /// The current state of these messages; ones that are gone are left out.
     pub fn metadata(&self, ids: &[String]) -> Result<Vec<MessageMetadata>> {

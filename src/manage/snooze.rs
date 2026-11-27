@@ -4,12 +4,16 @@
 //! on every provider. (Proton refuses a top-level folder named "Snoozed":
 //! the name is its own snooze's.)
 //!
-//! The times are kept on this computer and, where the server has METADATA
-//! (RFC 5464), also as a private annotation on the inbox, so Picacho on
-//! another computer wakes them too. Messages are found again by their
-//! Message-ID: their UIDs change when they move. One moved out of Snoozed
-//! by hand is simply forgotten.
+//! The times are kept on this computer and on the server, so Picacho on
+//! another computer shows and wakes them too (`shared`): as a private
+//! annotation on the inbox where the server has METADATA (RFC 5464), and
+//! otherwise as a note in the Picacho folder. A message woken or unsnoozed
+//! on one computer stops being snoozed on the others; one snoozed again
+//! takes the newer time. Messages are found again by their Message-ID (or
+//! their ids, which every computer shares): their UIDs change when they
+//! move. One moved out of Snoozed by hand is simply forgotten.
 use super::*;
+use super::shared::{GONE_FOR_MS, Gone, ListKind, Stampable, Stamped, now_ms};
 
 /// The folder snoozed mail waits in, inside `PARENT`.
 pub const FOLDER: &str = "Snoozed";
@@ -49,8 +53,38 @@ fn child_folder(names: &[Name], parent: &str, leaf: &str) -> Option<String> {
         .find(|n| n.name.eq_ignore_ascii_case(&name))
         .map(|n| n.name.clone())
 }
-/// Where the times are kept on servers with METADATA.
+/// Where the times are kept on servers with METADATA, as an array (as
+/// earlier versions wrote them, and read them still).
 const ENTRY: &str = "/private/vendor/tech.pinal.picacho/snoozed";
+/// Where the messages no longer snoozed are kept beside them.
+const GONE_ENTRY: &str = "/private/vendor/tech.pinal.picacho/snoozed-gone";
+
+/// Held while the list here is merged with the server's (snoozing and
+/// waking hold the account's lock, as sharing does too).
+static SNOOZED: Mutex<()> = Mutex::new(());
+
+fn snooze_state_key(account: &str) -> String {
+    format!("snoozed_synced:{account}")
+}
+fn load_snooze_list(b: &Backend, account: &str) -> Stamped<Snoozed> {
+    let mut list = Stamped { entries: b.snoozed(account), gone: b.snoozed_gone(account) };
+    list.normalize();
+    list
+}
+fn store_snooze_list(b: &Backend, account: &str, list: &Stamped<Snoozed>) -> Result<()> {
+    b.store_snoozed(account, &list.entries, &list.gone)
+}
+/// The snoozed messages, as they're shared (`shared`).
+pub(crate) static SNOOZE_LIST: ListKind<Snoozed> = ListKind {
+    note: "snoozed",
+    entry: ENTRY,
+    gone_entry: Some(GONE_ENTRY),
+    state_key: snooze_state_key,
+    load: load_snooze_list,
+    store: store_snooze_list,
+    guard: &SNOOZED,
+    always_lock: true,
+};
 
 /// A snoozed message.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -66,11 +100,56 @@ pub struct Snoozed {
     /// when it moves, so it is found again by them rather than its Message-ID.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ids: Vec<String>,
+    /// When it was last snoozed, or its time changed, on any computer
+    /// (milliseconds since the epoch); 0 in lists from before.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub changed: i64,
+}
+
+fn is_zero(v: &i64) -> bool {
+    *v == 0
+}
+
+impl Stampable for Snoozed {
+    fn key(&self) -> &str {
+        &self.message_id
+    }
+    fn changed(&self) -> i64 {
+        self.changed
+    }
 }
 
 impl Backend {
     fn snooze_key(account: &str) -> String {
         format!("snoozed:{account}")
+    }
+    fn snooze_gone_key(account: &str) -> String {
+        format!("snoozed_gone:{account}")
+    }
+    /// Messages no longer snoozed, remembered a while (`shared::Gone`).
+    fn snoozed_gone(&self, account: &str) -> Vec<Gone> {
+        self.store
+            .preference(&Self::snooze_gone_key(account))
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default()
+    }
+    /// Writes the list here as it is (merged, or stamped).
+    fn store_snoozed(&self, account: &str, list: &[Snoozed], gone: &[Gone]) -> Result<()> {
+        self.store
+            .set_preference(&Self::snooze_key(account), &serde_json::to_string(list)?)?;
+        let key = Self::snooze_gone_key(account);
+        if gone.is_empty() {
+            self.store.remove_preference(&key)
+        } else {
+            self.store.set_preference(&key, &serde_json::to_string(gone)?)
+        }
+    }
+    /// Shares the snoozed messages with the account's server, merging in
+    /// what other computers changed there (`shared`): when it's time, or
+    /// now with `force`. Returns whether the list here changed. Skipped
+    /// while the account is busy.
+    pub fn share_snoozed(&self, a: &Account, force: bool) -> Result<bool> {
+        self.sync_list(a, &SNOOZE_LIST, force)
     }
     /// The account's snoozed messages, soonest first.
     pub fn snoozed(&self, account: &str) -> Vec<Snoozed> {
@@ -82,60 +161,90 @@ impl Backend {
         list.sort_by_key(|s| s.until);
         list
     }
-    fn save_snoozed(
+    /// Saves the list after a change made here: entries new or changed
+    /// (another time, folder or ids) are dated now, and those removed are
+    /// remembered as gone, so other computers follow (`shared`). With a
+    /// connection to a server with METADATA, it's shared at once.
+    pub(super) fn save_snoozed(
         &self,
         c: Option<&mut Connection>,
         account: &str,
         list: &[Snoozed],
     ) -> Result<()> {
-        let json = serde_json::to_string(list)?;
-        self.store
-            .set_preference(&Self::snooze_key(account), &json)?;
+        let before = self.snoozed(account);
+        let now = now_ms();
+        let mut list = list.to_vec();
+        for s in &mut list {
+            s.changed = match before.iter().find(|b| b.message_id == s.message_id) {
+                Some(b) if b.until == s.until && b.folder == s.folder && b.ids == s.ids => b.changed,
+                _ => now,
+            };
+        }
+        let mut gone = self.snoozed_gone(account);
+        gone.retain(|g| g.at > now - GONE_FOR_MS && !list.iter().any(|s| s.message_id == g.message_id));
+        for b in &before {
+            if !list.iter().any(|s| s.message_id == b.message_id) {
+                gone.retain(|g| g.message_id != b.message_id);
+                gone.push(Gone { message_id: b.message_id.clone(), at: now });
+            }
+        }
+        self.store_snoozed(account, &list, &gone)?;
         if let Some(c) = c
             && c.extensions()?.metadata
         {
-            // Best effort: the times are kept here either way.
-            let value = (!list.is_empty()).then_some(json.as_str());
-            let _ = set_metadata(&mut c.session, "INBOX", ENTRY, value);
+            // Best effort: the times are kept here either way, and shared
+            // again later.
+            let shared = load_snooze_list(self, account);
+            if super::shared::write_metadata(c, &SNOOZE_LIST, &shared).is_ok() {
+                let state = super::shared::SyncState {
+                    shared: shared.fingerprint(),
+                    at: chrono::Utc::now().timestamp(),
+                    remote: !shared.is_empty(),
+                };
+                let _ = self.store.set_preference(&snooze_state_key(account), &serde_json::to_string(&state)?);
+            }
         }
         Ok(())
     }
-    /// This computer's snoozed messages and the server's (from another
-    /// computer), each message once; a time set here wins.
+    /// This computer's snoozed messages merged with the server's (from
+    /// other computers), where it has METADATA: each message once, at its
+    /// newest change; one woken elsewhere is no longer snoozed. Kept here.
     fn merged_snoozed(&self, c: &mut Connection, account: &str) -> Result<Vec<Snoozed>> {
-        let mut list = self.snoozed(account);
         if c.extensions()?.metadata {
-            for (_, value) in get_metadata(&mut c.session, "INBOX", &[ENTRY])? {
-                let theirs: Vec<Snoozed> = value
-                    .and_then(|v| serde_json::from_str(&v).ok())
-                    .unwrap_or_default();
-                for s in theirs {
-                    if !list.iter().any(|x| x.message_id == s.message_id) {
-                        list.push(s);
-                    }
-                }
+            let theirs = super::shared::read_metadata(c, &SNOOZE_LIST)?;
+            let ours = load_snooze_list(self, account);
+            let merged = ours.clone().merge(theirs, now_ms());
+            if merged != ours {
+                self.store_snoozed(account, &merged.entries, &merged.gone)?;
             }
         }
-        list.sort_by_key(|s| s.until);
-        Ok(list)
+        Ok(self.snoozed(account))
     }
     /// The account's Snoozed folder, made (and subscribed to) if missing.
-    fn snooze_folder(&self, c: &mut Connection, a: &Account) -> Result<String> {
+    /// Picacho's own folder on an IMAP server: the one there, or (with
+    /// `create`) a new one; `None` when there is none and none was made.
+    pub(super) fn picacho_folder(&self, c: &mut Connection, a: &Account, create: bool) -> Result<Option<String>> {
         let names = c.names(true)?.to_vec();
-        // Picacho's folder: the one there, or a new one.
-        let parent = match top_folder(&names, a, PARENT) {
-            Some(found) => found,
-            None => {
-                let name = if a.service == Service::ProtonBridge {
-                    bridge_folder(&names, PARENT)
-                } else {
-                    let namespace = c.namespace()?;
-                    new_folder_name(&names, a.provider, None, PARENT, namespace.as_deref())?
-                };
-                self.create_folder(c, &name, PARENT)?;
-                name
-            }
+        if let Some(found) = top_folder(&names, a, PARENT) {
+            return Ok(Some(found));
+        }
+        if !create {
+            return Ok(None);
+        }
+        let name = if a.service == Service::ProtonBridge {
+            bridge_folder(&names, PARENT)
+        } else {
+            let namespace = c.namespace()?;
+            new_folder_name(&names, a.provider, None, PARENT, namespace.as_deref())?
         };
+        self.create_folder(c, &name, PARENT)?;
+        Ok(Some(name))
+    }
+    fn snooze_folder(&self, c: &mut Connection, a: &Account) -> Result<String> {
+        // Picacho's folder: the one there, or a new one.
+        let parent = self
+            .picacho_folder(c, a, true)?
+            .with_context(|| t!("manage-snooze-the-server-didnt-keep-the-new"))?;
         let names = c.names(true)?.to_vec();
         let nestable = custom_folders(&names)
             .iter()
@@ -232,6 +341,7 @@ impl Backend {
                     until,
                     folder: folder.clone(),
                     ids: Vec::new(),
+                    changed: 0,
                 });
             }
             self.save_snoozed(Some(c), &a.id, &list)?;
@@ -253,8 +363,7 @@ impl Backend {
                     s.until = now;
                 }
             }
-            self.store
-                .set_preference(&Self::snooze_key(&a.id), &serde_json::to_string(&list)?)?;
+            self.save_snoozed(None, &a.id, &list)?;
         }
         self.wake_due(a)
     }
@@ -368,6 +477,7 @@ impl Backend {
                     .map(str::to_owned)
                     .into_iter()
                     .collect(),
+                changed: 0,
             });
         }
         self.save_snoozed(None, &a.id, &list)?;
@@ -520,6 +630,7 @@ impl Backend {
                 until,
                 folder: folder.clone(),
                 ids: id.into_iter().collect(),
+                changed: 0,
             });
         }
         self.save_snoozed(None, &a.id, &list)?;
@@ -653,6 +764,7 @@ impl Backend {
                     .map(str::to_owned)
                     .into_iter()
                     .collect(),
+                changed: 0,
             });
         }
         self.save_snoozed(None, &a.id, &list)?;
@@ -830,5 +942,56 @@ mod folder_name_tests {
         );
         assert_eq!(bridge_folder(&names, PARENT), "Folders/Picacho");
         assert_eq!(child_folder(&names, "Folders/Picacho", FOLDER), None);
+    }
+}
+
+#[cfg(test)]
+mod sharing_tests {
+    use super::*;
+
+    fn snoozed(id: &str, until: i64) -> Snoozed {
+        Snoozed {
+            message_id: id.into(),
+            subject: "Plans".into(),
+            sender: "Ana".into(),
+            until,
+            folder: "Picacho/Snoozed".into(),
+            ids: vec![],
+            changed: 0,
+        }
+    }
+
+    /// Changes made here are dated, and messages no longer snoozed are
+    /// remembered as gone, for other computers to follow.
+    #[test]
+    fn changes_here_are_dated_and_removals_remembered() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("picacho-snooze-{}", uuid::Uuid::new_v4()));
+        let b = Backend::new(Arc::new(crate::manage::store::Store::open(&dir)?));
+        let now = chrono::Utc::now().timestamp();
+        b.save_snoozed(None, "acct", &[snoozed("<a@x>", now + 60), snoozed("<b@x>", now + 60)])?;
+        let first = b.snoozed("acct");
+        assert!(first.iter().all(|s| s.changed > 0));
+        // Unchanged: its date stays; snoozed again until later: dated anew.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let mut again = first.clone();
+        again[1].until = now + 3600;
+        b.save_snoozed(None, "acct", &again)?;
+        let second = b.snoozed("acct");
+        assert_eq!(second[0].changed, first[0].changed);
+        assert!(second[1].changed > first[1].changed);
+        // Woken: gone, and remembered as such.
+        b.save_snoozed(None, "acct", &second[1..])?;
+        let gone: Vec<String> = b.snoozed_gone("acct").into_iter().map(|g| g.message_id).collect();
+        assert_eq!(gone, ["<a@x>"]);
+        // Snoozed again: no longer gone.
+        b.save_snoozed(None, "acct", &[snoozed("<a@x>", now + 60)])?;
+        let gone: Vec<String> = b.snoozed_gone("acct").into_iter().map(|g| g.message_id).collect();
+        assert_eq!(gone, ["<b@x>"]);
+        // A list written by an earlier version (no dates) still reads.
+        b.store.set_preference("snoozed:old", r#"[{"message_id":"<o@x>","subject":"","sender":"","until":1,"folder":"S"}]"#)?;
+        assert_eq!(b.snoozed("old")[0].changed, 0);
+        drop(b);
+        let _ = std::fs::remove_dir_all(dir);
+        Ok(())
     }
 }

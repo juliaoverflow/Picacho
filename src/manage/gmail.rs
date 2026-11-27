@@ -225,6 +225,10 @@ impl Backend {
             .collect();
         own_labels.sort();
         mail.set_labels(own_labels);
+        // Gmail's own sorting of its inbox (CATEGORY_PROMOTIONS…).
+        mail.set_server_category(crate::manage::categories::gmail_category(
+            m.label_ids.iter().map(String::as_str),
+        ));
         Ok(mail)
     }
 
@@ -815,6 +819,63 @@ pub(super) fn api_base(a: &Account, official: &str) -> String {
     }
     let _ = a;
     official.to_owned()
+}
+
+// Follow-up reminders and notes (`follow_up`, `notes`).
+impl Backend {
+    /// Picacho's label (made with `create`), by id.
+    fn picacho_label(&self, a: &Account, s: &Session, create: bool) -> Result<Option<String>> {
+        let parent = super::snooze::PARENT;
+        if let Some(l) = s.labels()?.into_iter().find(|l| !l.system && l.name.eq_ignore_ascii_case(parent)) {
+            return Ok(Some(l.id));
+        }
+        if !create {
+            return Ok(None);
+        }
+        let made = s.create_label(parent)?;
+        let _ = self.store.save_folders(&a.id, &remote_folders(&s.reload_labels()?));
+        Ok(Some(made.id))
+    }
+    /// The notes under Picacho's label, by message id.
+    pub(super) fn read_notes_gmail(&self, a: &Account, kind: &str) -> Result<super::notes::NoteSources> {
+        self.with_gmail(a, |s| {
+            let Some(label) = self.picacho_label(a, s, false)? else {
+                return Ok(None);
+            };
+            let ids = s.list_all(Some(&label), "", 50)?;
+            let mut out = Vec::new();
+            for m in s.metadata(&ids)? {
+                let subject = m.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("Subject")).map(|(_, v)| v.as_str());
+                if subject.is_some_and(|s| super::notes::titled(s, kind)) {
+                    out.push((m.id.clone(), s.raw(&m.id)?));
+                }
+            }
+            Ok(Some(out))
+        })
+    }
+    /// Puts a note under Picacho's label alone (out of the inbox), read;
+    /// then deletes `old`.
+    pub(super) fn write_note_gmail(&self, a: &Account, raw: &[u8], old: &[String]) -> Result<()> {
+        self.with_gmail(a, |s| {
+            let label = self
+                .picacho_label(a, s, true)?
+                .with_context(|| t!("manage-snooze-the-server-didnt-keep-the-new"))?;
+            s.insert(raw, &[&label])?;
+            if !old.is_empty() {
+                s.delete(old)?;
+            }
+            Ok(())
+        })
+    }
+    /// The messages of a Gmail conversation (its thread id), as rows (not
+    /// saved): where a reply may be that isn't downloaded.
+    pub(super) fn gmail_conversation(&self, a: &Account, thread: &str) -> Result<Vec<Mail>> {
+        self.with_gmail(a, |s| {
+            let ids = s.thread(thread)?;
+            let labels = self.gmail_labels(a, s, false)?;
+            s.metadata(&ids)?.iter().map(|m| self.gmail_mail(a, &labels, m, None)).collect()
+        })
+    }
 }
 
 #[cfg(test)]
