@@ -169,6 +169,10 @@ impl DesktopWidgetWindow {
         if self.snapshot.accounts.len() == 1 {
             return self.snapshot.accounts[0].name.clone();
         }
+        // All Accounts is the workspace's.
+        if !self.snapshot.workspace.is_empty() {
+            return self.snapshot.workspace.clone();
+        }
         match self.tab {
             WidgetTab::Packages | WidgetTab::Receipts => t!("widget-window-all-accounts").to_owned(),
             _ => t!("widget-window-all-inboxes").to_owned(),

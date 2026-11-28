@@ -195,6 +195,8 @@ impl MailApp {
                     .and_then(|_| self.selected_mail())
                     .and_then(|m| self.account_of(&m))
             })
+            // All Accounts: the workspace's account to write from, if set.
+            .or_else(|| self.workspace_from())
             .or_else(|| self.current_account());
         let own = account
             .as_ref()
@@ -588,6 +590,8 @@ impl MailApp {
             }
             ComposerEvent::Schedule(at) => self.schedule_send(composer, *at, cx),
             ComposerEvent::SaveTemplate(t) => self.save_template(t.clone(), cx),
+            ComposerEvent::Merge(drafts) => self.merge_send(composer, drafts.clone(), cx),
+            ComposerEvent::SaveSnippet(snippet) => self.save_snippet(snippet.clone(), cx),
         }
         cx.notify();
     }
@@ -733,7 +737,7 @@ impl MailApp {
     /// People to suggest in a composer's address fields: everyone in the
     /// listed mail, newest first, up to 2,000, not counting your own
     /// addresses. Kept until the list or your addresses change.
-    fn contacts(&self) -> Rc<Vec<(String, String)>> {
+    pub(super) fn contacts(&self) -> Rc<Vec<(String, String)>> {
         let mut own: Vec<String> = self
             .accounts
             .iter()
@@ -750,8 +754,8 @@ impl MailApp {
             return contacts.clone();
         }
         // The address book first, then people seen in mail.
-        let mut people =
-            crate::manage::backend::contacts::people(&self.backend.contacts());
+        // The workspace's address books.
+        let mut people = crate::manage::backend::contacts::people(&self.workspace_contacts());
         let mut seen: HashSet<String> = people.iter().map(|(_, e)| e.to_lowercase()).collect();
         seen.extend(own.iter().cloned());
         people.retain(|(_, e)| !own.contains(&e.to_lowercase()));
@@ -896,6 +900,158 @@ impl MailApp {
         cx.notify();
     }
 
+    /// Sends a mail merge's messages one after another, a moment apart (as
+    /// servers limit how fast mail may go), the composer saying how far it
+    /// got. Closing the composer doesn't stop it, and what's left is kept:
+    /// quitting, the rest go when Picacho starts again. All sent, the draft
+    /// goes; otherwise it stays, saying to whom they couldn't be sent.
+    fn merge_send(&mut self, composer: Entity<Composer>, drafts: Vec<Draft>, cx: &mut Context<Self>) {
+        if self.merge_queue.is_some() {
+            composer.update(cx, |c, cx| {
+                c.error = Some(t!("compose-merge-already-sending").into());
+                cx.notify();
+            });
+            return;
+        }
+        let (id, account) = {
+            let d = &composer.read(cx).draft;
+            (d.id.clone(), d.account.clone())
+        };
+        let queue = crate::manage::authoring::merge::Queue { draft: id, account, total: drafts.len(), remaining: drafts, failed: vec![] };
+        if let Err(e) = queue.save(&self.backend.store) {
+            composer.update(cx, |c, cx| {
+                c.error = Some(format!("{e:#}"));
+                cx.notify();
+            });
+            return;
+        }
+        composer.update(cx, |c, cx| {
+            c.save_now(cx);
+            c.sending = true;
+            c.error = None;
+            c.merge_progress = Some((0, queue.total));
+            cx.notify();
+        });
+        self.merge_queue = Some(queue);
+        self.merge_composer = Some(composer);
+        self.merge_next(true, cx);
+    }
+
+    /// A mail merge left unfinished when Picacho last stopped: the rest go.
+    pub(super) fn resume_merge(&mut self, cx: &mut Context<Self>) {
+        if self.merge_queue.is_some() {
+            return;
+        }
+        let Some(queue) = crate::manage::authoring::merge::Queue::load(&self.backend.store) else { return };
+        let left = queue.remaining.len();
+        if left > 0 {
+            self.notice(t!("compose-merge-resuming", count = left), false, cx);
+        }
+        self.merge_composer = self.composers.iter().find(|c| c.read(cx).draft.id == queue.draft).cloned();
+        self.merge_queue = Some(queue);
+        self.merge_next(true, cx);
+    }
+
+    fn merge_next(&mut self, first: bool, cx: &mut Context<Self>) {
+        let Some(queue) = &self.merge_queue else { return };
+        let Some(d) = queue.remaining.first().cloned() else {
+            return self.merge_done(cx);
+        };
+        let (total, left) = (queue.total, queue.remaining.len());
+        let Some(a) = self.accounts.iter().find(|a| a.id == queue.account).or(self.accounts.first()).cloned() else {
+            // Without an account, nothing more can go.
+            let error = t!("compose-connect-an-account-before-sending-your");
+            if let Some(q) = &mut self.merge_queue {
+                for d in q.remaining.drain(..) {
+                    q.failed.push(format!("{} ({error})", d.to));
+                }
+            }
+            return self.merge_done(cx);
+        };
+        if let Some(c) = &self.merge_composer {
+            c.update(cx, |c, cx| {
+                c.merge_progress = Some((total - left, total));
+                cx.notify();
+            });
+        }
+        let d = Draft { account: a.id.clone(), ..d };
+        let to = d.to.clone();
+        self.task(
+            cx,
+            move |b| {
+                if first {
+                    super::composer::wait_for_draft_writes(None);
+                }
+                use crate::manage::authoring::merge::Queue;
+                Queue::take(&b.store, &d.id)?;
+                let result = b.send_noting(&a, &d).map(|_| ()).map_err(|e| format!("{e:#}"));
+                Queue::done(&b.store, &to, result.clone().err())?;
+                Ok((to, result))
+            },
+            move |this, result, cx| {
+                let failure = match result {
+                    Ok((_, Ok(()))) => None,
+                    Ok((to, Err(e))) => Some(format!("{to} ({e})")),
+                    // Keeping the queue failed: stop here, as kept.
+                    Err(e) => {
+                        this.merge_queue = None;
+                        this.merge_composer = None;
+                        this.notice(format!("{e:#}"), true, cx);
+                        return;
+                    }
+                };
+                let more = this.merge_queue.as_mut().is_some_and(|q| {
+                    q.remaining.remove(0);
+                    q.failed.extend(failure);
+                    !q.remaining.is_empty()
+                });
+                if !more {
+                    return this.merge_next(false, cx);
+                }
+                cx.spawn(async move |this, cx| {
+                    cx.background_executor().timer(Duration::from_millis(800)).await;
+                    let _ = this.update(cx, |this, cx| this.merge_next(false, cx));
+                })
+                .detach();
+            },
+        );
+    }
+
+    fn merge_done(&mut self, cx: &mut Context<Self>) {
+        let Some(queue) = self.merge_queue.take() else { return };
+        let composer = self.merge_composer.take();
+        let _ = crate::manage::authoring::merge::Queue::clear(&self.backend.store);
+        let (count, failed) = (queue.total, queue.failed);
+        let open = composer.as_ref().is_some_and(|c| self.composers.contains(c));
+        if failed.is_empty() {
+            let backend = self.backend.clone();
+            let id = queue.draft.clone();
+            drop(super::composer::queue_draft_write(move || backend.discard_draft(&id)));
+            if let Some(c) = &composer {
+                self.close_composer(c, cx);
+            }
+            self.notice(t!("compose-merge-sent", count = count), false, cx);
+        } else {
+            let sent = count.saturating_sub(failed.len());
+            let error = t!("compose-merge-some-failed", sent = sent, count = count, failed = failed.join("; "));
+            if let Some(c) = &composer {
+                c.update(cx, |c, cx| {
+                    c.sending = false;
+                    c.merge_progress = None;
+                    c.error = Some(error.clone());
+                    cx.notify();
+                });
+            }
+            // Closed meanwhile (or after a restart): the draft waits in
+            // Drafts, and this says why.
+            if !open {
+                self.notice(error, true, cx);
+            }
+        }
+        self.refresh_drafts(cx);
+        self.sync_drafts_soon(&queue.account, cx);
+    }
+
     /// Puts a checked draft aside to be sent at `at` (Send Later): it is
     /// saved with the time and waits in Drafts.
     fn schedule_send(&mut self, composer: Entity<Composer>, at: i64, cx: &mut Context<Self>) {
@@ -959,6 +1115,8 @@ impl MailApp {
     /// passed while Picacho wasn't running go at the next check after it
     /// starts.
     pub(super) fn send_due(&mut self, cx: &mut Context<Self>) {
+        // A mail merge Picacho stopped in the middle of goes on.
+        self.resume_merge(cx);
         let mut open: HashSet<String> = self
             .composers
             .iter()
@@ -1178,6 +1336,8 @@ impl MailApp {
                 }
                 ComposerEvent::Schedule(at) => this.schedule_send(composer, *at, cx),
                 ComposerEvent::SaveTemplate(t) => this.save_template(t.clone(), cx),
+                ComposerEvent::Merge(drafts) => this.merge_send(composer, drafts.clone(), cx),
+                ComposerEvent::SaveSnippet(snippet) => this.save_snippet(snippet.clone(), cx),
             }
             cx.notify();
         });

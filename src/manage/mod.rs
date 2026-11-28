@@ -14,6 +14,8 @@ pub mod background;
 /// into them.
 pub mod categories;
 pub mod composing;
+/// Writing aids: finding text, Markdown shortcuts, emoji and mail merge.
+pub mod authoring;
 pub mod crypto;
 pub mod forwarding;
 /// Security keys: OpenPGP cards and PKCS#11 tokens, and their PINs.
@@ -35,6 +37,9 @@ pub mod model;
 pub mod openpgp;
 /// Pinned and muted mail, saved searches, blocked senders and rules kept here.
 pub mod organize;
+/// What a message's attachments become as it is sent: pictures made
+/// smaller, files too large shared as links.
+pub mod outgoing;
 pub mod protected_reply;
 pub mod smime;
 /// Tracking numbers in mail, for the reader and each account's Summary.
@@ -53,6 +58,9 @@ pub mod tracking;
 pub mod widgets;
 /// The optional encrypted database: its key and the keychain entry it's in.
 pub mod vault;
+/// Workspaces: named sets of accounts and calendars shown together, which
+/// notifications they let through, and when they turn on.
+pub mod workspaces;
 /// Files beside the database kept encrypted while it is (drafts' attachments).
 pub mod sealed_files;
 

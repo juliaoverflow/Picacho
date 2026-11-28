@@ -36,3 +36,17 @@ compose-sending-messages = { $count ->
 compose-sending = Sending…
 
 compose-undo = Undo
+
+compose-merge-sent = { $count ->
+        [one] Sent 1 message
+       *[other] Sent { $count } messages
+    }
+
+compose-merge-some-failed = Sent { $sent } of { $count }. Not sent: { $failed }
+
+compose-merge-already-sending = A mail merge is being sent already; this one can go once it's done.
+
+compose-merge-resuming = { $count ->
+        [one] Sending the mail merge’s last message, left when Picacho stopped
+       *[other] Sending the mail merge’s { $count } messages left when Picacho stopped
+    }

@@ -1552,6 +1552,11 @@ pub struct Secret {
     /// account's keys. The password itself isn't kept.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub proton_key: String,
+    /// Microsoft: scopes granted besides the mail ones (OneDrive, for
+    /// sharing large attachments), asked for again with each renewal, as
+    /// Microsoft renews only what is named.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub extra_scopes: String,
 }
 /// Says which secrets are there, never what they are: one printed for
 /// debugging (`{:?}`, an error's details) would otherwise put passwords
@@ -1685,6 +1690,10 @@ pub struct Draft {
     /// that text is there unchanged.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub signature_html: String,
+    /// How large its attached pictures are sent, when chosen for it;
+    /// otherwise as Settings → Composing says (`ComposeOptions::image_size`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_size: Option<crate::manage::composing::ImageSize>,
 }
 /// Delivery report options (RFC 3461 §4.1, §4.3). The defaults ask for
 /// every report and only the headers back, as Picacho always did.

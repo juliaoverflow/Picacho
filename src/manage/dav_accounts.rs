@@ -109,7 +109,7 @@ impl Backend {
     /// Google: asks, in the browser, for calendar or contacts access on top
     /// of mail, and keeps the token that covers both. Where it was already
     /// given, nothing is asked.
-    fn grant_google(&self, a: &Account, scope: &str, cancel: Arc<AtomicBool>) -> Result<()> {
+    pub(super) fn grant_google(&self, a: &Account, scope: &str, cancel: Arc<AtomicBool>) -> Result<()> {
         if self.granted(a, scope) {
             return Ok(());
         }

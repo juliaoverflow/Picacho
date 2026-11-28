@@ -72,8 +72,8 @@ pub(super) struct Bindable {
 pub(super) fn bindable() -> Vec<Bindable> {
     use Group::*;
     use composer::{
-        Bold, Bullets, Heading, InlineCode, InsertLink, Italic, Numbers, QuoteLines, SaveDraft,
-        SendDraft, Strike, TogglePreview, Underline,
+        Bold, Bullets, FindInDraft, Heading, InlineCode, InsertLink, Italic, Numbers, QuoteLines,
+        SaveDraft, SendDraft, Strike, TogglePreview, Underline,
     };
     fn b(
         group: Group,
@@ -135,6 +135,12 @@ pub(super) fn bindable() -> Vec<Bindable> {
         b(Mailbox, "go-spam", t!("shortcuts-go-to-spam"), "secondary-6", GoSpam),
         b(Mailbox, "go-trash", t!("shortcuts-go-to-trash"), "secondary-7", GoTrash),
         b(Mailbox, "go-all-mail", t!("shortcuts-go-to-all-mail"), "secondary-8", GoAllMail),
+        b(Mailbox, "new-tab", t!("tabs-new-tab"), "secondary-t", NewTab),
+        b(Mailbox, "close-tab", t!("tabs-close-tab"), "secondary-shift-w", CloseTab),
+        b(Mailbox, "next-tab", t!("tabs-next-tab"), "ctrl-tab", NextTab),
+        b(Mailbox, "previous-tab", t!("tabs-previous-tab"), "ctrl-shift-tab", PreviousTab),
+        b(Mailbox, "next-workspace", t!("workspaces-next-workspace"), "secondary-alt-]", NextWorkspace),
+        b(Mailbox, "previous-workspace", t!("workspaces-previous-workspace"), "secondary-alt-[", PreviousWorkspace),
         b(Writing, "new-message", t!("shortcuts-new-message"), "secondary-n", Compose),
         send,
         composing("save-draft", t!("shortcuts-save-draft"), "secondary-s", SaveDraft),
@@ -149,6 +155,7 @@ pub(super) fn bindable() -> Vec<Bindable> {
         composing("quote", t!("shortcuts-quote"), "secondary-shift-9", QuoteLines),
         composing("heading", t!("shortcuts-heading"), "secondary-alt-1", Heading),
         composing("preview-formatting", t!("shortcuts-preview-formatting"), "secondary-shift-p", TogglePreview),
+        composing("find-in-draft", t!("shortcuts-find-in-draft"), "secondary-f", FindInDraft),
         b(Writing, "undo", t!("shortcuts-undo"), "secondary-z", gpui_component::input::Undo),
         b(App, "settings", t!("shortcuts-settings"), "secondary-,", ShowAccounts),
         b(

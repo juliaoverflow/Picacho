@@ -1154,11 +1154,6 @@ impl std::fmt::Debug for Grant {
     }
 }
 
-/// Signs in to Gmail or Outlook in the browser. The account's email may be
-/// empty: the provider's ID token says which account was chosen.
-pub fn authorize(account: &Account, cancel: Arc<AtomicBool>) -> Result<Grant> {
-    authorize_with(account, &[], cancel)
-}
 
 /// Google's calendar and contacts scopes (CalDAV, CardDAV): asked only
 /// when the person chooses to use their Google account for calendars or
@@ -1167,8 +1162,15 @@ pub const GOOGLE_CALENDAR: &str = "https://www.googleapis.com/auth/calendar";
 pub const GOOGLE_CONTACTS: &str = "https://www.googleapis.com/auth/carddav";
 /// Google's contacts through the People API (`sync/google.rs`).
 pub const GOOGLE_PEOPLE: &str = "https://www.googleapis.com/auth/contacts";
+/// Google Drive, only the files Picacho puts there: large attachments
+/// shared as links (`manage::outgoing`). Asked only when chosen.
+pub const GOOGLE_DRIVE: &str = "https://www.googleapis.com/auth/drive.file";
+/// OneDrive through Microsoft Graph, for the same; asked only when chosen.
+pub const GRAPH_FILES: &str = "https://graph.microsoft.com/Files.ReadWrite";
 
-/// As `authorize`, asking for `more` scopes besides the mail ones (Google's
+/// Signs in to Gmail or Outlook in the browser (the account's email may be
+/// empty: the provider's ID token says which account was chosen), asking
+/// for `more` scopes besides the mail ones (Google's
 /// incremental authorization, `include_granted_scopes`): the token that
 /// comes back reaches both, so calendars or contacts can use the mail
 /// account's sign-in. Google accounts only.
@@ -1180,7 +1182,7 @@ pub fn authorize_with(account: &Account, more: &[&str], cancel: Arc<AtomicBool>)
         return authorize_sso(account, sso, cancel);
     }
     ensure!(
-        more.is_empty() || account.provider == Provider::Gmail,
+        more.is_empty() || account.provider == Provider::Gmail || (account.provider == Provider::Outlook && account.graph()),
         t!("sync-oauth-only-google-accounts-are-asked-for")
     );
     let microsoft = account.provider == Provider::Outlook;
@@ -1205,9 +1207,9 @@ pub fn authorize_with(account: &Account, more: &[&str], cancel: Arc<AtomicBool>)
     if account.provider == Provider::Gmail {
         url.query_pairs_mut()
             .extend_pairs([("access_type", "offline"), ("prompt", "consent")]);
-        if !more.is_empty() {
-            url.query_pairs_mut().append_pair("include_granted_scopes", "true");
-        }
+        // What was granted before (calendars, contacts, Drive) stays with
+        // the new sign-in, also when signing in again.
+        url.query_pairs_mut().append_pair("include_granted_scopes", "true");
     } else {
         url.query_pairs_mut()
             .append_pair("prompt", "select_account");
@@ -1414,15 +1416,16 @@ pub fn redeem(account: &Account, grant: &Grant) -> Result<(Secret, Identity)> {
     };
     let (mut secret, value) = exchange(token, &fields, &client)?;
     secret.client_secret = account.client_secret.clone();
+    let extra = EXTRA_SCOPES;
+    // Microsoft renews only the scopes it is asked for: the extra ones
+    // asked now are asked again with each renewal.
+    if account.provider == Provider::Outlook && account.sso.is_none() {
+        secret.extra_scopes = extra_asked(&grant.scope);
+    }
     if let Some(granted) = value["scope"].as_str() {
         let mut needed = needed_scopes(account, &grant.scope);
-        // Calendar or contacts access, where it was asked for.
-        needed.extend(
-            grant
-                .scope
-                .split_whitespace()
-                .filter(|s| [GOOGLE_CALENDAR, GOOGLE_CONTACTS, GOOGLE_PEOPLE].contains(s)),
-        );
+        // Calendar, contacts or file access, where it was asked for.
+        needed.extend(grant.scope.split_whitespace().filter(|s| extra.contains(s)));
         let missing: Vec<&str> = needed
             .into_iter()
             .filter(|s| !granted_scope(granted, s))
@@ -1786,6 +1789,21 @@ fn exchange(
     };
     Ok((secret, value))
 }
+/// Scopes asked for on top of the mail ones, only when chosen: calendars,
+/// contacts, and storage for large attachments.
+const EXTRA_SCOPES: [&str; 5] = [GOOGLE_CALENDAR, GOOGLE_CONTACTS, GOOGLE_PEOPLE, GOOGLE_DRIVE, GRAPH_FILES];
+
+/// The extra scopes (`EXTRA_SCOPES`) among those `asked`.
+fn extra_asked(asked: &str) -> String {
+    asked.split_whitespace().filter(|s| EXTRA_SCOPES.contains(s)).collect::<Vec<_>>().join(" ")
+}
+
+/// What a renewal asks Microsoft for: the account's scopes and the extra
+/// ones it was given.
+fn renewal_scope(scope: &str, extra: &str) -> String {
+    format!("{scope} {extra}").trim().to_owned()
+}
+
 pub fn refresh(account: &Account, secret: &mut Secret) -> Result<bool> {
     if !account.oauth || secret.expires_at > chrono::Utc::now().timestamp() + 120 {
         return Ok(false);
@@ -1816,8 +1834,9 @@ pub fn refresh(account: &Account, secret: &mut Secret) -> Result<bool> {
         ("refresh_token", secret.refresh_token.as_str()),
         ("grant_type", "refresh_token"),
     ];
+    let with_extra = renewal_scope(scope, &secret.extra_scopes);
     if account.provider == Provider::Outlook {
-        fields.push(("scope", scope));
+        fields.push(("scope", &with_extra));
     }
     // Microsoft Entra renews a token for one resource at a time: Exchange's
     // is asked for again by name.
@@ -2502,4 +2521,16 @@ mod tests {
         )]);
         assert!(browser.wait(&AtomicBool::new(false)).is_err());
     }
+}
+
+#[cfg(test)]
+#[test]
+fn storage_access_is_kept_through_renewals() {
+    let asked = format!("{GRAPH_SCOPES} {GRAPH_FILES}");
+    assert_eq!(extra_asked(&asked), GRAPH_FILES);
+    assert_eq!(extra_asked(GRAPH_SCOPES), "");
+    assert_eq!(renewal_scope(GRAPH_SCOPES, ""), GRAPH_SCOPES);
+    assert_eq!(renewal_scope(GRAPH_SCOPES, GRAPH_FILES), asked);
+    // Microsoft names Graph's scopes without its address.
+    assert!(granted_scope("Mail.ReadWrite Files.ReadWrite", GRAPH_FILES));
 }

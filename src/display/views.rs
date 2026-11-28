@@ -190,7 +190,9 @@ impl MailApp {
     /// Works out what the open view lists; call when it or its aliases change.
     pub(super) fn update_scope(&mut self) {
         self.scope = match &self.account {
-            Some(id) => fwd::scope(id, self.folder, &self.accounts, &self.forwarding),
+            // All Accounts (and aliases delivered anywhere) draw only on the
+            // workspace's accounts.
+            Some(id) => fwd::scope(id, self.folder, &self.workspace_accounts(), &self.forwarding),
             None => fwd::Scope::default(),
         };
     }
@@ -245,6 +247,7 @@ impl MailApp {
             self.accounts.iter().any(|a| a.id == id)
         };
         listed
+            && self.in_workspace(id)
             && match mailbox {
                 Mailbox::Standard(folder) if fwd::is_view(id) => Self::view_folders(id).contains(folder),
                 Mailbox::Standard(folder) => *folder != Folder::Other,
@@ -366,7 +369,7 @@ impl MailApp {
         fwd::sent_as(&m.from, &m.to, m.cc(), &self.forwarding, &self.alias_routes)
     }
     pub(super) fn shows_all_mail(&self) -> bool {
-        self.all_mail && self.accounts.len() > 1
+        self.all_mail && self.accounts.iter().filter(|a| self.in_workspace(&a.id)).count() > 1
     }
     /// Lists the open view from the cache: one mailbox as it is, with its
     /// placeholders, or several merged newest first.
@@ -964,12 +967,21 @@ impl MailApp {
         if let Err(e) = fwd::save(&self.backend.store, &self.forwarding) {
             self.notice(format!("{e:#}"), true, cx);
         }
+        self.views_moved(cx);
+    }
+    /// After the views the sidebar lists changed (aliases, All Accounts, the
+    /// workspace on): updates the sidebar, and leaves a view that is no
+    /// longer listed.
+    pub(super) fn views_moved(&mut self, cx: &mut Context<Self>) {
         self.sync_tree();
         let gone = match self.account.as_deref() {
             Some(ALL_MAIL) => !self.shows_all_mail(),
-            Some(id) if fwd::is_view(id) => !fwd::separate_views(&self.forwarding)
-                .iter()
-                .any(|v| v == id),
+            Some(id) if fwd::is_view(id) => {
+                !fwd::separate_views(&self.forwarding).iter().any(|v| v == id)
+                    || !self.in_workspace(id)
+            }
+            // An account the workspace on hides.
+            Some(id) => !self.in_workspace(id),
             _ => false,
         };
         if gone {

@@ -175,3 +175,5 @@ shortcuts-shortcuts-file = Shortcuts File
 shortcuts-edit-as-text = Edit as Text
 
 shortcuts-reset-all-shortcuts = Reset All Shortcuts
+
+shortcuts-find-in-draft = Find and Replace in Message

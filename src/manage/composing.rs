@@ -46,6 +46,8 @@ pub struct ComposeOptions {
     pub account_signatures: std::collections::BTreeMap<String, String>,
     /// Reusable messages (canned responses), inserted from the composer.
     pub templates: Vec<Template>,
+    /// Reusable bits of text, put where the caret is.
+    pub snippets: Vec<Snippet>,
     /// Add the signature to replies and forwards, not only new messages.
     pub signature_on_replies: bool,
     /// Seconds a sent message waits, with an Undo, before it leaves. 0 sends
@@ -60,6 +62,115 @@ pub struct ComposeOptions {
     pub paste_formatted: bool,
     /// The formatted composer underlines words spelled wrong.
     pub spellcheck: bool,
+    /// Markdown typed in the formatted composer formats as it is typed:
+    /// "- " starts a list, "> " a quote, `**bold**` is bold.
+    pub markdown_shortcuts: bool,
+    /// How large pictures attached to new messages are sent (each
+    /// message can choose otherwise).
+    pub image_size: ImageSize,
+    /// Where attachments too large to send go instead, shared as links.
+    pub cloud: CloudStorage,
+}
+
+/// How large attached pictures (photos) are sent: as they are, or made
+/// smaller first, their longest side at most this many pixels.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImageSize {
+    Actual,
+    #[default]
+    Large,
+    Medium,
+    Small,
+}
+
+impl ImageSize {
+    pub const ALL: [ImageSize; 4] = [ImageSize::Actual, ImageSize::Large, ImageSize::Medium, ImageSize::Small];
+    /// The longest side a picture is sent at, `None` for as it is.
+    pub fn max_side(self) -> Option<u32> {
+        match self {
+            ImageSize::Actual => None,
+            ImageSize::Large => Some(2048),
+            ImageSize::Medium => Some(1280),
+            ImageSize::Small => Some(640),
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            ImageSize::Actual => t!("manage-composing-image-size-actual"),
+            ImageSize::Large => t!("manage-composing-image-size-large"),
+            ImageSize::Medium => t!("manage-composing-image-size-medium"),
+            ImageSize::Small => t!("manage-composing-image-size-small"),
+        }
+    }
+}
+
+/// The kind of storage large attachments are shared from.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CloudKind {
+    /// None set up.
+    #[default]
+    None,
+    /// A Nextcloud (or ownCloud) server: files go to its WebDAV, and it
+    /// makes each a public link.
+    Nextcloud,
+    /// Any WebDAV folder; links are its files' addresses under
+    /// `public_url` (a folder the web server shows), or their own.
+    WebDav,
+    /// The Google Drive of a Gmail account (`account`), signed in to as it
+    /// is, with access to the files Picacho puts there.
+    GoogleDrive,
+    /// The OneDrive of an Outlook account using Microsoft Graph.
+    OneDrive,
+}
+
+impl CloudKind {
+    /// Storage reached through a mail account's own sign-in.
+    pub fn uses_account(self) -> bool {
+        matches!(self, CloudKind::GoogleDrive | CloudKind::OneDrive)
+    }
+}
+
+/// Where attachments too large for the outgoing server go, shared as
+/// links in the message instead, once set up. The password is in the keychain
+/// (`outgoing::CLOUD_SECRET`).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CloudStorage {
+    pub kind: CloudKind,
+    /// Nextcloud: the server's address. WebDAV: the folder's address.
+    pub url: String,
+    pub user: String,
+    /// The folder files go in, inside the storage.
+    pub folder: String,
+    /// WebDAV: the address the folder's files are seen at publicly, if
+    /// not their WebDAV address.
+    pub public_url: String,
+    /// Days a Nextcloud or OneDrive link works for; 0 for no end.
+    pub expire_days: u32,
+    /// Google Drive and OneDrive: the mail account (its id) whose storage
+    /// it is.
+    pub account: String,
+}
+
+impl CloudStorage {
+    pub fn configured(&self) -> bool {
+        match self.kind {
+            CloudKind::None => false,
+            k if k.uses_account() => !self.account.is_empty(),
+            _ => !self.url.trim().is_empty(),
+        }
+    }
+}
+
+/// A reusable bit of text (Markdown), put where the caret is from the "/"
+/// menu or the templates menu, its placeholders filled in.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Snippet {
+    pub name: String,
+    pub body: String,
 }
 
 impl Default for ComposeOptions {
@@ -73,12 +184,16 @@ impl Default for ComposeOptions {
             signature: String::new(),
             account_signatures: Default::default(),
             templates: Vec::new(),
+            snippets: Vec::new(),
             signature_on_replies: true,
             undo_send_seconds: 5,
             attachment_reminder: true,
             warn_empty_subject: true,
             paste_formatted: false,
             spellcheck: true,
+            markdown_shortcuts: true,
+            image_size: ImageSize::Large,
+            cloud: CloudStorage::default(),
         }
     }
 }
@@ -287,12 +402,22 @@ pub const PLACEHOLDERS: [(&str, &str); 11] = [
 /// `text` with its placeholders (`PLACEHOLDERS`, any case, spaces inside
 /// the braces allowed) filled in. Other text in braces stays as it is.
 pub fn fill_placeholders(text: &str, p: &Placeholders) -> String {
+    fill_placeholders_with(text, p, &[], false)
+}
+
+/// `fill_placeholders`, with `extra` values by name too (a mail merge's
+/// columns, `merge::key`), which come first. With `html`, the values are
+/// escaped for HTML (`text` is HTML).
+pub fn fill_placeholders_with(text: &str, p: &Placeholders, extra: &[(String, String)], html: bool) -> String {
     let first = |name: &str| name.split_whitespace().next().unwrap_or("").to_owned();
     let last = |name: &str| {
         let words: Vec<&str> = name.split_whitespace().collect();
         if words.len() > 1 { words.last().copied().unwrap_or("").to_owned() } else { String::new() }
     };
     let value = |key: &str| -> Option<String> {
+        if let Some((_, v)) = extra.iter().find(|(k, _)| k == key) {
+            return Some(v.clone());
+        }
         Some(match key {
             "name" => p.name.clone(),
             "first_name" | "firstname" => first(&p.name),
@@ -308,6 +433,12 @@ pub fn fill_placeholders(text: &str, p: &Placeholders) -> String {
             _ => return None,
         })
     };
+    let escape = |v: String| {
+        if !html {
+            return v;
+        }
+        v.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
+    };
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
     while let Some(open) = rest.find('{') {
@@ -319,7 +450,7 @@ pub fn fill_placeholders(text: &str, p: &Placeholders) -> String {
         });
         match filled {
             Some((v, close)) => {
-                out.push_str(&v);
+                out.push_str(&escape(v));
                 rest = &after[close + 1..];
             }
             None => {

@@ -22,6 +22,7 @@ const EN: &[(&str, &str)] = &[
     ("calendar-views.ftl", include_str!("../../locales/en/calendar-views.ftl")),
     ("calendar.ftl", include_str!("../../locales/en/calendar.ftl")),
     ("categories.ftl", include_str!("../../locales/en/categories.ftl")),
+    ("cloud-settings.ftl", include_str!("../../locales/en/cloud-settings.ftl")),
     ("compose.ftl", include_str!("../../locales/en/compose.ftl")),
     ("composer.ftl", include_str!("../../locales/en/composer.ftl")),
     ("contacts.ftl", include_str!("../../locales/en/contacts.ftl")),
@@ -59,6 +60,7 @@ const EN: &[(&str, &str)] = &[
     ("subscriptions.ftl", include_str!("../../locales/en/subscriptions.ftl")),
     ("summary.ftl", include_str!("../../locales/en/summary.ftl")),
     ("sync.ftl", include_str!("../../locales/en/sync.ftl")),
+    ("tabs.ftl", include_str!("../../locales/en/tabs.ftl")),
     ("templates.ftl", include_str!("../../locales/en/templates.ftl")),
     ("tools.ftl", include_str!("../../locales/en/tools.ftl")),
     ("tray.ftl", include_str!("../../locales/en/tray.ftl")),
@@ -70,6 +72,7 @@ const EN: &[(&str, &str)] = &[
     ("widgets.ftl", include_str!("../../locales/en/widgets.ftl")),
     ("windows.ftl", include_str!("../../locales/en/windows.ftl")),
     ("window.ftl", include_str!("../../locales/en/window.ftl")),
+    ("workspaces.ftl", include_str!("../../locales/en/workspaces.ftl")),
 ];
 
 /// The text of `language`'s files.

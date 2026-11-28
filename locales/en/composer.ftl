@@ -246,3 +246,204 @@ composer-sent-as-pgp-mime = Sent as PGP/MIME: switch to inline PGP for apps that
 composer-discard-draft = Discard draft
 
 composer-new-message-2 = New message
+
+composer-slash-heading-1 = Heading 1
+
+composer-slash-heading-1-detail = A large section title
+
+composer-slash-heading-2 = Heading 2
+
+composer-slash-heading-2-detail = A section title
+
+composer-slash-heading-3 = Heading 3
+
+composer-slash-heading-3-detail = A smaller title
+
+composer-slash-bulleted-list = Bulleted list
+
+composer-slash-bulleted-list-detail = A list with bullets
+
+composer-slash-numbered-list = Numbered list
+
+composer-slash-numbered-list-detail = A list with numbers
+
+composer-slash-quote = Quote
+
+composer-slash-quote-detail = Text set apart as quoted
+
+composer-slash-code-block = Code block
+
+composer-slash-code-block-detail = Text in a fixed-width font, as typed
+
+composer-slash-table = Table
+
+composer-slash-table-detail = A grid of 2 rows and 3 columns
+
+composer-slash-divider = Divider
+
+composer-slash-divider-detail = A line across the message
+
+composer-slash-emoji = Emoji
+
+composer-slash-emoji-detail = Choose an emoji
+
+composer-slash-date = Today’s date
+
+composer-slash-date-detail = The date, written out
+
+composer-slash-time = The time
+
+composer-slash-time-detail = The time now
+
+composer-slash-no-match = No commands match
+
+composer-slash-template = Template
+
+composer-find = Find
+
+composer-replace-with = Replace with
+
+composer-replaced = { $count ->
+        [one] Replaced 1 match
+       *[other] Replaced { $count } matches
+    }
+
+composer-no-matches = No matches
+
+composer-match-of = { $current } of { $count }
+
+composer-previous-match = Previous
+
+composer-next-match = Next
+
+composer-match-case = Match case
+
+composer-replace = Replace
+
+composer-replace-all = Replace all
+
+composer-close-find = Close find
+
+composer-find-and-replace = Find and Replace
+
+composer-find-an-emoji = Find an emoji
+
+composer-recently-used = Recently used
+
+composer-no-emoji-found = No emoji found
+
+composer-insert-emoji = Insert emoji
+
+composer-text-style = Text color, font and size
+
+composer-automatic-color = Automatic
+
+composer-no-highlight = No highlight
+
+composer-default-font = The message’s font
+
+composer-normal-size = Normal
+
+composer-text-color = Text color
+
+composer-highlight = Highlight
+
+composer-size = Size
+
+composer-font = Font
+
+composer-table = Table
+
+composer-insert-table = Insert table
+
+composer-table-size = { $rows } × { $columns } table
+
+composer-insert-row-above = Insert row above
+
+composer-insert-row-below = Insert row below
+
+composer-insert-column-left = Insert column left
+
+composer-insert-column-right = Insert column right
+
+composer-widen-column = Widen column
+
+composer-narrow-column = Narrow column
+
+composer-equal-columns = Equal column widths
+
+composer-delete-row = Delete row
+
+composer-delete-column = Delete column
+
+composer-delete-table = Delete table
+
+composer-drag-column-edges = Drag the edges between columns to resize them.
+
+composer-pictures-size = Pictures: { $size }
+
+composer-pictures-size-tip = How large pictures are sent: smaller ones go faster and fill less of everyone’s mailbox. Click to change.
+
+composer-too-large-encrypted = These attachments may be too large to send, and an encrypted message can’t share them as links.
+
+composer-too-large-shared = Too large to send by mail: the largest files go as links from { $host }.
+
+composer-too-large-set-up-cloud = These attachments may be too large to send. Set up cloud storage in Settings → Composing to share them as links.
+
+composer-more = More
+
+composer-mail-merge = Mail merge
+
+composer-mail-merge-2 = Mail merge…
+
+composer-close-mail-merge = Close mail merge
+
+composer-merge-explained = Send this message to each person in a spreadsheet saved as CSV. Put a column’s placeholder in the subject or text, and each message gets that person’s value.
+
+composer-merge-choose = Choose a CSV file…
+
+composer-merge-other-file = Other file…
+
+composer-merge-file = { $file }: { $count ->
+        [one] 1 row
+       *[other] { $count } rows
+    }
+
+composer-merge-addresses-from = Addresses from the column
+
+composer-merge-next-column = Use the next column
+
+composer-merge-placeholders = Placeholders (put where the cursor is)
+
+composer-merge-preview = Message { $current } of { $count }
+
+composer-merge-to = To: { $to }
+
+composer-merge-skipped = { $count ->
+        [one] 1 row has no email address and is skipped.
+       *[other] { $count } rows have no email address and are skipped.
+    }
+
+composer-merge-no-copies = Cc and Bcc aren’t used: each message goes only to its row’s address.
+
+composer-merge-no-addresses = No row has an email address in the column chosen.
+
+composer-merge-confirm = { $count ->
+        [one] Send 1 personalized message?
+       *[other] Send { $count } personalized messages?
+    }
+
+composer-merge-send = { $count ->
+        [one] Send 1 message
+       *[other] Send { $count } messages
+    }
+
+composer-merge-sending = Sending { $current } of { $count }…
+
+composer-snippets = Snippets
+
+composer-snippet = Snippet
+
+composer-save-selection-as-snippet = Save selection as snippet
+
+composer-select-text-for-a-snippet = Select the text to keep as a snippet first.

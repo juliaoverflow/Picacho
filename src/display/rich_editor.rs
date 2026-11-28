@@ -16,9 +16,15 @@ use gpui_component::input as ia;
 use std::path::PathBuf;
 use unicode_segmentation::UnicodeSegmentation as _;
 
+#[path = "rich_editor/authoring.rs"]
+mod authoring;
+pub(super) use authoring::{SlashCommand, SlashItem, TableOp};
+
 /// What a rich editor tells its composer.
 pub(super) enum RichEvent {
     Changed,
+    /// A slash command for the composer to carry out (at the caret).
+    Slash(SlashCommand),
 }
 
 /// A selection: where it started and where it is now.
@@ -66,7 +72,7 @@ pub(super) enum Mark {
 }
 
 /// What the selection is, for the toolbar's buttons.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub(super) struct Active {
     pub(super) bold: bool,
     pub(super) italic: bool,
@@ -79,6 +85,12 @@ pub(super) struct Active {
     pub(super) numbers: bool,
     pub(super) quote: bool,
     pub(super) align: rt::Align,
+    pub(super) color: Option<rt::Color>,
+    pub(super) background: Option<rt::Color>,
+    pub(super) family: Option<String>,
+    pub(super) size: Option<f32>,
+    /// The caret is in a table.
+    pub(super) table: bool,
 }
 
 /// A picture the editor shows, decoded off the main thread.
@@ -161,6 +173,16 @@ pub(super) struct RichEditor {
     handle_drag: Option<gpui_base::SelectionEdge>,
     /// The edit menu (right click, or after a touch selection).
     menu: Option<Menu>,
+    /// Markdown typed formats as it is typed (Settings → Composing).
+    pub(super) markdown: bool,
+    /// Find's matches, highlighted.
+    highlights: Vec<(Pos, Pos)>,
+    /// The slash menu, while a "/" command is typed.
+    slash: Option<authoring::Slash>,
+    /// What the slash menu offers besides its blocks (templates).
+    pub(super) slash_extra: Vec<SlashItem>,
+    /// A table column's edge being dragged.
+    column_drag: Option<authoring::ColumnDrag>,
 }
 
 /// A picture's grip being dragged.
@@ -222,6 +244,11 @@ impl RichEditor {
             touch_range: None,
             handle_drag: None,
             menu: None,
+            markdown: true,
+            highlights: Vec::new(),
+            slash: None,
+            slash_extra: Vec::new(),
+            column_drag: None,
         }
     }
 
@@ -236,6 +263,8 @@ impl RichEditor {
         self.pending = None;
         self.undo.clear();
         self.redo.clear();
+        self.slash = None;
+        self.highlights.clear();
         self.revision += 1;
         cx.notify();
     }
@@ -294,15 +323,31 @@ impl RichEditor {
         self.goal_x = None;
         self.menu = None;
         self.touch_range = None;
+        self.check_slash();
         if let Some(w) = window {
             w.notify_text_input_changed(&self.focus);
         }
         cx.emit(RichEvent::Changed);
         cx.notify();
     }
-    /// Removes the selection; where the caret is after.
+    /// Removes the selection; where the caret is after. Across table
+    /// cells, only their text goes: the cells stay.
     fn delete_selection(&mut self) -> Pos {
-        let at = self.doc.delete(self.sel.start(), self.sel.end());
+        let (start, end) = (self.sel.start(), self.sel.end());
+        // From or into a table's cell (tables wholly selected go whole).
+        let in_cell = |bi: usize| rt::table::cell_index(&self.doc.block(bi).path).is_some();
+        let crosses = (in_cell(start.block) || in_cell(end.block))
+            && (start.block..end.block).any(|i| !rt::table::same_cell(&self.doc.block(i).path, &self.doc.block(i + 1).path));
+        if crosses {
+            for bi in (start.block..=end.block).rev() {
+                let from = if bi == start.block { start.offset } else { 0 };
+                let to = if bi == end.block { end.offset } else { self.doc.block(bi).len() };
+                self.doc.delete(Pos::new(bi, from), Pos::new(bi, to));
+            }
+            self.sel = Selection::caret(start);
+            return start;
+        }
+        let at = self.doc.delete(start, end);
         self.sel = Selection::caret(at);
         at
     }
@@ -338,6 +383,10 @@ impl RichEditor {
         self.sel = Selection::caret(at);
         self.pending = Some(style);
         self.finish(kind, window, cx);
+        if kind == EditKind::Typing && text.chars().count() == 1 {
+            self.maybe_open_slash(text, cx);
+            self.apply_input_rules(text, window, cx);
+        }
     }
     /// Puts `fragment` (pasted formatting) over the selection.
     pub(super) fn insert_doc(&mut self, fragment: &Doc, window: Option<&Window>, cx: &mut Context<Self>) {
@@ -627,6 +676,11 @@ impl RichEditor {
             numbers: in_list("ol"),
             quote: info.quotes > 0,
             align: info.align,
+            color: style.color,
+            background: style.background,
+            family: style.family.clone(),
+            size: style.size,
+            table: self.in_table(),
         }
     }
 
@@ -701,6 +755,7 @@ impl RichEditor {
         self.marked = None;
         self.last_edit = None;
         self.reveal = true;
+        self.check_slash();
         cx.notify();
     }
     fn horizontal(&mut self, forward: bool, select: bool, word: bool, cx: &mut Context<Self>) {
@@ -787,6 +842,10 @@ impl RichEditor {
                 if h.block == 0 {
                     return;
                 }
+                // A cell's start: the cell before isn't joined to it.
+                if !rt::table::same_cell(&path, &self.doc.block(h.block - 1).path) {
+                    return;
+                }
             }
             let target = to.unwrap_or_else(|| self.prev_pos(h));
             if target == h {
@@ -803,8 +862,13 @@ impl RichEditor {
             return;
         }
         if self.sel.is_empty() {
-            let target = to.unwrap_or_else(|| self.next_pos(self.sel.head));
-            if target == self.sel.head {
+            let h = self.sel.head;
+            let target = to.unwrap_or_else(|| self.next_pos(h));
+            if target == h {
+                return;
+            }
+            // A cell's end: the cell after isn't joined to it.
+            if target.block != h.block && !rt::table::same_cell(&self.doc.block(h.block).path, &self.doc.block(target.block).path) {
                 return;
             }
             self.sel.anchor = target;
@@ -817,6 +881,12 @@ impl RichEditor {
     fn enter(&mut self, action: &ia::Enter, window: &mut Window, cx: &mut Context<Self>) {
         if action.secondary || self.disabled {
             cx.propagate();
+            return;
+        }
+        if self.slash_open() && !self.slash_entries().is_empty() && self.choose_slash(None, Some(window), cx) {
+            return;
+        }
+        if !action.shift && self.enter_rules(window, cx) {
             return;
         }
         if action.shift {
@@ -960,6 +1030,11 @@ impl RichEditor {
                 return;
             }
         }
+        // A table column's edge is dragged to resize its columns.
+        if !touch && !self.disabled && event.click_count == 1 && self.start_column_drag(local, event.position) {
+            cx.notify();
+            return;
+        }
         let p = layout.hit(&self.doc, local);
         // A click on a picture selects it.
         if let Some((image, _)) = layout.image_at(local) {
@@ -1030,11 +1105,14 @@ impl RichEditor {
         cx.notify();
     }
     fn dragging(&self) -> bool {
-        self.selecting || self.resize.is_some()
+        self.selecting || self.resize.is_some() || self.column_drag.is_some()
     }
     fn on_mouse_move(&mut self, event: &MouseMoveEvent, window: &mut Window, cx: &mut Context<Self>) {
         // Moves without the button held aren't a drag (a window refresh's).
         if event.pressed_button != Some(MouseButton::Left) {
+            return;
+        }
+        if self.drag_column(event.position, cx) {
             return;
         }
         if let Some(r) = &mut self.resize {
@@ -1106,6 +1184,9 @@ impl RichEditor {
     fn on_mouse_up(&mut self, _: &MouseUpEvent, window: &mut Window, cx: &mut Context<Self>) {
         self.selecting = false;
         self.drag_point = None;
+        if self.end_column_drag(window, cx) {
+            return;
+        }
         if let Some(r) = self.resize.take() {
             if (r.width - r.start_width).abs() >= 1. {
                 self.begin(EditKind::Other);
@@ -1765,8 +1846,21 @@ impl Render for RichEditor {
             .on_action(cx.listener(|t, _: &ia::MoveToNextWord, _, cx| t.horizontal(true, false, true, cx)))
             .on_action(cx.listener(|t, _: &ia::SelectToPreviousWordStart, _, cx| t.horizontal(false, true, true, cx)))
             .on_action(cx.listener(|t, _: &ia::SelectToNextWordEnd, _, cx| t.horizontal(true, true, true, cx)))
-            .on_action(cx.listener(|t, _: &ia::MoveUp, _, cx| t.vertical(false, false, false, cx)))
-            .on_action(cx.listener(|t, _: &ia::MoveDown, _, cx| t.vertical(true, false, false, cx)))
+            .on_action(cx.listener(|t, _: &ia::MoveUp, _, cx| {
+                if !t.slash_move(-1, cx) {
+                    t.vertical(false, false, false, cx)
+                }
+            }))
+            .on_action(cx.listener(|t, _: &ia::MoveDown, _, cx| {
+                if !t.slash_move(1, cx) {
+                    t.vertical(true, false, false, cx)
+                }
+            }))
+            .on_action(cx.listener(|t, _: &ia::Escape, _, cx| {
+                if !t.close_slash(cx) {
+                    cx.propagate();
+                }
+            }))
             .on_action(cx.listener(|t, _: &SelectUp, _, cx| t.vertical(false, true, false, cx)))
             .on_action(cx.listener(|t, _: &SelectDown, _, cx| t.vertical(true, true, false, cx)))
             .on_action(cx.listener(|t, _: &ia::MovePageUp, _, cx| t.vertical(false, false, true, cx)))
@@ -1792,6 +1886,13 @@ impl Render for RichEditor {
                 cx.notify();
             }))
             .on_action(cx.listener(|t, _: &ia::IndentInline, w, cx| {
+                if t.slash_open() && !t.slash_entries().is_empty() {
+                    t.choose_slash(None, Some(w), cx);
+                    return;
+                }
+                if t.table_tab(true, w, cx) {
+                    return;
+                }
                 let b = t.sel.head.block;
                 if rt::innermost_list(&t.doc.block(b).path).is_some() {
                     t.begin(EditKind::Other);
@@ -1805,6 +1906,9 @@ impl Render for RichEditor {
                 }
             }))
             .on_action(cx.listener(|t, _: &ia::OutdentInline, w, cx| {
+                if t.table_tab(false, w, cx) {
+                    return;
+                }
                 let b = t.sel.head.block;
                 if rt::innermost_list(&t.doc.block(b).path).is_some() {
                     t.begin(EditKind::Other);
@@ -1835,6 +1939,7 @@ impl Render for RichEditor {
                     .child(RichText { editor: cx.entity() }),
             )
             .children(self.menu_view(cx))
+            .children(self.slash_view(cx))
     }
 }
 
@@ -1850,8 +1955,21 @@ struct Layout {
     blocks: Vec<BlockBox>,
     /// Table cells, for their borders.
     cells: Vec<Bounds<Pixels>>,
+    /// Tables' columns, for dragging their edges.
+    tables: Vec<TableBox>,
     /// What it was laid out for (see `layout_key`).
     key: LayoutKey,
+}
+
+/// A table's columns as laid out.
+struct TableBox {
+    /// Its first block.
+    first: usize,
+    top: Pixels,
+    bottom: Pixels,
+    width: Pixels,
+    /// The x of the edges between its columns.
+    edges: Vec<Pixels>,
 }
 
 #[derive(Clone, PartialEq)]
@@ -2077,6 +2195,18 @@ impl BlockBox {
 impl Layout {
     fn local(&self, p: Point<Pixels>) -> Point<Pixels> {
         p - self.origin.get()
+    }
+    /// The table column edge at `p`: the table's first block, the column
+    /// left of the edge, and the table's width.
+    fn column_edge_at(&self, p: Point<Pixels>) -> Option<(usize, usize, f32)> {
+        // Inner tables (laid out after the table holding them) first.
+        self.tables.iter().rev().find_map(|t| {
+            if p.y < t.top || p.y > t.bottom {
+                return None;
+            }
+            let i = t.edges.iter().position(|x| (p.x - *x).abs() <= px(4.))?;
+            Some((t.first, i, f32::from(t.width)))
+        })
     }
     /// The block at `p`, or the nearest.
     fn block_at(&self, p: Point<Pixels>) -> Option<usize> {
@@ -2343,6 +2473,7 @@ struct Builder<'a> {
     mono: SharedString,
     boxes: Vec<BlockBox>,
     cells: Vec<Bounds<Pixels>>,
+    tables: Vec<TableBox>,
     /// Pictures not decoded yet.
     wanted: Vec<String>,
     typing: Option<(usize, usize)>,
@@ -2357,6 +2488,7 @@ fn lay_out(e: &RichEditor, width: Pixels, family: SharedString, typing: Option<(
         mono: mono_family().into(),
         boxes: (0..e.doc.blocks.len()).map(|_| BlockBox::default()).collect(),
         cells: Vec::new(),
+        tables: Vec::new(),
         wanted: Vec::new(),
         typing,
     };
@@ -2368,6 +2500,7 @@ fn lay_out(e: &RichEditor, width: Pixels, family: SharedString, typing: Option<(
         height: height.max(px(20.)),
         blocks: b.boxes,
         cells: b.cells,
+        tables: b.tables,
         key: layout_key(e, typing),
     }
 }
@@ -2413,7 +2546,8 @@ impl Builder<'_> {
     }
 
     /// A table: its rows one below another, each row's cells beside each
-    /// other in equal columns (spans kept), each as tall as the row's tallest.
+    /// other in its columns (as wide as the table says, else equal; spans
+    /// kept), each as tall as the row's tallest.
     fn table(&mut self, range: std::ops::Range<usize>, k: usize, left: Pixels, width: Pixels, y: Pixels, window: &mut Window) -> Pixels {
         struct Cell {
             range: std::ops::Range<usize>,
@@ -2462,8 +2596,22 @@ impl Builder<'_> {
             .max()
             .unwrap_or(1)
             .max(1);
-        let column = width / columns as f32;
+        // Its columns' widths: as dragged, or as its cells say.
+        let mut widths: Vec<Option<rt::table::Width>> = match self.e.dragged_percents(range.start) {
+            Some(p) => p.iter().map(|w| Some(rt::table::Width::Percent(*w))).collect(),
+            None => self.e.doc.table_with(range.start, k).map(|t| t.widths()).unwrap_or_default(),
+        };
+        widths.resize(columns, None);
+        let sizes = rt::table::column_widths(&widths, f32::from(width));
+        let mut col_x = Vec::with_capacity(columns + 1);
+        let mut at = left;
+        for w in &sizes {
+            col_x.push(at);
+            at += px(*w);
+        }
+        col_x.push(left + width);
         let pad = px(6.);
+        let table_top = y;
         let mut y = y + px(2.);
         for row in rows {
             let top = y;
@@ -2472,8 +2620,8 @@ impl Builder<'_> {
             let mut rects = Vec::new();
             for cell in row.cells {
                 let span = if cell.span == usize::MAX { columns } else { cell.span.min(columns - col.min(columns - 1)) };
-                let x = left + column * col as f32;
-                let w = column * span as f32;
+                let x = col_x[col.min(columns)];
+                let w = col_x[(col + span).min(columns)] - x;
                 let inner = (w - pad * 2.).max(px(16.));
                 let end = self.range(cell.range, cell.depth, x + pad, inner, top + pad, window) + pad;
                 bottom = bottom.max(end);
@@ -2485,6 +2633,7 @@ impl Builder<'_> {
             }
             y = bottom;
         }
+        self.tables.push(TableBox { first: range.start, top: table_top, bottom: y, width, edges: col_x[1..columns].to_vec() });
         y + px(6.)
     }
 
@@ -2547,7 +2696,8 @@ impl Builder<'_> {
         if info.rule {
             rule = Some(Bounds::new(point(left_in, y + px(8.)), size(avail, px(1.))));
             y += px(17.);
-        } else if b.runs.iter().any(|r| r.image.is_some()) {
+        } else if b.runs.iter().any(|r| r.image.is_some() || (r.style.size.is_some() && !info.pre)) {
+            // Pictures, or text of other sizes: flowed piece by piece.
             let (flow, height) = self.flow(bi, &pieces_of, font_px, line_height, left_in, avail, align, y, window);
             y += height;
             pieces.push(Piece::Flow(flow));
@@ -2637,8 +2787,9 @@ impl Builder<'_> {
     ) -> (FlowBox, Pixels) {
         enum Tok {
             /// A shaped line, from `start` to `end`; `fit` is where its
-            /// width counts to (before trailing spaces).
-            Word { line: Rc<ShapedLine>, base: usize, start: usize, end: usize, fit: usize },
+            /// width counts to (before trailing spaces). `height` is its
+            /// line's (text of its own size).
+            Word { line: Rc<ShapedLine>, base: usize, start: usize, end: usize, fit: usize, height: Pixels },
             Image(ImageBox),
             Break(usize),
         }
@@ -2646,9 +2797,16 @@ impl Builder<'_> {
         let b = &e.doc.blocks[bi];
         // Text runs as styled pieces, by block offset.
         let mut toks: Vec<Tok> = Vec::new();
-        let mut segment: Vec<(std::ops::Range<usize>, TextRun)> = Vec::new();
+        let mut segment: Vec<(std::ops::Range<usize>, TextRun, Pixels)> = Vec::new();
         let text = b.text();
-        let flush_segment = |segment: &mut Vec<(std::ops::Range<usize>, TextRun)>, toks: &mut Vec<Tok>, window: &mut Window| {
+        let base_size = e.look.size;
+        // A run's own size (CSS pixels, as 16 is the composer's size).
+        let pre = self.infos[bi].pre;
+        let size_of = |run: &rt::Run| match run.style.size {
+            Some(z) if !pre => px((z * base_size / 16.).clamp(8., 64.)),
+            _ => font_px,
+        };
+        let flush_segment = |segment: &mut Vec<(std::ops::Range<usize>, TextRun, Pixels)>, toks: &mut Vec<Tok>, window: &mut Window| {
             let (Some(first), Some(last)) = (segment.first(), segment.last()) else { return };
             let (start, end) = (first.0.start, last.0.end);
             // Each line of it (between `\n`s) shaped on its own.
@@ -2662,41 +2820,56 @@ impl Builder<'_> {
                 }
             }
             lines.push((line_start, end));
-            for (n, &(ls, le)) in lines.iter().enumerate() {
+            for (n, &(line_from, line_to)) in lines.iter().enumerate() {
                 if n > 0 {
-                    toks.push(Tok::Break(ls));
+                    toks.push(Tok::Break(line_from));
                 }
-                if ls == le {
+                if line_from == line_to {
                     continue;
                 }
-                let runs: Vec<TextRun> = segment
-                    .iter()
-                    .filter_map(|(r, run)| {
-                        let (a, z) = (r.start.max(ls), r.end.min(le));
-                        (a < z).then(|| TextRun { len: z - a, ..run.clone() })
-                    })
-                    .collect();
-                let s: SharedString = text[ls..le].to_owned().into();
-                let line = Rc::new(window.text_system().shape_line(s.clone(), font_px, &runs, None));
-                // Words with the spaces after them; ideographs one by one.
-                let mut ws = 0;
-                let chars: Vec<(usize, char)> = s.char_indices().collect();
-                let mut k = 0;
-                while k < chars.len() {
-                    let (i, c) = chars[k];
-                    let wide = is_wide(c);
-                    let next = chars.get(k + 1).map(|&(_, n)| n);
-                    let boundary = match next {
-                        None => true,
-                        Some(n) => (c.is_whitespace() && !n.is_whitespace()) || wide || is_wide(n),
-                    };
-                    if boundary {
-                        let end = i + c.len_utf8();
-                        let fit = s[ws..end].trim_end().len() + ws;
-                        toks.push(Tok::Word { line: line.clone(), base: ls, start: ws, end, fit });
-                        ws = end;
+                // Stretches of one size, each shaped at its size.
+                let mut groups: Vec<(usize, usize, Pixels)> = Vec::new();
+                for (r, _, size) in segment.iter() {
+                    let (a, z) = (r.start.max(line_from), r.end.min(line_to));
+                    if a >= z {
+                        continue;
                     }
-                    k += 1;
+                    match groups.last_mut() {
+                        Some(g) if g.2 == *size && g.1 == a => g.1 = z,
+                        _ => groups.push((a, z, *size)),
+                    }
+                }
+                for (ls, le, size) in groups {
+                    let runs: Vec<TextRun> = segment
+                        .iter()
+                        .filter_map(|(r, run, _)| {
+                            let (a, z) = (r.start.max(ls), r.end.min(le));
+                            (a < z).then(|| TextRun { len: z - a, ..run.clone() })
+                        })
+                        .collect();
+                    let s: SharedString = text[ls..le].to_owned().into();
+                    let height = (size * 1.45).round();
+                    let line = Rc::new(window.text_system().shape_line(s.clone(), size, &runs, None));
+                    // Words with the spaces after them; ideographs one by one.
+                    let mut ws = 0;
+                    let chars: Vec<(usize, char)> = s.char_indices().collect();
+                    let mut k = 0;
+                    while k < chars.len() {
+                        let (i, c) = chars[k];
+                        let wide = is_wide(c);
+                        let next = chars.get(k + 1).map(|&(_, n)| n);
+                        let boundary = match next {
+                            None => true,
+                            Some(n) => (c.is_whitespace() && !n.is_whitespace()) || wide || is_wide(n),
+                        };
+                        if boundary {
+                            let end = i + c.len_utf8();
+                            let fit = s[ws..end].trim_end().len() + ws;
+                            toks.push(Tok::Word { line: line.clone(), base: ls, start: ws, end, fit, height });
+                            ws = end;
+                        }
+                        k += 1;
+                    }
                 }
             }
             segment.clear();
@@ -2708,7 +2881,8 @@ impl Builder<'_> {
                 let (w, h, picture) = self.picture_size(bi, at, image, avail);
                 toks.push(Tok::Image(ImageBox { offset: at, bounds: Bounds::new(Point::default(), size(w, h)), picture, alt: image.alt.clone().into() }));
             } else {
-                segment.extend(pieces_of(at, run));
+                let size = size_of(run);
+                segment.extend(pieces_of(at, run).into_iter().map(|(r, t)| (r, t, size)));
             }
             at += run.text.len();
         }
@@ -2739,7 +2913,7 @@ impl Builder<'_> {
                     row.used = row.x;
                     row.items.push(FlowItem::Image(image));
                 }
-                Tok::Word { line, base, mut start, end, fit } => {
+                Tok::Word { line, base, mut start, end, fit, height: word_height } => {
                     loop {
                         let width_to = |i: usize| line.x_for_index(i) - line.x_for_index(start);
                         let row = rows.last().expect("a row");
@@ -2768,7 +2942,7 @@ impl Builder<'_> {
                                 t.end = stop;
                             }
                         } else {
-                            row.items.push(FlowItem::Text(FlowText { line: line.clone(), base, start, end: stop, x, top: px(0.), height: line_height }));
+                            row.items.push(FlowItem::Text(FlowText { line: line.clone(), base, start, end: stop, x, top: px(0.), height: word_height }));
                         }
                         row.x = x + (line.x_for_index(stop) - line.x_for_index(start));
                         row.used = x + (line.x_for_index(fit.clamp(start, stop)) - line.x_for_index(start));
@@ -2794,7 +2968,15 @@ impl Builder<'_> {
                     _ => None,
                 })
                 .fold(px(0.), |a, h| a.max(h));
-            let height = line_height.max(tallest + descent + px(2.));
+            let tallest_text = row
+                .items
+                .iter()
+                .filter_map(|i| match i {
+                    FlowItem::Text(t) => Some(t.height),
+                    _ => None,
+                })
+                .fold(line_height, |a, h| a.max(h));
+            let height = tallest_text.max(tallest + descent + px(2.));
             let shift = match align {
                 TextAlign::Center => ((avail - row.used) / 2.).max(px(0.)),
                 TextAlign::Right => (avail - row.used).max(px(0.)),
@@ -2805,7 +2987,7 @@ impl Builder<'_> {
                 match item {
                     FlowItem::Text(t) => {
                         t.x += left + shift;
-                        t.top = y + height - line_height;
+                        t.top = y + height - t.height;
                     }
                     FlowItem::Image(i) => {
                         i.bounds.origin.x += left + shift;
@@ -2909,7 +3091,7 @@ const GRIP: f32 = 10.;
 
 impl Element for RichText {
     type RequestLayoutState = ();
-    type PrepaintState = Option<(Rc<Layout>, Hitbox, Option<Hitbox>)>;
+    type PrepaintState = Option<(Rc<Layout>, Hitbox, Option<Hitbox>, Vec<Hitbox>)>;
 
     fn id(&self) -> Option<ElementId> {
         None
@@ -2946,7 +3128,7 @@ impl Element for RichText {
         _: &mut (),
         window: &mut Window,
         cx: &mut App,
-    ) -> Option<(Rc<Layout>, Hitbox, Option<Hitbox>)> {
+    ) -> Option<(Rc<Layout>, Hitbox, Option<Hitbox>, Vec<Hitbox>)> {
         let family = window.text_style().font_family.clone();
         let layout = cached_layout(&self.editor, bounds.size.width, family, window, cx);
         layout.origin.set(bounds.origin);
@@ -2984,7 +3166,18 @@ impl Element for RichText {
             let corner = bounds.origin + r.bottom_right();
             window.insert_hitbox(Bounds::new(corner - point(px(GRIP), px(GRIP)), size(px(GRIP * 2.), px(GRIP * 2.))), HitboxBehavior::Normal)
         });
-        Some((layout, hitbox, grip))
+        // Tables' column edges show the resize pointer.
+        let edges = if self.editor.read(cx).disabled {
+            vec![]
+        } else {
+            layout
+                .tables
+                .iter()
+                .flat_map(|t| t.edges.iter().map(move |x| Bounds::new(point(*x - px(3.), t.top), size(px(6.), t.bottom - t.top))))
+                .map(|r| window.insert_hitbox(Bounds::new(bounds.origin + r.origin, r.size), HitboxBehavior::Normal))
+                .collect()
+        };
+        Some((layout, hitbox, grip, edges))
     }
     fn paint(
         &mut self,
@@ -2992,11 +3185,15 @@ impl Element for RichText {
         _: Option<&InspectorElementId>,
         bounds: Bounds<Pixels>,
         _: &mut (),
-        state: &mut Option<(Rc<Layout>, Hitbox, Option<Hitbox>)>,
+        state: &mut Option<(Rc<Layout>, Hitbox, Option<Hitbox>, Vec<Hitbox>)>,
         window: &mut Window,
         cx: &mut App,
     ) {
-        let Some((layout, hitbox, grip_hitbox)) = state.clone() else { return };
+        let Some((layout, hitbox, grip_hitbox, edge_hitboxes)) = state.clone() else { return };
+        for h in &edge_hitboxes {
+            window.set_cursor_style(CursorStyle::ResizeLeftRight, h);
+        }
+        let highlights = self.editor.read(cx).highlights.clone();
         let (focus, sel, look, blank, placeholder, doc, handles, resizable) = {
             let e = self.editor.read(cx);
             (
@@ -3049,6 +3246,10 @@ impl Element for RichText {
             }
             if let Some(rule) = b.rule {
                 window.paint_quad(fill(Bounds::new(o + rule.origin, rule.size), rgb(look.border)));
+            }
+            // Find's matches, under the text.
+            for (hs, he) in highlights.iter().filter(|(hs, _)| hs.block == bi) {
+                paint_span(b, hs.offset, he.offset, o, find_color(look), window);
             }
             let selected = !sel.is_empty() && bi >= s.block && bi <= e.block;
             let from = if bi == s.block { s.offset } else { 0 };
@@ -3220,6 +3421,38 @@ impl RichText {
             window.prevent_default();
             cx.stop_propagation();
         });
+    }
+}
+
+/// The color find's matches are highlighted in.
+fn find_color(look: Look) -> Hsla {
+    let mut h: Hsla = rgb(0xffc400).into();
+    h.a = if look.dark { 0.38 } else { 0.45 };
+    h
+}
+
+/// Paints `from..to` of block `b` (in one block) in `color`.
+fn paint_span(b: &BlockBox, from: usize, to: usize, o: Point<Pixels>, color: Hsla, window: &mut Window) {
+    for piece in &b.pieces {
+        match piece {
+            Piece::Line(l) => paint_line_selection(l, from, to, false, o, color, window),
+            Piece::Flow(f) => {
+                for row in &f.rows {
+                    for item in &row.items {
+                        if let FlowItem::Text(t) = item {
+                            let (a, z) = (from.max(t.base + t.start), to.min(t.base + t.end));
+                            if a < z {
+                                let r = Bounds::from_corners(
+                                    point(o.x + t.x_of(a - t.base), o.y + t.top),
+                                    point(o.x + t.x_of(z - t.base), o.y + t.top + t.height),
+                                );
+                                window.paint_quad(fill(r, color));
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 

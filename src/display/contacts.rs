@@ -6,7 +6,8 @@ use super::*;
 impl MailApp {
     pub(super) fn contacts_page(&self, cx: &Context<Self>) -> AnyElement {
         let c = self.colors();
-        let cards = self.backend.contacts();
+        // The workspace's address books.
+        let cards = self.workspace_contacts();
         let server = self.backend.primary_contacts_server();
         let first = server.is_some();
         let busy = self.contacts_busy;

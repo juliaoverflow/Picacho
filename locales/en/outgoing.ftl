@@ -55,3 +55,5 @@ outgoing-receipt-subject = Subject: { $subject }
 
 # Ends a read receipt
 outgoing-this-only-says-the-message-was = This only says the message was shown; it doesn't guarantee that it was read or understood.
+
+outgoing-cloud-shared-as-links = Files shared as links:

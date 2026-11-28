@@ -2122,13 +2122,26 @@ impl Backend {
     /// events once for each repeat, changed and cancelled repeats as they
     /// now are. Soonest first.
     pub fn agenda(&self, from: i64, to: i64) -> Vec<Event> {
+        self.agenda_in(from, to, |_| true)
+    }
+    /// `agenda`, of the calendars (hrefs) `shown` keeps.
+    pub fn agenda_in(&self, from: i64, to: i64, shown: impl Fn(&str) -> bool) -> Vec<Event> {
         let mut out: Vec<Event> = self
             .cached_events()
             .iter()
+            .filter(|s| shown(&s.calendar))
             .flat_map(|s| ical::occurrences(&s.event, &s.overrides, from, to))
             .collect();
         out.sort_by_key(|e| e.start);
         out
+    }
+    /// The calendar (href) each event and task is in, by uid.
+    pub fn event_calendars(&self) -> std::collections::HashMap<String, String> {
+        self.cached_events()
+            .iter()
+            .map(|s| (s.event.uid.clone(), s.calendar.clone()))
+            .chain(self.calendar_tasks().into_iter().map(|t| (t.event.uid, t.calendar)))
+            .collect()
     }
     /// Changes one repeat of a repeating event (the one that started at
     /// `occurrence`), leaving the others as they are.

@@ -135,6 +135,15 @@ impl Backend {
             .and_then(|json| serde_json::from_str(&json).ok())
             .unwrap_or_default()
     }
+    /// Every card of the contacts sources (ids, `""` for the first) that
+    /// `shown` keeps.
+    pub fn contacts_in(&self, shown: impl Fn(&str) -> bool) -> Vec<Card> {
+        self.contacts_source_ids()
+            .into_iter()
+            .filter(|id| shown(id))
+            .flat_map(|id| self.in_contacts_source(&id, || self.contacts()))
+            .collect()
+    }
     fn save_contacts(&self, cards: &[Card]) -> Result<()> {
         // Outside any source, every source's cards would be read together
         // and written into the first.

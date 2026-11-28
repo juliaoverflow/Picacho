@@ -71,10 +71,34 @@ impl MailApp {
     /// Every account (and view) with its folders, then Add Account.
     fn mobile_mailbox_sections(&self, mut body: Stateful<Div>, cx: &Context<Self>) -> Stateful<Div> {
         let c = self.colors();
+        // The workspace on, to switch from, once there's one.
+        if !self.workspaces.list.is_empty() {
+            let (name, lead) = match self.workspace() {
+                Some(w) => (w.name.clone(), workspaces::badge(w, 24.).into_any_element()),
+                None => (
+                    t!("workspaces-everything").to_owned(),
+                    icon_el("workspace", 22., c.accent).into_any_element(),
+                ),
+            };
+            body = body.child(div().pt_4().child(self.group(vec![
+                self.cell(
+                    "mobile-workspace",
+                    lead,
+                    name,
+                    Some(t!("workspaces-switch-workspace").to_owned()),
+                    true,
+                    false,
+                    act(Action::Workspaces(workspaces::WsAction::Menu)),
+                    cx,
+                )
+                .into_any_element(),
+            ])));
+        }
         if self.shows_all_mail() {
             body = body.child(self.mobile_view_section(ALL_MAIL, cx));
         }
-        for id in tree::account_order(&self.tree) {
+        let shown = self.shown_tree();
+        for id in tree::account_order(&shown) {
             if fwd::is_view(&id) {
                 body = body.child(self.mobile_view_section(&id, cx));
             } else if let Some((index, a)) =
@@ -85,7 +109,7 @@ impl MailApp {
         }
         // Accounts the sidebar's tree doesn't hold yet.
         for (index, a) in self.accounts.iter().enumerate() {
-            if !tree::account_order(&self.tree).contains(&a.id) {
+            if !tree::account_order(&self.tree).contains(&a.id) && self.in_workspace(&a.id) {
                 body = body.child(self.mobile_account_section(a, index, cx));
             }
         }

@@ -36,6 +36,9 @@ pub(crate) mod motion;
 #[cfg(test)]
 #[path = "compose_tests.rs"]
 mod compose_tests;
+#[cfg(test)]
+#[path = "authoring_tests.rs"]
+mod authoring_tests;
 #[path = "composer.rs"]
 mod composer;
 #[path = "rich_editor.rs"]
@@ -127,10 +130,22 @@ mod stalls;
 mod shortcuts;
 #[path = "templates.rs"]
 mod templates;
+#[path = "cloud_settings.rs"]
+mod cloud_settings;
 #[path = "calendar_views.rs"]
 mod calendar_views;
+#[path = "tabs.rs"]
+mod tabs;
+#[cfg(test)]
+#[path = "tabs_tests.rs"]
+mod tabs_tests;
 #[path = "tree.rs"]
 mod tree;
+#[path = "workspaces.rs"]
+mod workspaces;
+#[cfg(test)]
+#[path = "workspaces_tests.rs"]
+mod workspaces_tests;
 #[path = "views.rs"]
 mod views;
 #[path = "window.rs"]
@@ -230,7 +245,16 @@ actions!(
         FindInMessage,
         PrintMessage,
         SaveAsPdf,
-        ToggleThreads
+        ToggleThreads,
+        /// Tabs (`tabs.rs`): a new one, the open one closed, the next and
+        /// the previous one.
+        NewTab,
+        CloseTab,
+        NextTab,
+        PreviousTab,
+        /// Workspaces (`workspaces.rs`): the next and the previous one.
+        NextWorkspace,
+        PreviousWorkspace
     ]
 );
 
@@ -695,6 +719,10 @@ enum Page {
     Organizing,
     /// Inbox Control: VIPs, the Screener, notifications and quiet hours.
     InboxControl,
+    /// Workspaces: sets of accounts and calendars shown together.
+    Workspaces,
+    /// One workspace's page, opened from Workspaces.
+    Workspace(String),
     /// Keyboard Shortcuts: every shortcut, changed by pressing new keys.
     Shortcuts,
     Account(String),
@@ -1360,10 +1388,16 @@ enum Action {
     Keys(shortcuts::KeyAction),
     /// Signatures per mailbox and templates.
     Templates(templates::TemplateAction),
+    /// The cloud storage large attachments are shared from.
+    Cloud(cloud_settings::CloudAction),
     /// Calendar and Contacts views, the calendar's grids, custom repeats.
     Calendar(calendar_views::CalAction),
     /// The app lock and the encrypted database (Settings → Privacy).
     Lock(applock::LockAction),
+    /// Tabs in the title bar (`tabs.rs`).
+    Tabs(tabs::TabAction),
+    /// Switching workspaces and Settings → Workspaces (`workspaces.rs`).
+    Workspaces(workspaces::WsAction),
 }
 
 /// A conversation's rows for one message at one list revision.
@@ -1715,6 +1749,10 @@ pub struct MailApp {
     /// Scheduled drafts that couldn't reach their server, and when to try
     /// them again.
     scheduled_retry: HashMap<String, std::time::Instant>,
+    /// A mail merge being sent (kept in the database too), and the
+    /// composer it came from while that's open.
+    merge_queue: Option<crate::manage::authoring::merge::Queue>,
+    merge_composer: Option<Entity<Composer>>,
     /// The date and time picker of the open dialog (Snooze).
     picker: Option<Entity<DateTimePicker>>,
     picker_subscription: Option<Subscription>,
@@ -1749,6 +1787,10 @@ pub struct MailApp {
     control_ui: inbox_control::ControlUi,
     lens: inbox_control::Lens,
     screened_waiting: usize,
+    /// Workspaces (`manage::workspaces`), the one the window shows, and
+    /// Settings' fields for them.
+    workspaces: crate::manage::workspaces::Workspaces,
+    ws_ui: workspaces::WorkspaceUi,
     /// The inbox's categories: the tab shown, how mail is sorted into
     /// them, and each tab's unread count (`manage::categories`).
     sorting: categories::Sorting,
@@ -1779,6 +1821,8 @@ pub struct MailApp {
     /// Settings → Composing: the mailbox whose signature is edited (None:
     /// every mailbox's), and the template being named.
     templates: templates::TemplatesUi,
+    /// Settings → Composing → Large attachments: the cloud storage's fields.
+    cloud: cloud_settings::CloudUi,
     /// The app lock: whether Picacho is locked, its screen and Settings.
     lock: applock::LockUi,
     /// Calendar or Contacts shown in place of the list and reader.
@@ -2179,6 +2223,8 @@ pub struct MailApp {
     /// with this `load_generation` has it (see `open_notified`): it may
     /// only just have arrived, not yet synced. Until the `Instant`.
     open_listed: Option<(u64, String, std::time::Instant)>,
+    /// The window's tabs: mailboxes and searches kept open (`tabs.rs`).
+    tabs: tabs::Tabs,
 }
 fn input(
     placeholder: &str,
@@ -2379,6 +2425,7 @@ impl MailApp {
                 this.scroll_list_to_top();
                 this.load_mail_kinds(cx);
                 this.search_texts_soon(cx);
+                this.save_tabs(cx);
                 cx.notify();
             }
         })]);
@@ -2387,6 +2434,22 @@ impl MailApp {
         let org_ui = organize::OrgUi::new(window, cx);
         let control = crate::manage::inbox_control::InboxControl::load(&backend.store);
         let control_ui = inbox_control::ControlUi::new(window, cx);
+        let mut workspaces = crate::manage::workspaces::Workspaces::load(&backend.store);
+        {
+            // Accounts removed while Picacho was closed.
+            let ids: Vec<String> = accounts.iter().map(|a| a.id.clone()).collect();
+            if !ids.is_empty() && workspaces.reconcile(&ids) {
+                workspaces.save(&backend.store);
+            }
+        }
+        let ws_ui =
+            workspaces::WorkspaceUi::new(workspaces.current().map(|w| w.id.clone()), window, cx);
+        // A workspace's name is saved as it's typed.
+        subscriptions.push(cx.subscribe(&ws_ui.name, |this, _, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::Change) {
+                this.rename_workspace(cx);
+            }
+        }));
         let sorting = categories::Sorting::load(&backend.store);
         let find = tools::Find::new(window, cx);
         subscriptions.push(cx.subscribe_in(&find.input, window, |this, _, event, w, cx| {
@@ -2684,6 +2747,7 @@ impl MailApp {
             .preference(crate::manage::composing::PREFERENCE)
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default();
+        let cloud = cloud_settings::CloudUi::new(&compose_options.cloud, window, cx);
         let signature_input = reworded_area(cx.new(|cx| {
             TextareaState::new(window, cx)
                 .placeholder(t!("ui-your-name-title-phone"))
@@ -3121,6 +3185,8 @@ impl MailApp {
             draft_syncs: HashSet::new(),
             scheduled_sending: HashSet::new(),
             scheduled_retry: HashMap::new(),
+            merge_queue: None,
+            merge_composer: None,
             pushed,
             draft_synced: HashMap::new(),
             label_input,
@@ -3349,6 +3415,8 @@ impl MailApp {
             control_ui,
             lens: inbox_control::Lens::Inbox,
             screened_waiting: 0,
+            workspaces,
+            ws_ui,
             sorting,
             keys_ui: Default::default(),
             thread_counts: HashMap::new(),
@@ -3361,6 +3429,7 @@ impl MailApp {
             local_results: None,
             applying_rules: false,
             templates,
+            cloud,
             lock,
             app_view: None,
             cal,
@@ -3369,6 +3438,7 @@ impl MailApp {
             shared_looking: HashSet::new(),
             mobile: mobile::Mobile::new(),
             open_listed: None,
+            tabs: tabs::Tabs::new(),
         };
         this.update_scope();
         this.load_looks(cx);
@@ -3403,8 +3473,9 @@ impl MailApp {
                 // A tapped notification's mail (it opened Picacho), else
                 // back where the person was, else the first mailbox.
                 if let Some(target) = crate::display::notify::take_clicked() {
+                    this.restore_tabs_only();
                     this.open_notified(target, w, cx);
-                } else if this.restore_place(w, cx) {
+                } else if this.restore_tabs(w, cx) || this.restore_place(w, cx) {
                 } else if this.messages.is_empty() {
                     let first = this.account.clone();
                     this.open_mailbox(first, Folder::Inbox.into(), w, cx);
@@ -3433,6 +3504,8 @@ impl MailApp {
                     this.refresh_aliases_due(views::ALIAS_REFRESH, cx);
                     this.show_due_reminders(cx);
                     this.refresh_jmap_threads(cx);
+                    // A workspace's schedule may have turned.
+                    this.apply_workspace(true, cx);
                     true
                 });
                 if !checked.unwrap_or(false) {
@@ -4083,7 +4156,8 @@ impl MailApp {
         }
         self.counts_running = true;
         let store = self.backend.store.clone();
-        let accounts = self.accounts.clone();
+        // All Accounts counts only the workspace's.
+        let accounts = self.workspace_accounts();
         let forwarding = self.forwarding.clone();
         let all_mail = self.shows_all_mail();
         let now = chrono::Utc::now().timestamp();
@@ -4468,12 +4542,21 @@ impl MailApp {
                 "inbox",
                 Action::OpenMailbox(id.into(), mailbox.clone()),
             ),
+        ];
+        if !self.mobile.on {
+            entries.push(entry(
+                t!("tabs-open-in-new-tab"),
+                "plus",
+                Action::Tabs(tabs::TabAction::New(Some((id.into(), mailbox.clone())))),
+            ));
+        }
+        entries.extend([
             entry(
                 t!("ui-refresh"),
                 "refresh",
                 Action::OpenMailbox(id.into(), mailbox.clone()),
             ),
-        ];
+        ]);
         if !matches!(mailbox, Mailbox::Standard(Folder::Drafts | Folder::Starred)) {
             entries.push(entry(
                 t!("ui-mark-all-as-read"),
@@ -5563,6 +5646,7 @@ impl MailApp {
                     this.set_messages(ms, cx);
                     this.listed = Some(key);
                 }
+                this.finish_tab_restore(cx);
                 this.apply_pending_listed(cx);
                 this.refresh(cx);
             });
@@ -9185,14 +9269,18 @@ impl MailApp {
             Action::Filters(action) => self.filter_action(action, w, cx),
             Action::Organize(action) => self.org_action(action, w, cx),
             Action::Control(action) => self.control_action(action, w, cx),
+            Action::Workspaces(action) => self.workspace_action(action, w, cx),
             Action::Categories(action) => self.cat_action(action, w, cx),
             Action::Tools(action) => self.tool_action(action, w, cx),
             Action::Keys(action) => self.key_action(action, cx),
             Action::Templates(action) => self.template_action(action, w, cx),
+            Action::Cloud(action) => self.cloud_action(action, w, cx),
             Action::Calendar(action) => self.cal_action(action, w, cx),
             Action::Lock(action) => self.lock_action(action, w, cx),
+            Action::Tabs(action) => self.tabs_action(action, w, cx),
         }
         self.sync_selecting();
+        self.save_tabs(cx);
         cx.notify();
     }
     /// Selection mode is "something is selected", or turned on from the
@@ -9750,7 +9838,7 @@ impl MailApp {
                     .font_weight(FontWeight::SEMIBOLD)
                     .child("Picacho"),
             )
-            .child(div().flex_1())
+            .child(self.tab_strip(cx))
             .child(small(self.button(
                 "theme",
                 t!("ui-switch-appearance"),
@@ -9830,6 +9918,8 @@ impl MailApp {
         let count = self.unread_for(account, &mailbox);
         let entries = self.mailbox_entries(account, mailbox.clone());
         let action = Action::OpenMailbox(account.to_owned(), mailbox.clone());
+        let tab_target = (account.to_owned(), mailbox.clone());
+        let middle_target = tab_target.clone();
         let selector = format!("nav-{account}-{}", mailbox.key());
         // A server folder is renamed in place, as top folders are.
         let rename = match &mailbox {
@@ -9922,9 +10012,24 @@ impl MailApp {
                 // Double-clicking a server folder renames it, as with top folders.
                 match &double {
                     Some(rename) if e.click_count() >= 2 => this.handle(rename.clone(), w, cx),
+                    // ⌘/Ctrl-click opens it in a new tab, as in a browser.
+                    _ if e.modifiers().secondary(cx) && !this.mobile.on => {
+                        let target = Some(tab_target.clone());
+                        this.handle(Action::Tabs(tabs::TabAction::New(target)), w, cx)
+                    }
                     _ => this.handle(action.clone(), w, cx),
                 }
             }))
+            // So does the middle button.
+            .on_mouse_up(
+                MouseButton::Middle,
+                cx.listener(move |this, _, w, cx| {
+                    if !editing && !this.mobile.on {
+                        let target = Some(middle_target.clone());
+                        this.handle(Action::Tabs(tabs::TabAction::New(target)), w, cx)
+                    }
+                }),
+            )
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(move |this, e: &MouseDownEvent, _, cx| {
@@ -9946,13 +10051,15 @@ impl MailApp {
             .px_2()
             .pb_2();
         let mut list = self.tree_list(list, &self.sidebar_scroll, cx);
+        list = list.children(self.workspace_switcher(cx));
         let row = Cell::new(0);
         if self.shows_all_mail()
             && let Some(el) = self.view_block(ALL_MAIL, 0, &row, false, cx)
         {
             list = list.child(el);
         }
-        for el in self.sidebar_nodes(&self.tree, 0, &row, cx) {
+        let tree = self.shown_tree();
+        for el in self.sidebar_nodes(&tree, 0, &row, cx) {
             list = list.child(el);
         }
         #[cfg(feature = "sample-data")]
@@ -10096,13 +10203,15 @@ impl MailApp {
             )
             .child(div().h(px(1.)).w(px(28.)).my_1().bg(rgb(c.border)));
         let mut rail = self.tree_list(rail, &self.rail_scroll, cx);
+        rail = rail.children(self.workspace_rail(cx));
         let row = Cell::new(0);
         if self.shows_all_mail()
             && let Some(el) = self.rail_view(ALL_MAIL, &row, false, cx)
         {
             rail = rail.child(el);
         }
-        for el in self.rail_nodes(&self.tree, &row, cx) {
+        let tree = self.shown_tree();
+        for el in self.rail_nodes(&tree, &row, cx) {
             rail = rail.child(el);
         }
         rail = rail.child(self.app_view_links(true, cx));
@@ -13290,6 +13399,24 @@ impl MailApp {
             .on_action(cx.listener(|this, _: &GoSpam, w, cx| this.go(Folder::Junk, w, cx)))
             .on_action(cx.listener(|this, _: &GoTrash, w, cx| this.go(Folder::Trash, w, cx)))
             .on_action(cx.listener(|this, _: &GoAllMail, w, cx| this.go(Folder::All, w, cx)))
+            .on_action(cx.listener(|this, _: &NewTab, w, cx| {
+                this.handle(Action::Tabs(tabs::TabAction::New(None)), w, cx)
+            }))
+            .on_action(cx.listener(|this, _: &CloseTab, w, cx| {
+                this.handle(Action::Tabs(tabs::TabAction::CloseActive), w, cx)
+            }))
+            .on_action(cx.listener(|this, _: &NextTab, w, cx| {
+                this.handle(Action::Tabs(tabs::TabAction::Cycle(true)), w, cx)
+            }))
+            .on_action(cx.listener(|this, _: &PreviousTab, w, cx| {
+                this.handle(Action::Tabs(tabs::TabAction::Cycle(false)), w, cx)
+            }))
+            .on_action(cx.listener(|this, _: &NextWorkspace, w, cx| {
+                this.handle(Action::Workspaces(workspaces::WsAction::Cycle(true)), w, cx)
+            }))
+            .on_action(cx.listener(|this, _: &PreviousWorkspace, w, cx| {
+                this.handle(Action::Workspaces(workspaces::WsAction::Cycle(false)), w, cx)
+            }))
             .on_action(cx.listener(|this, _: &ShowAllMail, w, cx| {
                 this.handle(Action::SetFilter(Filter::All), w, cx)
             }))
@@ -13854,6 +13981,7 @@ fn icon_el(name: &str, size: f32, color: u32) -> Div {
         "bell-off",
         "vip",
         "screener",
+        "workspace",
         "print",
         "external",
         "template",
@@ -13862,6 +13990,8 @@ fn icon_el(name: &str, size: f32, color: u32) -> Div {
         "people",
         "plane",
         "bank",
+        "table",
+        "smile",
     ]
     .contains(&name)
     {
@@ -14524,6 +14654,11 @@ fn menus() -> Vec<Menu> {
                 MenuItem::separator(),
                 MenuItem::action(t!("ui-mark-all-as-read"), MarkAllRead),
                 MenuItem::action(t!("ui-refresh"), Refresh),
+                MenuItem::separator(),
+                MenuItem::action(t!("tabs-new-tab"), NewTab),
+                MenuItem::action(t!("tabs-close-tab"), CloseTab),
+                MenuItem::action(t!("tabs-next-tab"), NextTab),
+                MenuItem::action(t!("tabs-previous-tab"), PreviousTab),
             ],
         ),
         menu(

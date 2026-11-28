@@ -598,7 +598,17 @@ impl Backend {
             };
             self.verify(account, secret, taken, &cancel, true)
         } else if account.oauth {
-            let grant = crate::sync::oauth::authorize(&account, cancel.clone())?;
+            // Signing in again, an Outlook account keeps the extra access it
+            // was given (OneDrive, for large attachments), asked for again:
+            // Microsoft's new sign-in covers only what it names. (Google
+            // keeps what was granted, `include_granted_scopes`.)
+            let kept = if account.provider == Provider::Outlook && account.graph() && !account.id.is_empty() {
+                store::read_secret(&account.id).map(|s| s.extra_scopes).unwrap_or_default()
+            } else {
+                String::new()
+            };
+            let more: Vec<&str> = kept.split_whitespace().collect();
+            let grant = crate::sync::oauth::authorize_with(&account, &more, cancel.clone())?;
             self.redeem(account, grant, taken, &cancel)
         } else {
             // Kerberos uses the system's ticket; there is no password.
@@ -4386,7 +4396,101 @@ impl Backend {
             Err(e) => Err(e),
         }
     }
+    /// Sends `d` as `manage::outgoing` prepares it: its pictures at its
+    /// picture size, and, with cloud storage set up, its largest files
+    /// shared as links when it would be too large (or, sent, the server
+    /// said it was, before taking it).
     fn send_held(&self, a: &Account, d: &Draft, hold_until: Option<i64>) -> Result<Vec<String>> {
+        use crate::manage::outgoing;
+        let options: crate::manage::composing::ComposeOptions = self
+            .store
+            .preference(crate::manage::composing::PREFERENCE)
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default();
+        let shares = options.cloud.configured() && !d.encrypt;
+        let cloud: std::cell::RefCell<Option<outgoing::Sharer>> = Default::default();
+        let share = |path: &std::path::Path, name: &str| -> Result<String> {
+            let mut cloud = cloud.borrow_mut();
+            if cloud.is_none() {
+                *cloud = Some(self.cloud_sharer(&options.cloud, None)?);
+            }
+            cloud.as_ref().expect("just made").share(path, name)
+        };
+        // Through an API, whose limits aren't said before sending: shared
+        // when larger than mail is taken almost everywhere. By SMTP, the
+        // server's SIZE says (shared on a refusal, below), except past what
+        // Picacho would build at all.
+        let limit = crate::sync::smtp::DEFAULT_LIMIT;
+        let api = a.api_sending() && !(d.send_as.trim().is_empty() && a.identity(&d.identity).is_some_and(|i| i.smtp.is_some()));
+        let over = shares.then_some(if api { limit * 95 / 100 } else { limit * 4 * 9 / 10 });
+        let mut prepared = outgoing::prepare(&self.store.path, &options, d, over, &share)?;
+        let mut result = self.send_held_once(a, &prepared.draft, hold_until);
+        if shares
+            && prepared.shared.is_empty()
+            && let Err(e) = &result
+            && let Some(large) = e.downcast_ref::<crate::sync::smtp::MessageTooLarge>()
+        {
+            let limit = large.limit * 9 / 10;
+            drop(prepared);
+            prepared = outgoing::prepare(&self.store.path, &options, d, Some(limit), &share)?;
+            result = self.send_held_once(a, &prepared.draft, hold_until);
+        }
+        let mut notes = result?;
+        if !prepared.shared.is_empty() {
+            let names: Vec<&str> = prepared.shared.iter().map(|s| s.name.as_str()).collect();
+            notes.push(t!("manage-backend-shared-as-links", count = names.len(), names = names.join(", ")));
+        }
+        Ok(notes)
+    }
+    /// What uploads large attachments to `storage`: a Nextcloud or WebDAV
+    /// folder, signed in with `password` (the one kept, without), or a mail
+    /// account's Google Drive or OneDrive, with its sign-in.
+    pub fn cloud_sharer(&self, storage: &crate::manage::composing::CloudStorage, password: Option<&str>) -> Result<crate::manage::outgoing::Sharer> {
+        use crate::manage::composing::CloudKind;
+        use crate::manage::outgoing::{AccountCloud, Cloud, DRIVE_BASE, GRAPH_BASE, Sharer};
+        if !storage.kind.uses_account() {
+            // Without one kept (or a keychain), the storage says if it needs one.
+            let password = match password {
+                Some(p) => p.to_owned(),
+                None => crate::manage::store::read_secret_text(crate::manage::outgoing::CLOUD_SECRET).ok().flatten().unwrap_or_default(),
+            };
+            return Ok(Sharer::Dav(Cloud::new(storage, &password, self.tls_connector()?)?));
+        }
+        let a = self
+            .store
+            .accounts()?
+            .into_iter()
+            .find(|a| a.id == storage.account)
+            .with_context(|| t!("manage-outgoing-cloud-account-gone"))?;
+        let secret = self.credentials(&a)?;
+        let base = gmail::api_base(&a, if storage.kind == CloudKind::GoogleDrive { DRIVE_BASE } else { GRAPH_BASE });
+        Ok(Sharer::Account(AccountCloud::new(storage, &secret.access_token, &base, self.tls_connector()?)?))
+    }
+    /// Asks, in the browser, for access to `a`'s Google Drive or OneDrive
+    /// (only Picacho's own files on Drive) on top of its mail, and keeps the
+    /// sign-in that covers both. Already given, nothing is asked.
+    pub fn connect_cloud(&self, a: &Account, kind: crate::manage::composing::CloudKind, cancel: Arc<std::sync::atomic::AtomicBool>) -> Result<()> {
+        use crate::manage::composing::CloudKind;
+        match kind {
+            CloudKind::GoogleDrive => {
+                ensure!(a.provider == Provider::Gmail && a.oauth && a.sso.is_none(), t!("manage-outgoing-cloud-not-this-account"));
+                self.grant_google(a, crate::sync::oauth::GOOGLE_DRIVE, cancel)
+            }
+            CloudKind::OneDrive => {
+                ensure!(a.provider == Provider::Outlook && a.graph() && a.oauth, t!("manage-outgoing-cloud-not-this-account"));
+                if self.credentials(a)?.extra_scopes.split_whitespace().any(|s| s == crate::sync::oauth::GRAPH_FILES) {
+                    return Ok(());
+                }
+                let grant = crate::sync::oauth::authorize_with(a, &[crate::sync::oauth::GRAPH_FILES], cancel)?;
+                let (secret, _) = crate::sync::oauth::redeem(a, &grant)?;
+                self.save_credentials(&a.id, &secret)?;
+                self.graph.lock().unwrap().remove(&a.id);
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+    fn send_held_once(&self, a: &Account, d: &Draft, hold_until: Option<i64>) -> Result<Vec<String>> {
         // Encrypted with Bcc through Proton's API: one message goes to
         // everyone, so it can't be kept from naming the Bcc recipients' keys
         // (RFC 5322 §3.6.3), and Proton rebuilds each submission from its

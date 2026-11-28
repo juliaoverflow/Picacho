@@ -66,6 +66,8 @@ public final class WidgetStore {
         int accentDark = 0x86cfaa;
         int totalUnread;
         boolean calendarConnected;
+        /** The workspace on, by name; empty for everything. */
+        String workspace = "";
         final List<Account> accounts = new ArrayList<>();
         final List<Message> messages = new ArrayList<>();
         final List<Event> events = new ArrayList<>();
@@ -84,10 +86,41 @@ public final class WidgetStore {
             return 0;
         }
 
+        /**
+         * Whether All Accounts takes in this account: the workspace on shows it.
+         * An account the snapshot doesn't list is taken in.
+         */
+        boolean shown(String accountId) {
+            for (Account a : accounts) {
+                if (a.id.equals(accountId)) {
+                    return a.shown;
+                }
+            }
+            return true;
+        }
+
+        /** The one account All Accounts shows, if only one. */
+        private Account onlyShown() {
+            Account only = null;
+            for (Account a : accounts) {
+                if (a.shown) {
+                    if (only != null) {
+                        return null;
+                    }
+                    only = a;
+                }
+            }
+            return only;
+        }
+
         String labelFor(Context context, String accountId) {
             if (accountId == null || accountId.isEmpty()) {
-                if (accounts.size() == 1) {
-                    return accounts.get(0).name;
+                if (!workspace.isEmpty()) {
+                    return workspace;
+                }
+                Account only = onlyShown();
+                if (only != null) {
+                    return only.name;
                 }
                 return Lang.of(context).getString(R.string.widget_all_inboxes);
             }
@@ -101,8 +134,12 @@ public final class WidgetStore {
 
         String accountLabelFor(Context context, String accountId) {
             if (accountId == null || accountId.isEmpty()) {
-                if (accounts.size() == 1) {
-                    return accounts.get(0).name;
+                if (!workspace.isEmpty()) {
+                    return workspace;
+                }
+                Account only = onlyShown();
+                if (only != null) {
+                    return only.name;
                 }
                 return Lang.of(context).getString(R.string.widget_all_accounts);
             }
@@ -118,7 +155,7 @@ public final class WidgetStore {
             List<Message> out = new ArrayList<>();
             boolean hasFilter = accountId != null && !accountId.isEmpty();
             for (Message m : messages) {
-                if (hasFilter && !accountId.equals(m.accountId)) {
+                if (hasFilter ? !accountId.equals(m.accountId) : !shown(m.accountId)) {
                     continue;
                 }
                 if (unreadOnly && !m.unread) {
@@ -136,7 +173,7 @@ public final class WidgetStore {
             List<TrackedPackage> out = new ArrayList<>();
             boolean hasFilter = accountId != null && !accountId.isEmpty();
             for (TrackedPackage p : packages) {
-                if (hasFilter && !accountId.equals(p.accountId)) {
+                if (hasFilter ? !accountId.equals(p.accountId) : !shown(p.accountId)) {
                     continue;
                 }
                 out.add(p);
@@ -156,7 +193,7 @@ public final class WidgetStore {
             boolean hasFilter = accountId != null && !accountId.isEmpty();
             int total = 0;
             for (Account a : accounts) {
-                if (!hasFilter || accountId.equals(a.id)) {
+                if (hasFilter ? accountId.equals(a.id) : a.shown) {
                     total += a.packages;
                 }
             }
@@ -168,7 +205,7 @@ public final class WidgetStore {
             boolean hasFilter = accountId != null && !accountId.isEmpty();
             int total = 0;
             for (Account a : accounts) {
-                if (!hasFilter || accountId.equals(a.id)) {
+                if (hasFilter ? accountId.equals(a.id) : a.shown) {
                     total += a.receipts;
                 }
             }
@@ -179,7 +216,7 @@ public final class WidgetStore {
             List<ReceiptItem> out = new ArrayList<>();
             boolean hasFilter = accountId != null && !accountId.isEmpty();
             for (ReceiptItem r : receipts) {
-                if (hasFilter && !accountId.equals(r.accountId)) {
+                if (hasFilter ? !accountId.equals(r.accountId) : !shown(r.accountId)) {
                     continue;
                 }
                 out.add(r);
@@ -199,14 +236,18 @@ public final class WidgetStore {
         /** Packages and receipts the Summary lists for this account. */
         final int packages;
         final int receipts;
+        /** The workspace on shows it: All Accounts takes it in. */
+        final boolean shown;
 
-        Account(String id, String name, String email, int unread, int packages, int receipts) {
+        Account(String id, String name, String email, int unread, int packages, int receipts,
+                boolean shown) {
             this.id = id;
             this.name = name;
             this.email = email;
             this.unread = unread;
             this.packages = packages;
             this.receipts = receipts;
+            this.shown = shown;
         }
     }
 
@@ -381,6 +422,7 @@ public final class WidgetStore {
             snap.accentDark = root.optInt("accent_dark", snap.accentDark);
             snap.totalUnread = root.optInt("total_unread", 0);
             snap.calendarConnected = root.optBoolean("calendar_connected", false);
+            snap.workspace = root.optString("workspace", "");
 
             JSONArray accs = root.optJSONArray("accounts");
             if (accs != null) {
@@ -393,7 +435,8 @@ public final class WidgetStore {
                                 o.optString("email", ""),
                                 o.optInt("unread", 0),
                                 o.optInt("packages", 0),
-                                o.optInt("receipts", 0)));
+                                o.optInt("receipts", 0),
+                                o.optBoolean("shown", true)));
                     }
                 }
             }

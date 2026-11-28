@@ -390,12 +390,13 @@ impl InboxControl {
 }
 
 /// What deciding about new mail away from the window needs: who is known
-/// (loaded only when the Screener or the categories ask), and the
-/// categories' settings.
+/// (loaded only when the Screener or the categories ask), the
+/// categories' settings, and the workspace on (`workspaces`).
 pub struct Gate {
     pub control: InboxControl,
     pub categories: Categorizing,
     pub known: Option<Known>,
+    pub workspaces: super::workspaces::Workspaces,
 }
 impl Gate {
     /// The settings in `store`; who `accounts` know is read only when
@@ -410,6 +411,7 @@ impl Gate {
             control,
             categories,
             known,
+            workspaces: super::workspaces::Workspaces::load(store),
         }
     }
     /// Whether `m` waits in the Screener.
@@ -425,6 +427,10 @@ impl Gate {
         m: &Mail,
         content: impl FnOnce() -> super::categories::Content,
     ) -> bool {
+        // Mail to an account the workspace on keeps quiet.
+        if !self.workspaces.announces_account(&m.account, &Local::now()) {
+            return false;
+        }
         let screened = self.screens(m);
         let categories = &self.categories;
         let known = &self.known;

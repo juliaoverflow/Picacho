@@ -330,7 +330,9 @@ impl MailApp {
         cx: &Context<Self>,
     ) -> Stateful<Div> {
         let c = self.colors();
-        let active = self.page == page;
+        // A workspace's page is within Workspaces.
+        let active = self.page == page
+            || (page == Page::Workspaces && matches!(self.page, Page::Workspace(_)));
         let selector = id.clone();
         div()
             .id(SharedString::from(id))
@@ -469,6 +471,13 @@ impl MailApp {
                 t!("settings-inbox-control").into(),
                 icon_el("vip", 15., c.muted).into_any_element(),
                 Page::InboxControl,
+                cx,
+            ))
+            .child(self.settings_nav(
+                "settings-workspaces".into(),
+                t!("settings-workspaces").into(),
+                icon_el("workspace", 15., c.muted).into_any_element(),
+                Page::Workspaces,
                 cx,
             ))
             .when(!self.mobile.on, |nav| {
@@ -1143,6 +1152,16 @@ impl MailApp {
                 cx,
             )
             .max_w(px(420.));
+        let pictures = self
+            .segmented(
+                "image-size",
+                crate::manage::composing::ImageSize::ALL
+                    .into_iter()
+                    .map(|size| (size.label().to_owned(), set(&|o| o.image_size = size), o.image_size == size))
+                    .collect(),
+                cx,
+            )
+            .max_w(px(420.));
         let toggle = |id: &str, on: bool, change: &dyn Fn(&mut ComposeOptions)| {
             let id = id.to_string();
             let selector = id.clone();
@@ -1178,6 +1197,13 @@ impl MailApp {
                     .row(row(
                         t!("settings-check-spelling"),
                         toggle("spellcheck", o.spellcheck, &|o| o.spellcheck = !o.spellcheck),
+                    ))
+                    .row(self.toggle_row(
+                        t!("settings-markdown-shortcuts"),
+                        t!("settings-markdown-shortcuts-caption"),
+                        toggle("markdown-shortcuts", o.markdown_shortcuts, &|o| {
+                            o.markdown_shortcuts = !o.markdown_shortcuts
+                        }),
                     )),
             ))
             .child(self.settings_group(
@@ -1195,8 +1221,10 @@ impl MailApp {
                         toggle("empty-subject", o.warn_empty_subject, &|o| {
                             o.warn_empty_subject = !o.warn_empty_subject
                         }),
-                    )),
+                    ))
+                    .row(self.setting_row(t!("settings-send-pictures-at"), t!("settings-send-pictures-at-caption"), pictures)),
             ))
+            .child(self.settings_group(t!("settings-large-attachments"), self.cloud_settings(cx)))
             .child(self.settings_group(
                 t!("settings-signature"),
                 Rows::new()
@@ -1231,6 +1259,7 @@ impl MailApp {
                     )),
             ))
             .child(self.settings_group(t!("templates-templates"), self.templates_settings(cx)))
+            .child(self.settings_group(t!("templates-snippets"), self.snippets_settings(cx)))
             .into_any_element()
     }
     pub(super) fn account_page(&self, index: usize, cx: &Context<Self>) -> AnyElement {
@@ -2586,6 +2615,8 @@ impl MailApp {
             Page::LocalAi => self.local_ai_page(cx),
             Page::Organizing => self.organizing_page(cx),
             Page::InboxControl => self.inbox_control_page(cx),
+            Page::Workspaces => self.workspaces_page(cx),
+            Page::Workspace(id) => self.workspace_page(id, cx),
             Page::Shortcuts => self.shortcuts_page(cx),
             Page::About if self.mobile.on => self.mobile_about_page(cx),
             Page::About => self.general_page(cx),

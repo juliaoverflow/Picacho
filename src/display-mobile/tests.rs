@@ -1521,3 +1521,66 @@ fn home_screen_widget_links_open_inbox_message_compose_and_calendar(cx: &mut Tes
         "widget compose action should open a composer"
     );
 }
+
+#[gpui::test]
+fn workspaces_switch_from_mailboxes_and_open_their_page_on_a_phone(cx: &mut TestAppContext) {
+    use super::super::workspaces::{Template, WsAction};
+    let (view, cx) = phone(PHONE, cx);
+    let (work, home) = view.read_with(cx, |this, _| {
+        (this.accounts[0].id.clone(), this.accounts[1].id.clone())
+    });
+    // No workspaces: no switcher on the Mailboxes screen.
+    view.update_in(cx, |this, w, cx| this.close(w, cx));
+    assert_eq!(screen(&view, cx), Screen::Mailboxes);
+    assert!(!shown(cx, "mobile-workspace"));
+
+    // A new one opens its page full screen, with a way back.
+    act(&view, Action::Workspaces(WsAction::New(Template::Blank)), cx);
+    assert_eq!(screen(&view, cx), Screen::Settings);
+    let id = view.read_with(cx, |this, _| match &this.page {
+        Page::Workspace(id) => id.clone(),
+        other => panic!("{other:?}"),
+    });
+    assert!(shown(cx, "settings-page"));
+    assert!(shown(cx, "mobile-settings-back"));
+    touchable(cx, "workspace-color-0");
+    act(
+        &view,
+        Action::Workspaces(WsAction::EveryAccount(id.clone(), false)),
+        cx,
+    );
+    act(
+        &view,
+        Action::Workspaces(WsAction::ToggleAccount(id.clone(), home.clone())),
+        cx,
+    );
+    let row: &'static str = Box::leak(format!("workspace-account-{work}").into_boxed_str());
+    let b = bounds(cx, row);
+    assert!(b.size.height >= px(TOUCH - 0.5), "a fingertip's row");
+    assert!(b.right() <= px(PHONE.0));
+    // Back goes to Workspaces, then to the list of pages.
+    view.update_in(cx, |this, w, cx| this.close(w, cx));
+    view.read_with(cx, |this, _| assert_eq!(this.page, Page::Workspaces));
+    assert!(shown(cx, "workspace-row-0"));
+    view.update_in(cx, |this, w, cx| this.close(w, cx));
+    assert!(shown(cx, "mobile-settings-list"));
+    assert!(shown(cx, "mobile-settings-workspaces"));
+    view.update_in(cx, |this, w, cx| this.close(w, cx));
+    assert_ne!(screen(&view, cx), Screen::Settings);
+
+    // Mailboxes: the switcher, and only the workspace's account.
+    view.update_in(cx, |this, w, cx| {
+        while this.mobile_screen() != Screen::Mailboxes {
+            this.close(w, cx);
+        }
+    });
+    assert!(shown(cx, "mobile-workspace"));
+    let home_section: &'static str = Box::leak(format!("mobile-account-{home}").into_boxed_str());
+    let work_section: &'static str = Box::leak(format!("mobile-account-{work}").into_boxed_str());
+    assert!(shown(cx, work_section));
+    assert!(!shown(cx, home_section), "Home is hidden");
+    touchable(cx, "mobile-workspace");
+    // Everything again from the switcher's menu.
+    act(&view, Action::Workspaces(WsAction::Switch(None)), cx);
+    assert!(shown(cx, home_section));
+}

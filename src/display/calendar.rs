@@ -1360,9 +1360,23 @@ impl MailApp {
         }
         self.task(
             cx,
-            |b| Ok(b.due_reminders(chrono::Utc::now().timestamp())),
-            |_, result: anyhow::Result<Vec<(Event, i64)>>, _| {
-                for (e, _) in result.unwrap_or_default() {
+            |b| {
+                let due = b.due_reminders(chrono::Utc::now().timestamp());
+                // Which calendar each is from, for the workspace on.
+                let calendars = if due.is_empty() { Default::default() } else { b.event_calendars() };
+                Ok(due
+                    .into_iter()
+                    .map(|(e, _)| {
+                        let calendar = calendars.get(&e.uid).cloned();
+                        (e, calendar)
+                    })
+                    .collect())
+            },
+            |this, result: anyhow::Result<Vec<(Event, Option<String>)>>, _| {
+                for (e, calendar) in result.unwrap_or_default() {
+                    if !this.workspace_reminds(calendar.as_deref()) {
+                        continue;
+                    }
                     let body = if e.location.is_empty() {
                         event_when(&e)
                     } else {
@@ -2108,7 +2122,13 @@ impl MailApp {
             ));
         }
         // Open tasks.
-        let tasks = self.backend.calendar_tasks();
+        // The workspace's calendars' tasks.
+        let tasks: Vec<_> = self
+            .backend
+            .calendar_tasks()
+            .into_iter()
+            .filter(|t| self.shows_calendar(&t.calendar))
+            .collect();
         let mut task_section = None;
         if !tasks.is_empty() {
             let count = tasks.len();
@@ -2469,8 +2489,7 @@ impl MailApp {
         // Coming events.
         let now = chrono::Utc::now().timestamp();
         let coming: Vec<Event> = self
-            .backend
-            .agenda(now, now + 366 * 86_400)
+            .workspace_agenda(now, now + 366 * 86_400)
             .into_iter()
             .take(60)
             .collect();

@@ -14,6 +14,7 @@
 //! U+FFFC character and a line break inside a block (`<br>`) is `\n`.
 pub mod css;
 pub mod html;
+pub mod table;
 #[cfg(test)]
 mod tests;
 
@@ -497,6 +498,11 @@ impl Doc {
     /// Splits the block at `pos` (Enter); the start of the new block.
     pub fn split(&mut self, pos: Pos) -> Pos {
         let pos = self.clamp(pos);
+        // A table cell's own text becomes its first line: the new line goes
+        // in the same cell, not a new cell beside it.
+        if self.blocks[pos.block].element().is("td") || self.blocks[pos.block].element().is("th") {
+            self.block_mut(pos.block).path.push(Element::new("div"));
+        }
         let b = &self.blocks[pos.block];
         let at_end = pos.offset >= b.len();
         let element = b.element().clone();
@@ -774,6 +780,23 @@ impl Doc {
     /// Quotes blocks `range`, or unquotes them when all are quoted.
     pub fn toggle_quote(&mut self, range: std::ops::RangeInclusive<usize>) {
         let all = range.clone().all(|i| self.blocks[i].path.iter().any(|e| e.is("blockquote")));
+        // Across table cells: each cell's lines quoted inside it, so the
+        // table stays one.
+        let (first, last) = (*range.start(), *range.end());
+        if (first..last).any(|i| !table::same_cell(&self.blocks[i].path, &self.blocks[i + 1].path)) {
+            let mut start = first;
+            for i in first..=last {
+                if i == last || !table::same_cell(&self.blocks[i].path, &self.blocks[i + 1].path) {
+                    self.quote_group(start..=i, all);
+                    start = i + 1;
+                }
+            }
+            return;
+        }
+        self.quote_group(range, all);
+    }
+
+    fn quote_group(&mut self, range: std::ops::RangeInclusive<usize>, all: bool) {
         if all {
             for i in range {
                 let b = self.block_mut(i);
@@ -786,6 +809,12 @@ impl Doc {
                 }
             }
             return;
+        }
+        // A cell's own text is a line in it first: the quote goes inside.
+        for i in range.clone() {
+            if matches!(self.blocks[i].element().tag.as_str(), "td" | "th") {
+                self.block_mut(i).path.push(Element::new("div"));
+            }
         }
         // One quote around them all, inside what they all share (not
         // between a list and its items, or a table and its rows).
@@ -828,6 +857,55 @@ impl Doc {
             } else if !own.is("hr") {
                 b.path.push(Element::new(&tag));
             }
+        }
+    }
+
+    /// Makes blocks `range` a code block (`<pre>`), or ordinary lines when
+    /// all are.
+    pub fn toggle_pre(&mut self, range: std::ops::RangeInclusive<usize>) {
+        let all = range.clone().all(|i| self.blocks[i].is_pre());
+        for i in range {
+            let b = self.block_mut(i);
+            let last = b.path.len() - 1;
+            if all {
+                if let Some(k) = b.path.iter().rposition(|e| e.is("pre")) {
+                    if k == last {
+                        b.path[k] = b.path[k].renamed("div");
+                    } else {
+                        b.path.remove(k);
+                    }
+                }
+            } else if b.path[last].is_plain_block() {
+                b.path[last] = b.path[last].renamed("pre");
+            } else if !b.is_rule() && !b.is_pre() {
+                b.path.push(Element::new("pre"));
+            }
+        }
+    }
+
+    /// A horizontal rule at block `bi` (in place of an empty line, else
+    /// after it) and a line after it; the start of that line.
+    pub fn insert_rule(&mut self, bi: usize) -> Pos {
+        let b = &self.blocks[bi];
+        let mut container = b.path.clone();
+        container.pop();
+        while container.last().is_some_and(|e| matches!(e.tag.as_str(), "li" | "ul" | "ol")) {
+            container.pop();
+        }
+        let mut hr = container.clone();
+        hr.push(Element::new("hr"));
+        let mut line = container;
+        line.push(Element::new("div"));
+        let rule = Rc::new(Block { path: hr, runs: vec![] });
+        let after = Rc::new(Block { path: line, runs: vec![] });
+        if b.is_empty() && !b.is_rule() {
+            self.blocks[bi] = rule;
+            self.blocks.insert(bi + 1, after);
+            Pos::new(bi + 1, 0)
+        } else {
+            self.blocks.insert(bi + 1, rule);
+            self.blocks.insert(bi + 2, after);
+            Pos::new(bi + 2, 0)
         }
     }
 

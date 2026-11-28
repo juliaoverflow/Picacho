@@ -344,11 +344,11 @@ impl MailApp {
             self.save_tree();
         }
     }
-    /// The first account the sidebar lists.
+    /// The first account the sidebar lists (in the workspace on).
     pub(super) fn first_account(&self) -> Option<String> {
         account_order(&self.tree)
             .into_iter()
-            .find(|id| !fwd::is_view(id))
+            .find(|id| !fwd::is_view(id) && self.in_workspace(id))
     }
     pub(super) fn open(&self, key: &str) -> bool {
         !self.collapsed.contains(key)

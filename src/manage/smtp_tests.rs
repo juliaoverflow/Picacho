@@ -1015,3 +1015,59 @@ fn sealed_drafts_keep_their_attachments_encrypted_on_disk() -> Result<()> {
     std::fs::remove_dir_all(path)?;
     Ok(())
 }
+
+/// A message larger than the server's SIZE, with cloud storage set up,
+/// goes again with its large file shared as a link (and nothing was sent
+/// the first time); its photo goes smaller.
+#[test]
+fn too_large_messages_share_their_files_as_links() -> Result<()> {
+    let fixture = SmtpFixture::start("250-fixture\r\n250-SIZE 400000\r\n250 AUTH PLAIN\r\n", no_script())?;
+    let (b, a, path) = smtp_account(&fixture)?;
+    let (cloud, asked) = crate::manage::outgoing::test_nextcloud(r#"{"ocs":{"meta":{"status":"ok"},"data":{"url":"https://cloud.test/s/Xy7"}}}"#);
+    let options = crate::manage::composing::ComposeOptions {
+        image_size: crate::manage::composing::ImageSize::Small,
+        cloud: crate::manage::composing::CloudStorage {
+            kind: crate::manage::composing::CloudKind::Nextcloud,
+            url: cloud,
+            user: "sam".into(),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    b.store.set_preference(crate::manage::composing::PREFERENCE, &serde_json::to_string(&options)?)?;
+    let video = path.join("video.bin");
+    std::fs::write(&video, vec![9u8; 600_000])?;
+    let photo = path.join("photo.jpg");
+    let mut img = image::RgbImage::new(1200, 900);
+    for (x, y, p) in img.enumerate_pixels_mut() {
+        *p = image::Rgb([(x % 256) as u8, (y % 256) as u8, 90]);
+    }
+    let mut bytes = Vec::new();
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut bytes, 90).encode_image(&img)?;
+    std::fs::write(&photo, &bytes)?;
+    let d = Draft {
+        id: "large".into(),
+        account: a.id.clone(),
+        to: "ana@example.com".into(),
+        subject: "Large".into(),
+        body: "Here it is.".into(),
+        attachments: vec![video.clone(), photo.clone()],
+        ..Draft::default()
+    };
+    b.store.save_draft(&d)?;
+    let notes = b.send_noting(&a, &d)?;
+    let seen = fixture.finish();
+    assert_eq!(seen.transactions.len(), 1, "sent once: {seen:?}");
+    let text = seen.transactions[0].text();
+    assert!(text.contains("https://cloud.test/s/Xy7"), "{text}");
+    assert!(text.contains("video.bin"), "named in the text");
+    assert!(!text.contains("filename=\"video.bin\""), "not attached");
+    assert!(text.contains("photo.jpg"), "the photo stays attached");
+    assert!(notes.iter().any(|n| n.contains("video.bin was shared as a link")), "{notes:?}");
+    assert!(asked.lock().unwrap().iter().any(|r| r.starts_with("PUT ") && r.contains("video.bin")));
+    // The draft's own files are as they were.
+    assert_eq!(std::fs::metadata(&photo)?.len() as usize, bytes.len());
+    drop(b);
+    std::fs::remove_dir_all(path)?;
+    Ok(())
+}

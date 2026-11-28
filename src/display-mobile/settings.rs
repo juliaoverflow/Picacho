@@ -76,6 +76,12 @@ impl MailApp {
             Page::LocalAi => t!("mobile-settings-local-ai").into(),
             Page::Organizing => t!("mobile-settings-rules-layout").into(),
             Page::InboxControl => t!("mobile-settings-inbox-control").into(),
+            Page::Workspaces => t!("mobile-settings-workspaces").into(),
+            Page::Workspace(id) => self
+                .workspaces
+                .get(id)
+                .map(|w| w.name.clone())
+                .unwrap_or_else(|| t!("mobile-settings-workspaces").into()),
             Page::Shortcuts => t!("mobile-settings-keyboard-shortcuts").into(),
             Page::About => t!("mobile-settings-about-picacho").into(),
             Page::Account(id) => self
@@ -105,7 +111,9 @@ impl MailApp {
     ) -> AnyElement {
         let c = self.colors();
         let row = |id: &'static str, icon: &'static str, page: Page| {
-            let active = beside && self.page == page;
+            // A workspace's page is within Workspaces.
+            let within = page == Page::Workspaces && matches!(self.page, Page::Workspace(_));
+            let active = beside && (self.page == page || within);
             self.cell(
                 id,
                 icon_el(icon, 22., c.accent).into_any_element(),
@@ -178,6 +186,7 @@ impl MailApp {
                 row("mobile-settings-local-ai", "sparkle", Page::LocalAi),
                 row("mobile-settings-organizing", "filter", Page::Organizing),
                 row("mobile-settings-inbox-control", "vip", Page::InboxControl),
+                row("mobile-settings-workspaces", "workspace", Page::Workspaces),
             ]))
             .child(self.group_label(t!("mobile-settings-mailboxes")))
             .child(self.group(mailboxes))
@@ -225,8 +234,10 @@ impl MailApp {
             ),
         };
         // Back to the list of pages, or from reverse aliases to Forwarding.
-        let leading = (stacked || (self.fwd_reverse.is_some() && sub_open(self)))
-            .then(|| self.back_icon("mobile-settings-back", cx));
+        let leading = (stacked
+            || (self.fwd_reverse.is_some() && sub_open(self))
+            || matches!(self.page, Page::Workspace(_)))
+        .then(|| self.back_icon("mobile-settings-back", cx));
         div()
             .id("mobile-settings-page")
             .relative()

@@ -461,6 +461,27 @@ pub(crate) struct ServerLimits {
 /// FUTURERELEASE, or not that far ahead): nothing was sent.
 #[derive(Debug)]
 pub(crate) struct NoServerHold;
+
+/// A message larger than its outgoing server takes (its SIZE, RFC 1870),
+/// refused before anything was sent: it may go again smaller (its large
+/// attachments shared as links, `manage::outgoing`).
+#[derive(Debug)]
+pub(crate) struct MessageTooLarge {
+    pub(crate) size: usize,
+    pub(crate) limit: usize,
+    pub(crate) host: String,
+}
+impl std::fmt::Display for MessageTooLarge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&t!(
+            "sync-smtp-this-message-is-with-its-attachments",
+            size = megabytes(self.size),
+            host = self.host,
+            limit = megabytes(self.limit)
+        ))
+    }
+}
+impl std::error::Error for MessageTooLarge {}
 impl std::fmt::Display for NoServerHold {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(t!("sync-smtp-the-outgoing-server-cant-hold-this"))
@@ -1409,12 +1430,7 @@ pub(crate) fn deliver_bytes(
         data_size(&bytes)
     };
     if size > limit {
-        bail!(t!(
-            "sync-smtp-this-message-is-with-its-attachments",
-            size = megabytes(size),
-            host = endpoint.host,
-            limit = megabytes(limit)
-        ));
+        return Err(MessageTooLarge { size, limit, host: endpoint.host.clone() }.into());
     }
     if a.require_tls {
         ensure!(

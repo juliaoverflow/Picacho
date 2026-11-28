@@ -78,7 +78,7 @@ impl ControlUi {
 
 /// The days of the week, Monday first, as a quiet window's buttons name
 /// them.
-fn day_names() -> [&'static str; 7] {
+pub(super) fn day_names() -> [&'static str; 7] {
     [
         t!("inbox-control-day-mon"),
         t!("inbox-control-day-tue"),
@@ -91,7 +91,7 @@ fn day_names() -> [&'static str; 7] {
 }
 
 /// A window's days in words: every day, weekdays, weekends, or each.
-fn days_text(days: u8) -> String {
+pub(super) fn days_text(days: u8) -> String {
     match days & EVERY_DAY {
         EVERY_DAY => t!("inbox-control-every-day").into(),
         WEEKDAYS => t!("inbox-control-weekdays").into(),
@@ -183,10 +183,13 @@ impl MailApp {
         ))
     }
 
-    /// Whether new mail `m` is announced: not filed away or silenced by a
-    /// rule, not waiting in the Screener, and as the notification settings
-    /// and quiet hours say.
+    /// Whether new mail `m` is announced: to an account the workspace on
+    /// lets speak up, not filed away or silenced by a rule, not waiting in
+    /// the Screener, and as the notification settings and quiet hours say.
     pub(super) fn announces(&self, m: &Mail) -> bool {
+        if !self.workspace_announces(&m.account) {
+            return false;
+        }
         let category = |m: &Mail| self.announced_tab(m);
         let facts = crate::manage::organize::Facts {
             category: Some(&category),

@@ -1191,7 +1191,7 @@ sync-oauth-the-sign-ins-id-token-doesnt-2 = The sign-in's ID token doesn't belon
 
 sync-oauth-the-sign-ins-id-token-names = The sign-in's ID token names no account.
 
-sync-oauth-only-google-accounts-are-asked-for = Only Google accounts are asked for calendar or contacts access this way.
+sync-oauth-only-google-accounts-are-asked-for = Only Google accounts, and Outlook accounts using Microsoft Graph, are asked for more access this way.
 
 sync-oauth-doesnt-let-mail-apps-sign-in = { $host } doesn't let mail apps sign in in the browser without registering them first. Use a password or an API token instead.
 

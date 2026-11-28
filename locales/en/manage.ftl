@@ -1235,6 +1235,8 @@ manage-widgets-no-subject = (No subject)
 
 manage-widgets-upcoming = Upcoming:
 
+manage-widgets-workspace = Workspace: { $name }
+
 # src/manage/gmail.rs and src/manage/graph.rs.
 
 manage-gmail-this-message-isnt-from-this-gmail = This message isn't from this account.
@@ -1344,3 +1346,48 @@ manage-organize-add-a-condition = Add a condition to the rule
 manage-organize-add-an-action = Add an action to the rule
 
 manage-organize-a-rule-moves-mail-once = A rule can move mail to one place only
+
+manage-composing-image-size-actual = Actual size
+
+manage-composing-image-size-large = Large (2048 px)
+
+manage-composing-image-size-medium = Medium (1280 px)
+
+manage-composing-image-size-small = Small (640 px)
+
+manage-merge-too-many-rows = The spreadsheet has more than { $max } rows.
+
+manage-merge-the-file-is-empty = The file is empty.
+
+manage-merge-no-rows-below-the-headings = The file has no rows below its headings.
+
+manage-merge-too-large = The file is too large for a mail merge.
+
+manage-outgoing-cloud-couldnt-share = { $name } couldn’t be shared as a link
+
+manage-outgoing-cloud-full = The cloud storage is full.
+
+manage-outgoing-cloud-no-link = The cloud storage didn’t give a link to the file.
+
+manage-outgoing-cloud-not-set-up = Cloud storage isn’t set up.
+
+manage-outgoing-cloud-server-answered = The cloud storage answered with error { $status }.
+
+manage-outgoing-cloud-sign-in-failed = The cloud storage didn’t accept the user name and password.
+
+manage-outgoing-cloud-the-address-isnt-valid = The cloud storage’s address isn’t valid.
+
+manage-backend-shared-as-links = { $count ->
+        [one] { $names } was shared as a link.
+       *[other] { $names } were shared as links.
+    }
+
+manage-outgoing-cloud-server-said = The cloud storage said: { $message }
+
+manage-outgoing-cloud-sign-in-again = The storage didn’t accept the account’s sign-in: connect it again in Settings → Composing → Large attachments.
+
+manage-outgoing-cloud-account-gone = The account whose storage large attachments go to was removed. Choose another in Settings → Composing.
+
+manage-outgoing-cloud-not-this-account = This account can’t share files that way.
+
+manage-merge-interrupted = Picacho stopped while it was being sent; it may not have gone

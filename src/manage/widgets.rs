@@ -11,6 +11,7 @@
 //! reload budget.
 
 use crate::manage::{
+    workspaces::Workspaces,
     local_ai::{self, otp},
     model::{Account, Folder, Mail},
     parcels::{self, Override as ParcelOverride},
@@ -84,6 +85,24 @@ pub struct Snapshot {
     /// translations of their own (KDE Plasma's), by name (`labels`).
     #[serde(default)]
     pub labels: BTreeMap<String, String>,
+    /// The workspace on (`workspaces`), by name; empty for everything.
+    /// All Accounts' counts and lists are its accounts'.
+    #[serde(default)]
+    pub workspace: String,
+    /// Every workspace, for switching from the tray.
+    #[serde(default)]
+    pub workspaces: Vec<WidgetWorkspace>,
+}
+
+/// A workspace, as the tray offers it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WidgetWorkspace {
+    pub id: String,
+    pub name: String,
+    /// It's the one on.
+    pub on: bool,
+    /// Unread inbox mail in its accounts.
+    pub unread: usize,
 }
 
 impl Snapshot {
@@ -110,8 +129,16 @@ impl Snapshot {
             receipts: Vec::new(),
             language: String::new(),
             labels: BTreeMap::new(),
+            workspace: String::new(),
+            workspaces: Vec::new(),
         }
         .worded()
+    }
+
+    /// Whether All Accounts takes in account `id`: the workspace on shows
+    /// it (an account the snapshot doesn't list is taken in).
+    pub fn shown(&self, id: &str) -> bool {
+        self.accounts.iter().find(|a| a.id == id).is_none_or(|a| a.shown)
     }
 
     /// With the language Picacho shows, and the widgets' words in it.
@@ -128,7 +155,7 @@ impl Snapshot {
     pub fn package_total(&self, account_id: Option<&str>) -> usize {
         let counted = match account_id.filter(|id| !id.is_empty()) {
             Some(id) => self.accounts.iter().find(|a| a.id == id).map_or(0, |a| a.packages),
-            None => self.accounts.iter().map(|a| a.packages).sum(),
+            None => self.accounts.iter().filter(|a| a.shown).map(|a| a.packages).sum(),
         };
         counted.max(filtered_packages(self, account_id, usize::MAX).len())
     }
@@ -139,7 +166,7 @@ impl Snapshot {
     pub fn receipt_total(&self, account_id: Option<&str>) -> usize {
         let counted = match account_id.filter(|id| !id.is_empty()) {
             Some(id) => self.accounts.iter().find(|a| a.id == id).map_or(0, |a| a.receipts),
-            None => self.accounts.iter().map(|a| a.receipts).sum(),
+            None => self.accounts.iter().filter(|a| a.shown).map(|a| a.receipts).sum(),
         };
         counted.max(filtered_receipts(self, account_id, usize::MAX).len())
     }
@@ -159,6 +186,12 @@ pub struct AccountSummary {
     /// Receipts the Summary lists for this account (not hidden).
     #[serde(default)]
     pub receipts: usize,
+    /// The workspace on shows it: All Accounts' counts and lists take it in.
+    #[serde(default = "shown_by_default")]
+    pub shown: bool,
+}
+fn shown_by_default() -> bool {
+    true
 }
 
 /// An inbox message row shown in the Inbox and Unread widgets.
@@ -350,6 +383,11 @@ pub fn snapshot(store: &Store, now: i64) -> Snapshot {
     let accounts = store.accounts().unwrap_or_default();
     let unread_map = store.unread_counts().unwrap_or_default();
     let inbox_key = Folder::Inbox.key();
+    // All Accounts is the workspace's accounts (`workspaces`).
+    let workspaces = Workspaces::load(store);
+    let current = workspaces.current_at(&Local::now());
+    let all_ids: Vec<String> = accounts.iter().map(|a| a.id.clone()).collect();
+    let shows = |id: &str| current.is_none_or(|w| w.shows_account_among(id, &all_ids));
 
     let mut total_unread = 0usize;
     let mut account_summaries = Vec::with_capacity(accounts.len());
@@ -360,7 +398,10 @@ pub fn snapshot(store: &Store, now: i64) -> Snapshot {
             .get(&(a.id.clone(), inbox_key.to_owned()))
             .copied()
             .unwrap_or(0);
-        total_unread = total_unread.saturating_add(unread);
+        let shown = shows(&a.id);
+        if shown {
+            total_unread = total_unread.saturating_add(unread);
+        }
         let label = account_label(a);
         account_summaries.push(AccountSummary {
             id: a.id.clone(),
@@ -369,6 +410,7 @@ pub fn snapshot(store: &Store, now: i64) -> Snapshot {
             unread,
             packages: 0,
             receipts: 0,
+            shown,
         });
         if let Ok(list) = store.newest(&a.id, Folder::Inbox, PER_ACCOUNT) {
             for m in list {
@@ -380,7 +422,28 @@ pub fn snapshot(store: &Store, now: i64) -> Snapshot {
     }
 
     raw_messages.sort_by(|(a, _), (b, _)| b.date.cmp(&a.date).then_with(|| a.id.cmp(&b.id)));
-    raw_messages.truncate(MAX_MESSAGES);
+    // The newest of the workspace's, for All Accounts, and as many of the
+    // others', for widgets set to one of them.
+    let (mut kept_shown, mut kept_other) = (0, 0);
+    raw_messages.retain(|(m, _)| {
+        let kept = if shows(&m.account) { &mut kept_shown } else { &mut kept_other };
+        *kept += 1;
+        *kept <= MAX_MESSAGES
+    });
+    let workspace_list: Vec<WidgetWorkspace> = workspaces
+        .list
+        .iter()
+        .map(|w| WidgetWorkspace {
+            id: w.id.clone(),
+            name: w.name.clone(),
+            on: current.is_some_and(|c| c.id == w.id),
+            unread: account_summaries
+                .iter()
+                .filter(|a| w.shows_account_among(&a.id, &all_ids))
+                .map(|a| a.unread)
+                .sum(),
+        })
+        .collect();
 
     let hide_codes = local_ai::otp_enabled(store);
     let detector = hide_codes.then(|| local_ai::otp_detector(store).ok()).flatten();
@@ -420,7 +483,8 @@ pub fn snapshot(store: &Store, now: i64) -> Snapshot {
         .iter()
         .map(|a| (a.id.as_str(), a.name.as_str()))
         .collect();
-    let (calendar_connected, events) = calendar_agenda(store, now);
+    let (calendar_connected, events) =
+        calendar_agenda(store, now, |href| current.is_none_or(|w| w.shows_calendar(href)));
     // Mail looked through only for accounts whose mail changed in ways
     // that matter to parcels and receipts since the last snapshot, and
     // then once for both (`Store::widget_scans`).
@@ -459,6 +523,8 @@ pub fn snapshot(store: &Store, now: i64) -> Snapshot {
         receipts,
         language: String::new(),
         labels: BTreeMap::new(),
+        workspace: current.map(|w| w.name.clone()).unwrap_or_default(),
+        workspaces: workspace_list,
     }
     .worded();
     if crate::manage::applock::hides_contents(store) {
@@ -786,7 +852,8 @@ pub fn filtered_messages<'a>(
         .messages
         .iter()
         .filter(|m| {
-            account_filter.is_none_or(|id| m.account_id == id) && (!unread_only || m.unread)
+            account_filter.map_or_else(|| snapshot.shown(&m.account_id), |id| m.account_id == id)
+                && (!unread_only || m.unread)
         })
         .take(limit)
         .collect()
@@ -803,7 +870,7 @@ pub fn filtered_packages<'a>(
     snapshot
         .packages
         .iter()
-        .filter(|p| account_filter.is_none_or(|id| p.account_id == id))
+        .filter(|p| account_filter.map_or_else(|| snapshot.shown(&p.account_id), |id| p.account_id == id))
         .take(limit)
         .collect()
 }
@@ -819,7 +886,7 @@ pub fn filtered_receipts<'a>(
     snapshot
         .receipts
         .iter()
-        .filter(|r| account_filter.is_none_or(|id| r.account_id == id))
+        .filter(|r| account_filter.map_or_else(|| snapshot.shown(&r.account_id), |id| r.account_id == id))
         .take(limit)
         .collect()
 }
@@ -900,7 +967,7 @@ fn truncate_chars(s: &str, max: usize) -> String {
 
 /// Reads cached calendar events from `store` and expands upcoming occurrences
 /// from the start of today (local time) through `AGENDA_DAYS` ahead.
-fn calendar_agenda(store: &Store, now: i64) -> (bool, Vec<WidgetEvent>) {
+fn calendar_agenda(store: &Store, now: i64, shown: impl Fn(&str) -> bool) -> (bool, Vec<WidgetEvent>) {
     use crate::manage::backend::pim_sources::{Pim, key_in, source_ids};
     // Every calendar source's (`pim_sources`): the first under the keys it
     // always had, the others under keys of their own.
@@ -929,6 +996,8 @@ fn calendar_agenda(store: &Store, now: i64) -> (bool, Vec<WidgetEvent>) {
     }
 
     let connected = server.is_some() || !calendars.is_empty() || !stored.is_empty();
+    // The workspace's calendars.
+    stored.retain(|s| shown(&s.calendar));
     if stored.is_empty() {
         return (connected, Vec::new());
     }
@@ -1067,9 +1136,13 @@ pub fn waybar_json(snap: &Snapshot) -> String {
             count = snap.total_unread
         ));
     }
-    let unread_msgs: Vec<&WidgetMessage> = snap.messages.iter().filter(|m| m.unread).take(5).collect();
+    // The workspace on, by name.
+    if !snap.workspace.is_empty() {
+        lines.push(t!("manage-widgets-workspace", name = snap.workspace.clone()));
+    }
+    let unread_msgs = filtered_messages(snap, None, true, 5);
     let shown = if unread_msgs.is_empty() {
-        snap.messages.iter().take(3).collect::<Vec<_>>()
+        filtered_messages(snap, None, false, 3)
     } else {
         unread_msgs
     };
@@ -1479,6 +1552,52 @@ mod tests {
     }
 
     #[test]
+    fn all_accounts_in_widgets_is_the_workspaces() {
+        let (store, dir) = temp_store();
+        store.save_account(&account("work", "work@example.com", "Work")).unwrap();
+        store.save_account(&account("home", "home@example.com", "Personal")).unwrap();
+        let template = demo_mail().remove(0);
+        let mail = |id: &str, account: &str, date: i64| Mail {
+            id: id.into(),
+            account: account.into(),
+            folder: Folder::Inbox,
+            date,
+            unread: true,
+            ..template.clone()
+        };
+        store
+            .save_messages(&[mail("w1", "work", 100), mail("h1", "home", 200), mail("h2", "home", 300)])
+            .unwrap();
+        let mut ws = crate::manage::workspaces::Workspaces::default();
+        let id = ws.add("Office");
+        ws.get_mut(&id).unwrap().accounts = Some(["work".to_owned()].into());
+        ws.choose(Some(id.clone()), chrono::Utc::now().timestamp());
+        ws.save(&store);
+
+        let snap = snapshot(&store, 1_700_000_600);
+        assert_eq!(snap.workspace, "Office");
+        assert_eq!(snap.total_unread, 1, "only Work's unread mail");
+        assert!(snap.shown("work") && !snap.shown("home"));
+        let all: Vec<&str> = filtered_messages(&snap, None, false, 10).iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(all, ["w1"]);
+        // A widget set to Personal still shows it.
+        assert_eq!(unread_for(&snap, Some("home")), 2);
+        assert_eq!(filtered_messages(&snap, Some("home"), false, 10).len(), 2);
+        assert_eq!(snap.workspaces.len(), 1);
+        assert!(snap.workspaces[0].on && snap.workspaces[0].unread == 1);
+        assert!(waybar_json(&snap).contains("Office"));
+
+        // Back to everything.
+        ws.choose(None, chrono::Utc::now().timestamp());
+        ws.save(&store);
+        let snap = snapshot(&store, 1_700_000_600);
+        assert!(snap.workspace.is_empty() && snap.total_unread == 3);
+        assert!(!snap.workspaces[0].on);
+        drop(store);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn snapshot_expands_upcoming_calendar_events_and_filters_past_or_cancelled() {
         let (store, dir) = temp_store();
         let now = Utc
@@ -1596,9 +1715,12 @@ mod tests {
                 unread: 2,
                 packages: 0,
                 receipts: 0,
+                shown: true,
             }],
             language: String::new(),
             labels: BTreeMap::new(),
+            workspace: String::new(),
+            workspaces: Vec::new(),
             messages: vec![WidgetMessage {
                 id: "m1".into(),
                 account_id: "a1".into(),

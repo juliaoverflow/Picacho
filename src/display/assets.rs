@@ -195,9 +195,21 @@ impl AssetSource for Assets {
                 "<rect x='3' y='3' width='18' height='18' rx='2'/><path d='M3 9h18M9 21V9'/>",
             ),
             "mail/ban.svg" => Some("<circle cx='12' cy='12' r='9'/><path d='m5.6 5.6 12.8 12.8'/>"),
+            // The composer's tables: a grid.
+            "mail/table.svg" => Some(
+                "<rect x='3' y='4' width='18' height='16' rx='2'/><path d='M3 10h18M3 15h18M9 4v16M15 4v16'/>",
+            ),
+            // The emoji picker: a smiling face.
+            "mail/smile.svg" => Some(
+                "<circle cx='12' cy='12' r='9'/><path d='M8 14s1.5 2 4 2 4-2 4-2M9 9h.01M15 9h.01'/>",
+            ),
             // A VIP: a crown.
             "mail/vip.svg" => Some(
                 "<path d='M11.6 3.3a.5.5 0 0 1 .8 0l3 5.6a1 1 0 0 0 1.5.3l4.3-3.7a.5.5 0 0 1 .8.5l-2.8 10.3a1 1 0 0 1-1 .7H5.8a1 1 0 0 1-1-.7L2 6a.5.5 0 0 1 .8-.5l4.3 3.7a1 1 0 0 0 1.5-.3Z M5 21h14'/>",
+            ),
+            // Workspaces: stacked layers.
+            "mail/workspace.svg" => Some(
+                "<path d='M12.8 2.2a2 2 0 0 0-1.6 0L2.6 6.1a1 1 0 0 0 0 1.8l8.6 3.9a2 2 0 0 0 1.6 0l8.6-3.9a1 1 0 0 0 0-1.8Z'/><path d='m2 12.6 9.2 4.2a2 2 0 0 0 1.6 0l9.2-4.2'/><path d='m2 17.6 9.2 4.2a2 2 0 0 0 1.6 0l9.2-4.2'/>",
             ),
             // The Screener: a person, checked.
             "mail/screener.svg" => Some(

@@ -546,6 +546,13 @@ impl MailApp {
         }
         // Settings: a page goes back to the list of pages.
         if self.modal == Some(Modal::Settings) {
+            // A workspace's page goes back to Workspaces.
+            if matches!(self.page, Page::Workspace(_)) {
+                self.ws_ui.deleting = None;
+                self.handle(Action::SettingsPage(Page::Workspaces), w, cx);
+                self.mobile_popped(cx);
+                return true;
+            }
             // Beside the list, reverse aliases go back to Forwarding, in
             // their column; anything else leaves Settings.
             if Self::mobile_split(w) {
@@ -924,7 +931,9 @@ impl MailApp {
         match screen {
             Screen::Reader => !self.subs_open,
             Screen::List => true,
-            Screen::Settings => self.fwd_reverse.is_none(),
+            Screen::Settings => {
+                self.fwd_reverse.is_none() && !matches!(self.page, Page::Workspace(_))
+            }
             Screen::Subscriptions => self.selected.is_none() && self.subs_sender.is_none(),
             Screen::Summary | Screen::AppView(_) => true,
             Screen::Mailboxes | Screen::Setup => false,

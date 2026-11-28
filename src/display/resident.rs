@@ -142,7 +142,16 @@ fn event_loop(
 ) -> anyhow::Result<()> {
     // Started at sign-in, this may come before the panel's tray.
     let tray = tray::create_patient(commands);
-    let command = futures::executor::block_on(requests.next()).unwrap_or(TrayCommand::Quit);
+    tray::follow(&state.store);
+    // Switching workspaces is done here; anything else ends the process.
+    let command = loop {
+        match futures::executor::block_on(requests.next()) {
+            Some(TrayCommand::Workspace(id)) => {
+                crate::manage::workspaces::Workspaces::switch_in(&state.store, id)
+            }
+            command => break command.unwrap_or(TrayCommand::Quit),
+        }
+    };
     // Opening can take a moment (a check under way finishes first): the
     // icon pulses meanwhile, so the click is seen to have done something.
     if command != TrayCommand::Quit
@@ -206,6 +215,8 @@ fn event_loop(
                 }
                 Some(TrayCommand::Open)
             }
+            // Only Linux's tray switches workspaces.
+            Event::UserEvent(TrayCommand::Workspace(_)) => None,
             Event::UserEvent(command) => Some(command),
             _ => None,
         };

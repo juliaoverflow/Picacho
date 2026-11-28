@@ -386,3 +386,15 @@ settings-new-mail-scheduled-mail-and-snoozes = Keep checking for mail, sending s
 settings-switching-signs-in-again = Instead of IMAP and SMTP. Switching signs in again in the browser and reads the account's mail again; drafts are kept.
 
 settings-inbox-control = Inbox Control
+
+settings-workspaces = Workspaces
+
+settings-markdown-shortcuts = Markdown shortcuts
+
+settings-markdown-shortcuts-caption = Typing "- ", "1. ", "> " or "## " starts a list, quote or heading, and **bold**, *italic*, `code` and ~~struck~~ text formats as it is typed. Type "/" for more.
+
+settings-send-pictures-at = Send pictures at
+
+settings-send-pictures-at-caption = Photos larger than this are made smaller as they’re sent, without where they were taken. Each message can choose otherwise.
+
+settings-large-attachments = Large attachments

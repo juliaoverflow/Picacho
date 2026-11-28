@@ -18,6 +18,9 @@ struct WidgetSnapshot: Codable, Sendable {
     let events: [WidgetEvent]
     let packages: [WidgetPackage]
     let receipts: [WidgetReceipt]
+    /// The workspace on, by name; empty for everything. All Accounts'
+    /// counts and lists are its accounts'.
+    let workspace: String
 
     enum CodingKeys: String, CodingKey {
         case version
@@ -34,6 +37,7 @@ struct WidgetSnapshot: Codable, Sendable {
         case events
         case packages
         case receipts
+        case workspace
     }
 
     init(
@@ -50,7 +54,8 @@ struct WidgetSnapshot: Codable, Sendable {
         calendarConnected: Bool,
         events: [WidgetEvent],
         packages: [WidgetPackage] = [],
-        receipts: [WidgetReceipt] = []
+        receipts: [WidgetReceipt] = [],
+        workspace: String = ""
     ) {
         self.version = version
         self.generatedAt = generatedAt
@@ -66,6 +71,7 @@ struct WidgetSnapshot: Codable, Sendable {
         self.events = events
         self.packages = packages
         self.receipts = receipts
+        self.workspace = workspace
     }
 
     init(from decoder: Decoder) throws {
@@ -84,6 +90,7 @@ struct WidgetSnapshot: Codable, Sendable {
         events = try c.decodeIfPresent([WidgetEvent].self, forKey: .events) ?? []
         packages = try c.decodeIfPresent([WidgetPackage].self, forKey: .packages) ?? []
         receipts = try c.decodeIfPresent([WidgetReceipt].self, forKey: .receipts) ?? []
+        workspace = try c.decodeIfPresent(String.self, forKey: .workspace) ?? ""
     }
 
     static let empty = WidgetSnapshot(
@@ -291,12 +298,26 @@ struct WidgetSnapshot: Codable, Sendable {
         return accounts.first(where: { $0.id == accountId })?.unread ?? 0
     }
 
+    /// Whether All Accounts takes in this account: the workspace on shows
+    /// it. An account the snapshot doesn't list is taken in.
+    func shown(_ accountId: String) -> Bool {
+        accounts.first(where: { $0.id == accountId })?.shown ?? true
+    }
+
+    /// The accounts All Accounts takes in.
+    private var shownAccounts: [AccountSummary] {
+        accounts.filter { $0.shown ?? true }
+    }
+
     func label(for accountId: String?) -> String {
         if let accountId, !accountId.isEmpty {
             return accounts.first(where: { $0.id == accountId })?.name ?? String(localized: "Inbox", bundle: .picacho)
         }
-        if accounts.count == 1 {
-            return accounts[0].name
+        if !workspace.isEmpty {
+            return workspace
+        }
+        if shownAccounts.count == 1 {
+            return shownAccounts[0].name
         }
         return String(localized: "All Inboxes", bundle: .picacho)
     }
@@ -305,15 +326,22 @@ struct WidgetSnapshot: Codable, Sendable {
         if let accountId, !accountId.isEmpty {
             return accounts.first(where: { $0.id == accountId })?.name ?? String(localized: "All Accounts", bundle: .picacho)
         }
-        if accounts.count == 1 {
-            return accounts[0].name
+        if !workspace.isEmpty {
+            return workspace
+        }
+        if shownAccounts.count == 1 {
+            return shownAccounts[0].name
         }
         return String(localized: "All Accounts", bundle: .picacho)
     }
 
     func filteredMessages(accountId: String?, unreadOnly: Bool, limit: Int) -> [WidgetMessage] {
         let filtered = messages.filter { msg in
-            if let accountId, !accountId.isEmpty, msg.accountId != accountId {
+            if let accountId, !accountId.isEmpty {
+                if msg.accountId != accountId {
+                    return false
+                }
+            } else if !shown(msg.accountId) {
                 return false
             }
             if unreadOnly && !msg.unread {
@@ -326,7 +354,11 @@ struct WidgetSnapshot: Codable, Sendable {
 
     func filteredPackages(accountId: String?, limit: Int) -> [WidgetPackage] {
         let filtered = packages.filter { pkg in
-            if let accountId, !accountId.isEmpty, pkg.accountId != accountId {
+            if let accountId, !accountId.isEmpty {
+                if pkg.accountId != accountId {
+                    return false
+                }
+            } else if !shown(pkg.accountId) {
                 return false
             }
             return true
@@ -337,21 +369,25 @@ struct WidgetSnapshot: Codable, Sendable {
     /// How many packages the Summary lists for one account, or for All
     /// Accounts when none is chosen: the widgets' "View all N".
     func packageTotal(accountId: String?) -> Int {
-        let chosen = accounts.filter { accountId == nil || accountId!.isEmpty || $0.id == accountId }
+        let chosen = (accountId ?? "").isEmpty ? shownAccounts : accounts.filter { $0.id == accountId }
         let counted = chosen.reduce(0) { $0 + ($1.packages ?? 0) }
         return max(counted, filteredPackages(accountId: accountId, limit: Int.max).count)
     }
 
     /// How many receipts the Summary lists for one account, or for all.
     func receiptTotal(accountId: String?) -> Int {
-        let chosen = accounts.filter { accountId == nil || accountId!.isEmpty || $0.id == accountId }
+        let chosen = (accountId ?? "").isEmpty ? shownAccounts : accounts.filter { $0.id == accountId }
         let counted = chosen.reduce(0) { $0 + ($1.receipts ?? 0) }
         return max(counted, filteredReceipts(accountId: accountId, limit: Int.max).count)
     }
 
     func filteredReceipts(accountId: String?, limit: Int) -> [WidgetReceipt] {
         let filtered = receipts.filter { rcpt in
-            if let accountId, !accountId.isEmpty, rcpt.accountId != accountId {
+            if let accountId, !accountId.isEmpty {
+                if rcpt.accountId != accountId {
+                    return false
+                }
+            } else if !shown(rcpt.accountId) {
                 return false
             }
             return true
@@ -387,6 +423,8 @@ struct AccountSummary: Codable, Hashable, Identifiable, Sendable {
     /// snapshots from before they were counted).
     var packages: Int? = nil
     var receipts: Int? = nil
+    /// The workspace on shows it (absent in older snapshots: shown).
+    var shown: Bool? = nil
 }
 
 struct WidgetMessage: Codable, Hashable, Identifiable, Sendable {

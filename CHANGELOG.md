@@ -13,6 +13,43 @@ same version in `Cargo.toml`.
 
 ### Added
 
+- Workspaces: named sets of accounts, calendars and address books, such as
+  Work and Personal, switched between at the top of the sidebar, with
+  ⌘⌥] and ⌘⌥[, or from the tray (Linux). The sidebar, All Accounts and
+  its unread counts, the calendar, contacts and the composer's suggestions,
+  and home-screen, desktop and Waybar widgets show only the workspace's.
+  Each decides which notifications get through (its own, everything or
+  nothing), which account new messages in All Accounts come from, and when
+  it turns on by itself. Settings → Workspaces starts them from Work,
+  Personal or Focus, each with a page of its own, on phones too.
+- Tabs (desktop): several mailboxes and searches open at once in the title
+  bar, each keeping its search (server searches and results on this
+  computer included), filter and open message. With one tab only
+  a + button shows. Open in New Tab (sidebar menu, ⌘/Ctrl-click, middle
+  click), ⌘T, ⌘⇧W, Ctrl+Tab; drag to reorder; reopened at launch.
+- Composer authoring: tables in formatted messages (insert from a size
+  grid, add and remove rows and columns, widen, narrow or even out
+  columns, drag column edges; Tab moves between cells). Text color,
+  highlight, font and size. Markdown typed as shortcuts ("- ", "1. ",
+  "> ", "## ", `**bold**`, `*italic*`, `` `code` ``, `~~struck~~`, "---"),
+  undone with one ⌘Z (Settings → Composing → Markdown shortcuts). A "/"
+  menu of blocks, tables, emoji, the date and your templates as snippets.
+  An emoji picker, and Find and Replace (⌘F, ⌘⇧F/Ctrl+H) in formatted and
+  plain messages. Snippets (Settings → Composing), put where the cursor is
+  from the "/" menu or the templates menu, or saved from a selection.
+- Photos are made smaller as they're sent (Large, 2048 px, by default;
+  Settings → Composing → Send pictures at, and per message), without their
+  location metadata. The draft keeps the originals.
+- Large attachments as links: with Nextcloud, a WebDAV folder, or a mail
+  account's Google Drive or OneDrive set up in Settings → Composing →
+  Large attachments, a message too large for its outgoing server sends its
+  largest files as links instead. Never for encrypted messages.
+- Signing a Google account in again keeps the calendar, contacts and
+  Drive access it was given; an Outlook account keeps its OneDrive access.
+- Mail merge: one personalized message per row of a CSV spreadsheet, its
+  columns as placeholders, previewed and sent one after another (the
+  footer's More menu); an unfinished merge goes on after Picacho restarts.
+
 - Security keys: OpenPGP keys on a YubiKey, Nitrokey, Gnuk or other
   OpenPGP card, and S/MIME certificates on a PKCS#11 token (a YubiKey's
   PIV through ykcs11 or OpenSC, a smart card), sign and decrypt on the key

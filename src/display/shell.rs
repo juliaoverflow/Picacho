@@ -69,6 +69,8 @@ pub(super) fn launch(store: Arc<Store>, listener: Option<instance::Listener>, cx
             .spawn(async move { crate::display::autostart::refresh(&dir) })
             .detach();
     }
+    // The tray's counts follow the widget snapshots.
+    tray::follow(&backend.store);
     cx.set_global(Shell {
         backend,
         main: None,
@@ -88,6 +90,7 @@ pub(super) fn launch(store: Arc<Store>, listener: Option<instance::Listener>, cx
                     crate::display::launch::push("picacho://widget/panel".to_owned());
                     open(cx);
                 }
+                TrayCommand::Workspace(id) => switch_workspace(id, cx),
                 TrayCommand::Quit => quit(cx),
             });
         }
@@ -100,6 +103,15 @@ pub(super) fn launch(store: Arc<Store>, listener: Option<instance::Listener>, cx
     })
     .detach();
     open(cx);
+}
+
+/// Turns a workspace on from the tray: in the window, where one is open.
+fn switch_workspace(id: Option<String>, cx: &mut App) {
+    let shell = cx.global::<Shell>();
+    match shell.view.as_ref().and_then(|v| v.upgrade()) {
+        Some(view) => view.update(cx, |this, cx| this.switch_workspace(id, cx)),
+        None => crate::manage::workspaces::Workspaces::switch_in(&shell.backend.store, id),
+    }
 }
 
 /// Whether closing the last window leaves Picacho running in the

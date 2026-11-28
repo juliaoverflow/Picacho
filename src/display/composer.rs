@@ -8,6 +8,9 @@ use crate::manage::composing::{ComposeOptions, mentions_attachment};
 use crate::manage::richtext::{self as rt, ListKind, html as rhtml};
 use gpui_component::input::RopeExt as _;
 
+#[path = "composer/authoring.rs"]
+mod authoring;
+
 actions!(
     composer,
     [
@@ -23,7 +26,8 @@ actions!(
         Heading,
         SaveDraft,
         SendDraft,
-        TogglePreview
+        TogglePreview,
+        FindInDraft
     ]
 );
 
@@ -57,6 +61,11 @@ pub(super) enum ComposerEvent {
     Schedule(i64),
     /// Keep this as a template (Settings → Composing lists them).
     SaveTemplate(crate::manage::composing::Template),
+    /// Keep this as a snippet (Settings → Composing lists them).
+    SaveSnippet(crate::manage::composing::Snippet),
+    /// Send these messages, one after another: a mail merge's, one per
+    /// row of its spreadsheet. The draft goes once they're all sent.
+    Merge(Vec<Draft>),
 }
 impl EventEmitter<ComposerEvent> for Composer {}
 
@@ -191,6 +200,22 @@ pub(super) struct Composer {
     revision: u64,
     saved: bool,
     focus: FocusHandle,
+    /// Find and replace, while open.
+    find: Option<authoring::FindBar>,
+    /// What the last Replace All did.
+    find_notice: Option<String>,
+    /// The emoji picker, while open.
+    emoji: Option<authoring::EmojiPicker>,
+    /// The text style menu (colors, fonts, sizes) is open.
+    style_open: bool,
+    /// The table menu is open, with the size its grid points at.
+    table_open: Option<Option<(usize, usize)>>,
+    /// The More menu is open.
+    more_open: bool,
+    /// Mail merge's panel, while open.
+    merge: Option<authoring::MergePanel>,
+    /// A mail merge being sent: how many went, of how many.
+    pub(super) merge_progress: Option<(usize, usize)>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -269,13 +294,18 @@ impl Composer {
         crate::manage::spelling::spelling().use_personal(backend.store.path.join("dictionary.txt"));
         let rich = cx.new(|cx| RichEditor::new(doc, t!("composer-write-your-message"), look_of(colors, false), cx));
         let mut subscriptions = vec![];
-        subscriptions.push(cx.subscribe(&rich, |this, rich, _: &RichEvent, cx| {
+        subscriptions.push(cx.subscribe_in(&rich, window, |this, rich, e: &RichEvent, w, cx| {
+            if let RichEvent::Slash(command) = e {
+                return this.on_slash(command, w, cx);
+            }
             // Another edit after a paste lets its offer go.
             let revision = rich.read(cx).revision;
             if this.rich_paste.as_ref().is_some_and(|p| p.revision != revision) {
                 this.rich_paste = None;
             }
             this.preview = false;
+            this.find_notice = None;
+            this.refresh_find(cx);
             this.changed(cx);
         }));
         for (i, state) in recipients.iter().enumerate() {
@@ -320,6 +350,7 @@ impl Composer {
                 if this.paste.as_ref().is_some_and(|p| p.body_len != len) {
                     this.paste = None;
                 }
+                this.find_notice = None;
                 this.changed(cx);
             }
         }));
@@ -371,6 +402,14 @@ impl Composer {
             revision: 0,
             saved: true,
             focus: cx.focus_handle(),
+            find: None,
+            find_notice: None,
+            emoji: None,
+            style_open: false,
+            table_open: None,
+            more_open: false,
+            merge: None,
+            merge_progress: None,
             _subscriptions: subscriptions,
         }
     }
@@ -1670,6 +1709,26 @@ impl Composer {
                 },
             )));
         }
+        if !self.options.snippets.is_empty() {
+            menu = menu.child(
+                div()
+                    .px_2()
+                    .pt_2()
+                    .pb_1()
+                    .text_size(px(11.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(rgb(c.muted))
+                    .child(t!("composer-snippets")),
+            );
+        }
+        for (i, snippet) in self.options.snippets.iter().enumerate() {
+            menu = menu.child(row(format!("snippet-{i}"), snippet.name.clone()).on_click(cx.listener(
+                move |this, _, w, cx| {
+                    this.templates_open = false;
+                    this.insert_snippet(i, w, cx);
+                },
+            )));
+        }
         menu.child(div().h(px(1.)).my_1().bg(rgb(c.border))).child(
             row("template-save".into(), t!("composer-save-this-message-as-a-template").into()).on_click(
                 cx.listener(|this, _, _, cx| {
@@ -2763,6 +2822,16 @@ impl Composer {
         row
     }
 
+    /// The formatting toolbar, and the menus it opens below it.
+    fn toolbar_with_menus(&self, cx: &Context<Self>) -> Div {
+        div()
+            .relative()
+            .flex_shrink_0()
+            .child(self.toolbar(cx))
+            .when(self.style_open, |d| d.child(deferred(self.style_menu(cx)).with_priority(2)))
+            .when(self.table_open.is_some(), |d| d.child(deferred(self.table_menu(cx)).with_priority(2)))
+    }
+
     fn toolbar(&self, cx: &Context<Self>) -> Stateful<Div> {
         let c = self.colors;
         let sep = || div().w(px(1.)).h(px(16.)).mx_1().bg(rgb(c.border));
@@ -2840,6 +2909,31 @@ impl Composer {
             }))
             .child(sep())
             .child(self.icon_button(
+                "text-style",
+                "palette",
+                t!("composer-text-style"),
+                self.style_open || active.color.is_some() || active.background.is_some() || active.family.is_some() || active.size.is_some(),
+                cx,
+                |t, _, cx| {
+                    t.style_open = !t.style_open;
+                    t.table_open = None;
+                    cx.notify();
+                },
+            ))
+            .child(self.icon_button(
+                "table",
+                "table",
+                if active.table { t!("composer-table") } else { t!("composer-insert-table") },
+                self.table_open.is_some() || active.table,
+                cx,
+                |t, _, cx| {
+                    t.table_open = if t.table_open.is_some() { None } else { Some(None) };
+                    t.style_open = false;
+                    cx.notify();
+                },
+            ))
+            .child(sep())
+            .child(self.icon_button(
                 "align",
                 match active.align {
                     rt::Align::Left => "text-align-start",
@@ -2880,6 +2974,20 @@ impl Composer {
                 },
             ))
             .child(div().flex_1())
+            .child(self.icon_button(
+                "find",
+                "search",
+                tip(t!("composer-find-and-replace"), "find-in-draft"),
+                self.find.is_some(),
+                cx,
+                |t, w, cx| {
+                    if t.find.is_some() {
+                        t.close_find(w, cx);
+                    } else {
+                        t.open_find(false, w, cx);
+                    }
+                },
+            ))
             .child(self.icon_button(
                 "preview",
                 "preview",
@@ -2992,7 +3100,9 @@ impl Composer {
         let listed = |p: &std::path::PathBuf| {
             !p.file_name().is_some_and(|n| shown.iter().any(|s| *s == n.to_string_lossy()))
         };
-        if !self.draft.attachments.iter().any(listed) {
+        let chip = self.pictures_chip(cx);
+        let note = self.large_files_note();
+        if !self.draft.attachments.iter().any(listed) && chip.is_none() {
             return None;
         }
         let c = self.colors;
@@ -3062,7 +3172,7 @@ impl Composer {
                     ),
             );
         }
-        Some(list)
+        Some(list.children(chip).children(note))
     }
 
     fn footer(&self, cx: &Context<Self>) -> Div {
@@ -3088,7 +3198,13 @@ impl Composer {
             .child(if self.sending { t!("composer-sending") } else { t!("composer-send") })
             .tooltip(|w, cx| Tooltip::new(keys(&super::shortcuts::tip(t!("composer-send"), "send", cx))).build(w, cx))
             .on_click(cx.listener(|this, _, w, cx| this.request_send(w, cx)));
-        let status = if let Some(error) = &self.error {
+        let status = if let Some((sent, of)) = self.merge_progress {
+            div()
+                .min_w_0()
+                .truncate()
+                .text_color(rgb(c.muted))
+                .child(t!("composer-merge-sending", current = (sent + 1).min(of), count = of))
+        } else if let Some(error) = &self.error {
             div()
                 .min_w_0()
                 .truncate()
@@ -3159,6 +3275,15 @@ impl Composer {
             .when(self.templates_open, |d| {
                 d.child(deferred(self.templates_menu(cx)).with_priority(2))
             })
+            .child(self.icon_button(
+                "emoji",
+                "smile",
+                t!("composer-insert-emoji"),
+                self.emoji.is_some(),
+                cx,
+                |t, w, cx| t.toggle_emoji(w, cx),
+            ))
+            .children(self.emoji_menu(cx).map(|m| deferred(m).with_priority(2)))
             .child(self.icon_button(
                 "follow-up",
                 "waiting",
@@ -3307,6 +3432,18 @@ impl Composer {
                     ))
                 })
             })
+            .child(self.icon_button(
+                "more",
+                "ellipsis",
+                t!("composer-more"),
+                self.more_open || self.merge.is_some(),
+                cx,
+                |t, _, cx| {
+                    t.more_open = !t.more_open;
+                    cx.notify();
+                },
+            ))
+            .when(self.more_open, |d| d.child(deferred(self.more_menu(cx)).with_priority(2)))
             .child(
                 div()
                     .flex_1()
@@ -3321,7 +3458,12 @@ impl Composer {
                 t!("composer-discard-draft"),
                 false,
                 cx,
-                |_, _, cx| cx.emit(ComposerEvent::Discard),
+                // Not while it is being sent (a mail merge): its files are in use.
+                |t, _, cx| {
+                    if !t.sending {
+                        cx.emit(ComposerEvent::Discard)
+                    }
+                },
             ))
     }
 }
@@ -3357,6 +3499,10 @@ impl Render for Composer {
             .on_action(cx.listener(|t, _: &SaveDraft, _, cx| t.save(cx)))
             .on_action(cx.listener(|t, _: &SendDraft, w, cx| t.request_send(w, cx)))
             .on_action(cx.listener(|t, _: &TogglePreview, _, cx| t.toggle_preview(cx)))
+            .on_action(cx.listener(|t, _: &FindInDraft, w, cx| t.open_find(false, w, cx)))
+            // The text fields' own find keys (⌘F, ⌘⇧F / Ctrl+H).
+            .on_action(cx.listener(|t, _: &gpui_component::input::Search, w, cx| t.open_find(false, w, cx)))
+            .on_action(cx.listener(|t, _: &gpui_component::input::Replace, w, cx| t.open_find(true, w, cx)))
             .on_drop(cx.listener(|this, paths: &ExternalPaths, w, cx| {
                 let paths = paths.paths().to_vec();
                 // Pictures dropped on formatted text go in it.
@@ -3398,18 +3544,25 @@ impl Render for Composer {
             let (look, sending, files) = (look_of(c, self.mobile), self.sending, self.draft.attachments.clone());
             // Phones' keyboards check spelling themselves.
             let spellcheck = self.options.spellcheck && !self.mobile;
+            let markdown = self.options.markdown_shortcuts;
+            let slash = self.slash_items();
             self.rich.update(cx, |r, _| {
                 r.look = look;
                 r.spellcheck = spellcheck;
                 r.disabled = sending;
+                r.markdown = markdown;
+                r.slash_extra = slash;
                 r.set_files(&files);
             });
-            root = root.child(self.toolbar(cx));
+            root = root.child(self.toolbar_with_menus(cx));
             root = root.children(self.link_bar(cx));
         }
+        root = root.children(self.find_bar(cx));
+        let merge = self.merge_panel(cx);
         root.child(self.body_view(cx))
             .children(self.attachments(cx))
             .child(self.footer(cx))
+            .children(merge.map(|m| deferred(m).with_priority(2)))
             // A phone shows Send Later as a page over the message.
             .when(self.mobile && self.later_open, |d| d.child(self.later_page(cx)))
     }

@@ -1018,7 +1018,7 @@ impl MailApp {
                 )
             }
         };
-        let events = self.backend.agenda(
+        let events = self.workspace_agenda(
             day_start(from) - 86_400,
             day_start(from + Days::days(days as i64)) + 86_400,
         );

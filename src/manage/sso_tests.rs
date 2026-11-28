@@ -194,7 +194,7 @@ fn sso_through_saml_signs_in_to_imap_pop3_and_smtp_and_renews() -> Result<()> {
     a.smtp_port = smtp;
     a.smtp_tls = Some(true);
     // The sign-in, as Add Account runs it: browser, tokens, IMAP check.
-    let grant = crate::sync::oauth::authorize(&a, Arc::new(AtomicBool::new(false)))?;
+    let grant = crate::sync::oauth::authorize_with(&a, &[], Arc::new(AtomicBool::new(false)))?;
     let (mut secret, who) = crate::sync::oauth::redeem(&a, &grant)?;
     assert_eq!(who.email, "ana@example.edu", "the SAML assertion's address");
     assert!(!secret.refresh_token.is_empty(), "offline access");

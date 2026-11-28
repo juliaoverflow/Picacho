@@ -209,3 +209,5 @@ mobile-sheets-always-trust = Always Trust { $site }
 mobile-sheets-copy-link = Copy Link
 
 mobile-settings-inbox-control = Inbox Control
+
+mobile-settings-workspaces = Workspaces
