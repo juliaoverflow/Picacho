@@ -1,5 +1,6 @@
-# Builds Picacho for Android (APKs) and Linux (Flatpak), publishes them to
-# Picacho's own repositories on Cloudflare R2, and creates the GitHub release.
+# Builds Picacho for Android (APKs), Linux (Flatpak) and Windows (an unsigned
+# MSI), publishes the first two to Picacho's own repositories on Cloudflare
+# R2, and creates the GitHub release with all three.
 #
 #   push to beta     the rolling beta: "Beta Build", no version number. The
 #                    Android app tech.pinal.picacho.beta (beside the release),
@@ -33,6 +34,8 @@ on:
       - packaging/**
       - fdroid/**
       - scripts/build-android.sh
+      - scripts/bundle-windows.ps1
+      - .config/dotnet-tools.json
       - scripts/release/**
       - .github/workflows/release.yml
 
@@ -255,6 +258,49 @@ jobs:
           path: out/*
           if-no-files-found: error
 
+  windows:
+    needs: prepare
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: windows
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+      - name: Build the MSI
+        shell: pwsh
+        env:
+          # "beta" makes the app Picacho Beta, its version "Beta Build".
+          PICACHO_CHANNEL: ${{ needs.prepare.outputs.channel == 'beta' && 'beta' || '' }}
+        run: |
+          # The runner's Visual Studio build tools, Windows SDK (fxc.exe,
+          # RC.EXE) and Strawberry Perl (OpenSSL) are what the script needs.
+          # Unsigned: no PICACHO_SIGNTOOL_CERT, so SmartScreen warns.
+          if (-not $env:PICACHO_CHANNEL) { Remove-Item Env:PICACHO_CHANNEL -ErrorAction SilentlyContinue }
+          & scripts\bundle-windows.ps1 release
+          $label = "${{ needs.prepare.outputs.label }}"
+          New-Item -ItemType Directory -Force out | Out-Null
+          # dist\Picacho-<version>-x64[-<culture>].msi -> out\picacho-<label>-x64[-<culture>].msi
+          $msis = Get-ChildItem dist\Picacho-*-x64*.msi
+          if (-not $msis) { throw "No MSI was built" }
+          foreach ($msi in $msis) {
+            $suffix = $msi.Name -replace '^Picacho-.+-x64(.*)\.msi$', '$1'
+            Copy-Item $msi.FullName "out\picacho-$label-x64$suffix.msi"
+          }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: out/*.msi
+          if-no-files-found: error
+
   publish-android:
     needs: [prepare, android]
     if: needs.prepare.outputs.publish == 'true'
@@ -315,7 +361,7 @@ jobs:
           sh scripts/release/publish-flatpak.sh $repos
 
   github-release:
-    needs: [prepare, android, flatpak, publish-android, publish-linux]
+    needs: [prepare, android, flatpak, windows, publish-android, publish-linux]
     if: needs.prepare.outputs.publish == 'true'
     runs-on: ubuntu-24.04
     permissions:
@@ -339,7 +385,10 @@ jobs:
 
           **Android:** add `https://android.repo.pinal.tech/repo?fingerprint=a029e7fcd4c66d85aa0baea0f87db04c854c559f056a8b2032b4b26d186ee9d5` in F-Droid, Droid-ify or Neo Store and install Picacho (or Picacho Beta), or install an APK below (`arm64-v8a` for most phones).
 
-          **Linux:** `flatpak install --from https://linux.repo.pinal.tech/tech.pinal.picacho.stable.flatpakref` (beta: `tech.pinal.picacho.beta.flatpakref`), or install a `.flatpak` bundle below.'
+          **Linux:** `flatpak install --from https://linux.repo.pinal.tech/tech.pinal.picacho.stable.flatpakref` (beta: `tech.pinal.picacho.beta.flatpakref`), or install a `.flatpak` bundle below.
+
+          **Windows:** download the `.msi` below, which installs for the current user without administrator rights. It is not code-signed yet, so SmartScreen may warn: choose **More info**, then **Run anyway**.'
+          assets="out/*.apk out/*.flatpak out/*.msi"
           if [ "${{ needs.prepare.outputs.channel }}" = beta ]; then
             # One rolling pre-release: replace the last beta and move its tag.
             {
@@ -350,7 +399,7 @@ jobs:
             for old in "$TAG" beta; do
               gh release delete "$old" --yes --cleanup-tag 2>/dev/null || true
             done
-            gh release create "$TAG" out/*.apk out/*.flatpak --target "$SHA" \
+            gh release create "$TAG" $assets --target "$SHA" \
               --title "Picacho Beta Build" --notes-file notes.md --prerelease --latest=false
           else
             version=${{ needs.prepare.outputs.version }}
@@ -359,12 +408,12 @@ jobs:
               echo "$install"
             } > notes.md
             if gh release view "$TAG" >/dev/null 2>&1; then
-              gh release upload "$TAG" out/*.apk out/*.flatpak --clobber
+              gh release upload "$TAG" $assets --clobber
               gh release edit "$TAG" --notes-file notes.md
             elif git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null; then
-              gh release create "$TAG" out/*.apk out/*.flatpak --title "Picacho $version" --notes-file notes.md --verify-tag
+              gh release create "$TAG" $assets --title "Picacho $version" --notes-file notes.md --verify-tag
             else
               # Tags the commit only now that it has been published.
-              gh release create "$TAG" out/*.apk out/*.flatpak --target "$SHA" --title "Picacho $version" --notes-file notes.md
+              gh release create "$TAG" $assets --target "$SHA" --title "Picacho $version" --notes-file notes.md
             fi
           fi

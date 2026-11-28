@@ -160,6 +160,8 @@ manage-backend-open-this-message-first = Open this message first
 
 manage-backend-attachment-not-found = Attachment not found
 
+manage-attachments-couldnt-read = Couldn't read this attachment's text
+
 manage-backend-the-folder-no-longer-exists-on = The folder “{ $name }” no longer exists on the server.
 
 manage-backend-the-account-it-was-shared-with = the account it was shared with
@@ -1391,3 +1393,31 @@ manage-outgoing-cloud-account-gone = The account whose storage large attachments
 manage-outgoing-cloud-not-this-account = This account can’t share files that way.
 
 manage-merge-interrupted = Picacho stopped while it was being sent; it may not have gone
+
+manage-system-search-isnt-allowed = Mail can’t go to the system’s search while it’s hidden outside Picacho or the local database is encrypted.
+
+manage-system-search-stopped = Adding mail to the system’s search stopped unexpectedly. It’s tried again shortly.
+
+manage-system-search-no-subject = (No subject)
+
+manage-system-search-no-folder = There’s no folder for Windows Search’s files.
+
+manage-system-search-windows-search-off = Windows Search isn’t running on this computer, so these messages can’t be found from it yet. Turn on the Windows Search service, or add “{ $path }” in Indexing Options.
+
+manage-system-search-windows-search-denied = Windows Search didn’t let Picacho add its folder. Add “{ $path }” in Indexing Options.
+
+manage-system-search-windows-search-failed = Windows Search couldn’t add Picacho’s folder ({ $e }). Add “{ $path }” in Indexing Options.
+
+manage-system-search-couldnt-make-folder = Couldn’t make the folder “{ $path }”
+
+manage-system-search-couldnt-remove-folder = Couldn’t remove the folder “{ $path }”
+
+manage-system-search-spotlight-unavailable = Spotlight isn’t available to Picacho here. Open Picacho from its application bundle.
+
+manage-system-search-spotlight-said = Spotlight said: { $e }
+
+manage-system-search-spotlight-didnt-answer = Spotlight didn’t answer.
+
+manage-system-search-from-on = { $from } · { $date }
+
+manage-system-search-no-session-bus = The desktop’s search can’t reach Picacho: { $e }

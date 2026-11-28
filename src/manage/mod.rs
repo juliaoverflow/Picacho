@@ -29,6 +29,9 @@ pub mod list_headers;
 pub mod local_ai;
 /// The text of attachments, for the local full-text index.
 pub mod attachment_text;
+/// Attachments across mail (the attachment browser) and what is shared
+/// with one person (the reader's contact panel).
+pub mod attachments;
 pub mod mail_kinds;
 /// Keeping memory small in the background (desktop).
 #[cfg_attr(any(target_os = "android", target_os = "ios"), allow(dead_code))]
@@ -53,6 +56,9 @@ pub mod search;
 pub mod status;
 pub mod store;
 pub mod subscriptions;
+/// Mail in the system's search: Spotlight (macOS) and Windows Search.
+#[cfg_attr(any(target_os = "android", target_os = "ios"), allow(dead_code))]
+pub mod system_search;
 pub mod tracking;
 /// Home-screen widget snapshots and deep-link actions (Android and iOS).
 pub mod widgets;

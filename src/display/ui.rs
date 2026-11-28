@@ -29,6 +29,13 @@ mod security_keys;
 use security_keys::SecurityKeyAction;
 #[path = "calendar.rs"]
 mod calendar;
+#[path = "attachments.rs"]
+mod attachments;
+#[path = "contact_panel.rs"]
+mod contact_panel;
+#[cfg(test)]
+#[path = "attachments_tests.rs"]
+mod attachments_tests;
 #[path = "jmap_extras.rs"]
 mod jmap_extras;
 #[path = "motion.rs"]
@@ -83,6 +90,11 @@ mod widget_window;
 mod mobile;
 #[path = "panes.rs"]
 mod panes;
+#[path = "palette.rs"]
+mod palette;
+#[cfg(test)]
+#[path = "palette_tests.rs"]
+mod palette_tests;
 #[path = "paste.rs"]
 mod paste;
 #[path = "prompt.rs"]
@@ -136,6 +148,11 @@ mod cloud_settings;
 mod calendar_views;
 #[path = "tabs.rs"]
 mod tabs;
+#[path = "tasks.rs"]
+mod tasks;
+#[cfg(test)]
+#[path = "tasks_tests.rs"]
+mod tasks_tests;
 #[cfg(test)]
 #[path = "tabs_tests.rs"]
 mod tabs_tests;
@@ -254,7 +271,14 @@ actions!(
         PreviousTab,
         /// Workspaces (`workspaces.rs`): the next and the previous one.
         NextWorkspace,
-        PreviousWorkspace
+        PreviousWorkspace,
+        /// Opens or closes the reader's contact panel (`contact_panel.rs`).
+        ToggleContactPanel,
+        /// Opens the attachment browser, or goes back to mail from it
+        /// (`attachments.rs`).
+        ShowAttachmentBrowser,
+        /// Opens or closes the command palette (`palette.rs`).
+        ShowCommandPalette
     ]
 );
 
@@ -754,6 +778,10 @@ pub(super) enum Undo {
     Draft(String),
     /// Messages just snoozed, by Message-ID: back to the inbox now.
     Snooze(String, Vec<String>),
+    /// A task just added (from an email): deleted again (its UID).
+    TaskAdded(String),
+    /// A task just marked done: to do again (its UID).
+    TaskDone(String),
 }
 /// Which delivery report option (`DsnOptions`) a switch turns over.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1392,12 +1420,20 @@ enum Action {
     Cloud(cloud_settings::CloudAction),
     /// Calendar and Contacts views, the calendar's grids, custom repeats.
     Calendar(calendar_views::CalAction),
+    /// The Tasks view, and tasks made from email (`tasks.rs`).
+    Tasks(tasks::TaskAction),
     /// The app lock and the encrypted database (Settings → Privacy).
     Lock(applock::LockAction),
     /// Tabs in the title bar (`tabs.rs`).
     Tabs(tabs::TabAction),
     /// Switching workspaces and Settings → Workspaces (`workspaces.rs`).
     Workspaces(workspaces::WsAction),
+    /// The attachment browser (`attachments.rs`).
+    Attachments(attachments::LibAction),
+    /// The reader's contact panel (`contact_panel.rs`).
+    ContactPanel(contact_panel::PanelAction),
+    /// The command palette (`palette.rs`).
+    Palette(palette::PaletteAction),
 }
 
 /// A conversation's rows for one message at one list revision.
@@ -1829,6 +1865,12 @@ pub struct MailApp {
     app_view: Option<calendar_views::AppView>,
     /// The calendar's view (agenda or grids) and custom repeat form.
     cal: calendar_views::CalViews,
+    /// The attachment browser's state (`attachments.rs`).
+    library: attachments::Library,
+    /// The reader's contact panel (`contact_panel.rs`).
+    contact_panel: contact_panel::ContactPanel,
+    /// The command palette (`palette.rs`).
+    palette: palette::Palette,
     /// What each account's server says about itself (METADATA).
     server_notes: HashMap<String, crate::manage::backend::ServerNotes>,
     /// JMAP accounts shared with each account's sign-in, as last looked
@@ -2156,6 +2198,8 @@ pub struct MailApp {
     collection_name: Entity<InputState>,
     /// The task editor: the UID of the task open in it, and its fields.
     task_editing: Option<String>,
+    /// The Tasks view (`tasks.rs`).
+    tasks: tasks::TasksView,
     task_title: Entity<InputState>,
     task_due: Entity<InputState>,
     task_notes: Entity<InputState>,
@@ -2481,6 +2525,13 @@ impl MailApp {
             });
         }
         let cal = calendar_views::CalViews::new(window, cx);
+        let library = attachments::Library::new(window, cx);
+        subscriptions.push(cx.subscribe(&library.search, |this, _, event, cx| {
+            if matches!(event, InputEvent::Change) {
+                this.library_search_changed(cx);
+            }
+        }));
+        let contact_panel = contact_panel::ContactPanel::new(&backend.store);
         let rename_input = input(t!("ui-folder-name"), false, window, cx);
         subscriptions.push(
             cx.subscribe_in(&rename_input, window, |this, _, event, w, cx| {
@@ -2508,6 +2559,10 @@ impl MailApp {
             if matches!(event, InputEvent::Change) {
                 cx.notify();
             }
+        }));
+        let palette = palette::Palette::new(window, cx);
+        subscriptions.push(cx.subscribe_in(&palette.input, window, |this, _, event, w, cx| {
+            this.palette_input(event, w, cx)
         }));
         let label_input = input(t!("ui-label-name"), false, window, cx);
         subscriptions.push(
@@ -3190,6 +3245,7 @@ impl MailApp {
             pushed,
             draft_synced: HashMap::new(),
             label_input,
+            palette,
             folder_edit: None,
             folder_saving: None,
             subs_return: Cell::new(None),
@@ -3362,6 +3418,7 @@ impl MailApp {
             event_guests,
             collection_name: input(t!("ui-name"), false, window, cx),
             task_editing: None,
+            tasks: tasks::TasksView::new(window, cx),
             task_title: input(t!("ui-task"), false, window, cx),
             task_due: input(t!("ui-2026-11-24-17-00-a"), false, window, cx),
             task_notes: input(t!("ui-notes"), false, window, cx),
@@ -3433,6 +3490,8 @@ impl MailApp {
             lock,
             app_view: None,
             cal,
+            library,
+            contact_panel,
             server_notes: HashMap::new(),
             jmap_shared: HashMap::new(),
             shared_looking: HashSet::new(),
@@ -4564,6 +4623,17 @@ impl MailApp {
                 Action::MarkAllRead(id.into(), mailbox.clone()),
             ));
         }
+        if (id == ALL_MAIL || self.accounts.iter().any(|a| a.id == id)) && mailbox.folder() != Folder::Drafts {
+            entries.push(entry(
+                t!("attachments-browse-attachments"),
+                "paperclip",
+                Action::Attachments(attachments::LibAction::Open {
+                    account: id.into(),
+                    mailbox: Some(mailbox.clone()),
+                    person: None,
+                }),
+            ));
+        }
         if self.accounts.iter().any(|a| a.id == id) {
             entries.push(Entry::Separator);
             entries.push(entry(
@@ -5114,6 +5184,11 @@ impl MailApp {
                 Action::FollowUpMenu(m.id.clone()),
             ));
         }
+        entries.push(entry(
+            t!("tasks-add-to-tasks"),
+            "tasks",
+            Action::Tasks(tasks::TaskAction::FromMail(m.id.clone(), None)),
+        ));
         entries.extend(
             self.move_folder_entry(t!("ui-move-to-folder-2"), MoveTarget::Mail(ids.clone())),
         );
@@ -6360,6 +6435,8 @@ impl MailApp {
                     self.wake_account(a, message_ids, cx);
                 }
             }
+            Undo::TaskAdded(uid) => self.remove_added_task(uid, cx),
+            Undo::TaskDone(uid) => self.reopen_task_now(uid, cx),
             Undo::Draft(id) => {
                 if self.discarding.remove(&id) && self.folder == Folder::Drafts {
                     self.load_drafts(cx);
@@ -6945,6 +7022,10 @@ impl MailApp {
         .detach();
     }
     fn close(&mut self, w: &mut Window, cx: &mut Context<Self>) {
+        // The command palette is above everything else.
+        if self.palette_escape(w, cx) {
+            return;
+        }
         // A phone goes back one screen at a time (Android's Back, Escape).
         if self.mobile.on && self.mobile_back(w, cx) {
             return;
@@ -7724,6 +7805,13 @@ impl MailApp {
         let mut entries = Vec::new();
         if let Some(text) = &menu.selection {
             entries.push(entry(t!("ui-copy"), "copy", Action::CopyText(text.clone())));
+            if let Some(id) = self.selected.clone() {
+                entries.push(entry(
+                    t!("tasks-add-selection-to-tasks"),
+                    "tasks",
+                    Action::Tasks(tasks::TaskAction::FromMail(id, Some(text.clone()))),
+                ));
+            }
         }
         if let Some(link) = &menu.link {
             if !entries.is_empty() {
@@ -9269,7 +9357,10 @@ impl MailApp {
             Action::Filters(action) => self.filter_action(action, w, cx),
             Action::Organize(action) => self.org_action(action, w, cx),
             Action::Control(action) => self.control_action(action, w, cx),
+            Action::Tasks(action) => self.tasks_action(action, w, cx),
             Action::Workspaces(action) => self.workspace_action(action, w, cx),
+            Action::Attachments(action) => self.library_action(action, w, cx),
+            Action::ContactPanel(action) => self.panel_action(action, w, cx),
             Action::Categories(action) => self.cat_action(action, w, cx),
             Action::Tools(action) => self.tool_action(action, w, cx),
             Action::Keys(action) => self.key_action(action, cx),
@@ -9278,6 +9369,12 @@ impl MailApp {
             Action::Calendar(action) => self.cal_action(action, w, cx),
             Action::Lock(action) => self.lock_action(action, w, cx),
             Action::Tabs(action) => self.tabs_action(action, w, cx),
+            Action::Palette(action) => self.palette_action(action, w, cx),
+        }
+        // A dialog opened (from the palette, or by a shortcut while it
+        // was open) takes the palette's place.
+        if self.palette.open && self.modal.is_some() {
+            self.close_palette(w, cx);
         }
         self.sync_selecting();
         self.save_tabs(cx);
@@ -13256,6 +13353,7 @@ impl MailApp {
                 self.menu.as_ref().is_some_and(|m| m.window.is_none()),
                 |d| d.child(self.popup_menu(window, cx)),
             )
+            .children(self.palette_layer(window, cx))
     }
 }
 impl MailApp {
@@ -13264,6 +13362,9 @@ impl MailApp {
     fn app_actions(&self, d: Stateful<Div>, cx: &Context<Self>) -> Stateful<Div> {
         d
             .on_action(cx.listener(|this, _: &Compose, w, cx| this.new_compose(0, w, cx)))
+            .on_action(cx.listener(|this, _: &ShowCommandPalette, w, cx| {
+                this.handle(Action::Palette(palette::PaletteAction::Toggle), w, cx)
+            }))
             .on_action(cx.listener(|this, _: &Quit, _, cx| this.quit_app(cx)))
             .map(android_clipboard)
             .on_action(cx.listener(|this, _: &CloseWindow, w, cx| {
@@ -13306,6 +13407,26 @@ impl MailApp {
                     && let Some(id) = this.selected.clone()
                 {
                     this.handle(Action::Tools(tools::ToolAction::SavePdf(id)), w, cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &ShowAttachmentBrowser, w, cx| {
+                if this.modal.is_none() && !this.onboarding {
+                    use calendar_views::{AppView, CalAction};
+                    let action = if this.app_view == Some(AppView::Attachments) {
+                        CalAction::Close
+                    } else {
+                        CalAction::Open(AppView::Attachments)
+                    };
+                    this.handle(Action::Calendar(action), w, cx);
+                    if this.mobile.on && this.app_view.is_some() {
+                        this.mobile.mailboxes = false;
+                        this.mobile_pushed(cx);
+                    }
+                }
+            }))
+            .on_action(cx.listener(|this, _: &ToggleContactPanel, w, cx| {
+                if this.modal.is_none() && !this.mobile.on {
+                    this.handle(Action::ContactPanel(contact_panel::PanelAction::Toggle), w, cx);
                 }
             }))
             .on_action(cx.listener(|this, _: &ToggleThreads, w, cx| {
@@ -13992,6 +14113,7 @@ fn icon_el(name: &str, size: f32, color: u32) -> Div {
         "bank",
         "table",
         "smile",
+        "tasks",
     ]
     .contains(&name)
     {
@@ -14454,6 +14576,13 @@ fn open_app_window(backend: Arc<Backend>, cx: &mut App) {
 fn start(app: Application, open: impl FnOnce(&mut App) + 'static) {
     let app = app.with_assets(crate::display::assets::Assets);
     app.on_open_urls(crate::display::launch::opened);
+    // A message chosen in Spotlight opens here, as a link to it would.
+    #[cfg(target_os = "macos")]
+    crate::manage::system_search::spotlight::handle_activities(c"GPUIApplicationDelegate", |link| {
+        if let Some(request) = crate::display::launch::request(&link) {
+            crate::display::launch::push(request);
+        }
+    });
     super::desktop::register();
     #[cfg(windows)]
     super::windows::register_default_app_if_unclaimed();
@@ -14633,7 +14762,11 @@ fn menus() -> Vec<Menu> {
                 MenuItem::action(t!("ui-group-by-conversation"), ToggleThreads),
                 MenuItem::separator(),
                 MenuItem::action(t!("ui-toggle-sidebar"), ToggleSidebar),
+                MenuItem::action(t!("ui-toggle-contact-panel"), ToggleContactPanel),
+                MenuItem::action(t!("ui-browse-attachments"), ShowAttachmentBrowser),
                 MenuItem::action(t!("ui-toggle-dark-mode"), ToggleTheme),
+                MenuItem::separator(),
+                MenuItem::action(t!("palette-command-palette-menu"), ShowCommandPalette),
                 MenuItem::separator(),
                 MenuItem::action(t!("ui-zoom-in"), ZoomIn),
                 MenuItem::action(t!("ui-zoom-out"), ZoomOut),

@@ -66,6 +66,11 @@ modules:
       - $CARGO_HOME/bin/cargo build --release --locked
       - install -Dm755 target/release/picacho /app/bin/picacho
       - install -Dm644 packaging/linux/tech.pinal.picacho.svg /app/share/icons/hicolor/scalable/apps/tech.pinal.picacho.svg
+      # Mail in GNOME's and KDE's searches (Settings → Privacy), which ask
+      # Picacho over D-Bus on tech.pinal.picacho.SearchProvider, a name of
+      # the app ID's that a Flatpak may own.
+      - install -Dm644 packaging/linux/tech.pinal.picacho.search-provider.ini /app/share/gnome-shell/search-providers/tech.pinal.picacho.search-provider.ini
+      - install -Dm644 packaging/linux/tech.pinal.picacho.krunner.desktop /app/share/krunner/dbusplugins/tech.pinal.picacho.desktop
       # The desktop entry and listing with their translations (locales/).
       - python3 scripts/release/l10n.py desktop packaging/flatpak/tech.pinal.picacho.desktop /app/share/applications/tech.pinal.picacho.desktop
       - python3 scripts/release/l10n.py metainfo packaging/flatpak/tech.pinal.picacho.metainfo.xml metainfo.xml

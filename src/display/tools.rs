@@ -204,7 +204,7 @@ const MAX_PREVIEW_ALLOC: u64 = 64 * 1024 * 1024;
 /// The largest picture file previewed: it is downloaded and held whole to
 /// decode, and one larger couldn't be decoded within the limits anyway.
 /// Larger ones open in another app (from a file, written as it downloads).
-const MAX_PREVIEW_FILE: usize = 64 * 1024 * 1024;
+pub(super) const MAX_PREVIEW_FILE: usize = 64 * 1024 * 1024;
 
 /// What decoding a picture may take: `MAX_PREVIEW_DIM` a side and
 /// `MAX_PREVIEW_ALLOC` of memory. For pictures from mail (attachments,
@@ -375,7 +375,7 @@ pub(super) fn is_image(a: &Attachment) -> bool {
 /// SVG is rasterized offline with `resvg` (no external fetches); BMP, ICO,
 /// TIFF, TGA, PNM, QOI and HDR are decoded with strict dimension/memory
 /// limits and encoded as PNG.
-fn decode_image_preview(bytes: Vec<u8>, mime: &str, name: &str) -> anyhow::Result<(ImageFormat, Vec<u8>)> {
+pub(super) fn decode_image_preview(bytes: Vec<u8>, mime: &str, name: &str) -> anyhow::Result<(ImageFormat, Vec<u8>)> {
     if is_svg(mime, name, Some(&bytes)) {
         // An SVG from mail loads nothing it names: no file (usvg's default
         // reads any path an `<image>` names, even with no resources folder)
@@ -637,51 +637,24 @@ impl MailApp {
 
     pub(super) fn tool_action(&mut self, action: ToolAction, w: &mut Window, cx: &mut Context<Self>) {
         match action {
-            ToolAction::Print(id) => self.with_full_message(id, cx, |this, m, cx| {
-                let remote = !this.reading_options(&m).block_remote;
-                let from = if m.sender.is_empty() || m.sender == m.from {
-                    m.from.clone()
-                } else {
-                    format!("{} <{}>", m.sender, m.from)
-                };
-                let date = date_full(m.date).to_string();
-                let title = m.subject.clone();
-                #[cfg(target_os = "macos")]
-                let title_mac = title.clone();
-                this.notice(t!("tools-preparing-to-print"), false, cx);
-                this.task(
-                    cx,
-                    move |_| {
-                        let pdf = crate::display::html::print::message_pdf(&m, &from, &date, remote)?;
-                        // macOS shows its print dialog on the main thread, below.
-                        #[cfg(target_os = "macos")]
-                        return Ok((pdf, None));
-                        #[cfg(not(target_os = "macos"))]
-                        {
-                            let how = crate::display::html::print::print_pdf(&pdf, &title)?;
-                            Ok((Vec::new(), Some(how)))
-                        }
-                    },
-                    move |this, result: anyhow::Result<(Vec<u8>, Option<crate::display::html::print::Printed>)>, cx| {
-                        use crate::display::html::print::Printed;
-                        match result {
-                            #[cfg(target_os = "macos")]
-                            Ok((pdf, None)) => {
-                                if let Err(e) = crate::display::html::print::print_pdf_macos(&pdf, &title_mac) {
-                                    this.notice(t!("tools-couldnt-print-the-message", e = format!("{:#}", e)), true, cx);
-                                }
-                            }
-                            Ok((_, Some(Printed::Viewer))) => this.notice(
-                                t!("tools-opened-the-message-as-a-pdf"),
-                                false,
-                                cx,
-                            ),
-                            Ok(_) => {}
-                            Err(e) => this.notice(t!("tools-couldnt-print-the-message", e = format!("{:#}", e)), true, cx),
-                        }
-                    },
-                );
-            }),
+            ToolAction::Print(id) => {
+                // Windows' print dialog belongs to the window Print came from.
+                #[cfg(windows)]
+                let owner = print_owner(w);
+                self.with_full_message(id, cx, move |this, m, cx| {
+                    let remote = !this.reading_options(&m).block_remote;
+                    let from = if m.sender.is_empty() || m.sender == m.from {
+                        m.from.clone()
+                    } else {
+                        format!("{} <{}>", m.sender, m.from)
+                    };
+                    let date = date_full(m.date).to_string();
+                    #[cfg(windows)]
+                    this.print_on_windows(owner, m, from, date, remote, cx);
+                    #[cfg(not(windows))]
+                    this.print_as_pdf(m, from, date, remote, cx);
+                })
+            }
             ToolAction::SavePdf(id) => self.with_full_message(id, cx, |this, m, cx| {
                 let remote = !this.reading_options(&m).block_remote;
                 let from = if m.sender.is_empty() || m.sender == m.from {
@@ -1085,6 +1058,120 @@ impl MailApp {
         );
     }
 
+    /// Prints `m` as a PDF through the system's print dialog: AppKit's on
+    /// macOS (on this thread), the desktop portal's on Linux (or the PDF
+    /// viewer, without one).
+    #[cfg(not(windows))]
+    fn print_as_pdf(&mut self, m: Mail, from: String, date: String, remote: bool, cx: &mut Context<Self>) {
+        let title = m.subject.clone();
+        #[cfg(target_os = "macos")]
+        let title_mac = title.clone();
+        self.notice(t!("tools-preparing-to-print"), false, cx);
+        self.task(
+            cx,
+            move |_| {
+                let pdf = crate::display::html::print::message_pdf(&m, &from, &date, remote)?;
+                // macOS shows its print dialog on the main thread, below.
+                #[cfg(target_os = "macos")]
+                return Ok((pdf, None));
+                #[cfg(not(target_os = "macos"))]
+                {
+                    let how = crate::display::html::print::print_pdf(&pdf, &title)?;
+                    Ok((Vec::new(), Some(how)))
+                }
+            },
+            move |this, result: anyhow::Result<(Vec<u8>, Option<crate::display::html::print::Printed>)>, cx| {
+                use crate::display::html::print::Printed;
+                match result {
+                    #[cfg(target_os = "macos")]
+                    Ok((pdf, None)) => {
+                        if let Err(e) = crate::display::html::print::print_pdf_macos(&pdf, &title_mac) {
+                            this.notice(t!("tools-couldnt-print-the-message", e = format!("{:#}", e)), true, cx);
+                        }
+                    }
+                    Ok((_, Some(Printed::Viewer))) => this.notice(
+                        t!("tools-opened-the-message-as-a-pdf"),
+                        false,
+                        cx,
+                    ),
+                    Ok(_) => {}
+                    Err(e) => this.notice(t!("tools-couldnt-print-the-message", e = format!("{:#}", e)), true, cx),
+                }
+            },
+        );
+    }
+
+    /// Prints `m` with Windows' print dialog, owned by window `owner`, and
+    /// Windows' print system (`html::print_windows`), on a thread of its
+    /// own: the dialog waits for the person printing, and laying the
+    /// message out on the printer's paper and sending it take a moment.
+    #[cfg(windows)]
+    fn print_on_windows(
+        &mut self,
+        owner: Option<isize>,
+        m: Mail,
+        from: String,
+        date: String,
+        remote: bool,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::display::html::print;
+        use futures::StreamExt as _;
+        enum Event {
+            /// The dialog closed with Print: the message is being laid out.
+            Preparing,
+            /// Sent to this printer, or `None`: the dialog was closed.
+            Done(anyhow::Result<Option<String>>),
+        }
+        let Some(owner) = owner else {
+            self.notice(t!("tools-couldnt-print-the-message", e = t!("tools-no-window-to-print-from")), true, cx);
+            return;
+        };
+        let (events, mut received) = futures::channel::mpsc::unbounded::<Event>();
+        let title = m.subject.clone();
+        let started = std::thread::Builder::new().name("print".into()).spawn(move || {
+            let progress = events.clone();
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                crate::display::html::print_windows::print_message(
+                    owner,
+                    &title,
+                    |paper| match paper {
+                        Some(paper) => print::message_pdf_on(&m, &from, &date, remote, paper),
+                        None => print::message_pdf(&m, &from, &date, remote),
+                    },
+                    move || {
+                        let _ = progress.unbounded_send(Event::Preparing);
+                    },
+                )
+            }))
+            .unwrap_or_else(|_| Err(anyhow::anyhow!(t!("ui-something-went-wrong-while-doing-this"))));
+            let _ = events.unbounded_send(Event::Done(result));
+        });
+        if let Err(e) = started {
+            self.notice(t!("tools-couldnt-print-the-message", e = e.to_string()), true, cx);
+            return;
+        }
+        cx.spawn(async move |this, cx| {
+            while let Some(event) = received.next().await {
+                let done = matches!(event, Event::Done(_));
+                let _ = this.update(cx, |this, cx| match event {
+                    Event::Preparing => this.notice(t!("tools-preparing-to-print"), false, cx),
+                    Event::Done(Ok(Some(printer))) => {
+                        this.notice(t!("tools-sent-to-the-printer", printer = printer), false, cx)
+                    }
+                    Event::Done(Ok(None)) => {}
+                    Event::Done(Err(e)) => {
+                        this.notice(t!("tools-couldnt-print-the-message", e = format!("{:#}", e)), true, cx)
+                    }
+                });
+                if done {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
     /// Acts on what Picacho was opened with (`launch`): writes to `mailto:`
     /// addresses, shows email files, and attaches shared files to a new
     /// message (the one a `mailto:` just started, if any).
@@ -1113,7 +1200,14 @@ impl MailApp {
                 // `launch::request` refuses them.
                 files.push(std::path::PathBuf::from(path));
             } else if let Some(path) = request.strip_prefix("file:") {
-                self.open_eml_file(std::path::Path::new(path), w, cx);
+                // A Windows Search result: the file Picacho wrote for a
+                // message opens that message, where it is now.
+                let action = crate::manage::system_search::link_for_file(std::path::Path::new(path))
+                    .and_then(|link| crate::manage::widgets::WidgetAction::parse(&link));
+                match action {
+                    Some(action) => self.open_widget_action(action, w, cx),
+                    None => self.open_eml_file(std::path::Path::new(path), w, cx),
+                }
             } else {
                 self.compose_mailto(&request, w, cx);
                 started = self.composers.last().cloned();
@@ -1537,6 +1631,16 @@ fn open_with_windows(path: &std::path::Path) {
         .arg("shell32.dll,OpenAs_RunDLL")
         .arg(path)
         .spawn();
+}
+
+/// The window `w` as Windows knows it (its HWND), to own a print dialog.
+#[cfg(windows)]
+fn print_owner(w: &Window) -> Option<isize> {
+    use raw_window_handle::RawWindowHandle;
+    match raw_window_handle::HasWindowHandle::window_handle(w).ok()?.as_raw() {
+        RawWindowHandle::Win32(handle) => Some(handle.hwnd.get()),
+        _ => None,
+    }
 }
 
 #[cfg(test)]

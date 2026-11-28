@@ -13,142 +13,185 @@ same version in `Cargo.toml`.
 
 ### Added
 
+- Mail in the system's search (Settings → Privacy, off by default): **Show
+  mail in Spotlight** on macOS and iOS, **Show mail in Windows Search** on
+  Windows and **Show mail in desktop search** on Linux (GNOME's Activities
+  search and KDE's KRunner) find messages by subject, people and text, and
+  choosing one opens it in Picacho. Junk and Trash stay out; new, changed,
+  moved and deleted mail follows in the background. On Linux Picacho answers
+  from its own index while it runs, copying nothing. Not while mail is
+  hidden outside Picacho, nor (but on Linux) while the database is
+  encrypted.
+- Command palette (⌘K/Ctrl+K, View → Command Palette…): find and run any
+  action, account, folder, label, saved search, contact or template by
+  typing a few of its letters, with quick actions on the open or selected
+  messages: Move to…, Snooze until… and Apply label…. In a composer
+  ⌘K/Ctrl+K still inserts a link; a custom shortcut sequence starting with
+  ⌘K/Ctrl+K now competes with it in the main window.
+- Attachments: a view of its own in the sidebar (and Mailboxes on phones),
+  ⌥⌘A/Ctrl+Alt+A, and Browse Attachments in a mailbox's menu, listing every
+  attachment of an account, a mailbox or All Accounts together. Filter by
+  kind, find words in names, senders, subjects and (from the local full-text
+  index) what attachments say, sort by date, size or name, preview pictures
+  and documents' text beside the list, and open, save, or pick several and
+  save them into a folder at once.
+- Contact panel: a drawer beside the open message (the panel button in the
+  reader's toolbar) with its other person's contact card, their latest mail
+  with you, the attachments of that mail and the events with them ahead,
+  together (⌥⌘I/Ctrl+Alt+I); Add to Contacts for people not in the address
+  book.
+- Tasks: a view of its own in the sidebar (and Mailboxes on phones), beside
+  Calendar and Contacts, with how many are due today or overdue. Today (with
+  what's overdue), Upcoming, Overdue, All and Completed; every source's task
+  lists together, by list and by tag; a quick-add field and an editor with
+  due date, notes, priority, tags and list; subtasks; and the history of
+  tasks done lately (here and on the servers), each to do again. Moving a
+  task to another list keeps all it has and takes its subtasks along. Add to
+  Tasks on a message (the reader's toolbar, the message menu, or the text
+  chosen in it) makes a task at once, with Undo, that opens the email again.
+  Microsoft To Do (for Outlook on Microsoft Graph; a task's steps are its
+  subtasks) and Google Tasks can be added there as task sources beside
+  CalDAV and JMAP; what they don't keep (a Google task's priority and tags,
+  the time a task is due, a step's notes) Picacho keeps. Workspaces can pick
+  task lists as they pick calendars.
 - Workspaces: named sets of accounts, calendars and address books, such as
-  Work and Personal, switched between at the top of the sidebar, with
-  ⌘⌥] and ⌘⌥[, or from the tray (Linux). The sidebar, All Accounts and
-  its unread counts, the calendar, contacts and the composer's suggestions,
-  and home-screen, desktop and Waybar widgets show only the workspace's.
-  Each decides which notifications get through (its own, everything or
-  nothing), which account new messages in All Accounts come from, and when
-  it turns on by itself. Settings → Workspaces starts them from Work,
-  Personal or Focus, each with a page of its own, on phones too.
+  Work and Personal, switched between at the top of the sidebar, with ⌘⌥]
+  and ⌘⌥[, or from the tray (Linux). The sidebar, All Accounts and its
+  unread counts, the calendar, contacts and the composer's suggestions, and
+  home-screen, desktop and Waybar widgets show only the workspace's. Each
+  decides which notifications get through (its own, everything or nothing),
+  which account new messages in All Accounts come from, and when it turns on
+  by itself. Settings → Workspaces starts them from Work, Personal or Focus,
+  each with a page of its own, on phones too.
 - Tabs (desktop): several mailboxes and searches open at once in the title
-  bar, each keeping its search (server searches and results on this
-  computer included), filter and open message. With one tab only
-  a + button shows. Open in New Tab (sidebar menu, ⌘/Ctrl-click, middle
-  click), ⌘T, ⌘⇧W, Ctrl+Tab; drag to reorder; reopened at launch.
-- Composer authoring: tables in formatted messages (insert from a size
-  grid, add and remove rows and columns, widen, narrow or even out
-  columns, drag column edges; Tab moves between cells). Text color,
-  highlight, font and size. Markdown typed as shortcuts ("- ", "1. ",
-  "> ", "## ", `**bold**`, `*italic*`, `` `code` ``, `~~struck~~`, "---"),
-  undone with one ⌘Z (Settings → Composing → Markdown shortcuts). A "/"
-  menu of blocks, tables, emoji, the date and your templates as snippets.
-  An emoji picker, and Find and Replace (⌘F, ⌘⇧F/Ctrl+H) in formatted and
-  plain messages. Snippets (Settings → Composing), put where the cursor is
-  from the "/" menu or the templates menu, or saved from a selection.
+  bar, each keeping its search (server searches and results on this computer
+  included), filter and open message. With one tab only a + button shows.
+  Open in New Tab (sidebar menu, ⌘/Ctrl-click, middle click), ⌘T, ⌘⇧W,
+  Ctrl+Tab; drag to reorder; reopened at launch.
+- Composer authoring: tables in formatted messages (insert from a size grid,
+  add and remove rows and columns, widen, narrow or even out columns, drag
+  column edges; Tab moves between cells). Text color, highlight, font and
+  size. Markdown typed as shortcuts ("- ", "1. ", "> ", "## ", `**bold**`,
+  `*italic*`, `` `code` ``, `~~struck~~`, "---"), undone with one ⌘Z
+  (Settings → Composing → Markdown shortcuts). A "/" menu of blocks, tables,
+  emoji, the date and your templates as snippets. An emoji picker, and Find
+  and Replace (⌘F, ⌘⇧F/Ctrl+H) in formatted and plain messages. Snippets
+  (Settings → Composing), put where the cursor is from the "/" menu or the
+  templates menu, or saved from a selection.
 - Photos are made smaller as they're sent (Large, 2048 px, by default;
   Settings → Composing → Send pictures at, and per message), without their
   location metadata. The draft keeps the originals.
 - Large attachments as links: with Nextcloud, a WebDAV folder, or a mail
-  account's Google Drive or OneDrive set up in Settings → Composing →
-  Large attachments, a message too large for its outgoing server sends its
-  largest files as links instead. Never for encrypted messages.
-- Signing a Google account in again keeps the calendar, contacts and
-  Drive access it was given; an Outlook account keeps its OneDrive access.
+  account's Google Drive or OneDrive set up in Settings → Composing → Large
+  attachments, a message too large for its outgoing server sends its largest
+  files as links instead. Never for encrypted messages.
+- Signing a Google account in again keeps the calendar, contacts and Drive
+  access it was given; an Outlook account keeps its OneDrive access.
 - Mail merge: one personalized message per row of a CSV spreadsheet, its
   columns as placeholders, previewed and sent one after another (the
   footer's More menu); an unfinished merge goes on after Picacho restarts.
-
-- Security keys: OpenPGP keys on a YubiKey, Nitrokey, Gnuk or other
-  OpenPGP card, and S/MIME certificates on a PKCS#11 token (a YubiKey's
-  PIV through ykcs11 or OpenSC, a smart card), sign and decrypt on the key
-  itself: the private key never leaves it and isn't kept in the keychain.
-  Add them in Settings → Encryption → Security keys; the PIN is asked
-  there, or above a message encrypted to the key, and kept in memory only
-  until unused for 30 minutes or Picacho locks. Desktop only.
-- Brand logos (BIMI): checking a sender also looks up its domain's
-  verified logo, shown in place of the initials on the message's row and
-  header. Only for a message that passed DMARC with an enforcing policy,
-  and only with a Verified Mark or Common Mark Certificate from a Mark
-  Verifying Authority (DigiCert, GlobalSign, SSL.com), whose embedded logo
-  is shown. Settings → Privacy → **Check senders when messages open** does
-  it without asking (off by default: the lookups reach the sender's DNS).
+- Security keys: OpenPGP keys on a YubiKey, Nitrokey, Gnuk or other OpenPGP
+  card, and S/MIME certificates on a PKCS#11 token (a YubiKey's PIV through
+  ykcs11 or OpenSC, a smart card), sign and decrypt on the key itself: the
+  private key never leaves it and isn't kept in the keychain. Add them in
+  Settings → Encryption → Security keys; the PIN is asked there, or above a
+  message encrypted to the key, and kept in memory only until unused for 30
+  minutes or Picacho locks. Desktop only.
+- Brand logos (BIMI): checking a sender also looks up its domain's verified
+  logo, shown in place of the initials on the message's row and header. Only
+  for a message that passed DMARC with an enforcing policy, and only with a
+  Verified Mark or Common Mark Certificate from a Mark Verifying Authority
+  (DigiCert, GlobalSign, SSL.com), whose embedded logo is shown. Settings →
+  Privacy → **Check senders when messages open** does it without asking (off
+  by default: the lookups reach the sender's DNS).
 - Fastmail's Masked Email in Settings → Forwarding, with an API token or
   through a Fastmail account already added (its JMAP session): list, make,
   describe, turn off and delete masked addresses. DuckDuckGo Email
-  Protection makes new Duck Addresses there too (its API can't list,
-  turn off or delete them, so those made in Picacho are kept here).
-
+  Protection makes new Duck Addresses there too (its API can't list, turn
+  off or delete them, so those made in Picacho are kept here).
 - Inbox Control (Settings → Inbox Control). **VIPs**: senders or whole
   domains whose mail is marked with a crown, gathered under VIPs in the
   sidebar, and always announced. **The Screener**: mail from first-time
   senders (not in your contacts, never written to) waits in the Screener,
-  unannounced, until you approve, block or route the sender to a
-  category; nothing moves on the server. **Notifications**: alert for
-  everything, only Primary and VIPs, or only VIPs, and keep any inbox tab
-  silent. **Quiet hours**: scheduled Do Not Disturb times on chosen days,
-  which VIPs may break through, and pausing notifications for an hour or
-  until morning. They apply with the window open, in the background and
-  to Proton's pushes; "Notify only for Primary" carries over.
+  unannounced, until you approve, block or route the sender to a category;
+  nothing moves on the server. **Notifications**: alert for everything, only
+  Primary and VIPs, or only VIPs, and keep any inbox tab silent. **Quiet
+  hours**: scheduled Do Not Disturb times on chosen days, which VIPs may
+  break through, and pausing notifications for an hour or until morning.
+  They apply with the window open, in the background and to Proton's pushes;
+  "Notify only for Primary" carries over.
 - Rules applied by Picacho have several conditions (all or any of them) and
-  several actions in order (as label, mark read and archive): conditions
-  on the text, a header, the mailing list, the size, attachments and the
-  inbox category besides sender, recipients and subject; contains, is,
-  starts with, ends with or a regular expression; and Don't notify and
-  Stop after this rule. Rules can be edited and reordered.
+  several actions in order (as label, mark read and archive): conditions on
+  the text, a header, the mailing list, the size, attachments and the inbox
+  category besides sender, recipients and subject; contains, is, starts
+  with, ends with or a regular expression; and Don't notify and Stop after
+  this rule. Rules can be edited and reordered.
 - Server filters (Sieve, Gmail, Microsoft 365 and Exchange) have several
-  tests (all or any) and several actions, with tests for attachments and
-  for mail smaller than a size. Filters with several tests or actions made
-  in other apps are shown and edited rather than left aside, where the
-  service can say them.
-
-- Snoozed mail is shared with Picacho on your other computers on every
-  kind of account, not only IMAP servers with METADATA: a message
-  snoozed on one shows as snoozed on the others and comes back there at
-  its time, and one woken or unsnoozed on one is no longer snoozed on the
-  others (before, another computer's older copy could bring it back).
-  Without METADATA the times are kept in a message in the Picacho folder.
+  tests (all or any) and several actions, with tests for attachments and for
+  mail smaller than a size. Filters with several tests or actions made in
+  other apps are shown and edited rather than left aside, where the service
+  can say them.
+- Snoozed mail is shared with Picacho on your other computers on every kind
+  of account, not only IMAP servers with METADATA: a message snoozed on one
+  shows as snoozed on the others and comes back there at its time, and one
+  woken or unsnoozed on one is no longer snoozed on the others (before,
+  another computer's older copy could bring it back). Without METADATA the
+  times are kept in a message in the Picacho folder.
 - Follow-up reminders: **Remind me if no reply** in the composer (in a day,
-  2 or 3 days, a week or two weeks), or on a message already sent (its
-  menu, or the reader's button in Sent), waits on a reply to it. If
-  nobody answers in time, Picacho reminds you (a notification, also from
-  the background monitor with no window open), and the message shows a
-  banner offering to follow up, be reminded again, or stop waiting. A reply
-  stops the wait by itself: any message naming it in References or
-  In-Reply-To, or in the same Gmail, Microsoft, JMAP or OBJECTID
-  conversation, that isn't yours and isn't an automatic reply or bounce.
-  **Waiting For** in the sidebar (under each account and All Accounts,
-  while something is waited on) lists that sent mail, with how many are
-  overdue.
-  What's waited on is shared with Picacho on your other computers (an
-  IMAP METADATA annotation, or else a message in a Picacho folder, on
-  every kind of account); before reminding, the server is asked for a
-  reply not downloaded yet, on every kind of account; and automatic
-  replies are told apart by their headers, Exchange's message classes,
-  Proton's automatic flag, and common subjects in several languages.
+  2 or 3 days, a week or two weeks), or on a message already sent (its menu,
+  or the reader's button in Sent), waits on a reply to it. If nobody answers
+  in time, Picacho reminds you (a notification, also from the background
+  monitor with no window open), and the message shows a banner offering to
+  follow up, be reminded again, or stop waiting. A reply stops the wait by
+  itself: any message naming it in References or In-Reply-To, or in the same
+  Gmail, Microsoft, JMAP or OBJECTID conversation, that isn't yours and
+  isn't an automatic reply or bounce. **Waiting For** in the sidebar (under
+  each account and All Accounts, while something is waited on) lists that
+  sent mail, with how many are overdue. What's waited on is shared with
+  Picacho on your other computers (an IMAP METADATA annotation, or else a
+  message in a Picacho folder, on every kind of account); before reminding,
+  the server is asked for a reply not downloaded yet, on every kind of
+  account; and automatic replies are told apart by their headers, Exchange's
+  message classes, Proton's automatic flag, and common subjects in several
+  languages.
 - Inbox categories: an inbox (or All Accounts' inbox) is sorted into
   Primary, Transactions, Travel, Finance, Updates, Newsletters, Promotions
   and Social, shown as tabs above it with each one's unread count, then All
-  Mail, the whole inbox with each message tagged with its category
-  (**Open the inbox on All Mail** in Settings makes it the first tab and
-  the one the inbox opens on); Forums can be turned on too. A category without a tab shows in the one it
-  belongs to (Travel in Transactions; Finance and Newsletters in Updates).
-  Where the tabs don't fit, the row scrolls (the wheel scrolls it
-  sideways), and an end with more tabs past it fades out under an arrow;
-  on phones the chips fade at their ends as the filters do. Mail is
-  sorted on this computer from its sender, list headers and words, so it
-  works for every kind of account, and follows Gmail's own categories and
-  Outlook's Focused Inbox on accounts that use their APIs. Mail from people
-  you write to, mail you replied to and sign-in codes stay in Primary.
-  **Move to Category…** in a message's menu, or dragging messages onto a
-  tab, sorts their sender there from now on. Searches look in every tab, and
-  `category:promotions` finds a category's mail. Settings → Rules & Layout
-  turns categories or single tabs off (their mail shows in Primary), lists
-  sorted senders, and can announce only Primary's new mail. **Show
+  Mail, the whole inbox with each message tagged with its category (**Open
+  the inbox on All Mail** in Settings makes it the first tab and the one the
+  inbox opens on); Forums can be turned on too. A category without a tab
+  shows in the one it belongs to (Travel in Transactions; Finance and
+  Newsletters in Updates). Where the tabs don't fit, the row scrolls (the
+  wheel scrolls it sideways), and an end with more tabs past it fades out
+  under an arrow; on phones the chips fade at their ends as the filters do.
+  Mail is sorted on this computer from its sender, list headers and words,
+  so it works for every kind of account, and follows Gmail's own categories
+  and Outlook's Focused Inbox on accounts that use their APIs. Mail from
+  people you write to, mail you replied to and sign-in codes stay in
+  Primary. **Move to Category…** in a message's menu, or dragging messages
+  onto a tab, sorts their sender there from now on. Searches look in every
+  tab, and `category:promotions` finds a category's mail. Settings → Rules &
+  Layout turns categories or single tabs off (their mail shows in Primary),
+  lists sorted senders, and can announce only Primary's new mail. **Show
   Categories** in the filter menu turns them off and on.
 - Sort the inbox (Settings → Local AI): a 1.2 MB model that runs on this
   computer helps sort mail into the inbox's categories where the rules
-  aren't sure, in the same 37 languages as the other local models (as do
-  the rules), and learns from the mail you move to another category, on
-  this computer only (**Forget** clears what it learned). It never takes
-  mail out of Primary unless it's very sure.
+  aren't sure, in the same 37 languages as the other local models (as do the
+  rules), and learns from the mail you move to another category, on this
+  computer only (**Forget** clears what it learned). It never takes mail out
+  of Primary unless it's very sure. The model is published as
+  [pinaltech/sift-categories](https://huggingface.co/pinaltech/sift-categories)
+  and downloaded from there, checked against its size and SHA-256, like the
+  other models.
 - Start in the background when you sign in (Settings → General): Picacho
   starts with your computer without a window, showing its tray icon and
   checking for mail. Turning off running in the background turns it off too.
 - Closing Picacho blurs its window behind "Closing Picacho…" or "Moving
-  Picacho to the background…" until it's gone, while it saves and tidies
-  its cache. (On macOS and Windows the window is covered without the blur.)
+  Picacho to the background…" until it's gone, while it saves and tidies its
+  cache. (On macOS and Windows the window is covered without the blur.) The
+  window goes as soon as the cover is done; the cover's logo breathes and
+  its spinner turns, and where Picacho draws its own title bar the bar stays
+  clear and its window buttons keep working.
 - On Linux, the dock or task manager shows Picacho as starting from the
   moment it's launched until its window opens, also when it was running in
   the background.
@@ -162,23 +205,22 @@ same version in `Cargo.toml`.
 - Task reminders, from CalDAV and JMAP servers alike, are shown with the
   calendar's, before each task is due.
 - Formatted messages are written as they will look, no longer as Markdown:
-  bold, italic, underline and the other formats show as such, lists,
-  quotes and headings as they're sent, links as links. Underline (⌘U/Ctrl+U),
+  bold, italic, underline and the other formats show as such, lists, quotes
+  and headings as they're sent, links as links. Underline (⌘U/Ctrl+U),
   alignment and Clear formatting are new in the toolbar. Pictures pasted or
-  dropped on the text show where they go, in the line when they fit, and
-  are sent there; drag a selected picture's corner to resize it. Tables
-  show as tables. Copying keeps the formatting (and pictures) in other apps.
+  dropped on the text show where they go, in the line when they fit, and are
+  sent there; drag a selected picture's corner to resize it. Tables show as
+  tables. Copying keeps the formatting (and pictures) in other apps.
 - Spelling in formatted messages: misspelled words are underlined, with
-  spellings, Learn and Ignore on a right click (Settings → Composing →
-  Check spelling). macOS and Windows use the system's spellchecker, Linux
-  the Hunspell dictionaries installed.
+  spellings, Learn and Ignore on a right click (Settings → Composing → Check
+  spelling). macOS and Windows use the system's spellchecker, Linux the
+  Hunspell dictionaries installed.
 - Phones and tablets: a long press in a formatted message selects a word,
   with handles and a Cut, Copy, Paste menu; dragging scrolls.
 - Drafts written in other mail apps keep their HTML formatting: fonts,
-  colors, alignment, tables and styles open as written and are sent as
-  they were, and their pictures show in the text. Picacho's own formatted
-  drafts are saved as HTML too, so other apps show their formatting.
-
+  colors, alignment, tables and styles open as written and are sent as they
+  were, and their pictures show in the text. Picacho's own formatted drafts
+  are saved as HTML too, so other apps show their formatting.
 - Gmail and Outlook accounts can use their provider's own API instead of
   IMAP and SMTP: **Use the Gmail API** or **Use Microsoft Graph** when
   adding the account. Microsoft 365 organizations that turn IMAP off can be
@@ -189,21 +231,21 @@ same version in `Cargo.toml`.
   are offered in Calendar and Contacts: repeating events as their series,
   with occurrences changed or cancelled on their own. Exchange holds
   scheduled mail and sends it at its time; imported mail arrives as mail,
-  not drafts; new mail is noticed within half a minute. An existing
-  account switches either way in its Settings.
-- Exchange Server in an organization's own data center, through Exchange
-  Web Services: found by Autodiscover, signed in with NTLMv2 or Kerberos,
-  or through Microsoft Entra where the organization uses hybrid modern
+  not drafts; new mail is noticed within half a minute. An existing account
+  switches either way in its Settings.
+- Exchange Server in an organization's own data center, through Exchange Web
+  Services: found by Autodiscover, signed in with NTLMv2 or Kerberos, or
+  through Microsoft Entra where the organization uses hybrid modern
   authentication. A server that offers only Basic sign-in, which sends the
   password itself, is used only once you turn on **Allow Basic sign-in**
   (offered when adding the account, and in its Settings), and only over
-  HTTPS. Mail, folders, drafts, sending and scheduled
-  sending, inbox rules and Out of Office, calendars (with availability),
-  contacts and the organization's directory. New mail is noticed as it
-  arrives (Exchange's streaming notifications). Servers requiring Extended
-  Protection for Authentication are signed in to. Autodiscover also
-  follows Exchange's redirects and SRV records within the domain, and asks
-  SOAP Autodiscover where the older form is off.
+  HTTPS. Mail, folders, drafts, sending and scheduled sending, inbox rules
+  and Out of Office, calendars (with availability), contacts and the
+  organization's directory. New mail is noticed as it arrives (Exchange's
+  streaming notifications). Servers requiring Extended Protection for
+  Authentication are signed in to. Autodiscover also follows Exchange's
+  redirects and SRV records within the domain, and asks SOAP Autodiscover
+  where the older form is off.
 - Exchange Server and Microsoft Graph accounts show how much space their
   mail takes.
 - Several calendar and address-book sources side by side: a work account
@@ -211,94 +253,52 @@ same version in `Cargo.toml`.
   iCloud, Nextcloud, any CalDAV/CardDAV server, Google or Proton). Settings
   → Calendar → **More Calendars** and Settings → Contacts → **More Address
   Books** add another account's calendars or contacts (a mail account's
-  provider, or another server), each read again or removed on its own;
-  every source's events, calendars, tasks and contacts show together.
-  **New events go to** chooses among every source's calendars; an event
-  moved to another account's calendar is made there and taken out of the
-  one it was in, and each event, task and contact is changed where it is.
-  What was set up before stays the first source, as it was.
+  provider, or another server), each read again or removed on its own; every
+  source's events, calendars, tasks and contacts show together. **New events
+  go to** chooses among every source's calendars; an event moved to another
+  account's calendar is made there and taken out of the one it was in, and
+  each event, task and contact is changed where it is. What was set up
+  before stays the first source, as it was.
 - Google calendars and contacts through Google's own APIs: the Google
   Calendar API (repeating events with their changed and cancelled
   occurrences, reminders, guests, when people are busy; Google sends
-  invitations itself, and invitations answered from mail are answered in
-  the calendar too) and the People API for contacts. Google asks once for
+  invitations itself, and invitations answered from mail are answered in the
+  calendar too) and the People API for contacts. Google asks once for
   calendar or contacts access on top of mail.
 - Subscribed calendar feeds (Settings → Calendar → **Subscribe**):
   `webcal://` and `.ics` addresses (holidays, sports, a team's schedule)
   read again hourly, every 6 hours, daily or weekly (chosen per feed), shown
   beside your calendars and never changed; an unchanged feed isn't
   downloaded again (ETag, Last-Modified).
-- Proton Calendar and Proton Contacts for Proton accounts signed in
-  without Bridge, end-to-end encrypted with the account's own keys:
-  contacts read, added, edited and deleted; calendars read, and events
-  without guests added, changed and deleted (events with guests are left to
-  Proton Calendar, which sends their invitations).
+- Proton Calendar and Proton Contacts for Proton accounts signed in without
+  Bridge, end-to-end encrypted with the account's own keys: contacts read,
+  added, edited and deleted; calendars read, and events without guests
+  added, changed and deleted (events with guests are left to Proton
+  Calendar, which sends their invitations).
 - Proton's own aliases (hide-my-email aliases, kept in Proton Pass) in
   Settings → Forwarding, for Proton accounts signed in without Bridge:
   choose **Proton** and the account, with no API key. Aliases are listed,
   made (with a chosen domain and prefix, or random), turned on and off,
   described, named, pinned, pointed at mailboxes and deleted; their
-  contacts' reverse aliases are listed, added, blocked and deleted; and
-  mail can be sent as an alias, as with SimpleLogin. An account that has
-  never used Proton Pass gets a vault for its aliases when it makes one,
-  and Pass's extra password is asked for where the account has one.
-  The account's own Proton addresses (but its original one) are listed
-  with its aliases: turned on and off, named, shown on their own, deleted,
-  and sent as directly.
-
-### Fixed
-
-- The window no longer stops responding for a few seconds at launch while
-  mail is checked: sorting a long list into its inbox tabs is done on
-  several threads, a whole look at the first check's unread mail is only
-  taken for mail that's announced, and the background look at listed mail
-  goes a part at a time, newest first. That look (with the inbox category
-  model) waits until mail checks are done, uses a quarter of the cores at
-  a lower priority, and allocates far less; the widgets' scans run at a
-  lower priority too, and the window's process keeps more allocator
-  arenas, so its thread no longer waits on theirs.
-- The inbox category model (Settings → Local AI → Sort the inbox) is
-  published as [pinaltech/sift-categories](https://huggingface.co/pinaltech/sift-categories)
-  and downloaded from there, checked against its size and SHA-256, like
-  the other models.
-- Sorting the inbox into categories no longer holds up the window at
-  launch, or when sorting (or the category model) is turned on or off:
-  what each message was found to be is kept in the cache instead of being
-  worked out again for every message each time; the window looks at only
-  a few newly arrived messages itself, the rest in the background; and
-  turning the model off keeps what the rules found.
-- Adding Proton's own aliases says it's signing in, then loading the
-  account's Proton addresses and aliases, with a spinner, rather than
-  showing the emptied form with a faded button.
-- Closing Picacho: the window goes as soon as its closing cover is done,
-  rather than staying on screen, frozen, until the process had ended
-  (Wayland only took it away then). The cover's logo breathes and its
-  spinner turns, and where Picacho draws its own title bar the bar stays
-  clear and its window buttons keep working.
-- Moving mail (archiving, deleting, a swipe on a phone) says so at once
-  with Undo, rather than once the server is done (seconds later, if at
-  all); Undo pressed before then waits for the move and puts the mail
-  back. Deleting a draft offers Undo too.
-- Phones: a row swipes only when the pan is clearly sideways, and archives
-  or deletes only once it has crossed a good part of the row (not a fixed
-  88 points), so a brush on the way to scrolling no longer moves mail.
-- Phones: Back from a message opened in search results goes back to the
-  results, rather than closing the search under the message and leaving
-  it open; Back pressed again while the screen slides away is no longer
-  dropped.
-- Tapping a notification opens its message even when it isn't listed yet:
-  it's taken from the cache, or fetched from Proton, rather than leaving
-  you in the inbox until the next check. Proton's pushes also fetch the
-  message they announce (with its text, where mail is kept offline), so
-  it's in the inbox before it's tapped.
-- Mobile view tests no longer take one another's launch requests (they
-  failed now and then when run together).
-- Inline PGP can be sent, not only read: with OpenPGP, the composer's
+  contacts' reverse aliases are listed, added, blocked and deleted; and mail
+  can be sent as an alias, as with SimpleLogin. An account that has never
+  used Proton Pass gets a vault for its aliases when it makes one, and
+  Pass's extra password is asked for where the account has one. The
+  account's own Proton addresses (but its original one) are listed with its
+  aliases: turned on and off, named, shown on their own, deleted, and sent
+  as directly.
+- Undo after moving mail (archiving, deleting, marking as spam, moving to a
+  folder, a swipe on a phone) or snoozing it, also with ⌘Z/Ctrl+Z outside a
+  text field: the notice shows at once, and Undo pressed before the server
+  is done waits for the move and puts the mail back. Deleting a draft offers
+  Undo too.
+- Inline PGP, for apps without PGP/MIME: received inline PGP mail keeps its
+  attachments and decrypts encrypted ones, and with OpenPGP the composer's
   inline PGP button signs the text in the clear or replaces it with an
-  armored encrypted message, and encrypts (`name.pgp`) or signs
-  (`name.sig`) each attachment on its own, for apps without PGP/MIME. Plain
-  text only. Received inline PGP mail now keeps its attachments, and
-  decrypts encrypted ones.
+  armored encrypted message, and encrypts (`name.pgp`) or signs (`name.sig`)
+  each attachment on its own. Plain text only. Attachments that a message's
+  signature or encryption doesn't cover are named in the message details,
+  which then don't show the message as fully signed or encrypted.
 - The interface is ready for translation: its text is in Fluent message
   files (`locales/`), shown in the system's language where Picacho has it
   (English for now), with each language's plural rules.
@@ -315,25 +315,30 @@ same version in `Cargo.toml`.
   windows and, on phones, the app switcher's picture (Android 13 and later
   also keep it out of Recents), and slower tries after wrong passcodes.
 - Hide mail outside Picacho (Settings → Privacy, on with the app lock or
-  encryption): notifications and widgets say how much new mail there is,
-  not who it's from or what it says.
+  encryption): notifications and widgets say how much new mail there is, not
+  who it's from or what it says.
 - An optional encrypted local database (SQLCipher, AES-256) with its key in
   the system keychain, turned on and off in place (Settings → Privacy). A
   database that can't be opened at launch (its key gone, the keychain
-  locked) gets a window offering Try Again or moving it aside to start over,
-  rather than Picacho quitting silently.
-
-- Group by Conversation in the message list (grouped as the reader gathers
-  a conversation), compact rows, and the reader below the list; Pin to Top
-  and Mute Conversation; dragging messages onto sidebar folders (within an
+  locked) gets a window offering Try Again or moving it aside to start over.
+  Turning encryption on or off converts the drafts' files kept beside the
+  database too, reporting success only once every file is converted and read
+  back, and carrying on after a failure or crash. The pieces of a large
+  message kept on disk so its download can resume are encrypted too.
+- Group by Conversation in the message list (grouped as the reader gathers a
+  conversation), compact rows, and the reader below the list; Pin to Top and
+  Mute Conversation; dragging messages onto sidebar folders (within an
   account, across accounts, onto All Mail to archive, or onto Drafts to
   start new drafts).
 - Find in Message (⌘F / Ctrl+F) with highlighted matches; ⌥⌘F searches the
   mailbox.
-- Print without a browser (the system print dialog on Linux and macOS; on
-  Windows, and on Linux without a print portal, the message opens as a PDF to
-  print from the viewer) and vector Save as PDF with full formatting, images
-  and embedded Unicode fonts.
+- Print without a browser or another app (the system print dialog on Linux,
+  macOS and Windows; on Linux without a print portal, the message opens as a
+  PDF to print from the viewer) and vector Save as PDF with full formatting,
+  images and embedded Unicode fonts. On Windows, Windows' own print dialog
+  (printer, Preferences, copies, page ranges, kept for next time) and print
+  system: the message is laid out on the printer's paper and printed as
+  vectors with Direct2D, or as pictures through GDI where that fails.
 - Attachments open from their saved file or a single cached copy beside the
   mail store, with the system's app, Quick Look (macOS), Open With…
   (Windows, macOS and Linux) and Show in Folder; PNG, JPEG, GIF, WebP, SVG,
@@ -341,11 +346,10 @@ same version in `Cargo.toml`.
   macOS) preview in the reader.
 - A local full-text index of downloaded mail (SQLite FTS5) covering whole
   messages and their attachments' text (text files, HTML, attached emails,
-  PDFs, Word, Excel, PowerPoint and OpenDocument files): words find
-  message text also beside `from:`-style operators, servers are asked about
-  mail downloaded only in part, and Search All Mail on This Computer lists
-  every account's matches as results of their own; Saved Searches in the
-  sidebar.
+  PDFs, Word, Excel, PowerPoint and OpenDocument files): words find message
+  text also beside `from:`-style operators, servers are asked about mail
+  downloaded only in part, and Search All Mail on This Computer lists every
+  account's matches as results of their own; Saved Searches in the sidebar.
 - Blocked senders and rules applied by Picacho to new inbox mail, for every
   service, by the window and in the background; Apply Rules Now for mail
   already in the inboxes (Settings → Rules & Layout).
@@ -365,8 +369,8 @@ same version in `Cargo.toml`.
   `.msg` files on macOS, Linux, Windows and Android; Settings → General
   reports default-app status and jumps directly to Picacho's page in Windows
   Default apps (or sets it directly via `xdg-mime`/`xdg-settings` on Linux);
-  requests forwarded through the background process hand over cleanly through
-  a private handover file inside the data directory.
+  requests forwarded through the background process hand over cleanly
+  through a private handover file inside the data directory.
 - Mark as Read, Archive, Delete and Reply buttons on new-mail notifications,
   and Mark All as Read, Archive All and Delete All on ones for several
   messages (Linux, Windows, macOS, Android), also while Picacho runs in the
@@ -377,27 +381,27 @@ same version in `Cargo.toml`.
   **Unread Mail** widget (also on the iOS Lock Screen), an upcoming
   **Calendar** agenda widget, and **Packages** and **Receipts** widgets
   showing as many of your recent deliveries and receipts/refunds as their
-  size fits (whole rows, never scaled), with **View all N** at the top, following
-  Picacho's theme accent color and Local AI's sign-in code hiding — natively
-  via Android AppWidgets, iOS and macOS WidgetKit, KDE Plasma 6 Plasmoids,
-  Windows 11 Widgets Board Adaptive Cards, `--widget-json`/`--widget-waybar`
-  CLI output, and a built-in **Desktop Widget** window (Window menu, tray
-  menu, or `--widget`).
+  size fits (whole rows, never scaled), with **View all N** at the top,
+  following Picacho's theme accent color and Local AI's sign-in code hiding
+  — natively via Android AppWidgets, iOS and macOS WidgetKit, KDE Plasma 6
+  Plasmoids, Windows 11 Widgets Board Adaptive Cards,
+  `--widget-json`/`--widget-waybar` CLI output, and a built-in **Desktop
+  Widget** window (Window menu, tray menu, or `--widget`).
 - Keyboard shortcuts changed in Settings → **Keyboard Shortcuts**: click a
-  shortcut and press new keys, or keys one after another for a sequence (keys
-  another action had are taken from it), reset one or all, or take one away.
-  Tooltips name the shortcuts as they are now. Every shortcut is listed there, the
-  composer's formatting ones too, in place of the old Keyboard Shortcuts
-  dialog and Rules & Layout's shortcuts section. They're kept in
-  `shortcuts.txt`, whose edits apply live without restarting Picacho.
-
+  shortcut and press new keys, or keys one after another for a sequence
+  (keys another action had are taken from it), reset one or all, or take one
+  away. Tooltips name the shortcuts as they are now. Every shortcut is
+  listed there, the composer's formatting ones too, in place of the old
+  Keyboard Shortcuts dialog and Rules & Layout's shortcuts section. They're
+  kept in `shortcuts.txt`, whose edits apply live without restarting
+  Picacho.
 - IMAP and POP3 servers that only offer STARTTLS (ports 143 and 110): the
   connection is upgraded before anything is sent, and never used plain.
   Found by autoconfig and port probing, or chosen in manual setup.
 - POP3: older mail is listed by its headers (TOP) and downloads whole when
   opened; servers asking to wait (LOGIN-DELAY, IN-USE, SYS/TEMP) pause
-  background checks instead of being taken for a wrong password; UTF-8
-  (RFC 6856) where offered.
+  background checks instead of being taken for a wrong password; UTF-8 (RFC
+  6856) where offered.
 - Filters (ManageSieve): room is checked first (HAVESPACE), Picacho's
   inactive script is replaced whole (RENAMESCRIPT), and QUOTA, TRYLATER and
   REFERRAL refusals say what they mean.
@@ -417,34 +421,32 @@ same version in `Cargo.toml`.
 - CalDAV and CardDAV: calendars and address books can be renamed and
   deleted; edits use Schedule-Tag where the server schedules, and its
   scheduling inbox is read; events and cards too large for the server are
-  refused before sending; files can be attached to events where the
-  calendar keeps them (RFC 8607); new cards go as vCard 4.0 to books that
-  take only that; the calendar server's storage is shown.
+  refused before sending; files can be attached to events where the calendar
+  keeps them (RFC 8607); new cards go as vCard 4.0 to books that take only
+  that; the calendar server's storage is shown.
 - Events in a time zone carry its VTIMEZONE, so Outlook and Exchange show
   them at the right time.
-
-- Single sign-on for IMAP and POP3 accounts with an organization's
-  identity provider (OpenID Connect / OAuth 2.0: Okta, Entra ID, Keycloak,
-  Authentik, ADFS…), including those that sign people in with SAML 2.0
-  behind it. Found from the domain's autoconfig file where it says so, or
-  set up under Server settings with the sign-in service's address. Picacho
-  registers itself where the provider allows, or uses a client id from the
-  administrator; the mail servers get the token with OAUTHBEARER or XOAUTH2.
+- Single sign-on for IMAP and POP3 accounts with an organization's identity
+  provider (OpenID Connect / OAuth 2.0: Okta, Entra ID, Keycloak, Authentik,
+  ADFS…), including those that sign people in with SAML 2.0 behind it. Found
+  from the domain's autoconfig file where it says so, or set up under Server
+  settings with the sign-in service's address. Picacho registers itself
+  where the provider allows, or uses a client id from the administrator; the
+  mail servers get the token with OAUTHBEARER or XOAUTH2.
 - Kerberos sign-in (SASL GSSAPI, RFC 4752) for IMAP and POP3 accounts, and
   their outgoing and filter servers, with the ticket the computer already
   has. Uses the system's Kerberos (GSS-API on Linux, the BSDs and macOS,
-  SSPI on Windows); no password is kept or sent, and a server without
-  GSSAPI is never tried with a password.
+  SSPI on Windows); no password is kept or sent, and a server without GSSAPI
+  is never tried with a password.
 - POP3: **Remove from the server** after download, after a week or after a
   month, and **Delete on the server too** for mail deleted here for good.
-  Both off by default; only mail saved here completely is removed, once
-  the server confirms.
+  Both off by default; only mail saved here completely is removed, once the
+  server confirms.
 - Tasks can be edited and deleted, have no due date, and keep what other
   apps set on them (priority, categories, alarms).
 - **Let the server send invitations**: a CalDAV server that schedules (RFC
   6638) can send the invitations, updates and cancellations for events you
   organize, instead of Picacho mailing them.
-
 - Calendars and address books read only what changed since the last sync
   (WebDAV sync-collection, RFC 6578; else the collection's ctag), rather
   than everything each time. Calendars for tasks only are left out, and
@@ -454,19 +456,19 @@ same version in `Cargo.toml`.
 - Calendars and contacts from Fastmail and other JMAP servers, signed in as
   the mail account already is (Settings → Calendar / Contacts).
 - Tasks (open VTODOs) in Settings → Calendar, added and marked done there;
-  reminders on events, shown as notifications; and "When Are They Free?"
-  for an event's guests, where the calendar server schedules (RFC 6638).
+  reminders on events, shown as notifications; and "When Are They Free?" for
+  an event's guests, where the calendar server schedules (RFC 6638).
 - New calendars and address books can be made on the server.
-- Contacts keep and edit postal addresses, birthdays and photos, and
-  groups with their members.
+- Contacts keep and edit postal addresses, birthdays and photos, and groups
+  with their members.
 - JMAP: messages handed to the server to send later are listed and can be
   taken back (Settings → Calendar → Held to send later). Sent messages say
   what became of each recipient's copy (Delivery). The server's own sending
   addresses are shown and can be renamed, added or removed. Conversations
-  include messages in other mailboxes, and messages can be copied to
-  another account the same sign-in reaches. Attached messages can be
-  previewed without downloading them, and read receipts are sent by the
-  server where it can (RFC 9007).
+  include messages in other mailboxes, and messages can be copied to another
+  account the same sign-in reaches. Attached messages can be previewed
+  without downloading them, and read receipts are sent by the server where
+  it can (RFC 9007).
 - JMAP mailboxes that changed are brought up to date from what changed in
   their listing (Email/queryChanges), rather than listed again.
 - IMAP: drafts are replaced in one step (REPLACE), imported mail goes in
@@ -484,15 +486,15 @@ same version in `Cargo.toml`.
   from before ESMTP.
 - Sending to more recipients than the server takes at once (RCPTMAX, or a
   452 "too many recipients") sends to the rest in another round. Refusals
-  say what the server's code means ("That mailbox doesn't exist").
-  Delivery reports name each recipient as written (ORCPT).
+  say what the server's code means ("That mailbox doesn't exist"). Delivery
+  reports name each recipient as written (ORCPT).
 - Windows: an installer for the current user (`scripts\bundle-windows.ps1`,
   unsigned for now), with Picacho's icon, version information and a Start
   menu shortcut. No console window opens. Notifications are Picacho's and
-  open the message when clicked. The data folder is limited to your
-  account. Picacho starts without WebView2 or Windows Hello: it says when
-  Proton's check needs WebView2, and offers security keys and phone
-  passkeys itself where Windows Hello isn't available.
+  open the message when clicked. The data folder is limited to your account.
+  Picacho starts without WebView2 or Windows Hello: it says when Proton's
+  check needs WebView2, and offers security keys and phone passkeys itself
+  where Windows Hello isn't available.
 - Events have a time zone: times are written in it, and Picacho says what
   time that is for you. Events elsewhere show both times.
 - Guests' answers and the times they propose come back to the organizer:
@@ -503,26 +505,26 @@ same version in `Cargo.toml`.
 - Checking a found key: its fingerprint and QR code, and a field to paste
   the fingerprint its owner gave you, which Picacho compares. Your own key
   shows yours, for others to check.
-- Repeating events show once for each time they happen, and one repeat
-  can be changed or deleted on its own. Events can be made to repeat
-  daily, weekly, monthly or yearly.
-- Events can have guests: they're sent an invitation from your account
-  when the event is saved, and a cancellation when it's deleted.
-- With Local AI → Understand dates, event times can be written as
-  "tomorrow at 10" or "every monday at 9"; an empty end is an hour later.
-- Keys Picacho finds for people are marked "not checked" until you
-  compare the fingerprint and mark them checked, and sending says when
-  one wasn't checked.
+- Repeating events show once for each time they happen, and one repeat can
+  be changed or deleted on its own. Events can be made to repeat daily,
+  weekly, monthly or yearly.
+- Events can have guests: they're sent an invitation from your account when
+  the event is saved, and a cancellation when it's deleted.
+- With Local AI → Understand dates, event times can be written as "tomorrow
+  at 10" or "every monday at 9"; an empty end is an hour later.
+- Keys Picacho finds for people are marked "not checked" until you compare
+  the fingerprint and mark them checked, and sending says when one wasn't
+  checked.
 - Encrypting the subject also hides the thread it's part of (In-Reply-To,
   References), Reply-To and Keywords.
 - S/MIME drafts sync with the server's Drafts, sealed to your certificate.
 - Reduce motion's Automatic follows Android's and iOS's settings, and
   notices changes whenever Picacho's window comes to the front.
-- Windows builds include OpenSSL, and the Android build script finds
-  Android Studio's SDK and NDK by itself.
-- Invitations in mail show what, when, where and who above the message,
-  with Accept, Maybe and Decline; the organizer is told (iMIP), from the
-  address that was invited.
+- Windows builds include OpenSSL, and the Android build script finds Android
+  Studio's SDK and NDK by itself.
+- Invitations in mail show what, when, where and who above the message, with
+  Accept, Maybe and Decline; the organizer is told (iMIP), from the address
+  that was invited.
 - Settings → Calendar: calendars on a CalDAV server (Fastmail, iCloud,
   Nextcloud, Radicale…). Accepted invitations go in, declined and cancelled
   ones come out, and events can be added, edited and deleted.
@@ -530,18 +532,22 @@ same version in `Cargo.toml`.
   CardDAV server when there is one; what other apps keep on a card stays.
 - OpenPGP keys are found automatically: on the address's domain (WKD), on
   keys.openpgp.org, and in Autocrypt headers; signed mail sends yours the
-  same way. Settings → Encryption → Find Key looks one up.
+  same way. Settings → Encryption → Find Key looks one up. A key from an
+  Autocrypt header, which anyone can forge, never replaces one found on the
+  domain or a keyserver, and such keys are limited in size and number. Key
+  lookups (WKD) only go to plain domain names, and read at most 1 MB.
 - Encrypt the subject too: with OpenPGP, the composer can hide the subject
   inside the encryption (others see "...").
 - Drafts to be sent encrypted sync with the server's Drafts, sealed to your
   own OpenPGP key, instead of staying on one device.
 - S/MIME: import your certificate (.p12/.pfx), read and check S/MIME mail,
   keep senders' certificates, and sign and encrypt with S/MIME instead of
-  OpenPGP.
+  OpenPGP. A sender's certificate is kept only for the address its message
+  is from, and a self-signed one never replaces one already kept.
 - Accessibility: menus are menus to screen readers and take the keyboard
   when they open; contacts, events, invitations, keys and certificates are
-  named. Settings → General → Reduce motion follows the system's setting
-  (or yours): nothing slides or fades, and spinners stand still.
+  named. Settings → General → Reduce motion follows the system's setting (or
+  yours): nothing slides or fades, and spinners stand still.
 - Settings → Encryption: OpenPGP for every account. Import your key and
   others' public keys (armored `.asc` files from GnuPG, Thunderbird,
   Proton…); they're kept in the system keychain. Mail encrypted to you
@@ -551,41 +557,41 @@ same version in `Cargo.toml`.
   encrypt to each recipient's and yours. Drafts to be sent encrypted aren't
   uploaded to the server.
 - Settings → Contacts: address books read from a CardDAV server (Fastmail,
-  iCloud, Nextcloud, Radicale…), and vCard files imported and exported.
-  The composer suggests these people first, then people from your mail.
+  iCloud, Nextcloud, Radicale…), and vCard files imported and exported. The
+  composer suggests these people first, then people from your mail.
 - A mailbox's menu has Export as Mbox… (all its messages in one mbox file,
   for other mail apps or a backup) and Import Messages… (`.mbox` files and
   `.eml` messages, added to it on the server).
-- Screen readers: buttons, links, switches, choices, settings pages,
-  folders (with unread counts) and messages (unread, sender, subject, date,
-  preview) say what they are and whether they're on or selected, and the
-  sidebar, message list, reader and composer are named regions. Tab and
-  Shift-Tab move between controls, with a visible focus ring.
-- The Summary's Receipts page shows what each receipt lists, under
-  Details: its items, subtotal, shipping, fees, tip, taxes and discounts,
-  and its total. They're read from the email's text or the sender's
-  markup. Receipts can be searched by what they list too.
+- Screen readers: buttons, links, switches, choices, settings pages, folders
+  (with unread counts) and messages (unread, sender, subject, date, preview)
+  say what they are and whether they're on or selected, and the sidebar,
+  message list, reader and composer are named regions. Tab and Shift-Tab
+  move between controls, with a visible focus ring.
+- The Summary's Receipts page shows what each receipt lists, under Details:
+  its items, subtotal, shipping, fees, tip, taxes and discounts, and its
+  total. They're read from the email's text or the sender's markup. Receipts
+  can be searched by what they list too.
 - Settings → Local AI → Suggest replies: a small model on this computer
   reads received mail and offers a few short replies under it (and in the
   Reply menu on phones and tablets), chosen for what the message says and
-  worded in its language, in 37 languages: "Let me check my calendar." for
-  a meeting request, "Das passt mir." for a German one. Choosing one starts
-  a reply with it written in. Replies you choose are offered more, and
+  worded in its language, in 37 languages: "Let me check my calendar." for a
+  meeting request, "Das passt mir." for a German one. Choosing one starts a
+  reply with it written in. Replies you choose are offered more, and
   right-clicking one stops it (Forget, beside the setting, starts over).
   Nothing is offered for mailing lists, no-reply senders, sign-in codes,
   receipts or package updates.
-- JMAP: delivery receipts are asked for where the server can (DSN), the
-  away reply works on servers that have only JMAP's own (VacationResponse,
-  such as Fastmail), mail accounts shared with your sign-in can be added
-  from the account's settings (Shared with you), search results show the
-  part of each message that matched, and servers that push changes only
-  over a WebSocket are followed too. Picacho reads the session again when
-  the server says it changed, and keeps to its request limits.
+- JMAP: delivery receipts are asked for where the server can (DSN), the away
+  reply works on servers that have only JMAP's own (VacationResponse, such
+  as Fastmail), mail accounts shared with your sign-in can be added from the
+  account's settings (Shared with you), search results show the part of each
+  message that matched, and servers that push changes only over a WebSocket
+  are followed too. Picacho reads the session again when the server says it
+  changed, and keeps to its request limits.
 - Settings → Sending → Let the server send scheduled messages: a message
-  sent later goes to the server at once, which holds it and sends it at
-  its time even with Picacho closed (SMTP FUTURERELEASE, JMAP HOLDUNTIL).
-- Outgoing servers: TLS from the start on any port (not only 465), chosen
-  in setup and for sending addresses' own servers, and found by
+  sent later goes to the server at once, which holds it and sends it at its
+  time even with Picacho closed (SMTP FUTURERELEASE, JMAP HOLDUNTIL).
+- Outgoing servers: TLS from the start on any port (not only 465), chosen in
+  setup and for sending addresses' own servers, and found by
   autoconfiguration; relays that take mail without signing in work too.
 - IMAP: Only subscribed folders (account settings) shows the folders
   subscribed to on the server; other users' and shared folders (NAMESPACE)
@@ -597,15 +603,14 @@ same version in `Cargo.toml`.
 - IMAP: on servers offering UIDONLY, messages are named only by their UIDs,
   sparing the server its sequence numbers (with Picacho-Patches' imap-proto
   patch 0006, which reads its UIDFETCH replies; until then it stays off).
-
 - Phones and tablets: tapping a link in an email first shows where it goes,
   warns of known tricks (look-alike letters, bare IP addresses, unencrypted
   pages), and offers Go Back, Open Anyway or Always Trust the site. Turn it
   off, or remove trusted sites, in Settings → Reading.
 - Desktop: hovering a link in an email shows its address at the bottom left
   of the mail view.
-- Phones and tablets: Edit on the Mailboxes screen sorts accounts by dragging
-  their handles, in the same order as the desktop's sidebar.
+- Phones and tablets: Edit on the Mailboxes screen sorts accounts by
+  dragging their handles, in the same order as the desktop's sidebar.
 - Pasting copied rich text into a message pastes it as plain text, with a
   “Paste with formatting” button to keep its bold, links and lists instead.
   Turn on Settings → Composing → Paste with formatting to make that the
@@ -636,46 +641,34 @@ same version in `Cargo.toml`.
 
 ### Changed
 
-- Settings is reorganized: every page groups its settings into titled
-  cards, with controls beside their names where they fit and long
-  explanations trimmed to a few words. A mailbox's page starts with its
-  picture (Change Picture is beside it), then Account, Sync, Sending,
-  Delivery, Storage and Filters; Contacts and Calendar show your contacts,
-  events and tasks before their server settings.
+- Settings is reorganized: every page groups its settings into titled cards,
+  with controls beside their names where they fit and long explanations
+  trimmed to a few words. A mailbox's page starts with its picture (Change
+  Picture is beside it), then Account, Sync, Sending, Delivery, Storage and
+  Filters; Contacts and Calendar show your contacts, events and tasks before
+  their server settings.
 
 ### Fixed
 
-- Tasks no longer show as events in calendars that hold both, tasks
-  without a due date are no longer dropped, and a task's due date is its
-  DUE rather than its start.
-- Usage notes no longer describe a "Load more" step the message list
-  doesn't have.
-- Saving an event with guests to iCloud, Fastmail, Nextcloud or Google no
-  longer has the server email them a second invitation: Picacho sends
-  invitations itself, and now tells the server so (SCHEDULE-AGENT=CLIENT).
-- Editing a contact keeps its email and phone labels (work, home, Apple's
-  custom labels), full name parts (prefixes, middle names, suffixes) and
-  organization units, unless those were what changed.
-- Saving an invitation with a reminder to a calendar no longer writes it
-  without the reminder's start, which some servers refused.
+- Usage notes no longer describe a "Load more" step the message list doesn't
+  have.
 - Leaving an IMAP folder (to delete it) uses UNSELECT where offered, so
   messages another app marked deleted aren't removed.
-- JMAP servers that are limiting requests (429, 503) pause background sync,
-  as IMAP servers that say so do.
 - HTML email: a newsletter inside a form shows instead of nothing; content
-  that fades in at first shows; wide emails are scaled to fit rather than cut
-  off; absolutely positioned content and fixed bars are shown once, in place;
-  sliced images in table cells meet without gaps; old attributes (centered
-  tables, images aligned left or right, cell background images, `<font>`
-  colors and sizes, named `bgcolor`s) apply; a body background reaches the
-  edges; short words in narrow cells no longer break letter by letter.
+  that fades in at first shows; wide emails are scaled to fit rather than
+  cut off; absolutely positioned content and fixed bars are shown once, in
+  place; sliced images in table cells meet without gaps; old attributes
+  (centered tables, images aligned left or right, cell background images,
+  `<font>` colors and sizes, named `bgcolor`s) apply; a body background
+  reaches the edges; short words in narrow cells no longer break letter by
+  letter.
 - HTML email: blocked images show their alt text, and tracking pixels sized
   in CSS stay invisible. Images load several at a time, and long newsletters
   load all of theirs.
 - HTML email in dark colors: an email whose dark styles only swap a logo is
-  no longer shown as light text on a white page; dark text on a pastel
-  color stays dark; black borders and rules turn light; links are readable;
-  SVG images keep their colors.
+  no longer shown as light text on a white page; dark text on a pastel color
+  stays dark; black borders and rules turn light; links are readable; SVG
+  images keep their colors.
 - HTML email: `#` links and Tab scroll to their target; the email's own
   scrolling boxes scroll; double- and triple-click, shift-click and Ctrl/⌘A
   select text; Chinese, Japanese and Thai words are selected and wrapped as
@@ -687,9 +680,6 @@ same version in `Cargo.toml`.
   Encryption), or says it is encrypted.
 - Proton (Direct): a refused sign-in no longer says Proton ended the
   session; it says which step was refused and what Proton answered.
-- JMAP: Require encryption in transit was ignored; messages now go only
-  where the server can ask for it (REQUIRETLS), and are refused otherwise,
-  as over SMTP.
 - Phones and tablets: the filter chips over the message list fade out at an
   edge with more chips scrolled past it.
 - Tablets: with the list and a message side by side, going back (Back, the
@@ -702,13 +692,14 @@ same version in `Cargo.toml`.
   Forwarding instead of closing Settings.
 - Phones and tablets: All Accounts (or an alias's view) names itself under
   the mailbox's name, rather than one of its accounts.
-- Tapping a new mail notification for a message not synced yet (such as one
-  just pushed) no longer leaves the message open before on screen; the new
-  one opens once it arrives.
 - Tapping a notification opens what it tells of: new mail opens the message
-  in its mailbox, mail back from snooze the inbox (or the message), a sent or
-  failed scheduled message Sent or Drafts. On Android it did nothing; on Linux
-  clicking one now does this too while Picacho's window is open.
+  in its mailbox (taken from the cache, or fetched from Proton, when it
+  isn't listed yet; one not synced yet opens once it arrives), mail back
+  from snooze the inbox (or the message), a sent or failed scheduled message
+  Sent or Drafts. On Android it did nothing; on Linux clicking one now does
+  this too while Picacho's window is open. Proton's pushes also fetch the
+  message they announce (with its text, where mail is kept offline), so it's
+  in the inbox before it's tapped.
 - Android: the keyboard shows for text fields, and Paste pastes what other
   apps copied (and Copy reaches them).
 - Android: Picacho scrolls and animates at the display's full refresh rate
@@ -723,105 +714,64 @@ same version in `Cargo.toml`.
 - Phones and tablets: text in an email can be selected and copied. A long
   press selects a word, moving the finger before lifting it selects more,
   and lifting it offers Copy, with the link or image pressed.
+- Phones: a row swipes only when the pan is clearly sideways, and archives
+  or deletes only once it has crossed a good part of the row (not a fixed 88
+  points), so a brush on the way to scrolling no longer moves mail.
+- Phones: Back from a message opened in search results goes back to the
+  results, rather than closing the search under the message and leaving it
+  open; Back pressed again while the screen slides away is no longer
+  dropped.
 
 ### Security
 
-- Turning the local database's encryption on or off converts the drafts'
-  files kept beside it as a migration that lasts failures and crashes:
-  Picacho reports success only once every file is converted and read back,
-  keeps the old key until then, and carries on when the switch is asked for
-  again or Picacho starts. Converting no longer writes over an attachment
-  named like its temporary file.
-- While the local database is encrypted, the pieces of a large message
-  kept on disk so its download can resume are encrypted too, each checked
-  when the download resumes; unencrypted pieces left from before are
-  deleted.
-- With a proxy set for the system, email images and other requests to
-  addresses strangers chose (one-click unsubscribing, MTA-STS policies, key
-  lookups, revocation checks) are no longer sent through it, since a proxy
-  looks names up itself and could reach your local network. If your proxy
-  refuses such requests itself, turn on **Proxy blocks local network** in
-  Settings → Reading (shown when a proxy is set), or set
-  `PICACHO_PROXY_BLOCKS_LOCAL_NETWORK=1` for the whole computer.
-- Check sender no longer says a certificate isn't revoked on the strength
-  of a revocation list that doesn't cover it: another partition of its
-  issuer's lists, a list for some reasons only, a delta list, or one not yet
-  issued or without an end date. Only lists that cover it are kept.
-- Exchange accounts no longer fall back to Basic sign-in on their own,
-  which sent the password itself to any server that left out NTLM. Where
-  your Exchange server offers only Basic, Picacho now says so and syncing
-  stops until you turn on **Allow Basic sign-in** in the account's
-  Settings. Autodiscover never sends Basic.
-- An Autocrypt header, which anyone can forge, no longer replaces a
-  contact's OpenPGP key found on their domain or a keyserver, so a forged
-  message can't have mail you encrypt go to someone else's key. Keys from
-  Autocrypt headers are limited in size and number.
-- An inline PGP message's attachments that its signature or encryption
-  doesn't cover are named in the message details, which no longer show the
-  message as fully signed or encrypted.
-- CardDAV and CalDAV send your password only to the server's own site,
-  even when the server names an address elsewhere.
 - Release builds ignore environment variables that would point sign-in and
   Pinal Mail at other servers.
 - A received message's Message-ID, read-receipt address or invitation
   organizer can no longer add headers to the read receipts, replies and
   calendar answers Picacho sends.
-- CardDAV and CalDAV never send your password over plain http, even when
-  the server points elsewhere.
-- An S/MIME certificate is kept only for the address its message is from,
-  and a self-signed one never replaces one already kept, so a stranger
-  can't have mail you encrypt go to their certificate.
-- Email images are never loaded from your computer or local network, and
-  an email's images can't run Picacho out of memory. A proxy set for the
-  system (also one on the local network) is used to load them.
+- Email images are never loaded from your computer or local network, and an
+  email's images can't run Picacho out of memory. Requests to addresses
+  strangers chose (email images, one-click unsubscribing, MTA-STS policies,
+  key lookups, revocation checks) don't go through a proxy set for the
+  system, since a proxy looks names up itself and could reach your local
+  network. If your proxy refuses such requests itself, turn on **Proxy
+  blocks local network** in Settings → Reading (shown when a proxy is set),
+  or set `PICACHO_PROXY_BLOCKS_LOCAL_NETWORK=1` for the whole computer.
 - Connections use TLS 1.2 or later.
 - Copied sign-in codes are marked sensitive on Android, so they don't show
   in the clipboard preview.
-- Key lookups (WKD) only go to plain domain names, and read at most 1 MB.
-- Mail sent over SMTP has every line ending made CRLF before it is sent,
-  so nothing in a forwarded message can end the data early (SMTP
-  smuggling).
+- Mail sent over SMTP has every line ending made CRLF before it is sent, so
+  nothing in a forwarded message can end the data early (SMTP smuggling).
 - An email whose start looks almost like a DOCTYPE no longer fails to
   render.
-- Importing a file larger than an import may be, or one without line
-  breaks, no longer reads it all into memory.
-- Release builds' signing key is only given to builds that publish, never
-  to a pull request's.
+- Release builds' signing key is only given to builds that publish, never to
+  a pull request's.
 
 ### Performance
 
-- Widgets are refreshed after a background check without looking through
-  every account's mail again unless it changed in ways packages and
-  receipts depend on, and then once for both.
-- Reading a message of thousands of parts no longer takes time growing
-  with the square of their number, and at most 4096 parts are looked at.
-- Opening a large email file checks its size before reading it, so an
-  oversized `.eml` or `.msg` can't run Picacho out of memory.
-- Reading and downloading mail no longer reads every OpenPGP key again
-  for each message, and other people's keys are kept in the database
-  rather than rewritten whole into the system keychain for each new one.
+- Reading a message of thousands of parts no longer takes time growing with
+  the square of their number, and at most 4096 parts are looked at.
 - Verification results are kept for recently read messages only, and
   pictures in quoted replies are decoded within the same limits as
   attachment previews.
-- An open email's thread, and Proton and JMAP accounts' watches, sleep
-  instead of waking several times a second.
-- Syncing Proton and JMAP accounts, marking a mailbox read and emptying a
-  folder no longer read every cached message's text; All Mail and Starred
-  read only the messages they show.
+- An open email's thread, and Proton accounts' watches, sleep instead of
+  waking several times a second.
+- Syncing Proton accounts, marking a mailbox read and emptying a folder no
+  longer read every cached message's text; All Mail and Starred read only
+  the messages they show.
 - Deleting or labelling thousands of chosen messages no longer stalls the
   window.
-- Exporting a mailbox and renaming a Proton or JMAP folder no longer read
-  every message's text at once; listing more of a large IMAP mailbox looks
-  up only its own messages.
+- Renaming a Proton folder no longer reads every message's text at once;
+  listing more of a large IMAP mailbox looks up only its own messages.
 - Less memory: the message list keeps only the open message's text, not
   every message read since the mailbox was opened; only the latest 32
   decrypted messages keep their text in memory; previews are at most 400
   characters; a message's raw source isn't kept once another opens; and on
   Linux memory an email or a long list used goes back to the system.
-- Counting subscriptions and code mail, and finding parcels and receipts,
-  no longer hold every message of an account at once.
-- Marking a Proton folder read keeps only the unread messages' ids, not
-  the whole folder's listing.
+- Counting subscriptions and code mail, and finding parcels and receipts, no
+  longer hold every message of an account at once.
+- Marking a Proton folder read keeps only the unread messages' ids, not the
+  whole folder's listing.
 
 ## [0.1.0] - 2026-11-16
 

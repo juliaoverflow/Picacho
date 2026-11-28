@@ -19,6 +19,9 @@ const GRID_VIEWPORT_HEIGHT: f32 = 560.;
 pub(super) enum AppView {
     Calendar,
     Contacts,
+    Tasks,
+    /// The attachment browser (`attachments.rs`).
+    Attachments,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -669,6 +672,12 @@ impl MailApp {
                 self.modal = None;
                 if view == AppView::Calendar && self.backend.calendar_server().is_some() {
                     self.handle(Action::SyncCalendar, w, cx);
+                }
+                if view == AppView::Tasks {
+                    self.sync_tasks_quietly(cx);
+                }
+                if view == AppView::Attachments {
+                    self.load_library(cx);
                 }
             }
             CalAction::Close => self.app_view = None,
@@ -1431,6 +1440,9 @@ impl MailApp {
         let (title, page) = match view {
             AppView::Calendar => (t!("calendar-views-calendar"), self.calendar_page(cx)),
             AppView::Contacts => (t!("calendar-views-contacts"), self.contacts_page(cx)),
+            AppView::Tasks => (t!("calendar-views-tasks"), self.tasks_page(cx)),
+            // A list and a preview of its own, which scroll themselves.
+            AppView::Attachments => return self.attachments_page(corners, false, cx),
         };
         div()
             .id("app-view")
@@ -1482,10 +1494,13 @@ impl MailApp {
             .into_any_element()
     }
 
-    /// The sidebar's Calendar and Contacts entries.
+    /// The sidebar's Calendar, Tasks, Contacts and Attachments entries
+    /// (Tasks with how many are due today or overdue).
     pub(super) fn app_view_links(&self, collapsed: bool, cx: &Context<Self>) -> AnyElement {
         let c = self.colors();
+        let due_now = self.tasks_due_now();
         let item = |id: &'static str, label: &'static str, icon: &'static str, view: AppView| {
+            let count = (view == AppView::Tasks && due_now > 0 && !collapsed).then_some(due_now);
             let active = self.app_view == Some(view);
             div()
                 .id(id)
@@ -1504,8 +1519,16 @@ impl MailApp {
                 .text_color(rgb(if active { c.text } else { c.muted }))
                 .when(!collapsed, |d| d.child(div().size(px(12.))))
                 .child(icon_el(icon, 15., if active { c.accent } else { c.muted }))
-                .when(!collapsed, |d| d.child(label))
-                .tooltip(move |w, cx| Tooltip::new(label).build(w, cx))
+                .when(!collapsed, |d| d.child(div().flex_1().child(label)))
+                .when_some(count, |d, n| d.child(div().text_size(px(11.)).text_color(rgb(c.muted)).child(n.to_string())))
+                .tooltip(move |w, cx| {
+                    let tip = if view == AppView::Attachments {
+                        keys(&shortcuts::tip(label, "attachments", cx))
+                    } else {
+                        label.to_owned()
+                    };
+                    Tooltip::new(tip).build(w, cx)
+                })
                 .on_click(cx.listener(move |this, _, w, cx| {
                     let action = if this.app_view == Some(view) {
                         CalAction::Close
@@ -1522,7 +1545,9 @@ impl MailApp {
             .mt_2()
             .when(collapsed, |d| d.items_center())
             .child(item("open-calendar", t!("calendar-views-calendar"), "clock", AppView::Calendar))
+            .child(item("open-tasks", t!("calendar-views-tasks"), "tasks", AppView::Tasks))
             .child(item("open-contacts", t!("calendar-views-contacts"), "contact", AppView::Contacts))
+            .child(item("open-attachments", t!("attachments-attachments"), "paperclip", AppView::Attachments))
             .into_any_element()
     }
 }

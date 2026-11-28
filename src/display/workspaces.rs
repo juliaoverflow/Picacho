@@ -400,11 +400,19 @@ impl MailApp {
         }
     }
     fn calendar_hrefs(&self) -> Vec<String> {
-        self.backend
-            .calendars()
-            .into_iter()
-            .map(|c| c.href)
-            .collect()
+        self.workspace_calendars().into_iter().map(|(c, _)| c.href).collect()
+    }
+    /// The calendars a workspace can show, and the task lists kept apart
+    /// from them (JMAP's, Microsoft To Do's, Google Tasks'): whether each
+    /// is a task list.
+    fn workspace_calendars(&self) -> Vec<(crate::sync::caldav::Calendar, bool)> {
+        let mut out: Vec<(crate::sync::caldav::Calendar, bool)> = self.backend.calendars().into_iter().map(|c| (c, false)).collect();
+        for list in self.backend.task_lists() {
+            if !out.iter().any(|(c, _)| c.href == list.href) {
+                out.push((list, true));
+            }
+        }
+        out
     }
     /// Opens workspace `id`'s page in Settings.
     fn open_workspace(&mut self, id: String, w: &mut Window, cx: &mut Context<Self>) {
@@ -1330,7 +1338,7 @@ impl MailApp {
         column = column.child(self.settings_group(t!("workspaces-shows"), accounts));
 
         // Its calendars.
-        let calendars = self.backend.calendars();
+        let calendars = self.workspace_calendars();
         let mut cal_rows = Rows::new();
         if calendars.is_empty() {
             cal_rows = cal_rows.row(self.setting(
@@ -1351,7 +1359,8 @@ impl MailApp {
                 ),
             ));
             if ws.calendars.is_some() {
-                for cal in &calendars {
+                for (cal, task_list) in &calendars {
+                    let name = if *task_list { t!("workspaces-task-list", name = cal.name) } else { cal.name.clone() };
                     let color = u32::from_str_radix(
                         cal.color.trim_start_matches('#').get(..6).unwrap_or(""),
                         16,
@@ -1367,7 +1376,7 @@ impl MailApp {
                                 .justify_center()
                                 .child(div().size(px(12.)).rounded_full().bg(rgb(color)))
                                 .into_any_element(),
-                            cal.name.clone(),
+                            name,
                             String::new(),
                             ws.shows_calendar(&cal.href),
                             act(WsAction::ToggleCalendar(id.clone(), cal.href.clone())),

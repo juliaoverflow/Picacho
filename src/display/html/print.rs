@@ -12,7 +12,7 @@ use super::{
 };
 use crate::manage::model::Mail;
 use anyrender::recording::RenderCommand;
-#[cfg_attr(any(target_os = "android", target_os = "ios"), allow(unused_imports))]
+#[cfg_attr(any(target_os = "android", target_os = "ios", windows), allow(unused_imports))]
 use anyhow::{Context as _, Result};
 use krilla::{
     Document,
@@ -159,9 +159,23 @@ fn choose_break(scene: &anyrender::Scene, max_slice_h: f32) -> f32 {
 }
 
 /// Renders `m` (its headers, HTML or plain-text body, inline images, and
-/// remote images when `remote` is true) into a multi-page vector PDF.
+/// remote images when `remote` is true) into a multi-page vector PDF, on
+/// this locale's paper (US Letter or A4).
 pub fn message_pdf(m: &Mail, from: &str, date: &str, remote: bool) -> Result<Vec<u8>> {
-    let (page_w, page_h) = page_size();
+    message_pdf_on(m, from, date, remote, page_size())
+}
+
+/// The smallest and largest paper laid out on, in PDF points (2 in, 200 in).
+const PAPER_RANGE: std::ops::RangeInclusive<f32> = 144.0..=14_400.0;
+
+/// `message_pdf` on paper of `paper` (width, height) in PDF points, as a
+/// printer has it: this locale's paper when that size can't be laid out on.
+pub fn message_pdf_on(m: &Mail, from: &str, date: &str, remote: bool, paper: (f32, f32)) -> Result<Vec<u8>> {
+    let (page_w, page_h) = if PAPER_RANGE.contains(&paper.0) && PAPER_RANGE.contains(&paper.1) {
+        paper
+    } else {
+        page_size()
+    };
     let print_w = page_w - 2. * MARGIN;
     let print_h = page_h - 2. * MARGIN;
     let css_width = (print_w / CSS_TO_PT).round().max(320.) as u32;
@@ -295,13 +309,14 @@ pub fn message_pdf(m: &Mail, from: &str, date: &str, remote: bool) -> Result<Vec
 
 /// How long a PDF written for printing is kept: long enough for a print
 /// dialog or viewer to read it, then it is removed with the next print.
-#[cfg_attr(any(target_os = "android", target_os = "ios"), allow(dead_code))]
+#[cfg_attr(any(target_os = "android", target_os = "ios", windows), allow(dead_code))]
 const PRINT_FILES_KEPT: Duration = Duration::from_secs(60 * 60);
 
 /// Writes `pdf_bytes` to a private file under the user's temporary folder for
 /// handing to a system print API, first removing ones older than
-/// `PRINT_FILES_KEPT` (they hold the text of mail).
-#[cfg_attr(any(target_os = "android", target_os = "ios"), allow(dead_code))]
+/// `PRINT_FILES_KEPT` (they hold the text of mail). Windows prints from
+/// memory, and writes none.
+#[cfg_attr(any(target_os = "android", target_os = "ios", windows), allow(dead_code))]
 fn temp_pdf(title: &str, pdf_bytes: &[u8]) -> Result<std::path::PathBuf> {
     let user: String = std::env::var("USER")
         .or_else(|_| std::env::var("USERNAME"))
@@ -374,10 +389,9 @@ fn private_dir(dir: &std::path::Path) -> bool {
 
 /// How a message was handed over for printing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg_attr(any(target_os = "android", target_os = "ios"), allow(dead_code))]
+#[cfg_attr(any(target_os = "android", target_os = "ios", windows), allow(dead_code))]
 pub enum Printed {
     /// The system's print dialog was shown (and printed, or was cancelled).
-    #[cfg_attr(windows, allow(dead_code))]
     Dialog,
     /// No print dialog could be shown here: the PDF was opened in the
     /// system's PDF viewer, to print from there.
@@ -389,22 +403,26 @@ pub enum Printed {
 ///
 /// - Linux: xdg-desktop-portal's Print dialog (`ashpd::desktop::print`);
 ///   with no portal running, the PDF opens in the system's PDF viewer.
-/// - Windows: the PDF opens in the system's PDF viewer (its own Print
-///   command shows the dialog). Windows' "print" verb isn't used: most PDF
-///   apps print with it at once, to the default printer, without a dialog.
+/// - Windows: `super::print_windows`, which shows Windows' own print
+///   dialog and prints through Windows' print system, with no other app.
 /// - macOS: `print_pdf_macos`, on the main thread, shows AppKit's dialog;
 ///   this function only opens the PDF there.
 #[allow(unused_variables)]
+#[cfg_attr(windows, allow(dead_code))]
 pub fn print_pdf(pdf_bytes: &[u8], title: &str) -> Result<Printed> {
-    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    #[cfg(all(unix, not(any(target_os = "android", target_os = "ios"))))]
     {
         let path = temp_pdf(title, pdf_bytes)?;
-        #[cfg(all(unix, not(target_os = "macos")))]
+        #[cfg(not(target_os = "macos"))]
         if futures::executor::block_on(linux_portal_print(&path, title)).is_ok() {
             return Ok(Printed::Dialog);
         }
         open::that(&path).with_context(|| t!("html-print-couldnt-open-the-pdf-to-print"))?;
         Ok(Printed::Viewer)
+    }
+    #[cfg(windows)]
+    {
+        anyhow::bail!(t!("html-print-printing-isnt-available-on-this-device"))
     }
     #[cfg(any(target_os = "android", target_os = "ios"))]
     {
@@ -580,6 +598,32 @@ mod tests {
                     .windows(b"/Subtype /Image".len())
                     .any(|w| w == b"/Subtype /Image")
         );
+        Ok(())
+    }
+
+    /// Laid out on a printer's paper (here A4, turned), pages are that size;
+    /// a size no paper has falls back to the locale's.
+    #[test]
+    fn pages_take_the_printers_paper() -> Result<()> {
+        let m = Mail {
+            subject: "Wide".into(),
+            body: Some("Hello".into()),
+            ..Mail::default()
+        };
+        let media_box = |pdf: &[u8]| -> Vec<f32> {
+            let text = String::from_utf8_lossy(pdf);
+            let at = text.find("/MediaBox").expect("a MediaBox");
+            let rest = &text[at + "/MediaBox".len()..];
+            let inside = &rest[rest.find('[').unwrap() + 1..rest.find(']').unwrap()];
+            inside.split_whitespace().map(|n| n.parse().unwrap()).collect()
+        };
+        let pdf = message_pdf_on(&m, "ana@example.org", "Nov 24, 2026", false, (841.89, 595.28))?;
+        let b = media_box(&pdf);
+        assert!((b[2] - b[0] - 841.89).abs() < 0.5 && (b[3] - b[1] - 595.28).abs() < 0.5, "{b:?}");
+        let pdf = message_pdf_on(&m, "ana@example.org", "Nov 24, 2026", false, (0., f32::NAN))?;
+        let b = media_box(&pdf);
+        let (w, h) = page_size();
+        assert!((b[2] - b[0] - w).abs() < 0.5 && (b[3] - b[1] - h).abs() < 0.5, "{b:?}");
         Ok(())
     }
 

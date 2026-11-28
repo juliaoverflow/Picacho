@@ -67,6 +67,8 @@ impl Status {
 
 static STATUS: std::sync::Mutex<Option<Status>> = std::sync::Mutex::new(None);
 
+/// What the tray shows now (Linux's; the others show no counts).
+#[cfg_attr(not(any(target_os = "linux", target_os = "freebsd")), allow(dead_code))]
 fn status() -> Status {
     STATUS.lock().unwrap_or_else(|e| e.into_inner()).clone().unwrap_or_default()
 }

@@ -174,6 +174,19 @@ impl MailApp {
             )
             .into_any_element(),
             self.cell(
+                "mobile-open-tasks",
+                icon_el("tasks", 22., c.accent).into_any_element(),
+                t!("calendar-views-tasks"),
+                None,
+                true,
+                false,
+                super::chrome::push(Action::Calendar(calendar_views::CalAction::Open(
+                    calendar_views::AppView::Tasks,
+                ))),
+                cx,
+            )
+            .into_any_element(),
+            self.cell(
                 "mobile-open-contacts",
                 icon_el("contact", 22., c.accent).into_any_element(),
                 t!("mobile-mailboxes-contacts"),
@@ -182,6 +195,19 @@ impl MailApp {
                 false,
                 super::chrome::push(Action::Calendar(calendar_views::CalAction::Open(
                     calendar_views::AppView::Contacts,
+                ))),
+                cx,
+            )
+            .into_any_element(),
+            self.cell(
+                "mobile-open-attachments",
+                icon_el("paperclip", 22., c.accent).into_any_element(),
+                t!("attachments-attachments"),
+                None,
+                true,
+                false,
+                super::chrome::push(Action::Calendar(calendar_views::CalAction::Open(
+                    calendar_views::AppView::Attachments,
                 ))),
                 cx,
             )

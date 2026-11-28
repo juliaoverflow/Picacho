@@ -41,6 +41,7 @@ pub(crate) mod retry;
 pub(crate) mod sasl;
 pub(crate) mod sieve;
 pub(crate) mod sieve_parse;
+pub(crate) mod tasks;
 pub(crate) mod smtp;
 pub(crate) mod stream;
 pub(crate) mod transport;

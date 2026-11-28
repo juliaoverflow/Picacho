@@ -2265,8 +2265,97 @@ pub fn from_jstask(v: &Value) -> Option<ical::Event> {
         tzid: if all_day { String::new() } else { zone.unwrap_or_default().to_owned() },
         utc: zone == Some("Etc/UTC") || zone == Some("UTC"),
         floating: matches!(clock, TaskClock::Floating) && due.is_some(),
+        priority: v["priority"].as_u64().unwrap_or(0).min(9) as u8,
+        categories: task_keywords(v),
+        parent: task_parent(v).unwrap_or_default(),
+        url: task_link(v).map(|(_, href)| href).unwrap_or_default(),
         ..Default::default()
     })
+}
+/// A Task's keywords (§4.2.10), as tags, in order.
+fn task_keywords(v: &Value) -> Vec<String> {
+    v["keywords"]
+        .as_object()
+        .into_iter()
+        .flatten()
+        .filter(|(_, on)| on.as_bool() == Some(true))
+        .map(|(k, _)| k.clone())
+        .collect()
+}
+/// The UID of the task a Task is part of (`relatedTo` with the `parent`
+/// relation, §1.4.10).
+fn task_parent(v: &Value) -> Option<String> {
+    v["relatedTo"]
+        .as_object()?
+        .iter()
+        .find(|(_, r)| r["relation"]["parent"] == true)
+        .map(|(uid, _)| uid.clone())
+}
+/// Where Picacho keeps a task's link in its `links` (§4.2.7).
+const TASK_LINK: &str = "picacho";
+/// A Task's link: (its key, its address); Picacho's own first, else the
+/// first by key.
+fn task_link(v: &Value) -> Option<(String, String)> {
+    let links = v["links"].as_object()?;
+    let href = |l: &Value| l["href"].as_str().filter(|h| !h.is_empty()).map(str::to_owned);
+    if let Some(h) = links.get(TASK_LINK).and_then(href) {
+        return Some((TASK_LINK.to_owned(), h));
+    }
+    let mut keys: Vec<&String> = links.keys().collect();
+    keys.sort();
+    keys.into_iter().find_map(|k| href(&links[k]).map(|h| (k.clone(), h)))
+}
+/// The patch for a task's priority, tags, parent and link, where they
+/// differ from the server's copy (`current`; a new task: where it has them).
+fn task_extras(e: &ical::Event, current: Option<&Value>, p: &mut Map<String, Value>) {
+    let none = Value::Null;
+    let c = current.unwrap_or(&none);
+    let was_priority = c["priority"].as_u64().unwrap_or(0) as u8;
+    if e.priority != was_priority {
+        p.insert("priority".into(), json!(e.priority.min(9)));
+    }
+    if e.categories != task_keywords(c) {
+        p.insert(
+            "keywords".into(),
+            if e.categories.is_empty() && current.is_some() {
+                Value::Null
+            } else {
+                Value::Object(e.categories.iter().map(|k| (k.clone(), json!(true))).collect())
+            },
+        );
+    }
+    if task_parent(c).unwrap_or_default() != e.parent {
+        // Its other relations stay.
+        let mut related: Map<String, Value> = c["relatedTo"]
+            .as_object()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|(_, r)| r["relation"]["parent"] != true)
+            .collect();
+        if !e.parent.is_empty() {
+            related.insert(e.parent.clone(), json!({ "@type": "Relation", "relation": { "parent": true } }));
+        }
+        if !related.is_empty() || current.is_some() {
+            p.insert("relatedTo".into(), if related.is_empty() { Value::Null } else { Value::Object(related) });
+        }
+    }
+    let was_link = task_link(c);
+    if was_link.as_ref().map(|(_, h)| h.as_str()).unwrap_or_default() != e.url {
+        let link = json!({ "@type": "Link", "href": e.url });
+        match (&was_link, c["links"].is_object()) {
+            (Some((key, _)), _) if e.url.is_empty() => {
+                p.insert(format!("links/{}", pointer_key(key)), Value::Null);
+            }
+            (_, true) => {
+                let key = was_link.map(|(k, _)| k).unwrap_or_else(|| TASK_LINK.to_owned());
+                p.insert(format!("links/{}", pointer_key(&key)), link);
+            }
+            _ => {
+                p.insert("links".into(), json!({ TASK_LINK: link }));
+            }
+        }
+    }
 }
 /// A JSON pointer's escapes (RFC 6901 §3), for a patch path's key.
 fn pointer_key(key: &str) -> String {
@@ -2429,6 +2518,7 @@ pub fn to_jstask(e: &ical::Event, current: Option<&Value>) -> Map<String, Value>
         p.insert("progress".into(), json!("needs-action"));
         p.insert("percentComplete".into(), Value::Null);
     }
+    task_extras(e, current, &mut p);
     p
 }
 /// A repeating task's rule (`recurrenceRule`; RFC 8984's
@@ -2579,6 +2669,53 @@ pub fn open_tasks(s: &Session, lists: &[JmapTaskList], now: i64) -> Result<(Vec<
 }
 /// Tasks still to do that changed, ids gone, and the new Task state.
 pub type TaskChanges = (Vec<JmapTask>, Vec<String>, String);
+/// The most finished tasks asked for at once, newest first.
+const MOST_DONE: usize = 300;
+/// The tasks done (`progress` completed) in the lists shown since `since`,
+/// by when they were last changed (`updated`, the time they were done
+/// where nothing changed since), newest first. Repeating ones aren't: one
+/// occurrence done isn't the task done.
+pub fn completed_tasks(s: &Session, lists: &[JmapTaskList], since: i64) -> Result<Vec<JmapTask>> {
+    let Some(account) = s.tasks_account() else {
+        return Ok(Vec::new());
+    };
+    let query = |sorted: bool| {
+        let mut args = json!({ "accountId": account, "filter": { "progress": ["completed"] }, "limit": MOST_DONE });
+        if sorted {
+            args["sort"] = json!([{ "property": "updated", "isAscending": false }]);
+        }
+        s.call_one("Task/query", args)
+    };
+    let v = match query(true) {
+        Err(e) if refused(&e, "unsupportedSort") || refused(&e, "invalidArguments") => query(false)?,
+        other => other?,
+    };
+    let ids: Vec<String> = v["ids"].as_array().into_iter().flatten().filter_map(|i| i.as_str().map(str::to_owned)).collect();
+    let (found, _) = get_all(s, "Task/get", account, &ids)?;
+    let mut out = Vec::new();
+    for v in &found {
+        let Some(id) = v["id"].as_str() else { continue };
+        let task_ids = task_lists_of(v);
+        let Some(list) = lists.iter().find(|l| l.shown && task_ids.contains(&l.id)) else { continue };
+        if task_rule(v).is_some() {
+            continue;
+        }
+        let Some(mut event) = from_jstask(v) else { continue };
+        event.completed_at = v["updated"]
+            .as_str()
+            .and_then(|u| DateTime::parse_from_rfc3339(u).ok())
+            .map_or(0, |u| u.timestamp());
+        if !event.completed || event.completed_at < since {
+            continue;
+        }
+        if event.uid.is_empty() {
+            event.uid = id.to_owned();
+        }
+        out.push(JmapTask { list: list.id.clone(), event, version: event_version(v), id: id.to_owned() });
+    }
+    out.sort_by_key(|t| std::cmp::Reverse(t.event.completed_at));
+    Ok(out)
+}
 /// Tasks changed or gone since `since` (Task/changes, §4.5), with `again`
 /// (ids) read anew too, as a repeating task's occurrence to do moves on
 /// with time: those still to do in the lists shown, the ids of the others,
@@ -2634,7 +2771,9 @@ fn occurrence_patch(task: &ical::Event, current: &Value, at: i64) -> Map<String,
         match k.as_str() {
             // The series': the same in every occurrence, so taken out of
             // this one's override.
-            "title" | "description" => {
+            _ if matches!(k.as_str(), "title" | "description" | "priority" | "keywords" | "relatedTo" | "links")
+                || k.starts_with("links/") =>
+            {
                 if current[&k] != val {
                     series.insert(k.clone(), val);
                 }
@@ -3104,5 +3243,45 @@ mod tests {
         phoned.phones.push("+1 555 0199".into());
         let patch = to_jscontact(&phoned, Some(&v));
         assert_eq!(patch["phones"]["m"]["features"]["mobile"], true);
+    }
+
+    /// A Task's priority, keywords, parent and link are read as a task's,
+    /// and only those changed are sent; other relations and links stay.
+    #[test]
+    fn task_priority_tags_parent_and_link() {
+        let v = json!({
+            "@type": "Task", "id": "T9", "uid": "sub@x", "taskListIds": { "l1": true }, "title": "Forms",
+            "priority": 3, "keywords": { "home": true, "money": true },
+            "relatedTo": { "taxes@x": { "@type": "Relation", "relation": { "parent": true } }, "s@x": { "@type": "Relation", "relation": { "next": true } } },
+            "links": { "k1": { "@type": "Link", "href": "https://example.org/a" } },
+        });
+        let e = from_jstask(&v).unwrap();
+        assert_eq!((e.priority, e.parent.as_str(), e.url.as_str()), (3, "taxes@x", "https://example.org/a"));
+        assert_eq!(e.categories, ["home", "money"]);
+        // Unchanged: none of them is sent.
+        let same = to_jstask(&e, Some(&v));
+        for k in ["priority", "keywords", "relatedTo", "links"] {
+            assert!(!same.keys().any(|p| p.starts_with(k)), "{k} isn't sent: {same:?}");
+        }
+        // Changed: priority and tags as they are now; the parent gone, the
+        // other relation kept; the link changed where it is.
+        let changed = ical::Event { priority: 0, categories: vec!["work".into()], parent: String::new(), url: "mid:m@x".into(), ..e.clone() };
+        let p = to_jstask(&changed, Some(&v));
+        assert_eq!(p["priority"], json!(0));
+        assert_eq!(p["keywords"], json!({ "work": true }));
+        assert_eq!(p["relatedTo"], json!({ "s@x": { "@type": "Relation", "relation": { "next": true } } }));
+        assert_eq!(p["links/k1"], json!({ "@type": "Link", "href": "mid:m@x" }));
+        // A new task with them: whole.
+        let new = ical::Event { uid: "n@x".into(), summary: "Call".into(), task: true, priority: 1, parent: "p@x".into(), url: "mid:m@x".into(), categories: vec!["a".into()], ..Default::default() };
+        let p = to_jstask(&new, None);
+        assert_eq!(p["priority"], json!(1));
+        assert_eq!(p["keywords"], json!({ "a": true }));
+        assert_eq!(p["relatedTo"]["p@x"]["relation"]["parent"], json!(true));
+        assert_eq!(p["links"]["picacho"]["href"], json!("mid:m@x"));
+        let back = from_jstask(&Value::Object(p)).unwrap();
+        assert_eq!((back.priority, back.parent.as_str(), back.url.as_str()), (1, "p@x", "mid:m@x"));
+        // A link taken off: gone from its place.
+        let unlinked = to_jstask(&ical::Event { url: String::new(), ..e.clone() }, Some(&v));
+        assert_eq!(unlinked["links/k1"], Value::Null);
     }
 }

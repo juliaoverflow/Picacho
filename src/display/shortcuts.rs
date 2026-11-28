@@ -123,9 +123,11 @@ pub(super) fn bindable() -> Vec<Bindable> {
         b(Messages, "open-in-window", t!("shortcuts-open-in-new-window"), "secondary-o", OpenInWindow),
         b(Messages, "find-in-message", t!("shortcuts-find-in-message"), "secondary-f", FindInMessage),
         b(Messages, "print", t!("shortcuts-print"), "secondary-p", PrintMessage),
+        b(Messages, "toggle-contact-panel", t!("shortcuts-show-hide-contact-panel"), "secondary-alt-i", ToggleContactPanel),
         b(Mailbox, "refresh", t!("shortcuts-refresh"), "secondary-r", Refresh),
         b(Mailbox, "search-mailbox", t!("shortcuts-search-mailbox"), "secondary-alt-f", Search),
         b(Mailbox, "select-all", t!("shortcuts-select-all-messages"), "secondary-a", SelectAllMail),
+        b(Mailbox, "attachments", t!("shortcuts-browse-attachments"), "secondary-alt-a", ShowAttachmentBrowser),
         b(Mailbox, "group-by-conversation", t!("shortcuts-group-by-conversation"), "secondary-shift-t", ToggleThreads),
         b(Mailbox, "go-inbox", t!("shortcuts-go-to-inbox"), "secondary-1", GoInbox),
         b(Mailbox, "go-starred", t!("shortcuts-go-to-starred"), "secondary-2", GoStarred),
@@ -157,6 +159,8 @@ pub(super) fn bindable() -> Vec<Bindable> {
         composing("preview-formatting", t!("shortcuts-preview-formatting"), "secondary-shift-p", TogglePreview),
         composing("find-in-draft", t!("shortcuts-find-in-draft"), "secondary-f", FindInDraft),
         b(Writing, "undo", t!("shortcuts-undo"), "secondary-z", gpui_component::input::Undo),
+        // In the window; a composer's own ⌘K (Insert Link) wins inside it.
+        b(App, "command-palette", t!("shortcuts-command-palette"), "secondary-k", ShowCommandPalette),
         b(App, "settings", t!("shortcuts-settings"), "secondary-,", ShowAccounts),
         b(
             App,
@@ -1166,14 +1170,16 @@ mod tests {
         let both = shown("secondary-k secondary-a");
         assert_eq!(both, format!("{} {}", shown("secondary-k"), shown("secondary-a")));
         // Code (⌘E) doesn't compete; Insert Link (⌘K) waits on it, but
-        // that's the composer, not the main window.
-        assert!(clashes(archive, &effective(archive, &custom), &all, &custom).is_empty());
+        // that's the composer, not the main window. The command palette's
+        // ⌘K is the main window's, so it does.
+        let names = |found: Vec<&Bindable>| found.iter().map(|b| b.name).collect::<Vec<_>>();
+        assert_eq!(
+            names(clashes(archive, &effective(archive, &custom), &all, &custom)),
+            vec!["command-palette"]
+        );
         let refresh = all.iter().find(|b| b.name == "refresh").unwrap();
-        let clash: Vec<_> = clashes(refresh, &["secondary-k".into()], &all, &custom)
-            .iter()
-            .map(|b| b.name)
-            .collect();
-        assert_eq!(clash, vec!["archive"]);
+        let clash = names(clashes(refresh, &["secondary-k".into()], &all, &custom));
+        assert_eq!(clash, vec!["archive", "command-palette"]);
     }
 
     #[test]

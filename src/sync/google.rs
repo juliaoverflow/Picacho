@@ -16,6 +16,8 @@
 //!
 //! These helpers only talk to Google; Manage keeps the result
 //! (`manage/google_pim.rs`).
+pub mod tasks;
+
 use super::rest::{Rest, escape};
 use crate::sync::carddav::Card;
 use crate::sync::ical::{self, Event, FreeBusy, PartStat};

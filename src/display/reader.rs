@@ -403,6 +403,14 @@ impl MailApp {
                 },
             )
             .child(self.button(
+                "add-to-tasks",
+                t!("tasks-add-to-tasks-button"),
+                "tasks",
+                Action::Tasks(super::tasks::TaskAction::FromMail(m.id.clone(), None)),
+                false,
+                cx,
+            ))
+            .child(self.button(
                 "read",
                 &shortcuts::tip(t!("reader-mark-read-unread"), "toggle-read", cx),
                 "mail",
@@ -417,7 +425,37 @@ impl MailApp {
                 Action::Move(Folder::Trash),
                 false,
                 cx,
-            ));
+            ))
+            // The contact panel's button, at the edge it opens from.
+            .when(!self.mobile.on && !single, |d| {
+                d.child(div().w(px(1.)).h(px(20.)).mx_1().bg(rgb(c.border)))
+                    .child(self.contact_panel_toggle(cx))
+            });
+        let panel = self.shows_contact_panel(single);
+        if panel && self.contact_panel_stale(&m.id) {
+            // Only what tells who the other person is: never its text.
+            let m = Mail {
+                id: m.id.clone(),
+                account: m.account.clone(),
+                folder: m.folder,
+                from: m.from.clone(),
+                sender: m.sender.clone(),
+                to: m.to.clone(),
+                ..Mail::default()
+            };
+            let view = cx.entity().downgrade();
+            cx.defer(move |cx| {
+                let _ = view.update(cx, |this, cx| this.ensure_contact_panel(&m, cx));
+            });
+        }
+        // The reader's width: the pane's, or the window's less the sidebar
+        // with the reader below the list.
+        let reader_width = if self.org.layout == crate::manage::organize::ReaderLayout::Below {
+            let window = self.window_width.get();
+            window - self.layout(window, compact).sidebar
+        } else {
+            self.reader_shown.get()
+        };
         div()
             .id("reader-pane")
             .role(Role::Main)
@@ -432,7 +470,24 @@ impl MailApp {
             .flex()
             .flex_col()
             .child(toolbar)
-            .child(self.reader_body(m, window, cx))
+            .child(
+                div()
+                    .relative()
+                    .flex()
+                    .flex_1()
+                    .min_h_0()
+                    .min_w_0()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .flex_1()
+                            .min_w_0()
+                            .h_full()
+                            .child(self.reader_body(m, window, cx)),
+                    )
+                    .when(panel, |d| d.child(self.contact_panel(m, reader_width, cx))),
+            )
             .into_any_element()
     }
 

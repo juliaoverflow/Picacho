@@ -2348,6 +2348,62 @@ fn jmap_tasks_read_and_written() -> Result<()> {
     Ok(())
 }
 
+/// A JMAP task moved to another of the account's lists moves there in
+/// place, its subtasks with it; what was done lately on the server is in
+/// the Completed history, and can be made to do again.
+#[test]
+fn jmap_tasks_move_in_place_and_completed_history() -> Result<()> {
+    let recently = chrono::DateTime::from_timestamp(chrono::Utc::now().timestamp() - 3600, 0).unwrap().to_rfc3339();
+    let long_ago = chrono::DateTime::from_timestamp(chrono::Utc::now().timestamp() - 200 * 86_400, 0).unwrap().to_rfc3339();
+    let fixture = Server {
+        modern: true,
+        tasks_on: true,
+        task_lists: vec![
+            json!({ "id": "l0", "name": "Home", "isSubscribed": true, "myRights": { "mayWrite": true } }),
+            json!({ "id": "l1", "name": "Work", "isDefault": true, "isSubscribed": true, "myRights": { "mayWrite": true } }),
+        ],
+        tasks: vec![
+            json!({ "@type": "Task", "id": "T1", "uid": "taxes@x", "taskListIds": { "l1": true }, "title": "Taxes", "priority": 2,
+                    "alerts": { "a1": { "@type": "Alert", "trigger": { "@type": "AbsoluteTrigger", "when": "2099-01-01T00:00:00Z" } } } }),
+            json!({ "@type": "Task", "id": "T5", "uid": "forms@x", "taskListIds": { "l1": true }, "title": "Forms",
+                    "relatedTo": { "taxes@x": { "@type": "Relation", "relation": { "parent": true } } } }),
+            json!({ "@type": "Task", "id": "T2", "uid": "old@x", "taskListIds": { "l1": true }, "title": "Old", "progress": "completed", "updated": recently }),
+            json!({ "@type": "Task", "id": "T6", "uid": "older@x", "taskListIds": { "l1": true }, "title": "Older", "progress": "completed", "updated": long_ago }),
+        ],
+        ..Default::default()
+    };
+    let (cert, port, server, _running) = start(fixture)?;
+    let (b, mut a, path) = backend(&cert)?;
+    let _cleanup = Cleanup(path);
+    a.provider = Provider::Jmap;
+    a.incoming_port = port;
+    b.store.save_account(&a)?;
+    b.connect_jmap_calendar(&a)?;
+    assert_eq!(b.calendar_tasks().len(), 2);
+    let draft = super::calendar::tasks::TaskDraft { summary: "Taxes".into(), priority: 2, list: "jmap:l0".into(), ..Default::default() };
+    let moved = b.edit_task_draft("taxes@x", &draft)?;
+    assert_eq!((moved.href.as_str(), moved.calendar.as_str()), ("jmap:T1", "jmap:l0"));
+    {
+        let s = server.lock().unwrap();
+        for id in ["T1", "T5"] {
+            let t = s.tasks.iter().find(|t| t["id"] == id).unwrap();
+            assert_eq!(t["taskListIds"], json!({ "l0": true }), "{id}");
+        }
+        // Nothing else of it changed: its alert stays.
+        assert!(s.tasks.iter().find(|t| t["id"] == "T1").unwrap()["alerts"]["a1"].is_object());
+    }
+    assert!(b.calendar_tasks().iter().all(|t| t.calendar == "jmap:l0"));
+    // Done lately on the server: in the history; long ago: not.
+    assert_eq!(b.sync_completed_tasks()?, 1);
+    let done = b.completed_tasks();
+    assert_eq!(done[0].event.uid, "old@x");
+    assert!(done[0].event.completed_at > 0);
+    b.reopen_task("old@x")?;
+    assert_eq!(server.lock().unwrap().tasks.iter().find(|t| t["id"] == "T2").unwrap()["progress"], "needs-action");
+    assert!(b.calendar_tasks().iter().any(|t| t.event.uid == "old@x"));
+    Ok(())
+}
+
 /// Tasks over JMAP once read follow changes (Task/changes); a repeating
 /// task is done one occurrence at a time; task alerts are reminders; and
 /// tasks others changed (TaskNotification) are told like calendars'.

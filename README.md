@@ -190,8 +190,8 @@ Browser sign-in uses Picacho's own registration with each provider. Set these wh
 
 | Variable                                                   | Used for                                                                                                                                          |
 | ---------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `PICACHO_GOOGLE_CLIENT_ID`, `PICACHO_GOOGLE_CLIENT_SECRET` | Google OAuth **Desktop app** client with the `https://mail.google.com/` scope; for **Use the Gmail API**, also the Gmail API turned on in its project and `https://www.googleapis.com/auth/gmail.settings.basic` |
-| `PICACHO_MICROSOFT_CLIENT_ID`                              | Microsoft Entra public client with `http://localhost` as a mobile and desktop redirect URI, and delegated `IMAP.AccessAsUser.All` and `SMTP.Send`; for **Use Microsoft Graph**, also Microsoft Graph's delegated `Mail.ReadWrite`, `Mail.Send`, `MailboxSettings.ReadWrite`, `Calendars.ReadWrite`, `Contacts.ReadWrite` and `People.Read` (none needs an administrator's consent). Exchange Server with hybrid modern authentication uses it too unless the administrator gives a client id: the organization's administrator consents to Office 365 Exchange Online's `EWS.AccessAsUser.All` for its on-premises server's URL |
+| `PICACHO_GOOGLE_CLIENT_ID`, `PICACHO_GOOGLE_CLIENT_SECRET` | Google OAuth **Desktop app** client with the `https://mail.google.com/` scope; for **Use the Gmail API**, also the Gmail API turned on in its project and `https://www.googleapis.com/auth/gmail.settings.basic`; for Google Tasks (Tasks → Task services), the Google Tasks API turned on and `https://www.googleapis.com/auth/tasks` on its consent screen |
+| `PICACHO_MICROSOFT_CLIENT_ID`                              | Microsoft Entra public client with `http://localhost` as a mobile and desktop redirect URI, and delegated `IMAP.AccessAsUser.All` and `SMTP.Send`; for **Use Microsoft Graph**, also Microsoft Graph's delegated `Mail.ReadWrite`, `Mail.Send`, `MailboxSettings.ReadWrite`, `Calendars.ReadWrite`, `Contacts.ReadWrite` and `People.Read`, and `Tasks.ReadWrite` for Microsoft To Do (Tasks → Task services, asked only then; none needs an administrator's consent). Exchange Server with hybrid modern authentication uses it too unless the administrator gives a client id: the organization's administrator consents to Office 365 Exchange Online's `EWS.AccessAsUser.All` for its on-premises server's URL |
 | `PICACHO_FASTMAIL_CLIENT_ID`                               | Fastmail OAuth public client with a loopback redirect (`http://127.0.0.1:<port>/callback`) and the JMAP core, mail, submission and Sieve scopes |
 
 Pinal Mail signs in with Pinal Accounts, and the mail server accepts Pinal's tokens over IMAP, SMTP and ManageSieve (XOAUTH2/OAUTHBEARER), so no password is stored. Picacho is an ordinary **native** app in Pinal's Developers portal, with redirect URIs `http://127.0.0.1/callback` (any port) and `https://accounts.pinal.tech/native/callback` (used by the macOS bundle, which Pinal hands back to `picacho://`), and the scopes `openid profile email offline_access mail.read mail.labels mail.compose mail.send mail.settings`.
@@ -284,6 +284,13 @@ Beyond reading, writing and organizing mail, Picacho has:
     while it's locked; **Hide mail outside Picacho** (on with the lock)
     keeps who and what out of notifications and widgets. Tries slow down
     after five wrong passcodes.
+  - *System search:* **Show mail in Spotlight** (macOS, iOS), **Show mail
+    in Windows Search** (Windows) or **Show mail in desktop search** (GNOME
+    and KDE Plasma on Linux) lets the system's search find your messages by
+    subject, people and text, and opens them in Picacho. Off by default,
+    and never while mail is hidden outside Picacho. Linux's searches ask
+    Picacho as you type, so nothing is copied; elsewhere it's also off while
+    the database is encrypted.
   - *Encrypted database:* the local copy of your mail, drafts, contacts,
     calendars and settings is encrypted with SQLCipher (AES-256), with a
     random key kept in the system keychain, so background checks still

@@ -43,6 +43,10 @@ pub(super) enum LockAction {
     SetEncrypted(bool),
     /// Keeps senders, subjects and previews out of notifications and widgets.
     SetHideContents(bool),
+    /// Puts mail in Spotlight or Windows Search, or takes it out.
+    SetSystemSearch(bool),
+    /// Windows: opens Indexing Options, to add Picacho's folder by hand.
+    OpenIndexingOptions,
 }
 
 /// Whether Picacho's windows are covered by the lock.
@@ -113,6 +117,8 @@ pub(super) struct LockUi {
     encrypting: bool,
     /// Notifications and widgets leave out what mail says.
     hide_contents: bool,
+    /// Mail is in Spotlight or Windows Search (`system_search`).
+    system_search: bool,
     /// A phone's screen is covered while Picacho isn't in front, so the
     /// app switcher's picture of it shows no mail.
     pub(super) obscured: bool,
@@ -157,6 +163,7 @@ impl LockUi {
             encrypted: store.encrypted(),
             encryption_error: None,
             hide_contents: applock::hides_contents(store),
+            system_search: crate::manage::system_search::enabled(store),
             obscured: false,
             deferred: Vec::new(),
         }
@@ -246,6 +253,13 @@ impl MailApp {
             }
             LockAction::SetEncrypted(on) => self.set_database_encrypted(on, cx),
             LockAction::SetHideContents(on) => self.set_hide_contents(on, cx),
+            LockAction::SetSystemSearch(on) => self.set_system_search(on, cx),
+            LockAction::OpenIndexingOptions => {
+                #[cfg(windows)]
+                if let Err(e) = std::process::Command::new("control.exe").arg("srchadmin.dll").spawn() {
+                    self.notice(format!("{e}"), true, cx);
+                }
+            }
         }
         cx.notify();
     }
@@ -433,12 +447,65 @@ impl MailApp {
             return;
         }
         self.lock.hide_contents = on;
+        // Hidden outside Picacho means out of the system's search too.
+        if on && self.lock.system_search {
+            self.set_system_search(false, cx);
+        }
         // Widgets show the change now, not at the next new mail.
         cx.background_spawn(async move {
             crate::manage::widgets::publish_force(&store);
         })
         .detach();
         cx.notify();
+    }
+
+    /// Puts mail in the system's search (every message queued, off this
+    /// thread: a large cache takes a moment) or takes it out.
+    fn set_system_search(&mut self, on: bool, cx: &mut Context<Self>) {
+        use crate::manage::system_search;
+        if on && !system_search::allowed(&self.backend.store) {
+            self.notice(t!("manage-system-search-isnt-allowed"), true, cx);
+            return;
+        }
+        self.lock.system_search = on;
+        self.write_in_order(
+            cx,
+            move |b| system_search::set_enabled(&b.store, on),
+            move |this, result, cx| match result {
+                Ok(()) if on => this.follow_system_search(cx),
+                Ok(()) => {}
+                Err(e) => {
+                    this.lock.system_search = system_search::enabled(&this.backend.store);
+                    this.notice(t!("applock-couldnt-save-the-setting", e = format!("{:#}", e)), true, cx);
+                }
+            },
+        );
+        cx.notify();
+    }
+
+    /// Settings → Privacy shows how many messages are still being added,
+    /// and anything that went wrong, while they are.
+    fn follow_system_search(&mut self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            // At most an hour: a very large cache, or a system that
+            // doesn't answer, is shown as it stands by then.
+            for _ in 0..1800 {
+                cx.background_executor().timer(Duration::from_secs(2)).await;
+                let Ok(going) = this.update(cx, |this, cx| {
+                    if this.retired || !this.lock.system_search {
+                        return false;
+                    }
+                    cx.notify();
+                    crate::manage::system_search::status().waiting > 0
+                }) else {
+                    return;
+                };
+                if !going {
+                    break;
+                }
+            }
+        })
+        .detach();
     }
 
     /// Tells the system what it may show of Picacho outside it: on Android
@@ -794,6 +861,75 @@ impl MailApp {
             .child(column)
     }
 
+    /// Mail in Spotlight or Windows Search: its switch, and how adding
+    /// mail is going.
+    fn system_search_rows(&self, rows: Rows, cx: &Context<Self>) -> Rows {
+        use crate::manage::system_search;
+        let c = self.colors();
+        let allowed = system_search::allowed(&self.backend.store);
+        // Not while it's no longer allowed: the worker takes mail out then.
+        let on = self.lock.system_search && allowed;
+        let (title, caption) = if cfg!(windows) {
+            (t!("applock-show-mail-in-windows-search"), t!("applock-windows-search-caption"))
+        } else if system_search::PUSHES {
+            (t!("applock-show-mail-in-spotlight"), t!("applock-spotlight-caption"))
+        } else {
+            (t!("applock-show-mail-in-desktop-search"), t!("applock-desktop-search-caption"))
+        };
+        let caption = if allowed {
+            caption
+        } else if system_search::PUSHES {
+            t!("applock-system-search-not-while-hidden")
+        } else {
+            t!("applock-desktop-search-not-while-hidden")
+        };
+        let mut rows = rows.row(self.switch_setting(
+            title,
+            caption,
+            "system-search".into(),
+            on,
+            Action::Lock(LockAction::SetSystemSearch(!on)),
+            cx,
+        ));
+        if !on {
+            return rows;
+        }
+        let status = system_search::status();
+        if status.waiting > 0 {
+            rows = rows.row(
+                div()
+                    .text_size(px(12.))
+                    .text_color(rgb(c.accent))
+                    .child(t!("applock-system-search-adding", count = status.waiting).to_string()),
+            );
+        }
+        if let Some(error) = status.error {
+            let mut problem = div()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .child(div().text_size(px(12.)).text_color(rgb(c.danger)).child(error));
+            if cfg!(windows) {
+                problem = problem.child(
+                    div().flex().child(
+                        self.button(
+                            "system-search-indexing-options",
+                            t!("applock-open-indexing-options"),
+                            "",
+                            Action::Lock(LockAction::OpenIndexingOptions),
+                            false,
+                            cx,
+                        )
+                        .border_1()
+                        .border_color(rgb(c.border)),
+                    ),
+                );
+            }
+            rows = rows.row(problem);
+        }
+        rows
+    }
+
     /// Settings → Privacy.
     pub(super) fn privacy_page(&self, cx: &Context<Self>) -> AnyElement {
         let c = self.colors();
@@ -890,7 +1026,7 @@ impl MailApp {
                 app_lock = app_lock.row(self.lock_form(cx));
             }
         }
-        let outside = Rows::new().row(self.switch_setting(
+        let mut outside = Rows::new().row(self.switch_setting(
             t!("applock-hide-mail-outside-picacho"),
             t!("applock-notifications-and-widgets-say-how-much"),
             "hide-contents".into(),
@@ -898,6 +1034,9 @@ impl MailApp {
             Action::Lock(LockAction::SetHideContents(!lock.hide_contents)),
             cx,
         ));
+        if crate::manage::system_search::AVAILABLE {
+            outside = self.system_search_rows(outside, cx);
+        }
         let encrypted = lock.encrypted;
         let mut database = Rows::new().row(self.switch_setting(
             t!("applock-encrypt-the-local-database"),

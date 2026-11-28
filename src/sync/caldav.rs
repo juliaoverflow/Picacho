@@ -54,6 +54,10 @@ pub struct Server {
     /// What the person calls this source (a feed's name), where they said.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub label: String,
+    /// A source of tasks alone, not calendars: Microsoft To Do (with
+    /// `graph_account`) or Google Tasks (with `google_account`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub tasks_only: bool,
 }
 
 fn is_zero_u32(n: &u32) -> bool {
@@ -270,6 +274,42 @@ pub fn tasks(
         return Err(e.context(t!("sync-caldav-the-calendar-server-didnt-list-your")));
     }
     sort_tasks(&mut out);
+    Ok(out)
+}
+
+/// A query for tasks done since a time (`{since}`: COMPLETED in a
+/// time-range, RFC 4791 §9.7.2), or done at all where that's refused.
+const DONE_QUERY: &str = "<?xml version=\"1.0\"?><c:calendar-query xmlns:d=\"DAV:\" xmlns:c=\"urn:ietf:params:xml:ns:caldav\"><d:prop><d:getetag/><c:schedule-tag/><c:calendar-data/></d:prop><c:filter><c:comp-filter name=\"VCALENDAR\"><c:comp-filter name=\"VTODO\"><c:prop-filter name=\"COMPLETED\">{range}</c:prop-filter></c:comp-filter></c:comp-filter></c:filter></c:calendar-query>";
+
+/// The tasks in `calendars` done since `since` (Unix seconds), newest first.
+/// A server that can't pick them by when (a time-range on COMPLETED) is
+/// asked for every done task, and the recent ones kept. Calendars that
+/// refuse are skipped: what was done is no reason to fail.
+pub fn completed_tasks(
+    server: &Server,
+    password: &str,
+    tls: native_tls::TlsConnector,
+    calendars: &[Calendar],
+    since: i64,
+) -> Result<Vec<Stored>> {
+    let c = client(server, password, tls)?;
+    let start = chrono::DateTime::from_timestamp(since, 0).unwrap_or_default().format("%Y%m%dT%H%M%SZ").to_string();
+    let ranged = DONE_QUERY.replace("{range}", &format!("<c:time-range start=\"{start}\"/>"));
+    let any = DONE_QUERY.replace("{range}", "");
+    let mut out = Vec::new();
+    for cal in calendars {
+        let href = url::Url::parse(&cal.href)?;
+        let Ok(found) = c.list(&href, &ranged, "calendar-data").or_else(|_| c.list(&href, &any, "calendar-data")) else {
+            continue;
+        };
+        out.extend(
+            found
+                .into_iter()
+                .filter_map(|r| stored_task(&cal.href, r))
+                .filter(|s| s.event.completed && s.event.completed_at >= since && s.event.recurrence.is_empty()),
+        );
+    }
+    out.sort_by_key(|s| std::cmp::Reverse(s.event.completed_at));
     Ok(out)
 }
 
@@ -1128,6 +1168,45 @@ mod tests {
         let seen = server.join().unwrap();
         assert_eq!(seen.len(), 5);
         Ok(())
+    }
+
+    #[test]
+    fn tasks_done_lately_are_read_by_when() -> Result<()> {
+        let now = chrono::Utc::now().timestamp();
+        let stamp = |t: i64| chrono::DateTime::from_timestamp(t, 0).unwrap().format("%Y%m%dT%H%M%SZ").to_string();
+        let todo = |uid: &str, at: i64| format!("BEGIN:VCALENDAR\nBEGIN:VTODO\nUID:{uid}\nSUMMARY:{uid}\nSTATUS:COMPLETED\nCOMPLETED:{}\nEND:VTODO\nEND:VCALENDAR\n", stamp(at));
+        let (recent, older, old) = (todo("recent", now - 3600), todo("older", now - 86_400), todo("old", now - 400 * 86_400));
+        let (port, server) = dav::test_server(3, move |method, path, body| match (method, path) {
+            // The first calendar picks them by when; the second can't.
+            ("REPORT", "/cal/a/") => {
+                assert!(body.contains("time-range start="), "{body}");
+                let items = [("/cal/a/1.ics", older.as_str()), ("/cal/a/2.ics", recent.as_str())];
+                ("207 Multi-Status", multistatus(&items))
+            }
+            ("REPORT", "/cal/b/") if body.contains("time-range") => ("403 Forbidden", String::new()),
+            ("REPORT", "/cal/b/") => ("207 Multi-Status", multistatus(&[("/cal/b/3.ics", old.as_str())])),
+            _ => ("404 Not Found", String::new()),
+        });
+        let srv = Server { url: format!("http://127.0.0.1:{port}"), user: "ana".into(), ..Default::default() };
+        let cals: Vec<Calendar> = ["a", "b"]
+            .iter()
+            .map(|c| Calendar { href: format!("http://127.0.0.1:{port}/cal/{c}/"), writable: true, ..Default::default() })
+            .collect();
+        let found = completed_tasks(&srv, "secret", native_tls::TlsConnector::new().unwrap(), &cals, now - 90 * 86_400)?;
+        // Newest first; the one done long ago left out.
+        assert_eq!(found.iter().map(|t| t.event.uid.as_str()).collect::<Vec<_>>(), ["recent", "older"]);
+        assert!(found[0].event.completed_at > found[1].event.completed_at);
+        server.join().unwrap();
+        Ok(())
+    }
+
+    /// A multistatus with calendar data, for the tests' servers.
+    fn multistatus(items: &[(&str, &str)]) -> String {
+        let mut body = String::from("<d:multistatus xmlns:d=\"DAV:\" xmlns:c=\"urn:ietf:params:xml:ns:caldav\">");
+        for (href, data) in items {
+            body.push_str(&format!("<d:response><d:href>{href}</d:href><d:propstat><d:prop><d:getetag>\"1\"</d:getetag><c:calendar-data>{data}</c:calendar-data></d:prop></d:propstat></d:response>"));
+        }
+        body + "</d:multistatus>"
     }
 
     #[test]

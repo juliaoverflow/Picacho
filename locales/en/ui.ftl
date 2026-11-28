@@ -818,6 +818,10 @@ ui-group-by-conversation = Group by Conversation
 
 ui-toggle-sidebar = Toggle Sidebar
 
+ui-toggle-contact-panel = Toggle Contact Panel
+
+ui-browse-attachments = Browse Attachments
+
 ui-toggle-dark-mode = Toggle Dark Mode
 
 ui-zoom-in = Zoom In

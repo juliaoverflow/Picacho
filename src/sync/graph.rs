@@ -20,6 +20,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 pub mod dav;
+pub mod todo;
 
 pub const BASE: &str = "https://graph.microsoft.com";
 const V: &str = "/v1.0";

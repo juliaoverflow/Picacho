@@ -39,6 +39,12 @@ fn install() -> std::io::Result<()> {
     };
     let data = base.data_dir();
     let _ = install_plasmoids(data);
+    // KRunner finds Picacho's search (`system_search::desktop_search`)
+    // here; GNOME reads only the system's folders, which packages fill.
+    let _ = write_if_changed(
+        &data.join(format!("krunner/dbusplugins/{APP_ID}.desktop")),
+        include_bytes!("../../packaging/linux/tech.pinal.picacho.krunner.desktop"),
+    );
 
     let entry = format!("applications/{APP_ID}.desktop");
     let system = std::env::var("XDG_DATA_DIRS")

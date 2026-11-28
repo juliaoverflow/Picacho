@@ -71,6 +71,12 @@ pub(super) fn launch(store: Arc<Store>, listener: Option<instance::Listener>, cx
     }
     // The tray's counts follow the widget snapshots.
     tray::follow(&backend.store);
+    // Mail in Spotlight or Windows Search, when turned on (Settings → Privacy).
+    crate::manage::system_search::start(backend.store.clone(), |link| {
+        if let Some(request) = crate::display::launch::request(&link) {
+            crate::display::launch::push(request);
+        }
+    });
     cx.set_global(Shell {
         backend,
         main: None,

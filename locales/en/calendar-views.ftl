@@ -81,6 +81,7 @@ calendar-views-all-day = All day
 calendar-views-calendar = Calendar
 
 calendar-views-contacts = Contacts
+calendar-views-tasks = Tasks
 
 calendar-views-back-to-mail = @Back to mail
 

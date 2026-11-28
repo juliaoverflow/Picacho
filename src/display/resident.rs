@@ -79,6 +79,11 @@ pub fn run(dir: &Path) -> anyhow::Result<()> {
             let _ = opens.unbounded_send(TrayCommand::Open);
         })),
     });
+    // Mail in the system's search: added to Spotlight or Windows Search
+    // here too, and Linux's searches ask here. A result chosen opens the
+    // window on it.
+    let _ = OPENS.set(commands.clone());
+    crate::manage::system_search::start(store.clone(), open_result);
     let launches = commands.clone();
     let socket = listener.serve(move || launches.unbounded_send(TrayCommand::Open).is_ok());
     let state = State {
@@ -88,6 +93,20 @@ pub fn run(dir: &Path) -> anyhow::Result<()> {
         socket,
     };
     event_loop(state, commands, requests)
+}
+
+/// Where a system search's result chosen here goes: to the window, which
+/// this process starts with it (`TrayCommand::Open`).
+static OPENS: std::sync::OnceLock<UnboundedSender<TrayCommand>> = std::sync::OnceLock::new();
+
+/// Opens message `link` (a system search's result) in the window.
+fn open_result(link: String) {
+    if let Some(request) = super::launch::request(&link) {
+        super::launch::push(request);
+    }
+    if let Some(opens) = OPENS.get() {
+        let _ = opens.unbounded_send(TrayCommand::Open);
+    }
 }
 
 /// What handing over or quitting ends.
@@ -183,6 +202,12 @@ fn event_loop(
     {
         use tao::platform::macos::{ActivationPolicy, EventLoopExtMacOS};
         event_loop.set_activation_policy(ActivationPolicy::Accessory);
+    }
+    // A message chosen in Spotlight opens the window on it. tao's
+    // delegate (made with the event loop) handles other activities.
+    #[cfg(target_os = "macos")]
+    {
+        crate::manage::system_search::spotlight::handle_activities(c"TaoAppDelegateParent", open_result);
     }
     let proxy = event_loop.create_proxy();
     std::thread::Builder::new()

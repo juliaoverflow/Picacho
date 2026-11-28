@@ -7,6 +7,7 @@
 // puts it in its UIWindow. A CADisplayLink asks GPUI for frames and pauses
 // while GPUI has nothing to draw; GPUI's frame waker resumes it.
 
+#import <CoreSpotlight/CoreSpotlight.h>
 #import <QuartzCore/QuartzCore.h>
 #import <UIKit/UIKit.h>
 
@@ -30,6 +31,8 @@ extern void picacho_ios_scene_started(void);
 extern void picacho_ios_scene_backgrounded(void);
 extern void picacho_ios_collect_shares(void);
 extern bool picacho_ios_privacy_cover(void);
+// The Rust library (src/ios.rs): something for the window to open.
+extern void picacho_ios_launch(const uint8_t *request, size_t len);
 
 // Opens `url`: a share the Share extension handed over
 // (<scheme>://share/<id>) is taken here; the rest go to GPUI (sign-in
@@ -43,6 +46,21 @@ static void openURL(NSURL *url) {
         return;
     }
     gpui_ios_handle_open_url((__bridge void *)url.absoluteString);
+}
+
+// A Spotlight result chosen (src/manage/system_search/spotlight.rs): its
+// identifier is the message's picacho:// link, which the window opens (and
+// Rust checks, as any link). Other activities aren't Picacho's.
+static void openActivity(NSUserActivity *activity) {
+    if (![activity.activityType isEqualToString:CSSearchableItemActionType]) {
+        return;
+    }
+    id link = activity.userInfo[CSSearchableItemActivityIdentifier];
+    if (![link isKindOfClass:[NSString class]]) {
+        return;
+    }
+    NSData *bytes = [(NSString *)link dataUsingEncoding:NSUTF8StringEncoding];
+    picacho_ios_launch(bytes.bytes, bytes.length);
 }
 
 @interface PicachoScene : UIResponder <UIWindowSceneDelegate>
@@ -85,6 +103,9 @@ static void wake(void *context) {
         // A scene connected again (iOS let the earlier one go): it shows the
         // same window.
         [self attachToScene:(UIWindowScene *)scene];
+        for (NSUserActivity *activity in options.userActivities) {
+            openActivity(activity);
+        }
         return;
     }
     started = YES;
@@ -113,6 +134,10 @@ static void wake(void *context) {
 
     for (UIOpenURLContext *context in options.URLContexts) {
         openURL(context.URL);
+    }
+    // Started by choosing a Spotlight result.
+    for (NSUserActivity *activity in options.userActivities) {
+        openActivity(activity);
     }
 }
 
@@ -157,6 +182,11 @@ static void wake(void *context) {
     for (UIOpenURLContext *context in contexts) {
         openURL(context.URL);
     }
+}
+
+// A Spotlight result chosen while Picacho ran.
+- (void)scene:(UIScene *)scene continueUserActivity:(NSUserActivity *)userActivity {
+    openActivity(userActivity);
 }
 
 - (void)sceneWillEnterForeground:(UIScene *)scene {

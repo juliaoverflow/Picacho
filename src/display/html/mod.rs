@@ -3,6 +3,9 @@
 mod document;
 mod pdf_scene;
 pub mod print;
+/// Windows' print dialog and print system, for Print.
+#[cfg(windows)]
+pub mod print_windows;
 mod resources;
 pub(crate) mod svg_guard;
 #[cfg(test)]

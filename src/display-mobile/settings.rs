@@ -408,7 +408,7 @@ impl MailApp {
 }
 
 impl MailApp {
-    /// Calendar or Contacts opened as its own full-screen view on phones.
+    /// Calendar, Tasks or Contacts opened as its own full-screen view on phones.
     pub(super) fn mobile_app_view(
         &mut self,
         view: calendar_views::AppView,
@@ -417,6 +417,35 @@ impl MailApp {
     ) -> AnyElement {
         let c = self.colors();
         let back = self.back_icon("mobile-app-view-back", cx);
+        if view == calendar_views::AppView::Attachments {
+            // Its list scrolls itself, under the bar.
+            return div()
+                .id("mobile-attachments")
+                .debug_selector(|| "mobile-attachments".into())
+                .size_full()
+                .flex()
+                .flex_col()
+                .bg(rgb(c.surface))
+                .child(self.nav_bar(
+                    "mobile-app-view-bar",
+                    insets,
+                    Some(back),
+                    t!("attachments-attachments").to_owned(),
+                    None,
+                    vec![],
+                ))
+                .child(
+                    div()
+                        .flex()
+                        .flex_1()
+                        .min_h_0()
+                        .pl(px(insets.left))
+                        .pr(px(insets.right))
+                        .pb(px(insets.below()))
+                        .child(self.attachments_page(Corners::default(), true, cx)),
+                )
+                .into_any_element();
+        }
         let (id, title, content) = match view {
             calendar_views::AppView::Calendar => {
                 ("mobile-calendar", t!("mobile-settings-calendar"), self.calendar_page(cx))
@@ -424,6 +453,8 @@ impl MailApp {
             calendar_views::AppView::Contacts => {
                 ("mobile-contacts", t!("mobile-settings-contacts"), self.contacts_page(cx))
             }
+            calendar_views::AppView::Tasks => ("mobile-tasks", t!("calendar-views-tasks"), self.tasks_page(cx)),
+            calendar_views::AppView::Attachments => unreachable!("drawn above"),
         };
         div()
             .id(id)

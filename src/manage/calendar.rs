@@ -11,6 +11,9 @@ use crate::sync::caldav::{self, Stored};
 use crate::sync::ical::{self, Event, PartStat};
 use super::pim_sources::{self, Pim};
 
+#[path = "tasks.rs"]
+pub mod tasks;
+
 const SERVER: &str = "calendar_server";
 const CALENDARS: &str = "calendars";
 const EVENTS: &str = "calendar_events";
@@ -46,6 +49,13 @@ const TASK_LISTS: &str = "calendar_task_lists";
 /// the task lists were then ("lists@state"): only changes are read while
 /// the lists shown and their default alerts are the same.
 const TASK_STATE: &str = "calendar_task_state";
+/// Tasks done here lately, newest first, as JSON: the Tasks view's
+/// Completed history, from which they can be opened again.
+const TASKS_DONE: &str = "calendar_tasks_done";
+/// What a task service doesn't keep of its tasks but Picacho does, by UID
+/// (`tasks::Kept`): a Google task's priority and tags, a due time, a To Do
+/// step's notes and due date.
+const TASK_EXTRAS: &str = "calendar_task_extras";
 /// Reminders already shown: "uid@start@before".
 const REMINDED: &str = "calendar_reminded";
 #[cfg_attr(test, allow(dead_code))]
@@ -63,7 +73,7 @@ const FEED_STATE: &str = "calendar_feed_state";
 /// When a feed was last tried, read or not (Unix seconds).
 const FEED_TRIED: &str = "calendar_feed_tried";
 /// Every key a source keeps, emptied when it's disconnected.
-const SOURCE_KEYS: &[&str] = &[SERVER, CALENDARS, EVENTS, SYNCED, DEFAULT, TASKS, TASK_LISTS, TASK_STATE, JMAP_STATE, NOTICES, PARTICIPANTS, FEED_STATE, FEED_TRIED];
+const SOURCE_KEYS: &[&str] = &[SERVER, CALENDARS, EVENTS, SYNCED, DEFAULT, TASKS, TASK_LISTS, TASK_STATE, TASKS_DONE, TASK_EXTRAS, JMAP_STATE, NOTICES, PARTICIPANTS, FEED_STATE, FEED_TRIED];
 
 /// One source's parsed events, shared.
 type Events = Arc<Vec<Stored>>;
@@ -136,12 +146,12 @@ impl Backend {
     }
     /// The source new events go to: the one chosen (`set_default_calendar`),
     /// else the first that can take them: the first source, else another.
-    /// Feeds take none.
+    /// Feeds and sources of tasks alone take none.
     pub fn default_calendar_source(&self) -> String {
         let writable: Vec<String> = self
             .calendar_source_ids()
             .into_iter()
-            .filter(|id| self.in_calendar_source(id, || self.calendar_server().is_some_and(|s| !s.feed)))
+            .filter(|id| self.in_calendar_source(id, || self.calendar_server().is_some_and(|s| !s.feed && !s.tasks_only)))
             .collect();
         let chosen = self.store.preference(DEFAULT_SOURCE).unwrap_or_default();
         if writable.contains(&chosen) {
@@ -283,8 +293,15 @@ impl Backend {
             });
         }
         let server = self.calendar_server();
-        if server.as_ref().is_some_and(|s| !s.jmap_account.is_empty()) {
-            return self.task_lists().into_iter().find(|l| l.writable);
+        // JMAP, Microsoft To Do and Google Tasks keep task lists of their own.
+        if server.as_ref().is_some_and(|s| !s.jmap_account.is_empty() || s.tasks_only) {
+            let lists = self.task_lists();
+            let chosen = self.cal_pref(DEFAULT).unwrap_or_default();
+            return lists
+                .iter()
+                .find(|l| l.writable && l.href == chosen)
+                .or_else(|| lists.iter().find(|l| l.writable))
+                .cloned();
         }
         // Google, Exchange, Proton and feeds keep no tasks here.
         if server.as_ref().is_some_and(|s| !s.dav()) {
@@ -982,6 +999,9 @@ impl Backend {
     /// Saves an event where the calendars are: CalDAV, or a JMAP server.
     fn calendar_save(&self, server: &caldav::Server, calendar: &str, stored: &Stored) -> Result<Stored> {
         ensure!(!server.feed, t!("manage-calendar-subscribed-calendars-are-read-only"));
+        if server.tasks_only {
+            return self.save_remote_task(server, calendar, stored);
+        }
         if let Some(a) = self.calendar_google(server)? {
             let invite = !stored.event.attendees.is_empty() && self.organized_here(&stored.event);
             return self.google_save_event(&a, calendar, stored, invite);
@@ -1089,6 +1109,9 @@ impl Backend {
     /// Removes an event where the calendars are.
     fn calendar_delete(&self, server: &caldav::Server, stored: &Stored) -> Result<()> {
         ensure!(!server.feed, t!("manage-calendar-subscribed-calendars-are-read-only"));
+        if server.tasks_only {
+            return self.delete_remote_task(server, stored);
+        }
         if let Some(a) = self.calendar_google(server)? {
             let Some(id) = stored.href.strip_prefix("google:").filter(|i| !i.is_empty()) else {
                 return Ok(());
@@ -1351,6 +1374,9 @@ impl Backend {
         let server = self
             .calendar_server()
             .with_context(|| t!("manage-calendar-no-calendar-server-is-set-up"))?;
+        if server.tasks_only {
+            return self.sync_remote_tasks(&server);
+        }
         if let Some(a) = self.calendar_jmap(&server)? {
             return self.sync_jmap_tasks(&a);
         }
@@ -1504,13 +1530,24 @@ impl Backend {
             .find(|t| t.event.uid == uid)
             .with_context(|| t!("manage-calendar-this-task-is-no-longer-on"))?;
         task.event.completed = done;
+        task.event.completed_at = if done { chrono::Utc::now().timestamp() } else { 0 };
         // The source is kept: only what changed is rewritten (`ical::update_task`).
         task.event.sequence += 1;
         let calendar = task.calendar.clone();
         *task = self.calendar_save(&server, &calendar, task)?;
         let repeats = !task.event.recurrence.is_empty();
         if done {
+            let finished = task.clone();
             tasks.retain(|t| t.event.uid != uid);
+            // A To Do task's steps are listed only while it's to do.
+            if finished.href.starts_with("todo:") {
+                tasks.retain(|t| !(t.event.parent == uid && t.href.starts_with("todo:")));
+            }
+            // A repeating one goes on: only the occurrences of other
+            // tasks are history.
+            if !repeats {
+                self.remember_done(finished)?;
+            }
         }
         self.set_cal_pref(TASKS, &serde_json::to_string(&tasks)?)?;
         // A repeating JMAP task: only that occurrence is done (or not), so
@@ -1739,6 +1776,9 @@ impl Backend {
             .with_context(|| t!("manage-calendar-no-calendar-server-is-set-up"))?;
         if server.feed {
             return self.sync_feed(&server);
+        }
+        if server.tasks_only {
+            return self.sync_remote_tasks(&server);
         }
         if let Some(a) = self.calendar_google(&server)? {
             return self.sync_google_calendar(&a);

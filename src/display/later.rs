@@ -27,17 +27,7 @@ impl MailApp {
         } else {
             ids
         };
-        let ids: HashSet<String> = ids.into_iter().collect();
-        let snoozable: Vec<String> = self
-            .messages
-            .iter()
-            .filter(|m| ids.contains(&m.id) && !m.pending)
-            .filter(|m| {
-                self.account_of(m)
-                    .is_some_and(|a| a.provider != Provider::Pop3)
-            })
-            .map(|m| m.id.clone())
-            .collect();
+        let snoozable = self.snoozable(ids);
         if snoozable.is_empty() {
             self.notice(t!("later-snoozing-needs-mail-kept-on-the"), true, cx);
             return;
@@ -66,6 +56,20 @@ impl MailApp {
         self.picker = Some(picker);
         self.modal = Some(Modal::Snooze(snoozable));
     }
+    /// Those of these messages that can be snoozed: listed, not still
+    /// being sent or saved, and kept on a server (not POP3).
+    pub(super) fn snoozable(&self, ids: Vec<String>) -> Vec<String> {
+        let ids: HashSet<String> = ids.into_iter().collect();
+        self.messages
+            .iter()
+            .filter(|m| ids.contains(&m.id) && !m.pending)
+            .filter(|m| {
+                self.account_of(m)
+                    .is_some_and(|a| a.provider != Provider::Pop3)
+            })
+            .map(|m| m.id.clone())
+            .collect()
+    }
     /// The snooze dialog: the picker.
     pub(super) fn snooze_modal(&self) -> AnyElement {
         match &self.picker {
@@ -73,7 +77,7 @@ impl MailApp {
             None => div().into_any_element(),
         }
     }
-    fn snooze(&mut self, ids: Vec<String>, until: i64, cx: &mut Context<Self>) {
+    pub(super) fn snooze(&mut self, ids: Vec<String>, until: i64, cx: &mut Context<Self>) {
         let ids: HashSet<String> = ids.into_iter().collect();
         let chosen: Vec<Mail> = self
             .messages

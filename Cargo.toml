@@ -381,7 +381,8 @@ apple-native-keyring-store = { version = "1", features = ["protected"] }
 # the version gpui-mobile uses.
 objc2 = "0.6"
 # The app lock's Face ID or Touch ID prompt (display/biometric.rs).
-objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSError", "NSString"] }
+# Spotlight's items (manage/system_search/spotlight.rs) take arrays.
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSArray", "NSError", "NSString"] }
 # Proton's security keys over NFC (Core NFC, packaging/ios/SecurityKeys.swift)
 # and a passkey on another phone by QR code and Bluetooth (caBLE): CTAP2
 # here, the NFC I/O through the Swift side (ios/keys.rs).
@@ -433,7 +434,39 @@ windows-sys = { version = "0.61", features = [
 windows-registry = "0.6"
 # Spelling in the formatted composer (manage/spelling.rs): Windows' spell
 # checking API. The version GPUI already uses.
-windows = { version = "0.62", features = ["Win32_Globalization", "Win32_System_Com"] }
+# Printing (display/html/print_windows.rs): the print dialog, Windows.Data.Pdf,
+# Direct2D's XPS print control and GDI. Windows Search's crawl scope
+# (manage/system_search/windows_search.rs).
+windows = { version = "0.62", features = [
+    "Win32_Globalization",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Memory",
+    "Win32_System_Search",
+    "Win32_System_WinRT",
+    "Win32_System_WinRT_Pdf",
+    "Win32_Graphics_Gdi",
+    "Win32_Graphics_Direct2D",
+    "Win32_Graphics_Direct2D_Common",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Imaging",
+    "Win32_Graphics_Printing",
+    "Win32_Graphics_Printing_PrintTicket",
+    "Win32_Storage_Xps",
+    "Win32_Storage_Xps_Printing",
+    "Win32_UI_Controls",
+    "Win32_UI_Controls_Dialogs",
+    "Data_Pdf",
+    "Foundation",
+    "Storage",
+    "Storage_Streams",
+    "UI",
+] }
+# The window's handle, to own the print dialog; the version GPUI uses.
+raw-window-handle = "0.6"
 
 [target.'cfg(any(target_os = "macos", windows))'.dependencies]
 # The tray (menu bar) icon while Picacho runs in the background (display/tray.rs).
@@ -452,6 +485,9 @@ libc = "0.2"
 # with `ask`), also inside Flatpak, and its Background request, which starts
 # Picacho at sign-in from inside Flatpak; the version GPUI already uses.
 ashpd = { version = "0.13", default-features = false, features = ["async-io", "background", "open_uri", "print"] }
+# GNOME's and KDE's searches ask Picacho for mail over D-Bus
+# (manage/system_search/desktop_search.rs); the version ashpd and ksni use.
+zbus = { version = "5", default-features = false, features = ["blocking-api"] }
 
 [patch.crates-io]
 # Patched crates, one folder each with its patches and README:

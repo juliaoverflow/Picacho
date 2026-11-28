@@ -505,6 +505,8 @@ impl MailApp {
             })
             .children(self.link_sheet(insets, window, cx))
             .children(self.mobile_toast(insets, screen, cx))
+            // A tablet's keyboard opens the command palette too.
+            .children(self.palette_layer(window, cx))
     }
 
     /// The system's insets: safe area and keyboard.
@@ -683,6 +685,8 @@ impl MailApp {
     #[cfg_attr(not(target_os = "android"), allow(dead_code))]
     pub(super) fn mobile_has_back(&self, w: &Window, cx: &App) -> bool {
         self.keyboard_shown(w)
+            // Back closes the command palette (`MailApp::close`).
+            || self.palette.open
             || self.links.confirm.is_some()
             || self.mobile_composer(cx).is_some()
             || self.menu.is_some()
@@ -771,6 +775,7 @@ impl MailApp {
             && !self.mobile_split_frame()
             && !self.mobile_split_settings()
             && self.menu.is_none()
+            && !self.palette.open
             && (self.modal.is_none() || self.modal == Some(Modal::Settings))
             && self.mobile_composer(cx).is_none()
             && self.mobile.back_release.is_none()
@@ -1282,6 +1287,7 @@ impl MailApp {
         (self.mobile_split_frame() || self.mobile_split_settings())
             && self.mobile_screen() != Screen::Mailboxes
             && self.menu.is_none()
+            && !self.palette.open
             && (self.modal.is_none() || self.modal == Some(Modal::Settings))
             && self.mobile_composer(cx).is_none()
             && self.links.confirm.is_none()

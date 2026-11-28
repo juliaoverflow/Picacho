@@ -196,6 +196,35 @@ pub struct Event {
     /// phone number).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub conferences: Vec<Conference>,
+    /// PRIORITY (RFC 5545 §3.8.1.9): 1 the highest to 9 the lowest; 0 none
+    /// given.
+    #[serde(default, skip_serializing_if = "is_zero_u8")]
+    pub priority: u8,
+    /// The task this one is part of (a subtask's RELATED-TO, of the
+    /// default RELTYPE=PARENT, RFC 5545 §3.8.4.5): its UID.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub parent: String,
+    /// URL (RFC 5545 §3.8.4.6): where there is more about it. A task made
+    /// from an email links back to it with a `mid:` address (RFC 2392).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub url: String,
+    /// When a task was done (COMPLETED), in Unix seconds; 0 where it isn't
+    /// done or the time isn't known.
+    #[serde(default, skip_serializing_if = "is_zero_i64")]
+    pub completed_at: i64,
+}
+
+fn is_zero_u8(n: &u8) -> bool {
+    *n == 0
+}
+fn is_zero_i64(n: &i64) -> bool {
+    *n == 0
+}
+
+/// Whether a RELATED-TO line names the component's parent: RELTYPE=PARENT,
+/// the default (RFC 5545 §3.2.15), rather than a child or sibling.
+fn names_parent(params: &[(String, String)]) -> bool {
+    param(params, "RELTYPE").is_none_or(|r| r.eq_ignore_ascii_case("PARENT"))
 }
 
 /// An event's IMAGE (RFC 7986 §5.10).
@@ -441,11 +470,14 @@ impl Event {
 /// kept as they came (`Event::kept`).
 /// CREATED isn't one: RFC 5545 §3.8.7.1 has it stay as it was first
 /// written, so it is kept; LAST-MODIFIED is written anew (§3.8.7.3).
-const MODELLED: [&str; 30] = [
+/// RELATED-TO is too, where it names the parent (`names_parent`). URL is
+/// read (`Event::url`) but kept as it came, with its parameters, unless
+/// it was changed (`url_kept`).
+const MODELLED: [&str; 31] = [
     "COMMENT", "BEGIN", "END", "UID", "DTSTAMP", "SEQUENCE", "DTSTART", "DTEND", "DUE", "DURATION",
     "EXDATE", "RDATE", "RECURRENCE-ID", "STATUS", "SUMMARY", "LOCATION", "DESCRIPTION",
     "RRULE", "ORGANIZER", "ATTENDEE", "COMPLETED", "PERCENT-COMPLETE", "LAST-MODIFIED",
-    "X-PICACHO", "GEO", "CATEGORIES", "CLASS", "COLOR", "IMAGE", "CONFERENCE",
+    "X-PICACHO", "GEO", "CATEGORIES", "CLASS", "COLOR", "IMAGE", "CONFERENCE", "PRIORITY",
 ];
 
 /// The lines of a component (unfolded, BEGIN and END included) that
@@ -488,8 +520,9 @@ fn kept_lines(lines: &[String]) -> String {
             i = j + 1;
             continue;
         }
-        let name = split_line(line).map(|(n, ..)| n).unwrap_or_default();
-        if !MODELLED.contains(&name.as_str()) {
+        let (name, params) = split_line(line).map(|(n, p, _)| (n, p)).unwrap_or_default();
+        let parent = name == "RELATED-TO" && names_parent(&params);
+        if !MODELLED.contains(&name.as_str()) && !parent {
             out.push(line.clone());
         }
         i += 1;
@@ -1318,9 +1351,65 @@ pub fn task_alarms(source: &str, due: i64) -> Vec<i64> {
     out
 }
 
+/// When a done task was done: as it says, else now.
+fn done_at(e: &Event) -> i64 {
+    if e.completed_at > 0 { e.completed_at } else { Utc::now().timestamp() }
+}
+
+/// Whether `line` is a component's own URL (not one in an alarm: those
+/// are in sub-components, which `kept` holds whole).
+fn is_url_line(line: &str) -> bool {
+    split_line(line).is_some_and(|(n, ..)| n == "URL")
+}
+/// Whether text kept as it came (`kept`, or a component's source lines)
+/// says link `url` as it is: then it is written as it came, parameters and
+/// all, rather than from `Event::url`. Without a URL there, `url` is new.
+fn url_kept(kept: &str, url: &str) -> bool {
+    let mut depth = 0;
+    for line in unfold(kept) {
+        let u = line.to_ascii_uppercase();
+        if u.starts_with("BEGIN:") {
+            depth += 1;
+        } else if u.starts_with("END:") {
+            depth -= 1;
+        } else if depth == 0
+            && let Some((name, _, value)) = split_line(&line)
+            && name == "URL"
+        {
+            return value.trim() == url;
+        }
+    }
+    false
+}
+
+/// A task's priority, link and parent as lines (also an event's priority
+/// and link), each only where it has one; the link not where it's kept
+/// as it came (`url_kept`).
+fn task_lines(e: &Event, url_kept: bool) -> Vec<String> {
+    let mut lines = Vec::new();
+    if e.priority > 0 {
+        lines.push(format!("PRIORITY:{}", e.priority.min(9)));
+    }
+    if !e.url.is_empty() && !url_kept {
+        lines.push(format!("URL:{}", e.url.replace(['\r', '\n'], "")));
+    }
+    if !e.parent.is_empty() {
+        lines.push(format!("RELATED-TO:{}", e.parent.replace(['\r', '\n'], "")));
+    }
+    lines
+}
+
+/// A component's source without its BEGIN and END lines, sub-components
+/// whole: what `url_kept` reads as it reads `Event::kept`.
+fn own_source_lines(source: &str) -> String {
+    let lines: Vec<String> = unfold(source).into_iter().filter(|l| !l.is_empty()).collect();
+    let inner = lines.get(1..lines.len().saturating_sub(1)).unwrap_or_default();
+    inner.join("\r\n")
+}
+
 /// A task's VTODO with what's edited here changed (summary, notes, due,
-/// done) and everything else kept as the server had it: priority,
-/// categories, alarms, other apps' properties. Without a source, it is
+/// done, priority, tags, link and parent) and everything else kept as the
+/// server had it: alarms, other apps' properties. Without a source, it is
 /// written from its fields.
 pub fn update_task(e: &Event) -> String {
     if e.source.is_empty() {
@@ -1336,7 +1425,11 @@ pub fn update_task(e: &Event) -> String {
         "SEQUENCE",
         "DTSTAMP",
         "LAST-MODIFIED",
+        "PRIORITY",
+        "CATEGORIES",
     ];
+    // The link as it came, unless it changed.
+    let url_kept = url_kept(&own_source_lines(&e.source), &e.url);
     let lines = unfold(&e.source);
     let mut out = Vec::new();
     let mut nested = 0;
@@ -1350,8 +1443,10 @@ pub fn update_task(e: &Event) -> String {
         } else if upper.starts_with("END:") {
             nested -= 1;
         }
-        let name = split_line(line).map(|(n, ..)| n).unwrap_or_default();
-        if nested == 0 && upper != "BEGIN:VTODO" && edited.contains(&name.as_str()) {
+        let (name, params) = split_line(line).map(|(n, p, _)| (n, p)).unwrap_or_default();
+        let parent = name == "RELATED-TO" && names_parent(&params);
+        let url = name == "URL" && !url_kept;
+        if nested == 0 && upper != "BEGIN:VTODO" && (edited.contains(&name.as_str()) || parent || url) {
             continue;
         }
         out.push(line.clone());
@@ -1378,10 +1473,14 @@ pub fn update_task(e: &Event) -> String {
             }
             if e.completed {
                 out.push("STATUS:COMPLETED".to_owned());
-                out.push(format!("COMPLETED:{now}"));
+                out.push(format!("COMPLETED:{}", stamp(done_at(e))));
                 out.push("PERCENT-COMPLETE:100".to_owned());
             } else {
                 out.push("STATUS:NEEDS-ACTION".to_owned());
+            }
+            out.extend(task_lines(e, url_kept));
+            if !e.categories.is_empty() {
+                out.push(format!("CATEGORIES:{}", e.categories.iter().map(|c| escape(c)).collect::<Vec<_>>().join(",")));
             }
         }
     }
@@ -1591,7 +1690,15 @@ fn parse_lines(lines: Vec<String>) -> Calendar {
                     e.cancelled |= e.status == "CANCELLED";
                     e.completed |= e.status == "COMPLETED";
                 }
-                "COMPLETED" => e.completed = true,
+                "COMPLETED" => {
+                    e.completed = true;
+                    e.completed_at = parse_time(&value, &params).map_or(0, |(t, _)| t);
+                }
+                "PRIORITY" => e.priority = value.trim().parse::<u8>().unwrap_or(0).min(9),
+                "URL" => e.url = value.trim().to_owned(),
+                "RELATED-TO" if e.parent.is_empty() && names_parent(&params) => {
+                    e.parent = value.trim().to_owned();
+                }
                 "GEO" => e.geo = value.trim().to_owned(),
                 "CATEGORIES" => e.categories.extend(
                     text_list(&value).into_iter().filter(|c| !c.is_empty()),
@@ -2788,7 +2895,7 @@ pub fn write_event(e: &Event) -> String {
         }
         if e.completed {
             lines.push("STATUS:COMPLETED".to_owned());
-            lines.push(format!("COMPLETED:{}", stamp(Utc::now().timestamp())));
+            lines.push(format!("COMPLETED:{}", stamp(done_at(e))));
         } else if !e.cancelled {
             // RFC 5545 §3.8.1.11: a task's other open state (IN-PROCESS) stays.
             let open = matches!(e.status.as_str(), "IN-PROCESS" | "NEEDS-ACTION");
@@ -2843,6 +2950,8 @@ pub fn write_event(e: &Event) -> String {
     if !e.color.is_empty() {
         lines.push(format!("COLOR:{}", e.color));
     }
+    let url_kept = url_kept(&e.kept, &e.url);
+    lines.extend(task_lines(e, url_kept));
     let with = |name: &str, params: &[(&str, String)], extra: &str, value: &str| {
         let mut head = name.to_owned();
         if !extra.is_empty() {
@@ -2905,8 +3014,14 @@ pub fn write_event(e: &Event) -> String {
         }
         lines.push("END:VALARM".to_owned());
     }
-    // What Picacho doesn't edit, as it came.
-    lines.extend(e.kept.split("\r\n").filter(|l| !l.is_empty()).map(str::to_owned));
+    // What Picacho doesn't edit, as it came (a link changed here aside).
+    lines.extend(
+        e.kept
+            .split("\r\n")
+            .filter(|l| !l.is_empty())
+            .filter(|l| url_kept || !is_url_line(l))
+            .map(str::to_owned),
+    );
     lines.push(format!("END:{kind}"));
     lines.iter().map(|l| fold(l)).collect()
 }
@@ -3660,5 +3775,44 @@ mod tests {
         let text = task_to_store(&new);
         assert!(text.contains("TRIGGER;RELATED=END:-PT30M"), "{text}");
         assert_eq!(parse_tasks(&text).pop().unwrap().alarms, [1800]);
+    }
+
+    /// A task's priority, tags, parent (a subtask) and link are read and
+    /// written; edited, only what changed is written anew, and a link
+    /// that didn't change keeps its parameters.
+    #[test]
+    fn tasks_keep_their_priority_tags_parent_and_link() {
+        let text = "BEGIN:VCALENDAR\r\nBEGIN:VTODO\r\nUID:sub\r\nSUMMARY:Forms\r\nPRIORITY:2\r\nCATEGORIES:Home,Money\r\nRELATED-TO:taxes\r\nRELATED-TO;RELTYPE=SIBLING:other\r\nURL;VALUE=URI:mid:a%2Fb@example.org\r\nCOMPLETED:20261101T100000Z\r\nSTATUS:COMPLETED\r\nEND:VTODO\r\nEND:VCALENDAR\r\n";
+        let t = parse_tasks(text).pop().unwrap();
+        assert_eq!((t.priority, t.parent.as_str(), t.url.as_str()), (2, "taxes", "mid:a%2Fb@example.org"));
+        assert_eq!(t.categories, ["Home", "Money"]);
+        assert!(t.completed);
+        assert_eq!(t.completed_at, 1_793_527_200);
+        // A sibling is kept as it came, the parent is the field.
+        assert!(t.kept.contains("RELTYPE=SIBLING") && !t.kept.contains("RELATED-TO:taxes"), "{}", t.kept);
+        // Written from its fields: each once, the link as it came.
+        let written = write_event(&Event { source: String::new(), ..t.clone() });
+        for line in ["PRIORITY:2", "RELATED-TO:taxes", "RELATED-TO;RELTYPE=SIBLING:other", "URL;VALUE=URI:mid:a%2Fb@example.org", "COMPLETED:20261101T100000Z"] {
+            assert_eq!(written.matches(line).count(), 1, "{line} in {written}");
+        }
+        assert_eq!(written.matches("URL").count(), 1, "{written}");
+        // Edited: the link unchanged stays as it was; priority, tags and
+        // parent are written from the fields.
+        let edited = Event { priority: 9, categories: vec!["Work".into()], parent: String::new(), completed: false, completed_at: 0, ..t.clone() };
+        let updated = update_task(&edited);
+        assert!(updated.contains("PRIORITY:9") && !updated.contains("PRIORITY:2"), "{updated}");
+        assert!(updated.contains("CATEGORIES:Work") && !updated.contains("Money"), "{updated}");
+        assert!(!updated.contains("RELATED-TO:taxes") && updated.contains("RELTYPE=SIBLING"), "{updated}");
+        assert!(updated.contains("URL;VALUE=URI:mid:a%2Fb@example.org"), "{updated}");
+        assert!(updated.contains("STATUS:NEEDS-ACTION") && !updated.contains("COMPLETED:"), "{updated}");
+        // A new link replaces the old one.
+        let relinked = update_task(&Event { url: "mid:new@example.org".into(), ..edited.clone() });
+        assert!(relinked.contains("URL:mid:new@example.org") && !relinked.contains("a%2Fb"), "{relinked}");
+        let back = parse_tasks(&format!("BEGIN:VCALENDAR\r\n{relinked}END:VCALENDAR\r\n")).pop().unwrap();
+        assert_eq!((back.priority, back.url.as_str(), back.parent.as_str()), (9, "mid:new@example.org", ""));
+        // A new task made here with them all.
+        let new = Event { uid: "n".into(), summary: "Call".into(), task: true, utc: true, priority: 1, parent: "p".into(), url: "mid:x@y".into(), categories: vec!["A".into()], ..Default::default() };
+        let back = parse_tasks(&task_to_store(&new)).pop().unwrap();
+        assert_eq!((back.priority, back.parent.as_str(), back.url.as_str(), back.categories.clone()), (1, "p", "mid:x@y", vec!["A".to_owned()]));
     }
 }

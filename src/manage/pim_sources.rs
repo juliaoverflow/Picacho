@@ -81,6 +81,14 @@ pub(crate) fn within<T>(kind: Pim, id: &str, work: impl FnOnce() -> T) -> T {
     work()
 }
 
+/// Runs `work` outside any source of `kind` (from within one: as if from
+/// outside, where reading puts every source's together).
+pub(crate) fn outside<T>(kind: Pim, work: impl FnOnce() -> T) -> T {
+    let before = WITHIN.with(|w| w.borrow_mut()[kind as usize].take());
+    let _restore = Restore { kind, before };
+    work()
+}
+
 /// The other sources' ids, in the order they were added.
 pub fn extra_sources(store: &Store, kind: Pim) -> Vec<String> {
     store

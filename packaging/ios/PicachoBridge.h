@@ -25,5 +25,6 @@ void picacho_ios_background_expire(void);
 // `value` says there is nothing more.
 void picacho_ios_answer(int32_t id, const uint8_t *value, size_t len);
 
-// Something for the window to open: `mailto:…` or `attach:<path>`.
+// Something for the window to open: `mailto:…`, `attach:<path>`, or a
+// message's `picacho://widget/message` link (a Spotlight result, main.m).
 void picacho_ios_launch(const uint8_t *request, size_t len);

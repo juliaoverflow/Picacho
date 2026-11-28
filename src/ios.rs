@@ -93,6 +93,9 @@ fn backend() -> anyhow::Result<Arc<Backend>> {
     let path = data_dir().ok_or_else(|| anyhow::anyhow!("no home directory"))?;
     let store = Arc::new(Store::open(&path)?);
     manage::widgets::publish_soon(store.clone());
+    // Mail in Spotlight, when turned on (Settings → Privacy). A result
+    // chosen comes through the scene (main.m, `picacho_ios_launch`).
+    manage::system_search::start(store.clone(), |_| {});
     let backend = display::new_backend(store);
     // Taps that come before the window is up wait for it; buttons pressed
     // without a window act through `notification_action`.
@@ -456,8 +459,9 @@ pub extern "C" fn picacho_ios_background_expire() {
     }
 }
 
-/// Something to open (Shares.swift: what the Share extension handed over):
-/// a `mailto:` address, or `attach:` and a file's path. The window takes
+/// Something to open (Shares.swift: what the Share extension handed over;
+/// main.m: a Spotlight result chosen): a `mailto:` address, `attach:` and a
+/// file's path, or a message's `picacho://widget/message` link. The window takes
 /// it (`display::launch`); requests pushed together start one message.
 ///
 /// # Safety

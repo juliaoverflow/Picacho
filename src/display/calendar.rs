@@ -102,7 +102,7 @@ fn format_local(t: i64, all_day: bool) -> String {
 }
 
 /// `t` written as the editor reads it, in `zone` (this computer's when `None`).
-fn format_in(t: i64, all_day: bool, zone: Option<chrono_tz::Tz>) -> String {
+pub(super) fn format_in(t: i64, all_day: bool, zone: Option<chrono_tz::Tz>) -> String {
     let dt = chrono::DateTime::from_timestamp(t, 0).unwrap_or_default();
     if all_day {
         dt.format("%Y-%m-%d").to_string()
@@ -1631,7 +1631,7 @@ impl MailApp {
     /// Local AI → Understand dates) words like "tomorrow at 10" or "every
     /// monday at 9". Returns the moment, whether it's a date, and a rule
     /// when the words repeat.
-    fn read_when(&self, text: &str) -> Option<(i64, bool, Option<String>)> {
+    pub(super) fn read_when(&self, text: &str) -> Option<(i64, bool, Option<String>)> {
         let zone = self.event_zone_chosen;
         if let Some((t, all_day)) = parse_in(text, zone) {
             return Some((t, all_day, None));

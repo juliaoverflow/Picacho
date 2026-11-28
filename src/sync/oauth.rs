@@ -1167,6 +1167,11 @@ pub const GOOGLE_PEOPLE: &str = "https://www.googleapis.com/auth/contacts";
 pub const GOOGLE_DRIVE: &str = "https://www.googleapis.com/auth/drive.file";
 /// OneDrive through Microsoft Graph, for the same; asked only when chosen.
 pub const GRAPH_FILES: &str = "https://graph.microsoft.com/Files.ReadWrite";
+/// Google Tasks (`sync/google/tasks.rs`); asked only when chosen.
+pub const GOOGLE_TASKS: &str = "https://www.googleapis.com/auth/tasks";
+/// Microsoft To Do through Microsoft Graph (`sync/graph/todo.rs`); asked
+/// only when chosen.
+pub const GRAPH_TASKS: &str = "https://graph.microsoft.com/Tasks.ReadWrite";
 
 /// Signs in to Gmail or Outlook in the browser (the account's email may be
 /// empty: the provider's ID token says which account was chosen), asking
@@ -1790,8 +1795,8 @@ fn exchange(
     Ok((secret, value))
 }
 /// Scopes asked for on top of the mail ones, only when chosen: calendars,
-/// contacts, and storage for large attachments.
-const EXTRA_SCOPES: [&str; 5] = [GOOGLE_CALENDAR, GOOGLE_CONTACTS, GOOGLE_PEOPLE, GOOGLE_DRIVE, GRAPH_FILES];
+/// contacts, tasks, and storage for large attachments.
+const EXTRA_SCOPES: [&str; 7] = [GOOGLE_CALENDAR, GOOGLE_CONTACTS, GOOGLE_PEOPLE, GOOGLE_DRIVE, GRAPH_FILES, GOOGLE_TASKS, GRAPH_TASKS];
 
 /// The extra scopes (`EXTRA_SCOPES`) among those `asked`.
 fn extra_asked(asked: &str) -> String {

@@ -105,6 +105,7 @@ workspaces-calendars-title = Calendars
 workspaces-calendars-caption = The calendar shows these calendars' events, tasks and reminders.
 
 workspaces-no-calendars = No calendars are set up yet. Add one in Settings → Calendar.
+workspaces-task-list = { $name } (tasks)
 
 workspaces-contacts-title = Address books
 

@@ -399,6 +399,45 @@ impl Store {
                INSERT INTO message_text_ids VALUES (NEW.id, last_insert_rowid());
              END;"
         ))?;
+        // The system's search (Spotlight, Windows Search; see
+        // `system_search`): what it was given of each message, and the
+        // messages to give it again. Triggers queue a message when it is
+        // added, removed, moved, or its words change, and only while that
+        // search is on where it is given copies (`SYSTEM_SEARCH_PUSH_PREFERENCE`:
+        // Spotlight, Windows Search; Linux's ask Picacho instead), so flags
+        // and the like cost nothing. A message queued
+        // again goes to the back with a new `seq` (never one used before),
+        // so one handed over meanwhile is seen to have changed. Removed and
+        // added again rather than `OR REPLACE`: in a trigger, the statement
+        // that set it off decides conflicts (the cache's upserts abort).
+        db.execute_batch(&format!(
+            "DROP TRIGGER IF EXISTS system_search_insert;
+             DROP TRIGGER IF EXISTS system_search_delete;
+             DROP TRIGGER IF EXISTS system_search_update;
+             CREATE TABLE IF NOT EXISTS system_search (id TEXT PRIMARY KEY, account TEXT NOT NULL, name TEXT NOT NULL);
+             CREATE TABLE IF NOT EXISTS system_search_queue (seq INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT NOT NULL UNIQUE);
+             CREATE TRIGGER IF NOT EXISTS system_search_push_insert AFTER INSERT ON messages WHEN {on} BEGIN
+               {queue_new}
+             END;
+             CREATE TRIGGER IF NOT EXISTS system_search_push_delete AFTER DELETE ON messages WHEN {on} BEGIN
+               {queue_old}
+             END;
+             CREATE TRIGGER IF NOT EXISTS system_search_push_update AFTER UPDATE OF id, account, folder, date, data ON messages
+               WHEN {on} AND (OLD.id IS NOT NEW.id OR OLD.account IS NOT NEW.account OR OLD.folder IS NOT NEW.folder
+                 OR OLD.date IS NOT NEW.date OR (OLD.data IS NOT NEW.data AND ({words})))
+             BEGIN
+               {queue_new}
+               {queue_old}
+             END;",
+            queue_new = "DELETE FROM system_search_queue WHERE id=NEW.id; INSERT INTO system_search_queue(id) VALUES (NEW.id);",
+            queue_old = "DELETE FROM system_search_queue WHERE id=OLD.id; INSERT INTO system_search_queue(id) VALUES (OLD.id);",
+            on = SYSTEM_SEARCH_ON,
+            words = ["$.subject", "$.snippet", "$.body", "$.from", "$.sender", "$.to", "$.cc", "$.message_id"]
+                .iter()
+                .map(|f| format!("json_extract(OLD.data,'{f}') IS NOT json_extract(NEW.data,'{f}')"))
+                .collect::<Vec<_>>()
+                .join(" OR "),
+        ))?;
         let list_dirty: Arc<Mutex<HashSet<String>>> = Arc::default();
         prepare_writer(&mut db, &list_dirty)?;
         let readers = (0..READERS)
@@ -794,6 +833,113 @@ impl Store {
         tx.commit()?;
         Ok(ids.len())
     }
+}
+
+/// The system's search (`system_search`), which phones don't have.
+#[cfg_attr(any(target_os = "android", target_os = "ios"), allow(dead_code))]
+impl Store {
+    /// Up to `limit` messages waiting for the system's search, first queued
+    /// first: each as it is now and as it was listed there before.
+    pub fn system_search_items(&self, limit: usize) -> Result<Vec<SystemSearchItem>> {
+        use rusqlite::OptionalExtension;
+        let db = self.read();
+        let mut queued = db.prepare_cached(
+            "SELECT q.id, q.seq, s.account, s.name FROM system_search_queue q
+             LEFT JOIN system_search s ON s.id=q.id ORDER BY q.seq LIMIT ?1",
+        )?;
+        let rows = queued
+            .query_map([limit as i64], |r| {
+                let listed = match (r.get::<_, Option<String>>(2)?, r.get::<_, Option<String>>(3)?) {
+                    (Some(account), Some(name)) => Some((account, name)),
+                    _ => None,
+                };
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, listed))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut message = db.prepare_cached(SYSTEM_SEARCH_MESSAGE)?;
+        let mut out = Vec::with_capacity(rows.len());
+        for (id, queued, listed) in rows {
+            let now = message
+                .query_row(params![id, SYSTEM_SEARCH_TEXT], system_search_message)
+                .optional()?;
+            out.push(SystemSearchItem { id, queued, now, listed });
+        }
+        Ok(out)
+    }
+    /// Each of `ids` still here, as the system's search shows it, with
+    /// at most `text` characters of its text, in their order.
+    #[cfg_attr(not(any(target_os = "linux", target_os = "freebsd")), allow(dead_code))]
+    pub fn system_search_messages(&self, ids: &[String], text: usize) -> Result<Vec<(String, SystemSearchMessage)>> {
+        use rusqlite::OptionalExtension;
+        let db = self.read();
+        let mut message = db.prepare_cached(SYSTEM_SEARCH_MESSAGE)?;
+        let mut out = Vec::with_capacity(ids.len());
+        for id in ids {
+            if let Some(m) = message.query_row(params![id, text as i64], system_search_message).optional()? {
+                out.push((id.clone(), m));
+            }
+        }
+        Ok(out)
+    }
+    /// Records what the system's search now has of queued messages: each
+    /// `(id, place in the queue, listed as)`, `None` for nothing. A message
+    /// queued again meanwhile (a new place) stays queued.
+    pub fn system_search_done(&self, done: &[(String, i64, Option<(String, String)>)]) -> Result<()> {
+        if done.is_empty() {
+            return Ok(());
+        }
+        let mut db = self.write();
+        let tx = db.transaction()?;
+        {
+            let mut keep = tx.prepare_cached("INSERT OR REPLACE INTO system_search (id, account, name) VALUES (?1, ?2, ?3)")?;
+            let mut forget = tx.prepare_cached("DELETE FROM system_search WHERE id=?1")?;
+            let mut dequeue = tx.prepare_cached("DELETE FROM system_search_queue WHERE id=?1 AND seq=?2")?;
+            for (id, queued, listed) in done {
+                match listed {
+                    Some((account, name)) => keep.execute(params![id, account, name])?,
+                    None => forget.execute([id])?,
+                };
+                dequeue.execute(params![id, queued])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+    /// Queues every message for the system's search, and every one it
+    /// has (as when it is turned on, or its index was lost).
+    pub fn system_search_queue_all(&self) -> Result<()> {
+        self.write().execute_batch(
+            "INSERT OR REPLACE INTO system_search_queue(id) SELECT id FROM messages;
+             INSERT OR REPLACE INTO system_search_queue(id) SELECT id FROM system_search;",
+        )?;
+        Ok(())
+    }
+    /// How many messages wait for the system's search.
+    pub fn system_search_waiting(&self) -> Result<usize> {
+        let n: i64 = self
+            .read()
+            .query_row("SELECT COUNT(*) FROM system_search_queue", [], |r| r.get(0))?;
+        Ok(n as usize)
+    }
+    /// Everything listed in the system's search: `(id, account, name)`.
+    pub fn system_search_listed(&self) -> Result<Vec<(String, String, String)>> {
+        let db = self.read();
+        let mut q = db.prepare("SELECT id, account, name FROM system_search")?;
+        let rows = q
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+    /// Forgets what the system's search was given and what it waited for
+    /// (once it has been emptied).
+    pub fn system_search_forget(&self) -> Result<()> {
+        self.write()
+            .execute_batch("DELETE FROM system_search; DELETE FROM system_search_queue;")?;
+        Ok(())
+    }
+}
+
+impl Store {
     /// Reads the text of up to `batch` downloaded messages' attachments
     /// that haven't been read yet (`attachment_text::extract`), and indexes
     /// it with the rest of each message. Returns how many messages were
@@ -2037,6 +2183,98 @@ impl Store {
             }
         }
         Ok(out)
+    }
+    /// The newest `limit` messages with attachments in `accounts`, without
+    /// their text, newest first: in `mailbox` where given, else outside
+    /// Drafts, Spam and Trash (`attachments::Library`). Copies of one
+    /// message (Gmail's labels, several folders) are listed once. Also how
+    /// many of them have attachments not listed yet: only headers were
+    /// downloaded, which tell there are attachments but not which.
+    pub fn attachment_mail(
+        &self,
+        accounts: &[String],
+        mailbox: Option<&Mailbox>,
+        limit: usize,
+    ) -> Result<(Vec<Mail>, usize)> {
+        // The `with_attachments` index's condition, word for word.
+        let which = match mailbox {
+            Some(m) => virtual_listed(m.folder()).unwrap_or("folder=?2"),
+            None => "(folder NOT IN ('drafts','junk','trash') AND ?2 IS NOT NULL)",
+        };
+        let key = mailbox.map_or_else(String::new, Mailbox::key);
+        let db = self.read();
+        let mut q = db.prepare(&format!(
+            "SELECT json_remove(data,'$.body','$.html') FROM messages WHERE account=?1 AND json_extract(data,'$.has_attachments') AND {which} ORDER BY date DESC, id DESC LIMIT ?3"
+        ))?;
+        let mut out = Vec::new();
+        let mut unlisted = 0;
+        for account in accounts {
+            let mut mails = Vec::new();
+            let mut rows = q.query(params![account, key, limit as i64])?;
+            while let Some(row) = rows.next()? {
+                let Ok(mail) = serde_json::from_str::<Mail>(row.get_ref(0)?.as_str()?) else {
+                    continue;
+                };
+                if mail.attachments().is_empty() {
+                    unlisted += 1;
+                } else {
+                    mails.push(mail);
+                }
+            }
+            out.extend(crate::manage::subscriptions::one_copy_each(mails));
+        }
+        out.sort_by(|a, b| b.date.cmp(&a.date).then_with(|| b.id.cmp(&a.id)));
+        out.truncate(limit);
+        Ok((out, unlisted))
+    }
+    /// The messages whose attachments' text (read by `index_attachments`)
+    /// holds every one of `words`, each a phrase, its last word's start
+    /// enough: up to `limit` of them, in any account.
+    pub fn attachment_text_matches(&self, words: &[String], limit: usize) -> Result<HashSet<String>> {
+        let Some(query) = fts_column_query("attachments", words) else {
+            return Ok(HashSet::new());
+        };
+        let db = self.read();
+        let mut q = db.prepare_cached(
+            "SELECT t.id FROM message_text f JOIN message_text_ids t ON t.rid=f.rowid WHERE message_text MATCH ?1 LIMIT ?2",
+        )?;
+        let ids = q
+            .query_map(params![query, limit as i64], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(ids)
+    }
+    /// The newest `limit` messages from or to `address` in `accounts`,
+    /// without their text, outside Drafts, Spam and Trash, each once: what
+    /// the reader's contact panel lists. Found through the full-text
+    /// index's people (sender, From, To and Cc), then checked address by
+    /// address, so `ana@example.com` doesn't find `diana@example.com`.
+    pub fn mail_with(&self, address: &str, accounts: &[String], limit: usize) -> Result<Vec<Mail>> {
+        let address = address.trim().to_lowercase();
+        let Some(query) = fts_column_query("people", std::slice::from_ref(&address)) else {
+            return Ok(Vec::new());
+        };
+        // The phrase, not its start: `ana@example.co` is someone else.
+        let query = query.replace("\"*", "\"");
+        let db = self.read();
+        let mut q = db.prepare_cached(
+            "SELECT json_remove(m.data,'$.body','$.html') FROM message_text f JOIN message_text_ids t ON t.rid=f.rowid JOIN messages m ON m.id=t.id
+             WHERE message_text MATCH ?1 AND m.folder NOT IN ('drafts','junk','trash') ORDER BY m.date DESC, m.id DESC LIMIT ?2",
+        )?;
+        // Some found are only near the address (another account's copy,
+        // a similar address): a few more are read than are kept.
+        let mut rows = q.query(params![query, (limit * 4).max(40) as i64])?;
+        let mut mails = Vec::new();
+        while let Some(row) = rows.next()? {
+            let Ok(mail) = serde_json::from_str::<Mail>(row.get_ref(0)?.as_str()?) else {
+                continue;
+            };
+            if accounts.contains(&mail.account) && crate::manage::attachments::involves(&mail, &address) {
+                mails.push(mail);
+            }
+        }
+        let mut mails = crate::manage::subscriptions::one_copy_each(mails);
+        mails.truncate(limit);
+        Ok(mails)
     }
     /// Works out again the preview (and text, where kept) of cached
     /// messages from their downloaded source, after how mail is read as
@@ -4571,6 +4809,77 @@ const TEXT_COLUMNS: &str = "coalesce(json_extract(data,'$.subject'),''), coalesc
 /// The same, of a trigger's NEW row.
 const TEXT_COLUMNS_NEW: &str = "coalesce(json_extract(NEW.data,'$.subject'),''), coalesce(json_extract(NEW.data,'$.sender'),'')||' '||coalesce(json_extract(NEW.data,'$.from'),'')||' '||coalesce(json_extract(NEW.data,'$.to'),'')||' '||coalesce(json_extract(NEW.data,'$.cc'),''), coalesce(json_extract(NEW.data,'$.body'), json_extract(NEW.data,'$.snippet'), ''), coalesce((SELECT text FROM message_attachment_text a WHERE a.id=NEW.id),'')";
 
+/// The preference that turns the system's search on (`system_search`).
+pub const SYSTEM_SEARCH_PREFERENCE: &str = "system_search";
+/// Set with it where the system's search is given copies of messages
+/// (Spotlight, Windows Search), which the store then queues.
+pub const SYSTEM_SEARCH_PUSH_PREFERENCE: &str = "system_search_push";
+/// Whether messages are queued for the system's search, for the triggers
+/// (word for word `SYSTEM_SEARCH_PUSH_PREFERENCE` set to "true").
+const SYSTEM_SEARCH_ON: &str = "(SELECT value FROM preferences WHERE key='system_search_push')='true'";
+/// The longest text of a message given to the system's search, in characters.
+#[cfg_attr(any(target_os = "android", target_os = "ios"), allow(dead_code))]
+const SYSTEM_SEARCH_TEXT: i64 = 32 * 1024;
+
+/// A message as the system's search is given it (`Store::system_search_items`).
+#[cfg_attr(any(target_os = "android", target_os = "ios"), allow(dead_code))]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SystemSearchMessage {
+    pub account: String,
+    /// Its mailbox's key (`Mailbox::key`).
+    pub mailbox: String,
+    pub date: i64,
+    pub subject: String,
+    pub from: String,
+    pub sender: String,
+    pub to: String,
+    pub cc: String,
+    /// Its text (or preview, when not downloaded), at most `SYSTEM_SEARCH_TEXT`.
+    pub text: String,
+    pub message_id: String,
+}
+
+/// A message as `SystemSearchMessage`, by id (?1), with at most ?2
+/// characters of its text.
+#[cfg_attr(target_os = "android", allow(dead_code))]
+const SYSTEM_SEARCH_MESSAGE: &str = "SELECT account, folder, date,
+   coalesce(json_extract(data,'$.subject'),''), coalesce(json_extract(data,'$.from'),''),
+   coalesce(json_extract(data,'$.sender'),''), coalesce(json_extract(data,'$.to'),''),
+   coalesce(json_extract(data,'$.cc'),''),
+   substr(coalesce(json_extract(data,'$.body'), json_extract(data,'$.snippet'), ''), 1, ?2),
+   coalesce(json_extract(data,'$.message_id'),'')
+ FROM messages WHERE id=?1";
+
+#[cfg_attr(target_os = "android", allow(dead_code))]
+fn system_search_message(r: &rusqlite::Row<'_>) -> rusqlite::Result<SystemSearchMessage> {
+    Ok(SystemSearchMessage {
+        account: r.get(0)?,
+        mailbox: r.get(1)?,
+        date: r.get(2)?,
+        subject: r.get(3)?,
+        from: r.get(4)?,
+        sender: r.get(5)?,
+        to: r.get(6)?,
+        cc: r.get(7)?,
+        text: r.get(8)?,
+        message_id: r.get(9)?,
+    })
+}
+
+/// A message queued for the system's search: what it is now, and what
+/// the system's search was given of it before.
+#[cfg_attr(any(target_os = "android", target_os = "ios"), allow(dead_code))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SystemSearchItem {
+    pub id: String,
+    /// Its place in the queue, for `Store::system_search_done`.
+    pub queued: i64,
+    /// The message now; `None` once it is gone.
+    pub now: Option<SystemSearchMessage>,
+    /// What it was listed as: its account and the name it was given.
+    pub listed: Option<(String, String)>,
+}
+
 /// `DOWNLOADED`, of the row named `m`.
 const DOWNLOADED_M: &str = "(m.raw IS NOT NULL OR m.source IS NOT NULL)";
 
@@ -4615,6 +4924,17 @@ fn fts_query(words: &[String], without: &[String]) -> Option<String> {
         query.push_str(&w);
     }
     Some(query)
+}
+
+/// A full-text query finding each of `words` (as `fts_query` does) in
+/// one `column` of the index only.
+fn fts_column_query(column: &str, words: &[String]) -> Option<String> {
+    let words: Vec<String> = words
+        .iter()
+        .filter_map(|w| fts_query(std::slice::from_ref(w), &[]))
+        .map(|phrase| format!("{column} : {phrase}"))
+        .collect();
+    (!words.is_empty()).then(|| words.join(" AND "))
 }
 
 fn write_messages(tx: &rusqlite::Transaction<'_>, messages: &[Mail]) -> Result<()> {

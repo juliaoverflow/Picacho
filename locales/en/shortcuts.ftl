@@ -32,6 +32,10 @@ shortcuts-previous-message = Previous Message
 
 shortcuts-open-in-new-window = Open in New Window
 
+shortcuts-show-hide-contact-panel = Show/Hide Contact Panel
+
+shortcuts-browse-attachments = Browse Attachments
+
 shortcuts-find-in-message = Find in Message
 
 shortcuts-print = Print
@@ -87,6 +91,8 @@ shortcuts-heading = Heading
 shortcuts-preview-formatting = Preview Formatting
 
 shortcuts-undo = Undo
+
+shortcuts-command-palette = Command Palette
 
 shortcuts-settings = Settings
 

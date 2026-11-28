@@ -54,6 +54,57 @@ pub fn extract(raw: &[u8]) -> String {
     out
 }
 
+/// Whether the text of an attachment of this type and name is read into
+/// the index: what a search of attachments' words can find in it.
+pub fn readable(mime: &str, name: &str) -> bool {
+    kind(&mime.to_ascii_lowercase(), name) != Kind::None
+}
+
+/// The text of one attachment, from its decoded `bytes`, as the index
+/// reads it (up to `MAX_PART_TEXT`): for previewing an attachment without
+/// opening it. Empty for what can't be read.
+pub fn part_text(bytes: &[u8], mime: &str, name: &str) -> String {
+    if bytes.len() > MAX_PART {
+        return String::new();
+    }
+    let mut text = match kind(&mime.to_ascii_lowercase(), name) {
+        Kind::Text => decode_text(bytes),
+        Kind::Html => html_to_text(&decode_text(bytes)),
+        Kind::Email => email_text(bytes, 0),
+        Kind::Pdf => pdf_text(bytes),
+        Kind::Office(entries) => office_text(bytes, entries),
+        Kind::None => String::new(),
+    };
+    truncate(&mut text, MAX_PART_TEXT);
+    text
+}
+
+/// Text without its MIME part's charset: UTF-16 or UTF-8 by its byte
+/// order mark, else UTF-8 (what isn't, replaced).
+fn decode_text(bytes: &[u8]) -> String {
+    match encoding_rs::Encoding::for_bom(bytes) {
+        Some((encoding, _)) => encoding.decode_with_bom_removal(bytes).0.into_owned(),
+        None => String::from_utf8_lossy(bytes).into_owned(),
+    }
+}
+
+/// The headers and text of an attached email (`.eml`, or Outlook's
+/// `.msg`) at `depth`, with its own attachments'.
+fn email_text(bytes: &[u8], depth: usize) -> String {
+    let mut inner = String::new();
+    if depth >= MAX_DEPTH {
+        return inner;
+    }
+    if crate::sync::msg::is_msg(bytes) {
+        if let Ok(eml) = crate::sync::msg::to_eml(bytes) {
+            message(&eml, depth + 1, true, &mut inner);
+        }
+    } else {
+        message(bytes, depth + 1, true, &mut inner);
+    }
+    inner
+}
+
 /// Adds what `raw` holds to `out`: its attachments' text, and, for an
 /// attached email (`whole`), its headers and text as well.
 fn message(raw: &[u8], depth: usize, whole: bool, out: &mut String) {
@@ -126,17 +177,7 @@ fn message(raw: &[u8], depth: usize, whole: bool, out: &mut String) {
                     .get_body()
                     .unwrap_or_else(|_| String::from_utf8_lossy(&bytes).into_owned()),
             ),
-            Kind::Email if depth < MAX_DEPTH => {
-                let mut inner = String::new();
-                if crate::sync::msg::is_msg(&bytes) {
-                    if let Ok(eml) = crate::sync::msg::to_eml(&bytes) {
-                        message(&eml, depth + 1, true, &mut inner);
-                    }
-                } else {
-                    message(&bytes, depth + 1, true, &mut inner);
-                }
-                inner
-            }
+            Kind::Email if depth < MAX_DEPTH => email_text(&bytes, depth),
             Kind::Pdf => pdf_text(&bytes),
             Kind::Office(entries) => office_text(&bytes, entries),
             Kind::Email | Kind::None => continue,
@@ -943,6 +984,26 @@ mod tests {
         assert!(text.contains("Original plan") && text.contains("Meet at noon"), "{text}");
         let image = extract(&with_attachment("photo.jpg", "image/jpeg", &[0xFF, 0xD8, 0xFF, 0xE0]));
         assert_eq!(image, "photo.jpg");
+    }
+
+    /// One attachment's text, read from its bytes alone, as the index
+    /// reads it within a message: for previews.
+    #[test]
+    fn one_attachments_text_for_previews() {
+        assert!(readable("application/pdf", "a.bin") && readable("", "notes.TXT"));
+        assert!(readable("application/octet-stream", "bid.docx"));
+        assert!(!readable("image/jpeg", "photo.jpg") && !readable("application/zip", "a.zip"));
+        assert_eq!(part_text(b"Quarterly figures", "text/plain", "n.txt"), "Quarterly figures");
+        // UTF-16 with its byte order mark.
+        let utf16: Vec<u8> = [0xFF, 0xFE].into_iter().chain("Résumé".encode_utf16().flat_map(u16::to_le_bytes)).collect();
+        assert_eq!(part_text(&utf16, "text/plain", "cv.txt"), "Résumé");
+        assert_eq!(part_text(b"<p>Hello <b>world</b></p>", "text/html", "p.html").trim(), "Hello world");
+        let docx = zip(&[("word/document.xml", "<w:p><w:t>Tender</w:t></w:p>")]);
+        assert!(part_text(&docx, "", "bid.docx").contains("Tender"));
+        let eml = b"From: b@example.com\r\nSubject: Original plan\r\n\r\nMeet at noon.";
+        let text = part_text(eml, "message/rfc822", "fwd.eml");
+        assert!(text.contains("Original plan") && text.contains("Meet at noon"), "{text}");
+        assert!(part_text(&[0xFF, 0xD8, 0xFF], "image/jpeg", "photo.jpg").is_empty());
     }
 
     /// A ToUnicode map's ranges name at most `MAX_CMAP_ENTRIES` codes in

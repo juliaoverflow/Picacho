@@ -1584,3 +1584,32 @@ fn workspaces_switch_from_mailboxes_and_open_their_page_on_a_phone(cx: &mut Test
     act(&view, Action::Workspaces(WsAction::Switch(None)), cx);
     assert!(shown(cx, home_section));
 }
+
+/// A tablet's keyboard opens the command palette on a phone too: it fits
+/// the screen, and Back closes it without leaving the screen under it,
+/// which a back swipe can't drag away meanwhile.
+#[gpui::test]
+fn back_closes_the_command_palette_first(cx: &mut TestAppContext) {
+    use crate::display::ui::palette::PaletteAction;
+    let (view, cx) = phone(PHONE, cx);
+    let id = first_message(&view, cx);
+    act(&view, Action::Select(id), cx);
+    settle(cx);
+    assert_eq!(screen(&view, cx), Screen::Reader);
+
+    act(&view, Action::Palette(PaletteAction::Toggle), cx);
+    let panel = bounds(cx, "palette");
+    assert!(panel.left() >= px(0.) && panel.right() <= px(PHONE.0), "{panel:?}");
+    assert!(panel.top() >= px(0.) && panel.bottom() <= px(PHONE.1), "{panel:?}");
+    let row = bounds(cx, "palette-row-0");
+    assert!(row.right() <= panel.right() && row.size.height > px(0.), "{row:?}");
+    view.update_in(cx, |this, w, cx| {
+        assert!(this.mobile_has_back(w, cx));
+        assert!(!this.mobile_can_go_back(cx));
+        this.close(w, cx);
+    });
+    settle(cx);
+    view.read_with(cx, |this, _| assert!(!this.palette.open));
+    assert_eq!(screen(&view, cx), Screen::Reader, "Back closed only the palette");
+    assert!(!shown(cx, "palette"));
+}

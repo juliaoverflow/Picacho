@@ -118,3 +118,26 @@ applock-that-isnt-the-current-passcode = That isn't the current passcode.
 applock-encrypting-stopped-part-way = Encrypting stopped part way.
 
 applock-notifications-widgets = Notifications & Widgets
+
+applock-show-mail-in-spotlight = Show mail in Spotlight
+
+applock-spotlight-caption = Find messages by subject, people and text in Spotlight. Choosing one opens it in Picacho. Junk and Trash stay out.
+
+applock-show-mail-in-windows-search = Show mail in Windows Search
+
+applock-windows-search-caption = Find messages by subject, people and text from Start and File Explorer. Picacho keeps a small copy of each message’s text for Windows to index; junk and trash stay out.
+
+applock-system-search-not-while-hidden = Not available while mail is hidden outside Picacho or the local database is encrypted.
+
+applock-system-search-adding = { $count ->
+        [one] Adding 1 message…
+       *[other] Adding { $count } messages…
+    }
+
+applock-open-indexing-options = Open Indexing Options
+
+applock-show-mail-in-desktop-search = Show mail in desktop search
+
+applock-desktop-search-caption = Find messages by subject, people and text from GNOME’s and KDE’s searches while Picacho runs, in a window or in the background. Choosing one opens it in Picacho. Nothing is copied: Picacho answers from its own index. Junk and Trash stay out.
+
+applock-desktop-search-not-while-hidden = Not available while mail is hidden outside Picacho.

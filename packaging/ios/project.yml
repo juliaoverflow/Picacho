@@ -161,6 +161,10 @@ targets:
           # Security keys over NFC (SecurityKeys.swift); iPads have none.
           - -weak_framework
           - CoreNFC
+          # Mail in Spotlight (src/manage/system_search/spotlight.rs, and
+          # main.m's results chosen).
+          - -framework
+          - CoreSpotlight
 
   # The Share sheet's Picacho: shared text, links and files start a message
   # (ShareExtension/ShareViewController.swift, Shares.swift).

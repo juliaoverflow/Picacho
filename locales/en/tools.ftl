@@ -100,3 +100,7 @@ tools-you-have-no-openpgp-key-of-2 = You have no OpenPGP key of your own to expo
 tools-could-not-set-default-email-app = Could not set default email app (xdg-mime / xdg-settings not available).
 
 tools-choose-your-default-email-app-in = Choose your default email app in your phone's Settings.
+
+tools-no-window-to-print-from = there's no window to print from.
+
+tools-sent-to-the-printer = Sent to { $printer }

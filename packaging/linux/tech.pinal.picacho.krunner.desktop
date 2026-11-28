@@ -1,0 +1,18 @@
+# KDE Plasma's KRunner asks Picacho for mail as one types, over D-Bus
+# (src/manage/system_search/desktop_search.rs), while Picacho runs and
+# Settings → Privacy → Show mail in desktop search is on. Installed in
+# krunner/dbusplugins/ (the Flatpak's exports, /usr/share, or ~/.local/share).
+[Desktop Entry]
+Type=Service
+Name=Picacho
+Comment=Mail in Picacho
+Icon=tech.pinal.picacho
+X-KDE-ServiceTypes=Plasma/Runner
+X-KDE-PluginInfo-Name=tech.pinal.picacho
+X-KDE-PluginInfo-Author=Pinal Technologies
+X-KDE-PluginInfo-License=MIT
+X-KDE-PluginInfo-EnabledByDefault=true
+X-Plasma-API=DBus
+X-Plasma-Request-Actions-Once=true
+X-Plasma-DBusRunner-Service=tech.pinal.picacho.SearchProvider
+X-Plasma-DBusRunner-Path=/tech/pinal/picacho/KRunner

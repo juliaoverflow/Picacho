@@ -223,6 +223,8 @@ impl AssetSource for Assets {
             "mail/people.svg" => Some(
                 "<circle cx='9' cy='8' r='3.5'/><path d='M2.5 20a6.5 6.5 0 0 1 13 0'/><path d='M16 4.6a3.5 3.5 0 0 1 0 6.8M18 14a6.5 6.5 0 0 1 3.5 6'/>",
             ),
+            // Tasks: a checklist.
+            "mail/tasks.svg" => Some("<path d='m3 6 2 2 4-4M3 14l2 2 4-4M13 6h8M13 14h8M13 20h8'/>"),
             "mail/tag.svg" => Some(
                 "<path d='M12.6 2.6A2 2 0 0 0 11.2 2H4a2 2 0 0 0-2 2v7.2a2 2 0 0 0 .6 1.4l8.7 8.7a2.4 2.4 0 0 0 3.4 0l6.6-6.6a2.4 2.4 0 0 0 0-3.4Z'/><circle cx='7.5' cy='7.5' r='.5'/>",
             ),
